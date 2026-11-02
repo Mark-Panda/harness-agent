@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.11
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Install protobuf generator
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+
+      - name: Check generated code
+        run: make generate-check
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Race tests
+        run: make test-race
+
+      - name: Contract tests
+        run: make test-contract
+
+      - name: Web tests
+        run: make test-web
+
+      - name: Build application
+        run: make build
+
+      - name: Start development stack
+        run: make docker-up
+
+      - name: Smoke test
+        run: make smoke
+
+      - name: Verify pgvector
+        run: docker compose exec -T postgres psql -U harness -d harness -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
+
+      - name: Stop development stack
+        if: always()
+        run: docker compose down

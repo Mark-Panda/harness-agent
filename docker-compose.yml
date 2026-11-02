@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg18
+    environment:
+      POSTGRES_DB: harness
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8.2.3-alpine
+    command: ["redis-server", "--requirepass", "harness", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "harness", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.74.0
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  app:
+    build:
+      context: .
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: postgres://harness:harness@postgres:5432/harness?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: harness
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:

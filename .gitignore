@@ -13,6 +13,9 @@ tmp/
 vendor/
 node_modules/
 web/dist/
+!internal/server/static/dist/
+internal/server/static/dist/*
+!internal/server/static/dist/index.html
 .idea/
 .vscode/
 .worktrees/

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.screenshots
+.worktrees
+node_modules
+web/node_modules
+web/dist
+internal/server/static/dist
+bin
+coverage
+tmp
+docs
+*.log
+.env
+.env.*

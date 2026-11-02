@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package harness.v1;
+
+option go_package = "github.com/Mark-Panda/harness-agent/api/harness/v1;harnessv1";
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
