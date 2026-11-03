@@ -99,3 +99,42 @@ func TestRunRepositoryLifecycleAndEventCursor(t *testing.T) {
 		t.Fatalf("illegal transition error = %v", err)
 	}
 }
+
+// TestRunRepositoryListAllRuns 验证管理员全局运行列表的系统作用域、联表字段与筛选。
+func TestRunRepositoryListAllRuns(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	repository := NewRunRepository(appDB)
+	ctx := context.Background()
+	page, err := repository.ListAllRuns(ctx, biz.AdminRunFilter{}, 5, "")
+	if err != nil {
+		t.Fatalf("list all runs: %v", err)
+	}
+	if len(page.Items) == 0 {
+		return
+	}
+	first := page.Items[0]
+	if first.Source == "" || first.Username == "" || first.Run.UserID == uuid.Nil {
+		t.Fatalf("missing joined fields: %#v", first)
+	}
+	userPage, err := repository.ListAllRuns(ctx, biz.AdminRunFilter{UserID: &first.Run.UserID}, 5, "")
+	if err != nil || len(userPage.Items) == 0 {
+		t.Fatalf("filter by user returned %#v, %v", userPage, err)
+	}
+	for _, item := range userPage.Items {
+		if item.Run.UserID != first.Run.UserID {
+			t.Fatalf("user filter leaked another user: %#v", item)
+		}
+	}
+	sourcePage, err := repository.ListAllRuns(ctx, biz.AdminRunFilter{Source: first.Source}, 5, "")
+	if err != nil || len(sourcePage.Items) == 0 {
+		t.Fatalf("filter by source returned %#v, %v", sourcePage, err)
+	}
+	for _, item := range sourcePage.Items {
+		if item.Source != first.Source {
+			t.Fatalf("source filter leaked another source: %#v", item)
+		}
+	}
+}

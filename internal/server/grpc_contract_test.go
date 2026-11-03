@@ -57,6 +57,19 @@ func (a *grpcContractAuth) ResetPassword(context.Context, string, string) error 
 func (a *grpcContractAuth) CreateUser(context.Context, biz.Principal, string, string) (service.PublicUser, error) {
 	return service.PublicUser{}, nil
 }
+func (a *grpcContractAuth) ListUsers(context.Context, biz.Principal, biz.UserFilter, int, string) (biz.Page[service.AdminUser], error) {
+	return biz.Page[service.AdminUser]{}, nil
+}
+func (a *grpcContractAuth) SetUserRole(context.Context, biz.Principal, uuid.UUID, biz.Role, string) error {
+	return nil
+}
+func (a *grpcContractAuth) FeishuLoginEnabled() bool { return false }
+func (a *grpcContractAuth) FeishuAuthorizeURL(string) (string, bool) {
+	return "", false
+}
+func (a *grpcContractAuth) LoginWithFeishu(context.Context, string) (service.AuthResult, error) {
+	return service.AuthResult{}, nil
+}
 
 // TestGRPCAuthenticationAndSessionContract 验证 gRPC 鉴权拦截器与请求身份注入。
 func TestGRPCAuthenticationAndSessionContract(t *testing.T) {

@@ -89,6 +89,26 @@ type RunFence struct {
 	Token int64
 }
 
+// AdminRunFilter 是管理员全局运行记录的筛选条件。
+type AdminRunFilter struct {
+	// UserID 只查看指定用户；为空表示全部用户。
+	UserID *uuid.UUID
+	// Source 按会话来源过滤；为空表示全部来源。
+	Source SessionSource
+}
+
+// RunSummary 是管理员全局运行记录的展示条目，附带会话来源与用户名。
+type RunSummary struct {
+	// Run 执行聚合本体。
+	Run Run
+	// Source 会话来源渠道。
+	Source SessionSource
+	// SessionTitle 会话标题，便于审计定位。
+	SessionTitle string
+	// Username 发起用户的可读名称。
+	Username string
+}
+
 // RunRepository 定义 Run 与事件的持久化契约。
 type RunRepository interface {
 	// CreateRun 创建 Run；同一用户幂等键冲突时返回已存在的 Run。
@@ -97,6 +117,8 @@ type RunRepository interface {
 	GetRun(ctx context.Context, userID, runID uuid.UUID) (Run, error)
 	// ListRuns 按会话游标分页列出 Run。
 	ListRuns(ctx context.Context, userID, sessionID uuid.UUID, limit int, cursor string) (Page[Run], error)
+	// ListAllRuns 按用户与来源筛选全局 Run，供管理员审计。
+	ListAllRuns(ctx context.Context, filter AdminRunFilter, limit int, cursor string) (Page[RunSummary], error)
 	// TransitionRun 以状态 CAS 推进 Run 状态。
 	TransitionRun(ctx context.Context, userID, runID uuid.UUID, from, to RunStatus, fields map[string]any) (Run, error)
 	// AppendEvent 追加事件并分配单调 seq。
@@ -412,6 +434,17 @@ func (s *RunService) List(ctx context.Context, principal Principal, sessionID uu
 		return Page[Run]{}, err
 	}
 	return s.repo.ListRuns(ctx, principal.UserID, sessionID, limit, cursor)
+}
+
+// ListAll 由管理员按用户与来源筛选全局 Run。
+func (s *RunService) ListAll(ctx context.Context, principal Principal, filter AdminRunFilter, limit int, cursor string) (Page[RunSummary], error) {
+	if err := RequireAdmin(principal); err != nil {
+		return Page[RunSummary]{}, err
+	}
+	if filter.Source != "" && filter.Source != SessionSourceWeb && filter.Source != SessionSourceFeishu && filter.Source != SessionSourceAPI {
+		return Page[RunSummary]{}, invalid("unsupported session source")
+	}
+	return s.repo.ListAllRuns(ctx, filter, limit, cursor)
 }
 
 // Enqueue 把非终态 Run 重新加入执行队列，用于恢复暂停的 Plan 或人工重放。

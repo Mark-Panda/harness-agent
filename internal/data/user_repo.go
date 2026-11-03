@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -122,6 +123,80 @@ func (r *UserRepository) GetUserByNormalizedUsername(ctx context.Context, normal
 		return biz.User{}, fmt.Errorf("get user by username: %w", err)
 	}
 	return toBizUser(model), nil
+}
+
+// ListUsers 在系统作用域下按状态与用户名筛选用户，按创建时间游标分页。
+// 管理员身份由应用服务层校验；数据库层只开放 users 表的系统只读策略。
+func (r *UserRepository) ListUsers(ctx context.Context, filter biz.UserFilter, limit int, cursor string) (biz.Page[biz.User], error) {
+	decoded, err := DecodeCursor(cursor)
+	if err != nil {
+		return biz.Page[biz.User]{}, fmt.Errorf("%w: invalid user cursor", biz.ErrInvalidConfig)
+	}
+	limit = NormalizeLimit(limit)
+	search := biz.NormalizeUsername(filter.Search)
+	// 转义 LIKE 通配符，避免用户名关键字扩大匹配范围。
+	search = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search)
+	var records []userModel
+	err = WithScope(ctx, r.appDB, Scope{System: true}, func(tx *gorm.DB) error {
+		query := tx.Model(&userModel{})
+		if filter.Status != "" {
+			query = query.Where("status = ?", string(filter.Status))
+		}
+		if search != "" {
+			query = query.Where("username_normalized LIKE ?", "%"+search+"%")
+		}
+		if decoded.ID != uuid.Nil {
+			query = query.Where("(created_at < ? OR (created_at = ? AND id < ?))", decoded.CreatedAt, decoded.CreatedAt, decoded.ID)
+		}
+		return query.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&records).Error
+	})
+	if err != nil {
+		return biz.Page[biz.User]{}, fmt.Errorf("list users: %w", err)
+	}
+	page := biz.Page[biz.User]{Items: make([]biz.User, 0, min(limit, len(records)))}
+	if len(records) > limit {
+		records = records[:limit]
+		last := records[len(records)-1]
+		page.NextCursor, err = EncodeCursor(Cursor{CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return biz.Page[biz.User]{}, err
+		}
+	}
+	for _, record := range records {
+		page.Items = append(page.Items, toBizUser(record))
+	}
+	return page, nil
+}
+
+// UpdateUserRole 更新目标用户角色并与审计事件同事务提交。
+// 角色校验由应用服务层完成；数据库层仍通过 RLS 限定只能更新目标用户自身行。
+func (r *UserRepository) UpdateUserRole(ctx context.Context, userID uuid.UUID, role biz.Role, event biz.OutboxEvent) error {
+	if userID == uuid.Nil || role != biz.RoleUser && role != biz.RoleAdmin {
+		return fmt.Errorf("%w: invalid user role", biz.ErrInvalidConfig)
+	}
+	if event.UserID == uuid.Nil {
+		event.UserID = userID
+	}
+	if event.AggregateID == "" {
+		event.AggregateID = userID.String()
+	}
+	updatedAt := time.Now().UTC()
+	err := WithScope(ctx, r.appDB, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		result := tx.Model(&userModel{}).Where("id = ?", userID).Updates(map[string]any{
+			"role": string(role), "updated_at": updatedAt,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return biz.ErrUserNotFound
+		}
+		return appendOutbox(tx, event)
+	})
+	if err != nil {
+		return fmt.Errorf("update user role: %w", err)
+	}
+	return nil
 }
 
 // UpdateUser 更新密码哈希、状态与凭据版本，并与审计事件同事务提交。

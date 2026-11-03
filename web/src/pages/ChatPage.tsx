@@ -46,6 +46,20 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+// toolCallNames 从消息的工具调用记录中提取名称，用于气泡内展示。
+function toolCallNames(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const name = (item as Record<string, unknown>).name;
+    return typeof name === "string" && name.length > 0 ? [name] : [];
+  });
+}
+
 interface LiveMessage {
   // key 使用事件序号去重。
   key: string;
@@ -96,8 +110,11 @@ export default function ChatPage() {
   const [deciding, setDeciding] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [showJump, setShowJump] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  // stickToBottomRef 记录用户是否停留在底部，避免新内容把正在翻历史的用户拽回去。
+  const stickToBottomRef = useRef(true);
 
   const agent = useMemo(() => {
     const target = session.data?.agent_id;
@@ -328,10 +345,9 @@ export default function ChatPage() {
           if (isTerminal(current.status)) {
             setConnection("closed");
             void refreshApprovals(runID);
-            if (current.status === "completed") {
-              messagesReload();
-              setLiveMessages([]);
-            }
+            // 无论成功、失败还是取消都重新拉取消息并清空临时流，避免与已落库消息重复。
+            messagesReload();
+            setLiveMessages([]);
             setRunsVersion((value) => value + 1);
             return;
           }
@@ -364,6 +380,9 @@ export default function ChatPage() {
     setSending(true);
     setSendError(null);
     setActionError(null);
+    // 发送后强制跟随新消息，即使之前正在向上翻阅历史。
+    stickToBottomRef.current = true;
+    setShowJump(false);
     try {
       await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", { content }, crypto.randomUUID());
       setDraft("");
@@ -417,13 +436,44 @@ export default function ChatPage() {
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const persistedMessages = (messages.data?.items ?? []).slice().reverse();
 
-  // 新消息或流式增量到达时自动滚到底部，模拟主流对话产品的阅读节奏。
+  // 新内容到达时只在用户停留在底部才自动滚动，向上翻阅历史时不打断阅读。
   useEffect(() => {
     const element = messageListRef.current;
-    if (element) {
+    if (!element) {
+      return;
+    }
+    if (stickToBottomRef.current) {
       element.scrollTop = element.scrollHeight;
+      setShowJump(false);
+      return;
+    }
+    if (persistedMessages.length + liveMessages.length > 0) {
+      setShowJump(true);
     }
   }, [persistedMessages.length, liveMessages.length, runActive]);
+
+  // scrollToLatest 主动回到底部，并恢复自动跟随。
+  const scrollToLatest = () => {
+    const element = messageListRef.current;
+    if (!element) {
+      return;
+    }
+    element.scrollTop = element.scrollHeight;
+    stickToBottomRef.current = true;
+    setShowJump(false);
+  };
+
+  // onMessageScroll 根据距底部距离切换自动跟随状态。
+  const onMessageScroll = () => {
+    const element = messageListRef.current;
+    if (!element) {
+      return;
+    }
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const nearBottom = distance <= 48;
+    stickToBottomRef.current = nearBottom;
+    setShowJump(!nearBottom && persistedMessages.length + liveMessages.length > 0);
+  };
 
   const copyMessage = async (key: string, content: string) => {
     try {
@@ -478,6 +528,7 @@ export default function ChatPage() {
           className="flex max-h-[58vh] min-h-[320px] flex-col gap-4 overflow-y-auto rounded-[3px] border border-line bg-paper/60 px-4 py-5"
           role="log"
           aria-live="polite"
+          onScroll={onMessageScroll}
         >
           {messages.loading ? (
             <LoadingState label="加载消息" />
@@ -549,6 +600,15 @@ export default function ChatPage() {
               助手正在处理第 {activeRun?.current_step_seq || 1} 步…
             </p>
           ) : null}
+          {showJump ? (
+            <button
+              type="button"
+              onClick={scrollToLatest}
+              className="sticky bottom-0 z-10 mx-auto rounded-[3px] border border-line-strong bg-paper-raised px-3 py-1.5 text-xs text-ink shadow-[0_6px_20px_rgb(31_27_21/0.12)] transition hover:border-accent hover:text-accent"
+            >
+              有新内容，回到底部
+            </button>
+          ) : null}
         </div>
 
         {pendingApprovals.length > 0 ? (
@@ -587,7 +647,11 @@ export default function ChatPage() {
             className="min-h-20 resize-none border-0 bg-transparent p-0 focus:ring-0"
             aria-label="消息内容"
             onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              // 输入法组合阶段按 Enter 只用于确认候选词，不触发发送。
+              if (event.nativeEvent.isComposing) {
+                return;
+              }
+              if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 void send();
               }
@@ -595,7 +659,7 @@ export default function ChatPage() {
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] text-muted">
-              {runActive ? "助手正在处理，发送暂时不可用。" : "Ctrl / ⌘ + Enter 发送 · 内容会自动保存"}
+              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 内容会自动保存"}
             </p>
             <div className="flex gap-2">
               {runActive ? (
@@ -686,6 +750,7 @@ function MessageBubble({
   copied: boolean;
   onCopy: (key: string, content: string) => Promise<void>;
 }) {
+  const toolNames = toolCallNames(toolCalls);
   if (role === "system") {
     return <div className="mx-auto max-w-[90%] rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2 text-center text-[11px] leading-5 text-muted">{content}</div>;
   }
@@ -735,7 +800,21 @@ function MessageBubble({
           ) : null}
         </div>
         <div className="rounded-[4px] border border-line bg-paper-raised px-4 py-3 text-sm leading-6">
-          <SafeMarkdown content={content} />
+          {content ? (
+            <SafeMarkdown content={content} />
+          ) : (
+            <p className="text-xs text-muted">{toolNames.length > 0 ? "正在调用工具，等待结果…" : "这一步没有文本输出。"}</p>
+          )}
+          {toolNames.length > 0 ? (
+            <p className="mt-2 flex flex-wrap items-center gap-1 text-[11px] text-muted">
+              调用工具：
+              {toolNames.map((toolName, index) => (
+                <span key={`${toolName}-${index}`} className="rounded-[2px] border border-line bg-paper-deep/50 px-1.5 py-0.5 font-mono">
+                  {toolName}
+                </span>
+              ))}
+            </p>
+          ) : null}
           {Array.isArray(toolCalls) && toolCalls.length > 0 ? (
             <details className="mt-2 text-[11px] text-muted">
               <summary className="cursor-pointer">工具调用记录（{toolCalls.length}）</summary>

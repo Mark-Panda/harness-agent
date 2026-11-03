@@ -87,6 +87,21 @@ func (mr *MockUserRepositoryMockRecorder) GetUserByNormalizedUsername(ctx, norma
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetUserByNormalizedUsername", reflect.TypeOf((*MockUserRepository)(nil).GetUserByNormalizedUsername), ctx, normalized)
 }
 
+// ListUsers mocks base method.
+func (m *MockUserRepository) ListUsers(ctx context.Context, filter biz.UserFilter, limit int, cursor string) (biz.Page[biz.User], error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListUsers", ctx, filter, limit, cursor)
+	ret0, _ := ret[0].(biz.Page[biz.User])
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListUsers indicates an expected call of ListUsers.
+func (mr *MockUserRepositoryMockRecorder) ListUsers(ctx, filter, limit, cursor any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListUsers", reflect.TypeOf((*MockUserRepository)(nil).ListUsers), ctx, filter, limit, cursor)
+}
+
 // UpdateUser mocks base method.
 func (m *MockUserRepository) UpdateUser(ctx context.Context, user biz.User, event biz.OutboxEvent) (biz.User, error) {
 	m.ctrl.T.Helper()
@@ -100,4 +115,18 @@ func (m *MockUserRepository) UpdateUser(ctx context.Context, user biz.User, even
 func (mr *MockUserRepositoryMockRecorder) UpdateUser(ctx, user, event any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateUser", reflect.TypeOf((*MockUserRepository)(nil).UpdateUser), ctx, user, event)
+}
+
+// UpdateUserRole mocks base method.
+func (m *MockUserRepository) UpdateUserRole(ctx context.Context, userID uuid.UUID, role biz.Role, event biz.OutboxEvent) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateUserRole", ctx, userID, role, event)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateUserRole indicates an expected call of UpdateUserRole.
+func (mr *MockUserRepositoryMockRecorder) UpdateUserRole(ctx, userID, role, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateUserRole", reflect.TypeOf((*MockUserRepository)(nil).UpdateUserRole), ctx, userID, role, event)
 }

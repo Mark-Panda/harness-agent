@@ -50,3 +50,66 @@ export function useRemote<T>(loader: () => Promise<T>, deps: DependencyList = []
 
   return { data, loading, error, reload };
 }
+
+// ClientPage 是完整加载列表的前端分页状态。
+export interface ClientPage<T> {
+  // page 当前页码，从 1 开始。
+  page: number;
+  // totalPages 总页数，至少为 1。
+  totalPages: number;
+  // pageItems 当前页数据。
+  pageItems: T[];
+  // setPage 跳转到指定页。
+  setPage: (page: number) => void;
+  // reset 回到第一页。
+  reset: () => void;
+}
+
+// useClientPage 对一次完整加载的列表做前端分页，数据收缩时自动回退页码。
+export function useClientPage<T>(items: T[], pageSize = 10): ClientPage<T> {
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const current = Math.min(page, totalPages);
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+  return {
+    page: current,
+    totalPages,
+    pageItems: items.slice((current - 1) * pageSize, current * pageSize),
+    setPage,
+    reset: () => setPage(1),
+  };
+}
+
+// CursorStack 是游标分页的页码栈，后端返回 next_cursor 时才能前进。
+export interface CursorStack {
+  // cursor 当前页游标，首页为空。
+  cursor: string | null;
+  // page 当前页码，从 1 开始。
+  page: number;
+  // next 携带下一页游标前进；游标为空时不移动。
+  next: (nextCursor: string | null) => void;
+  // prev 返回上一页。
+  prev: () => void;
+  // reset 回到首页。
+  reset: () => void;
+}
+
+// useCursorStack 维护游标分页位置，避免只靠下一页游标丢失返回路径。
+export function useCursorStack(): CursorStack {
+  const [cursors, setCursors] = useState<(string | null)[]>([null]);
+  return {
+    cursor: cursors[cursors.length - 1],
+    page: cursors.length,
+    next: (nextCursor) => {
+      if (nextCursor) {
+        setCursors((current) => [...current, nextCursor]);
+      }
+    },
+    prev: () => setCursors((current) => (current.length > 1 ? current.slice(0, -1) : current)),
+    reset: () => setCursors([null]),
+  };
+}

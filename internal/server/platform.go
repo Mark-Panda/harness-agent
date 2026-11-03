@@ -32,6 +32,7 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("POST /api/v1/providers", "llm_provider", handler.createProvider)
 	handle("GET /api/v1/providers", handler.listProviders)
 	handle("GET /api/v1/providers/{id}", handler.getProvider)
+	handle("GET /api/v1/providers/{id}/models", handler.listRemoteModels)
 	handle("PUT /api/v1/providers/{id}", handler.updateProvider)
 	handle("DELETE /api/v1/providers/{id}", handler.deleteProvider)
 	handleWrite("POST /api/v1/models", "llm_model", handler.createModel)
@@ -91,6 +92,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("GET /api/v1/runs/{id}/attempts", handler.runAttempts)
 	// 管理员 Break-Glass：凭书面理由跨用户读取脱敏执行记录，强制写入审计事件。
 	handle("POST /api/v1/admin/break-glass", handler.breakGlass)
+	// 管理员全局运行审计：按用户与来源筛选。
+	handle("GET /api/v1/admin/runs", handler.listAdminRuns)
 	// Supervisor 执行树：展示 Worker 子任务、尝试次数、结果与失败原因。
 	handle("GET /api/v1/runs/{id}/supervisor-tasks", handler.runSupervisorTasks)
 	if platform.Routing != nil {
@@ -402,6 +405,16 @@ func (h *platformHTTPHandler) getProvider(w http.ResponseWriter, r *http.Request
 func (h *platformHTTPHandler) listProviders(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.service.Providers.List(r.Context(), requestPrincipal(r))
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(providers, providerResponse)}, err)
+}
+
+// listRemoteModels 处理 GET /api/v1/providers/{id}/models：从供应商站点拉取可用模型。
+func (h *platformHTTPHandler) listRemoteModels(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	items, err := h.service.Providers.ListRemoteModels(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items}, err)
 }
 
 // createModel 处理 POST /api/v1/models：创建模型，1M+ 与核验准入由领域层强制。

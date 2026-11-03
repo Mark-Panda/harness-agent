@@ -443,6 +443,8 @@ type FeishuConfig struct {
 	AppID string `yaml:"app_id"`
 	// AppSecret 飞书应用 App Secret，必须由环境变量注入。
 	AppSecret string `yaml:"app_secret"`
+	// LoginRedirectURL 网页飞书登录回调地址；为空时不开放网页飞书登录。
+	LoginRedirectURL string `yaml:"login_redirect_url"`
 	// VerificationToken 事件订阅 Verification Token。
 	VerificationToken string `yaml:"verification_token"`
 	// EncryptKeys 事件加密密钥列表，第一个为当前密钥，其余为轮换期历史密钥。
@@ -824,6 +826,12 @@ func (c Config) validateFeishu() error {
 	}
 	if strings.TrimSpace(feishu.AppSecret) == "" {
 		return fmt.Errorf("feishu.app_secret is required when feishu is enabled")
+	}
+	if raw := strings.TrimSpace(feishu.LoginRedirectURL); raw != "" {
+		parsed, err := url.Parse(raw)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return fmt.Errorf("feishu.login_redirect_url must be an absolute HTTP(S) URL")
+		}
 	}
 	if strings.TrimSpace(feishu.VerificationToken) == "" {
 		return fmt.Errorf("feishu.verification_token is required when feishu is enabled")

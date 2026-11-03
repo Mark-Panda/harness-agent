@@ -1,11 +1,11 @@
 // 助手列表：用“我的助手”替代“Agent 编排”，突出创建、发布与开始对话。
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, LoadingState, PageHeader } from "../components/ui";
+import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, LoadingState, PageHeader } from "../components/ui";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
-import { useRemote } from "../lib/hooks";
+import { useCursorStack, useRemote } from "../lib/hooks";
 import type { Agent, AgentMode, MCP, ModelPolicy, Page, Skill } from "../lib/types";
 
 // modeLabel 把技术模式翻译成用户能理解的工作方式。
@@ -21,7 +21,11 @@ function modeLabel(mode: AgentMode): string {
 }
 
 export default function AgentsPage() {
-  const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=50"), []);
+  const paging = useCursorStack();
+  const agents = useRemote(
+    () => requestJSON<Page<Agent>>(`/api/v1/agents?limit=12${paging.cursor ? `&cursor=${encodeURIComponent(paging.cursor)}` : ""}`),
+    [paging.cursor],
+  );
   const policies = useRemote(() => requestJSON<Page<ModelPolicy>>("/api/v1/model-policies"), []);
   const skills = useRemote(() => requestJSON<Page<Skill>>("/api/v1/skills"), []);
   const mcps = useRemote(() => requestJSON<Page<MCP>>("/api/v1/mcps"), []);
@@ -76,8 +80,9 @@ export default function AgentsPage() {
       {agents.loading ? (
         <LoadingState />
       ) : agents.data && agents.data.items.length > 0 ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          {agents.data.items.map((agent) => (
+        <div className="flex flex-col gap-3">
+          <div className="grid gap-4 md:grid-cols-2">
+            {agents.data.items.map((agent) => (
             <article key={agent.id} className="flex flex-col gap-4 rounded-[4px] border border-line bg-paper-raised p-5 transition hover:border-line-strong">
               <header className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -151,6 +156,14 @@ export default function AgentsPage() {
               ) : null}
             </article>
           ))}
+          </div>
+          <CursorPager
+            page={paging.page}
+            count={agents.data.items.length}
+            hasNext={Boolean(agents.data.next_cursor)}
+            onPrev={paging.prev}
+            onNext={() => paging.next(agents.data?.next_cursor ?? null)}
+          />
         </div>
       ) : (
         <Card>

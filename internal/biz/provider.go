@@ -100,6 +100,58 @@ type CredentialOpener interface {
 type ProviderService struct {
 	repo   ProviderRepository
 	cipher CredentialCipher
+	// credentials 与 opener 仅在配置远程模型目录时启用。
+	credentials  ProviderCredentialRepository
+	opener       CredentialOpener
+	remoteModels RemoteModelLister
+}
+
+// RemoteModel 是供应商站点返回的可用模型摘要。
+type RemoteModel struct {
+	// ID 供应商侧模型名。
+	ID string `json:"id"`
+	// OwnedBy 供应商返回的归属方。
+	OwnedBy string `json:"owned_by"`
+}
+
+// RemoteModelLister 抽象供应商模型目录查询能力，便于测试替换网络调用。
+type RemoteModelLister interface {
+	// ListModels 使用解密后的 API Key 查询供应商模型列表。
+	ListModels(ctx context.Context, baseURL, apiKey string) ([]RemoteModel, error)
+}
+
+// WithRemoteModelCatalog 附加远程模型目录能力；缺少任一依赖时保持未启用。
+func (s *ProviderService) WithRemoteModelCatalog(credentials ProviderCredentialRepository, opener CredentialOpener, lister RemoteModelLister) *ProviderService {
+	if credentials != nil && opener != nil && lister != nil {
+		s.credentials = credentials
+		s.opener = opener
+		s.remoteModels = lister
+	}
+	return s
+}
+
+// ListRemoteModels 由管理员读取供应商站点可用模型；密钥只在内存中短暂解密。
+func (s *ProviderService) ListRemoteModels(ctx context.Context, principal Principal, providerID uuid.UUID) ([]RemoteModel, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return nil, err
+	}
+	if s.credentials == nil || s.opener == nil || s.remoteModels == nil {
+		return nil, invalid("remote model catalog is not configured")
+	}
+	provider, credential, err := s.credentials.GetProviderCredential(ctx, providerID)
+	if err != nil {
+		return nil, err
+	}
+	secret, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+	if err != nil {
+		return nil, invalid("provider credential cannot be decrypted")
+	}
+	defer func() {
+		for index := range secret {
+			secret[index] = 0
+		}
+	}()
+	return s.remoteModels.ListModels(ctx, provider.BaseURL, string(secret))
 }
 
 // NewProviderService 构造供应商服务，依赖仓库与凭证加密器。

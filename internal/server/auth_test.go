@@ -28,6 +28,8 @@ type fakeAuthApplication struct {
 	resetExpires  time.Time
 	// operationErr 仅用于 SetUserStatus，避免污染 Authenticate 结果。
 	operationErr error
+	// feishuEnabled 控制飞书登录入口测试开关。
+	feishuEnabled bool
 }
 
 func (f *fakeAuthApplication) Register(context.Context, string, string) (service.AuthResult, error) {
@@ -78,6 +80,34 @@ func (f *fakeAuthApplication) CreateUser(context.Context, biz.Principal, string,
 	return f.result.User, f.err
 }
 
+// ListUsers 返回空分页或预设错误，测试只验证路由与管理权限。
+func (f *fakeAuthApplication) ListUsers(context.Context, biz.Principal, biz.UserFilter, int, string) (biz.Page[service.AdminUser], error) {
+	return biz.Page[service.AdminUser]{}, f.err
+}
+
+// SetUserRole 返回预设操作错误。
+func (f *fakeAuthApplication) SetUserRole(context.Context, biz.Principal, uuid.UUID, biz.Role, string) error {
+	return f.operationErr
+}
+
+// FeishuLoginEnabled 返回测试配置的开关。
+func (f *fakeAuthApplication) FeishuLoginEnabled() bool {
+	return f.feishuEnabled
+}
+
+// FeishuAuthorizeURL 生成测试授权地址。
+func (f *fakeAuthApplication) FeishuAuthorizeURL(state string) (string, bool) {
+	if !f.feishuEnabled {
+		return "", false
+	}
+	return "https://accounts.example.com/authorize?state=" + state, true
+}
+
+// LoginWithFeishu 返回预设会话或错误。
+func (f *fakeAuthApplication) LoginWithFeishu(context.Context, string) (service.AuthResult, error) {
+	return f.result, f.err
+}
+
 func authTestHandler(application AuthApplication) http.Handler {
 	return NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, application, nil)
 }
@@ -93,6 +123,76 @@ func (f *fakeRateLimiter) Allow(context.Context, string) (ratelimit.Result, erro
 func (f *fakeRateLimiter) Reset(_ context.Context, key string) error {
 	f.resetKey = key
 	return nil
+}
+
+func TestAdminUserDirectoryRoute(t *testing.T) {
+	application := &fakeAuthApplication{principal: biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}}
+	handler := authTestHandler(application)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users?limit=5&status=active&q=ali", nil)
+	request.Header.Set("Authorization", "Bearer valid-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"items"`) {
+		t.Fatalf("list users returned %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	invalid := httptest.NewRequest(http.MethodGet, "/api/v1/admin/users?limit=0", nil)
+	invalid.Header.Set("Authorization", "Bearer valid-token")
+	invalidRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(invalidRecorder, invalid)
+	if invalidRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit returned %d", invalidRecorder.Code)
+	}
+}
+
+// TestFeishuLoginRoutes 验证飞书登录状态、授权跳转与 state 校验。
+func TestFeishuLoginRoutes(t *testing.T) {
+	application := &fakeAuthApplication{
+		feishuEnabled: true,
+		result:        service.AuthResult{Tokens: service.TokenPair{RefreshToken: "refresh"}},
+	}
+	handler := authTestHandler(application)
+
+	statusRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/feishu/status", nil))
+	if statusRecorder.Code != http.StatusOK || !strings.Contains(statusRecorder.Body.String(), `"enabled":true`) {
+		t.Fatalf("feishu status returned %d %s", statusRecorder.Code, statusRecorder.Body.String())
+	}
+
+	startRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(startRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/feishu/start", nil))
+	if startRecorder.Code != http.StatusFound || !strings.Contains(startRecorder.Header().Get("Location"), "state=") {
+		t.Fatalf("feishu start returned %d %s", startRecorder.Code, startRecorder.Header().Get("Location"))
+	}
+	stateCookie := startRecorder.Result().Cookies()
+	if len(stateCookie) == 0 || stateCookie[0].Name != feishuStateCookieName {
+		t.Fatalf("feishu start did not set state cookie")
+	}
+
+	mismatch := httptest.NewRequest(http.MethodGet, "/api/v1/auth/feishu/callback?code=code-1&state=wrong", nil)
+	mismatch.AddCookie(&http.Cookie{Name: feishuStateCookieName, Value: stateCookie[0].Value})
+	mismatchRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(mismatchRecorder, mismatch)
+	if mismatchRecorder.Code != http.StatusFound || !strings.Contains(mismatchRecorder.Header().Get("Location"), "feishu_error=state") {
+		t.Fatalf("state mismatch returned %d %s", mismatchRecorder.Code, mismatchRecorder.Header().Get("Location"))
+	}
+
+	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/feishu/callback?code=code-1&state="+stateCookie[0].Value, nil)
+	callback.AddCookie(&http.Cookie{Name: feishuStateCookieName, Value: stateCookie[0].Value})
+	callbackRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(callbackRecorder, callback)
+	if callbackRecorder.Code != http.StatusFound || callbackRecorder.Header().Get("Location") != "/" {
+		t.Fatalf("feishu callback returned %d %s", callbackRecorder.Code, callbackRecorder.Header().Get("Location"))
+	}
+	foundSessionCookie := false
+	for _, cookie := range callbackRecorder.Result().Cookies() {
+		if cookie.Name == refreshCookieName && cookie.Value != "" {
+			foundSessionCookie = true
+		}
+	}
+	if !foundSessionCookie {
+		t.Fatalf("feishu callback did not set session cookies")
+	}
 }
 
 func TestLoginRateLimited(t *testing.T) {

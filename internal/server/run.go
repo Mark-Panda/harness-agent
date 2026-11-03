@@ -66,6 +66,37 @@ func (h *platformHTTPHandler) listRuns(w http.ResponseWriter, r *http.Request) {
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(page.Items, runResponse), "next_cursor": page.NextCursor}, err)
 }
 
+// listAdminRuns 处理 GET /api/v1/admin/runs：管理员按用户与来源筛选全局运行记录。
+func (h *platformHTTPHandler) listAdminRuns(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, ok := pageRequest(w, r)
+	if !ok {
+		return
+	}
+	filter := biz.AdminRunFilter{Source: biz.SessionSource(r.URL.Query().Get("source"))}
+	if raw := r.URL.Query().Get("user_id"); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			writeErrorCode(w, http.StatusBadRequest, "invalid_user_id")
+			return
+		}
+		filter.UserID = &parsed
+	}
+	page, err := h.service.Runs.ListAll(r.Context(), requestPrincipal(r), filter, limit, cursor)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(page.Items))
+	for _, summary := range page.Items {
+		item := runResponse(summary.Run)
+		item["source"] = summary.Source
+		item["session_title"] = summary.SessionTitle
+		item["username"] = summary.Username
+		items = append(items, item)
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items, "next_cursor": page.NextCursor}, nil)
+}
+
 // cancelRun 处理 POST /api/v1/runs/{id}/cancel：取消非终态 Run。
 func (h *platformHTTPHandler) cancelRun(w http.ResponseWriter, r *http.Request) {
 	runID, ok := pathUUID(w, r)
@@ -403,7 +434,7 @@ func writeSSE(w http.ResponseWriter, seq int64, eventType string, payload map[st
 // runResponse 构造 Run 出参。
 func runResponse(run biz.Run) map[string]any {
 	return map[string]any{
-		"id": run.ID, "session_id": run.SessionID, "agent_id": run.AgentID, "agent_version": run.AgentVersion,
+		"id": run.ID, "session_id": run.SessionID, "user_id": run.UserID, "agent_id": run.AgentID, "agent_version": run.AgentVersion,
 		"mode": run.Mode, "status": run.Status, "current_step_seq": run.CurrentStepSeq, "attempt_no": run.AttemptNo,
 		"config_snapshot": run.ConfigSnapshot, "model_policy_snapshot": run.ModelPolicySnapshot,
 		"error_code": run.ErrorCode, "error_message": run.ErrorMessage,

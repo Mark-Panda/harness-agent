@@ -10,6 +10,16 @@ export interface User {
   status: UserStatus;
 }
 
+// AdminUser 是管理员用户目录条目，包含账号时间信息。
+export interface AdminUser {
+  id: string;
+  username: string;
+  role: Role;
+  status: UserStatus | "deleted";
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AuthSession {
   user: User;
   access_token: string;
@@ -66,6 +76,12 @@ export interface Model {
   status: ModelStatus;
   created_at: string;
   updated_at: string;
+}
+
+// RemoteModel 是供应商站点返回的可用模型摘要。
+export interface RemoteModel {
+  id: string;
+  owned_by: string;
 }
 
 export interface PolicyCandidate {
@@ -187,6 +203,7 @@ export type RunStatus = string;
 export interface Run {
   id: string;
   session_id: string;
+  user_id?: string;
   agent_id: string | null;
   agent_version: number | null;
   mode: AgentMode;
@@ -202,6 +219,13 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// AdminRun 是管理员全局运行记录的展示条目，附带会话来源与发起用户。
+export interface AdminRun extends Run {
+  source: SessionSource;
+  session_title: string;
+  username: string;
 }
 
 export interface ExecutionStep {

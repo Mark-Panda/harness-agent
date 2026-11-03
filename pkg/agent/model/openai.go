@@ -187,6 +187,64 @@ func NewClient(baseURL, apiKey string, timeout time.Duration) (*Client, error) {
 	}, nil
 }
 
+// RemoteModel 是供应商 /models 接口返回的可用模型条目。
+type RemoteModel struct {
+	// ID 供应商侧模型名，登记模型时必须完全一致。
+	ID string `json:"id"`
+	// OwnedBy 供应商返回的归属方，仅用于展示。
+	OwnedBy string `json:"owned_by"`
+}
+
+// Models 查询 OpenAI-compatible /models 接口，只读取模型标识与归属方。
+func (c *Client) Models(ctx context.Context) ([]RemoteModel, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create models request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.apiKey)
+	request.Header.Set("Accept", "application/json")
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: list provider models: %v", ErrRetryable, err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read provider models: %v", ErrRetryable, err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		class := ErrPermanent
+		switch {
+		case response.StatusCode == http.StatusTooManyRequests:
+			class = ErrRateLimited
+		case response.StatusCode >= 500:
+			class = ErrRetryable
+		case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
+			class = ErrAuthentication
+		}
+		return nil, &ResponseError{
+			StatusCode: response.StatusCode,
+			RetryAfter: RetryAfter(response.Header.Get("Retry-After"), 0),
+			Class:      class,
+			Message:    "provider model list failed",
+		}
+	}
+	var payload struct {
+		Data []RemoteModel `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("%w: decode provider models response", ErrPermanent)
+	}
+	models := make([]RemoteModel, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		models = append(models, RemoteModel{ID: strings.TrimSpace(item.ID), OwnedBy: strings.TrimSpace(item.OwnedBy)})
+	}
+	return models, nil
+}
+
 // EstimateTokens 使用字符数的保守估算（约 4 字节/Tokens），用于调用前上下文预算。
 func EstimateTokens(messages []ChatMessage) int64 {
 	total := 0

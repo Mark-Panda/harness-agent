@@ -1,10 +1,10 @@
 // 供应商管理：密钥只写不读，删除需二次确认。
 import { useState } from "react";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select } from "../../components/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Page, Provider } from "../../lib/types";
 
 interface ProviderFormState {
@@ -118,7 +118,8 @@ export default function ProvidersPage() {
   };
 
   const items = data?.items ?? [];
-  const allSelected = items.length > 0 && items.every((provider) => selected.has(provider.id));
+  const paging = useClientPage(items, 10);
+  const allSelected = paging.pageItems.length > 0 && paging.pageItems.every((provider) => selected.has(provider.id));
   const toggleSelected = (id: string) => {
     setSelected((current) => {
       const next = new Set(current);
@@ -131,7 +132,16 @@ export default function ProvidersPage() {
     });
   };
   const toggleAll = () => {
-    setSelected(allSelected ? new Set() : new Set(items.map((provider) => provider.id)));
+    const pageIDs = new Set(paging.pageItems.map((provider) => provider.id));
+    setSelected((current) => {
+      const next = new Set(current);
+      if (paging.pageItems.every((provider) => next.has(provider.id))) {
+        pageIDs.forEach((id) => next.delete(id));
+      } else {
+        pageIDs.forEach((id) => next.add(id));
+      }
+      return next;
+    });
   };
 
   // 批量删除复用单条接口，逐条执行并汇总失败项，避免一条失败中断其余删除。
@@ -185,6 +195,7 @@ export default function ProvidersPage() {
         {loading ? (
           <LoadingState />
         ) : data && data.items.length > 0 ? (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[720px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
@@ -202,7 +213,7 @@ export default function ProvidersPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {data.items.map((provider) => (
+                {paging.pageItems.map((provider) => (
                   <tr key={provider.id}>
                     <td className="py-3 pr-2">
                       <input
@@ -229,6 +240,8 @@ export default function ProvidersPage() {
               </tbody>
             </table>
           </div>
+          <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
+          </>
         ) : (
           <EmptyState title="还没有模型服务" description="接入一个 OpenAI 兼容服务后，就能在下一步登记它提供的模型。" action={<Button size="sm" onClick={() => setEditing("new")}>接入模型服务</Button>} />
         )}

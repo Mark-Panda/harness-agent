@@ -38,6 +38,26 @@ func main() {
 	}
 }
 
+// remoteModelLister 使用 OpenAI-compatible /models 接口读取供应商可用模型。
+type remoteModelLister struct{}
+
+// ListModels 调用供应商模型目录；只返回模型名与归属方，不记录密钥。
+func (remoteModelLister) ListModels(ctx context.Context, baseURL, apiKey string) ([]biz.RemoteModel, error) {
+	client, err := model.NewClient(baseURL, apiKey, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	remote, err := client.Models(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]biz.RemoteModel, 0, len(remote))
+	for _, item := range remote {
+		items = append(items, biz.RemoteModel{ID: item.ID, OwnedBy: item.OwnedBy})
+	}
+	return items, nil
+}
+
 func run() error {
 	cfg, err := config.LoadEnvironment(os.Getenv("APP_ENV"))
 	if err != nil {
@@ -147,15 +167,28 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	authOptions := []service.AuthServiceOption{
+		service.WithRefreshReplay(refreshReplay, service.DefaultRefreshReplayTTL),
+		service.WithPasswordReset(data.NewPasswordResetRepository(authDB)),
+		service.WithRegistrationEnabled(cfg.Auth.RegistrationEnabled),
+	}
+	// 网页飞书登录与事件接入共用应用凭据；未配置回调地址时不开放登录入口。
+	if cfg.Feishu.Enabled && strings.TrimSpace(cfg.Feishu.LoginRedirectURL) != "" {
+		oauthClient, oauthErr := feishu.NewOAuthClient(feishu.OAuthConfig{
+			AppID: cfg.Feishu.AppID, AppSecret: cfg.Feishu.AppSecret,
+		})
+		if oauthErr != nil {
+			return fmt.Errorf("configure feishu oauth client: %w", oauthErr)
+		}
+		authOptions = append(authOptions, service.WithFeishuLogin(oauthClient, data.NewFeishuIdentityRepository(authDB), cfg.Feishu.LoginRedirectURL))
+	}
 	authService, err := service.NewAuthService(
 		data.NewUserRepository(appDB, authDB),
 		data.NewRefreshTokenRepository(authDB),
 		jwtManager,
 		[]byte(cfg.Auth.RefreshTokenPepper),
 		nil,
-		service.WithRefreshReplay(refreshReplay, service.DefaultRefreshReplayTTL),
-		service.WithPasswordReset(data.NewPasswordResetRepository(authDB)),
-		service.WithRegistrationEnabled(cfg.Auth.RegistrationEnabled),
+		authOptions...,
 	)
 	if err != nil {
 		return err
@@ -174,6 +207,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	providerService.WithRemoteModelCatalog(catalogRepository, credentialKeys, remoteModelLister{})
 	modelService, err := biz.NewModelService(catalogRepository)
 	if err != nil {
 		return err

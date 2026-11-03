@@ -216,6 +216,64 @@ export function EmptyState({ title, description, action }: { title: string; desc
   );
 }
 
+// Pager 为一次完整加载的列表提供页码导航。
+export function Pager({
+  page,
+  totalPages,
+  total,
+  pageSize = 10,
+  onChange,
+}: {
+  page: number;
+  totalPages: number;
+  total: number;
+  pageSize?: number;
+  onChange: (page: number) => void;
+}) {
+  if (total <= 0) {
+    return null;
+  }
+  return (
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted">
+      <span>共 {total} 条 · 每页 {pageSize} 条</span>
+      <div className="flex items-center gap-2">
+        <Button size="sm" variant="secondary" disabled={page <= 1} onClick={() => onChange(page - 1)}>上一页</Button>
+        <span>第 {page} / {totalPages} 页</span>
+        <Button size="sm" variant="secondary" disabled={page >= totalPages} onClick={() => onChange(page + 1)}>下一页</Button>
+      </div>
+    </div>
+  );
+}
+
+// CursorPager 为后端游标分页的列表提供前后翻页；不知道总页数时只展示当前页。
+export function CursorPager({
+  page,
+  count,
+  hasNext,
+  onPrev,
+  onNext,
+}: {
+  page: number;
+  count: number;
+  hasNext: boolean;
+  onPrev: () => void;
+  onNext: () => void;
+}) {
+  if (count <= 0) {
+    return null;
+  }
+  return (
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted">
+      <span>本页 {count} 条</span>
+      <div className="flex items-center gap-2">
+        <Button size="sm" variant="secondary" disabled={page <= 1} onClick={onPrev}>上一页</Button>
+        <span>第 {page} 页</span>
+        <Button size="sm" variant="secondary" disabled={!hasNext} onClick={onNext}>下一页</Button>
+      </div>
+    </div>
+  );
+}
+
 export function ErrorBanner({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
     <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-[3px] border-l-4 border-rust bg-rust-soft/70 px-4 py-3 text-sm text-rust">
@@ -264,8 +322,14 @@ export function ConfirmDialog({
   if (!open) {
     return null;
   }
+  // 请求进行中禁止关闭弹窗，避免失败原因还没看到就被用户误关。
+  const requestCancel = () => {
+    if (!busy) {
+      onCancel();
+    }
+  };
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 p-4" role="presentation" onClick={onCancel}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 p-4" role="presentation" onClick={requestCancel}>
       <div
         role="dialog"
         aria-modal="true"
@@ -275,7 +339,7 @@ export function ConfirmDialog({
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
-            onCancel();
+            requestCancel();
           }
         }}
       >
@@ -289,7 +353,7 @@ export function ConfirmDialog({
         ) : null}
         {children ? <div className="mt-4">{children}</div> : null}
         <div className="mt-6 flex justify-end gap-2">
-          <Button variant="secondary" onClick={onCancel} disabled={busy} autoFocus>
+          <Button variant="secondary" onClick={requestCancel} disabled={busy} autoFocus>
             取消
           </Button>
           <Button variant={tone === "danger" ? "danger" : "primary"} onClick={onConfirm} loading={busy}>

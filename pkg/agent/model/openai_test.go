@@ -147,3 +147,35 @@ func TestClientValidationAndRetryAfter(t *testing.T) {
 		t.Fatalf("RetryAfter fallback = %v", duration)
 	}
 }
+
+// TestModelsListsProviderCatalog 验证从供应商 /models 接口读取模型名，并过滤空标识。
+func TestModelsListsProviderCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/models" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret-key" {
+			t.Fatalf("missing bearer token")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]string{
+				{"id": "deepseek-chat", "owned_by": "deepseek"},
+				{"id": "  ", "owned_by": "empty"},
+				{"id": "qwen-max", "owned_by": "alibaba"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "secret-key", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := client.Models(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].ID != "deepseek-chat" || items[1].ID != "qwen-max" {
+		t.Fatalf("Models() = %#v", items)
+	}
+}

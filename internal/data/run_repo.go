@@ -179,6 +179,91 @@ func (r *RunRepository) ListRuns(ctx context.Context, userID, sessionID uuid.UUI
 	return page, nil
 }
 
+// ListAllRuns 在系统作用域下按用户与会话来源筛选全局 Run，供管理员审计。
+func (r *RunRepository) ListAllRuns(ctx context.Context, filter biz.AdminRunFilter, limit int, cursor string) (biz.Page[biz.RunSummary], error) {
+	decoded, err := DecodeCursor(cursor)
+	if err != nil {
+		return biz.Page[biz.RunSummary]{}, fmt.Errorf("%w: invalid run cursor", biz.ErrInvalidConfig)
+	}
+	limit = NormalizeLimit(limit)
+	var records []runModel
+	sessionSources := map[uuid.UUID]sessionModel{}
+	usernames := map[uuid.UUID]string{}
+	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		query := tx.Table("agent_runs AS runs").
+			Select("runs.*").
+			Joins("JOIN sessions ON sessions.id = runs.session_id")
+		if filter.UserID != nil {
+			query = query.Where("runs.user_id = ?", *filter.UserID)
+		}
+		if filter.Source != "" {
+			query = query.Where("sessions.source = ?", string(filter.Source))
+		}
+		if decoded.ID != uuid.Nil {
+			query = query.Where("(runs.created_at < ? OR (runs.created_at = ? AND runs.id < ?))", decoded.CreatedAt, decoded.CreatedAt, decoded.ID)
+		}
+		if err := query.Order("runs.created_at DESC, runs.id DESC").Limit(limit + 1).Scan(&records).Error; err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return nil
+		}
+		sessionIDs := make([]uuid.UUID, 0, len(records))
+		userIDs := make([]uuid.UUID, 0, len(records))
+		seenSession := map[uuid.UUID]bool{}
+		seenUser := map[uuid.UUID]bool{}
+		for _, record := range records {
+			if !seenSession[record.SessionID] {
+				seenSession[record.SessionID] = true
+				sessionIDs = append(sessionIDs, record.SessionID)
+			}
+			if !seenUser[record.UserID] {
+				seenUser[record.UserID] = true
+				userIDs = append(userIDs, record.UserID)
+			}
+		}
+		var sessionRecords []sessionModel
+		if err := tx.Where("id IN ?", sessionIDs).Find(&sessionRecords).Error; err != nil {
+			return err
+		}
+		for _, session := range sessionRecords {
+			sessionSources[session.ID] = session
+		}
+		var userRecords []userModel
+		if err := tx.Where("id IN ?", userIDs).Find(&userRecords).Error; err != nil {
+			return err
+		}
+		for _, user := range userRecords {
+			usernames[user.ID] = user.Username
+		}
+		return nil
+	})
+	if err != nil {
+		return biz.Page[biz.RunSummary]{}, catalogError("list admin runs", err)
+	}
+	page := biz.Page[biz.RunSummary]{Items: make([]biz.RunSummary, 0, min(limit, len(records)))}
+	if len(records) > limit {
+		records = records[:limit]
+		last := records[len(records)-1]
+		page.NextCursor, err = EncodeCursor(Cursor{CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return biz.Page[biz.RunSummary]{}, err
+		}
+	}
+	for _, record := range records {
+		run, err := toBizRun(record)
+		if err != nil {
+			return biz.Page[biz.RunSummary]{}, err
+		}
+		session := sessionSources[record.SessionID]
+		page.Items = append(page.Items, biz.RunSummary{
+			Run: run, Source: biz.SessionSource(session.Source),
+			SessionTitle: session.Title, Username: usernames[record.UserID],
+		})
+	}
+	return page, nil
+}
+
 // TransitionRun 以状态 CAS 推进 Run，非法迁移由领域状态机拒绝。
 func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UUID, from, to biz.RunStatus, fields map[string]any) (biz.Run, error) {
 	var record runModel

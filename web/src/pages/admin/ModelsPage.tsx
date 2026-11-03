@@ -1,11 +1,11 @@
 // 模型目录：展示上下文窗口核验、能力与价格，生成模型强制 1M+ 上下文。
 import { useState } from "react";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select } from "../../components/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, formatNumber, statusLabel, statusTone } from "../../lib/format";
-import { useRemote } from "../../lib/hooks";
-import type { Model, ModelHealth, ModelKind, Page, Provider } from "../../lib/types";
+import { useClientPage, useRemote } from "../../lib/hooks";
+import type { Model, ModelHealth, ModelKind, Page, Provider, RemoteModel } from "../../lib/types";
 
 interface ModelFormState {
   providerId: string;
@@ -76,9 +76,35 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
   );
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [remoteModels, setRemoteModels] = useState<RemoteModel[]>([]);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
   const contextTokens = Number(form.contextWindowTokens || 0);
   const contextWarning = form.kind === "chat" && contextTokens < 1_000_000;
   const verificationWarning = form.kind === "chat" && (!form.verifiedAt || !form.verificationSource.trim());
+
+  // pullRemoteModels 从供应商站点读取可用模型名称，避免手工抄写出错。
+  const pullRemoteModels = async () => {
+    if (!form.providerId) {
+      setRemoteError("请先选择模型服务。");
+      return;
+    }
+    setRemoteBusy(true);
+    setRemoteError(null);
+    try {
+      const response = await requestJSON<{ items: RemoteModel[] }>(`/api/v1/providers/${form.providerId}/models`);
+      setRemoteModels(response.items);
+      if (response.items.length === 0) {
+        setRemoteError("站点没有返回可用模型。");
+      } else if (!form.remoteModelName) {
+        setForm((current) => ({ ...current, remoteModelName: response.items[0].id }));
+      }
+    } catch (failure) {
+      setRemoteError(describeError(failure));
+    } finally {
+      setRemoteBusy(false);
+    }
+  };
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -116,7 +142,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
     <Card title={initial ? `编辑模型：${initial.remote_model_name}` : "登记模型"} description="登记后，模型才能被选模规则引用。生成模型需要 1,000,000 以上上下文，并记录核验来源。">
       <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
         <Field label="来自哪个服务" hint="先接入模型服务，这里才能选择。">
-          <Select value={form.providerId} onChange={(event) => setForm({ ...form, providerId: event.target.value })} required>
+          <Select value={form.providerId} onChange={(event) => { setForm({ ...form, providerId: event.target.value }); setRemoteModels([]); setRemoteError(null); }} required>
             <option value="">选择模型服务</option>
             {providers.map((provider) => (
               <option key={provider.id} value={provider.id}>{provider.name}</option>
@@ -124,7 +150,30 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
           </Select>
         </Field>
         <Field label="模型名称" hint="必须与服务商控制台里的模型 ID 完全一致。">
-          <Input value={form.remoteModelName} onChange={(event) => setForm({ ...form, remoteModelName: event.target.value })} required placeholder="例如：deepseek-chat" />
+          <div className="flex gap-2">
+            <Input className="min-w-0 flex-1" value={form.remoteModelName} onChange={(event) => setForm({ ...form, remoteModelName: event.target.value })} required placeholder="例如：deepseek-chat" />
+            <Button type="button" size="sm" variant="secondary" loading={remoteBusy} disabled={!form.providerId} onClick={() => void pullRemoteModels()}>
+              从站点拉取
+            </Button>
+          </div>
+          {remoteModels.length > 0 ? (
+            <Select
+              className="mt-2"
+              value=""
+              onChange={(event) => {
+                if (event.target.value) {
+                  setForm({ ...form, remoteModelName: event.target.value });
+                }
+              }}
+              aria-label="选择拉取到的模型"
+            >
+              <option value="">选择拉取到的模型（{remoteModels.length} 个）</option>
+              {remoteModels.map((model) => (
+                <option key={model.id} value={model.id}>{model.id}{model.owned_by ? ` · ${model.owned_by}` : ""}</option>
+              ))}
+            </Select>
+          ) : null}
+          {remoteError ? <p role="alert" className="mt-1 text-xs text-rust">{remoteError}</p> : null}
         </Field>
         <Field label="用它来做什么" hint="大多数助手只用“生成”；向量与重排用于记忆检索。">
           <Select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as ModelKind })}>
@@ -257,7 +306,8 @@ export default function ModelsPage() {
   };
 
   const items = models.data?.items ?? [];
-  const allSelected = items.length > 0 && items.every((model) => selected.has(model.id));
+  const paging = useClientPage(items, 10);
+  const allSelected = paging.pageItems.length > 0 && paging.pageItems.every((model) => selected.has(model.id));
   const toggleSelected = (id: string) => {
     setSelected((current) => {
       const next = new Set(current);
@@ -270,7 +320,16 @@ export default function ModelsPage() {
     });
   };
   const toggleAll = () => {
-    setSelected(allSelected ? new Set() : new Set(items.map((model) => model.id)));
+    const pageIDs = new Set(paging.pageItems.map((model) => model.id));
+    setSelected((current) => {
+      const next = new Set(current);
+      if (paging.pageItems.every((model) => next.has(model.id))) {
+        pageIDs.forEach((id) => next.delete(id));
+      } else {
+        pageIDs.forEach((id) => next.add(id));
+      }
+      return next;
+    });
   };
 
   // 批量删除逐条调用现有接口：被规则引用的模型会失败，其余模型继续删除。
@@ -332,7 +391,7 @@ export default function ModelsPage() {
                 <Button size="sm" variant="danger" onClick={() => setBatchOpen(true)}>批量删除</Button>
               </>
             ) : null}
-            <Select className="w-48" value={providerFilter} onChange={(event) => { setProviderFilter(event.target.value); setSelected(new Set()); }} aria-label="按供应商筛选">
+            <Select className="w-48" value={providerFilter} onChange={(event) => { setProviderFilter(event.target.value); setSelected(new Set()); paging.reset(); }} aria-label="按供应商筛选">
               <option value="">全部供应商</option>
               {providers.data?.items.map((provider) => (
                 <option key={provider.id} value={provider.id}>{provider.name}</option>
@@ -344,6 +403,7 @@ export default function ModelsPage() {
         {models.loading ? (
           <LoadingState />
         ) : models.data && models.data.items.length > 0 ? (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[900px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
@@ -363,7 +423,7 @@ export default function ModelsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {models.data.items.map((model) => (
+                {paging.pageItems.map((model) => (
                   <tr key={model.id}>
                     <td className="py-3 pr-2">
                       <input
@@ -421,6 +481,8 @@ export default function ModelsPage() {
               </tbody>
             </table>
           </div>
+          <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
+          </>
         ) : (
           <EmptyState title="还没有可用模型" description="先接入模型服务，再登记至少一个已核验的生成模型。" action={<Button size="sm" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>} />
         )}

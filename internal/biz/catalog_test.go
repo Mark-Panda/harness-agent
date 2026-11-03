@@ -276,3 +276,40 @@ func TestPolicyServicePublishesOnlyEligibleCandidates(t *testing.T) {
 		t.Fatalf("nil dependency error = %v", err)
 	}
 }
+
+// TestProviderListRemoteModels 验证管理员读取供应商站点模型时的密钥解密与错误边界。
+func TestProviderListRemoteModels(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockProviderRepository(ctrl)
+	cipher := mocks.NewMockCredentialCipher(ctrl)
+	credentials := mocks.NewMockProviderCredentialRepository(ctrl)
+	opener := mocks.NewMockCredentialOpener(ctrl)
+	lister := mocks.NewMockRemoteModelLister(ctrl)
+	service, err := biz.NewProviderService(repo, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithRemoteModelCatalog(credentials, opener, lister)
+
+	admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+	providerID := uuid.New()
+	provider := biz.Provider{ID: providerID, Name: "primary", BaseURL: "https://models.example.com", Status: biz.ProviderEnabled}
+	credentials.EXPECT().GetProviderCredential(gomock.Any(), providerID).Return(provider, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil)
+	opener.EXPECT().Open("v1", []byte("ciphertext")).Return([]byte("secret"), nil)
+	lister.EXPECT().ListModels(gomock.Any(), provider.BaseURL, "secret").Return([]biz.RemoteModel{{ID: "deepseek-chat", OwnedBy: "deepseek"}}, nil)
+	items, err := service.ListRemoteModels(context.Background(), admin, providerID)
+	if err != nil || len(items) != 1 || items[0].ID != "deepseek-chat" {
+		t.Fatalf("ListRemoteModels() = %#v, %v", items, err)
+	}
+
+	if _, err := service.ListRemoteModels(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, providerID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("non-admin remote models error = %v", err)
+	}
+	plain, err := biz.NewProviderService(repo, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plain.ListRemoteModels(context.Background(), admin, providerID); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("unconfigured remote models error = %v", err)
+	}
+}

@@ -65,6 +65,16 @@ type AuthApplication interface {
 	ResetPassword(ctx context.Context, token, newPassword string) error
 	// CreateUser 由管理员邀请创建普通用户。
 	CreateUser(ctx context.Context, actor biz.Principal, username, password string) (service.PublicUser, error)
+	// ListUsers 由管理员分页读取用户目录。
+	ListUsers(ctx context.Context, actor biz.Principal, filter biz.UserFilter, limit int, cursor string) (biz.Page[service.AdminUser], error)
+	// SetUserRole 由管理员调整用户角色。
+	SetUserRole(ctx context.Context, actor biz.Principal, targetID uuid.UUID, role biz.Role, reason string) error
+	// FeishuLoginEnabled 返回是否已配置网页飞书登录。
+	FeishuLoginEnabled() bool
+	// FeishuAuthorizeURL 生成飞书授权地址。
+	FeishuAuthorizeURL(state string) (string, bool)
+	// LoginWithFeishu 用飞书授权码登录并签发会话。
+	LoginWithFeishu(ctx context.Context, code string) (service.AuthResult, error)
 }
 
 // AuthRateLimiter 是登录/注册限流抽象，按 IP 或用户名维度计数。
@@ -349,6 +359,40 @@ func (h *authHTTPHandler) setUserStatus(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// userRoleRequest 是管理员调整用户角色的请求体。
+type userRoleRequest struct {
+	// Role 目标角色：user/admin。
+	Role string `json:"role"`
+	// Reason 操作理由，写入审计。
+	Reason string `json:"reason"`
+}
+
+// setUserRole 处理 POST /api/v1/admin/users/{id}/role：管理员调整用户角色。
+func (h *authHTTPHandler) setUserRole(w http.ResponseWriter, r *http.Request) {
+	if !sameOriginRequest(r) {
+		writeErrorCode(w, http.StatusForbidden, "cross_origin_request")
+		return
+	}
+	principal, ok := biz.PrincipalFromContext(r.Context())
+	if !ok {
+		writeErrorCode(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request userRoleRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := h.service.SetUserRole(r.Context(), principal, id, biz.Role(request.Role), request.Reason); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // issuePasswordReset 处理 POST /api/v1/admin/users/{id}/password-reset：生成一次性短期改密令牌。
 func (h *authHTTPHandler) issuePasswordReset(w http.ResponseWriter, r *http.Request) {
 	if !sameOriginRequest(r) {
@@ -393,6 +437,106 @@ func (h *authHTTPHandler) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, user)
+}
+
+// listUsers 处理 GET /api/v1/admin/users：管理员分页查看用户目录。
+func (h *authHTTPHandler) listUsers(w http.ResponseWriter, r *http.Request) {
+	principal, ok := biz.PrincipalFromContext(r.Context())
+	if !ok {
+		writeErrorCode(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	limit, cursor, ok := pageRequest(w, r)
+	if !ok {
+		return
+	}
+	filter := biz.UserFilter{
+		Status: biz.UserStatus(r.URL.Query().Get("status")),
+		Search: r.URL.Query().Get("q"),
+	}
+	page, err := h.service.ListUsers(r.Context(), principal, filter, limit, cursor)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": page.Items, "next_cursor": page.NextCursor})
+}
+
+// 飞书网页登录 state Cookie 名称与路径。
+const feishuStateCookieName = "harness_feishu_state"
+
+// feishuStatus 处理 GET /api/v1/auth/feishu/status：前端据此决定是否展示飞书登录入口。
+func (h *authHTTPHandler) feishuStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.service == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": h.service.FeishuLoginEnabled()})
+}
+
+// feishuStart 处理 GET /api/v1/auth/feishu/start：生成 state 后跳转飞书授权页。
+func (h *authHTTPHandler) feishuStart(w http.ResponseWriter, r *http.Request) {
+	if h.service == nil || !h.service.FeishuLoginEnabled() {
+		writeErrorCode(w, http.StatusNotFound, "feishu_login_unavailable")
+		return
+	}
+	state, err := newCSRFToken()
+	if err != nil {
+		writeErrorCode(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: feishuStateCookieName, Value: state, Path: "/api/v1/auth/feishu",
+		MaxAge: 300, HttpOnly: true, Secure: h.cookies.Secure, SameSite: http.SameSiteLaxMode,
+	})
+	authorizeURL, ok := h.service.FeishuAuthorizeURL(state)
+	if !ok {
+		writeErrorCode(w, http.StatusNotFound, "feishu_login_unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, authorizeURL, http.StatusFound)
+}
+
+// feishuCallback 处理 GET /api/v1/auth/feishu/callback：校验 state、登录并跳回工作台。
+func (h *authHTTPHandler) feishuCallback(w http.ResponseWriter, r *http.Request) {
+	clearFeishuState := func() {
+		http.SetCookie(w, &http.Cookie{
+			Name: feishuStateCookieName, Value: "", Path: "/api/v1/auth/feishu", MaxAge: -1,
+			HttpOnly: true, Secure: h.cookies.Secure, SameSite: http.SameSiteLaxMode,
+		})
+	}
+	if h.service == nil || !h.service.FeishuLoginEnabled() {
+		clearFeishuState()
+		http.Redirect(w, r, "/login?feishu_error=unavailable", http.StatusFound)
+		return
+	}
+	cookie, err := r.Cookie(feishuStateCookieName)
+	state := r.URL.Query().Get("state")
+	if err != nil || cookie.Value == "" || len(state) != len(cookie.Value) || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(state)) != 1 {
+		clearFeishuState()
+		http.Redirect(w, r, "/login?feishu_error=state", http.StatusFound)
+		return
+	}
+	clearFeishuState()
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		http.Redirect(w, r, "/login?feishu_error=code", http.StatusFound)
+		return
+	}
+	result, err := h.service.LoginWithFeishu(r.Context(), code)
+	if err != nil {
+		http.Redirect(w, r, "/login?feishu_error=login", http.StatusFound)
+		return
+	}
+	csrf, err := newCSRFToken()
+	if err != nil {
+		http.Redirect(w, r, "/login?feishu_error=login", http.StatusFound)
+		return
+	}
+	h.setSessionCookies(w, result, csrf)
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // csrf 处理 GET /api/v1/auth/csrf：下发可被脚本读取的 CSRF Cookie，供刷新前双提交。

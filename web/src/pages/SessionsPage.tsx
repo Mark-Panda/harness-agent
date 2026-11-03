@@ -1,11 +1,11 @@
 // 会话列表：创建、打开、归档、导出与异步删除，并提供长期记忆数据操作。
 import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select } from "../components/ui";
+import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select } from "../components/ui";
 import { downloadJSON, mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/format";
-import { useRemote } from "../lib/hooks";
+import { useCursorStack, useRemote } from "../lib/hooks";
 import type { Agent, DeletionRequest, Page, Session } from "../lib/types";
 
 // waitForDeletion 轮询删除请求直到终态或超时。
@@ -27,7 +27,11 @@ async function waitForDeletion(id: string): Promise<DeletionRequest> {
 export default function SessionsPage() {
   const [params] = useSearchParams();
   const preselectedAgent = params.get("agent") ?? "";
-  const sessions = useRemote(() => requestJSON<Page<Session>>("/api/v1/sessions?limit=50"), []);
+  const paging = useCursorStack();
+  const sessions = useRemote(
+    () => requestJSON<Page<Session>>(`/api/v1/sessions?limit=20${paging.cursor ? `&cursor=${encodeURIComponent(paging.cursor)}` : ""}`),
+    [paging.cursor],
+  );
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100"), []);
   const [title, setTitle] = useState("新对话");
   const [agentID, setAgentID] = useState(preselectedAgent);
@@ -174,10 +178,11 @@ export default function SessionsPage() {
         </form>
         {creatingError ? <p role="alert" className="mt-3 text-xs text-rust">{creatingError}</p> : null}
       </Card>
-      <Card title="我的对话" description={`共 ${sessions.data?.items.length ?? 0} 个会话`}>
+      <Card title="我的对话" description={`本页 ${sessions.data?.items.length ?? 0} 个会话，按最近更新排序。`}>
         {sessions.loading ? (
           <LoadingState />
         ) : sessions.data && sessions.data.items.length > 0 ? (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[860px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
@@ -220,6 +225,14 @@ export default function SessionsPage() {
               </tbody>
             </table>
           </div>
+          <CursorPager
+            page={paging.page}
+            count={sessions.data.items.length}
+            hasNext={Boolean(sessions.data.next_cursor)}
+            onPrev={paging.prev}
+            onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
+          />
+          </>
         ) : (
           <EmptyState title="还没有对话" description="创建第一个对话后，就可以和助手交流并查看处理过程。" />
         )}

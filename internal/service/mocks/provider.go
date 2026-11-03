@@ -234,3 +234,42 @@ func (mr *MockCredentialOpenerMockRecorder) Open(keyVersion, ciphertext any) *go
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Open", reflect.TypeOf((*MockCredentialOpener)(nil).Open), keyVersion, ciphertext)
 }
+
+// MockRemoteModelLister is a mock of RemoteModelLister interface.
+type MockRemoteModelLister struct {
+	ctrl     *gomock.Controller
+	recorder *MockRemoteModelListerMockRecorder
+	isgomock struct{}
+}
+
+// MockRemoteModelListerMockRecorder is the mock recorder for MockRemoteModelLister.
+type MockRemoteModelListerMockRecorder struct {
+	mock *MockRemoteModelLister
+}
+
+// NewMockRemoteModelLister creates a new mock instance.
+func NewMockRemoteModelLister(ctrl *gomock.Controller) *MockRemoteModelLister {
+	mock := &MockRemoteModelLister{ctrl: ctrl}
+	mock.recorder = &MockRemoteModelListerMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockRemoteModelLister) EXPECT() *MockRemoteModelListerMockRecorder {
+	return m.recorder
+}
+
+// ListModels mocks base method.
+func (m *MockRemoteModelLister) ListModels(ctx context.Context, baseURL, apiKey string) ([]biz.RemoteModel, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListModels", ctx, baseURL, apiKey)
+	ret0, _ := ret[0].([]biz.RemoteModel)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListModels indicates an expected call of ListModels.
+func (mr *MockRemoteModelListerMockRecorder) ListModels(ctx, baseURL, apiKey any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListModels", reflect.TypeOf((*MockRemoteModelLister)(nil).ListModels), ctx, baseURL, apiKey)
+}

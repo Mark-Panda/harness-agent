@@ -1,11 +1,11 @@
 // Skill 模板管理：提示词模板与参数 Schema，管理员维护平台级能力。
 import { useRef, useState } from "react";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea } from "../../components/ui";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select, Textarea } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { parseSkillPackage } from "../../lib/skillPackage";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Page, Skill, SkillStatus } from "../../lib/types";
 
 interface SkillFormState {
@@ -106,6 +106,8 @@ export default function SkillsPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [importNote, setImportNote] = useState<string | null>(null);
   const importRef = useRef<HTMLInputElement | null>(null);
+  const skillItems = skills.data?.items ?? [];
+  const paging = useClientPage(skillItems, 10);
 
   // importPackage 解析 SKILL 包后直接创建草稿并打开编辑器，用户确认后再发布。
   const importPackage = async (file: File) => {
@@ -182,12 +184,12 @@ export default function SkillsPage() {
       {importError ? <ErrorBanner message={importError} /> : null}
       {importNote ? <Callout tone="success">{importNote}</Callout> : null}
       {editing ? <SkillForm initial={editing === "new" ? null : editing} onCancel={() => setEditing(null)} onSaved={() => { setEditing(null); skills.reload(); }} /> : null}
-      <Card title="已有技能" description={`共 ${skills.data?.items.length ?? 0} 个技能`}>
+      <Card title="已有技能" description={`共 ${skillItems.length} 个技能`}>
         {skills.loading ? (
           <LoadingState />
         ) : skills.data && skills.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
-            {skills.data.items.map((skill) => (
+            {paging.pageItems.map((skill) => (
               <article key={skill.id} className="rounded-lg border border-line bg-paper-deep/40 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -210,6 +212,7 @@ export default function SkillsPage() {
                 </details>
               </article>
             ))}
+            <Pager page={paging.page} totalPages={paging.totalPages} total={skillItems.length} onChange={paging.setPage} />
           </div>
         ) : (
           <EmptyState title="还没有技能" description="创建一段做事说明，之后可以在助手中勾选使用。" action={<Button size="sm" onClick={() => setEditing("new")}>新建技能</Button>} />

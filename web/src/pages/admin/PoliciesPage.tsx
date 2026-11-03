@@ -1,10 +1,10 @@
 // 选模规则：用“主选 + 替补”的排班方式替代 JSON 配置，降低理解成本。
 import { useState } from "react";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea } from "../../components/ui";
-import { mutate, requestJSON } from "../../lib/api";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select, Textarea } from "../../components/ui";
+import { ApiError, mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Model, ModelPolicy, Page } from "../../lib/types";
 
 interface PolicyFormState {
@@ -22,6 +22,14 @@ function slotLabel(index: number): string {
     return "主选";
   }
   return `替补 ${index}`;
+}
+
+// describePolicyDeleteError 把删除冲突翻译成可执行的下一步。
+function describePolicyDeleteError(failure: unknown): string {
+  if (failure instanceof ApiError && failure.code === "resource_conflict") {
+    return "这条规则正被助手引用，暂时不能删除。请先把引用它的助手切换到其他规则，再回来删除。";
+  }
+  return describeError(failure);
 }
 
 function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPolicy | null; models: Model[]; onSaved: () => void; onCancel: () => void }) {
@@ -213,10 +221,17 @@ export default function PoliciesPage() {
   const models = useRemote(() => requestJSON<Page<Model>>("/api/v1/models"), []);
   const policies = useRemote(() => requestJSON<Page<ModelPolicy>>("/api/v1/model-policies"), []);
   const [editing, setEditing] = useState<ModelPolicy | null | "new">(null);
+  const [viewing, setViewing] = useState<ModelPolicy | null>(null);
   const [deleting, setDeleting] = useState<ModelPolicy | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchError, setBatchError] = useState<string | null>(null);
+
+  const items = policies.data?.items ?? [];
+  const paging = useClientPage(items, 10);
 
   const runAction = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -242,9 +257,59 @@ export default function PoliciesPage() {
       setDeleting(null);
       policies.reload();
     } catch (failure) {
-      setDeleteError(describeError(failure));
+      setDeleteError(describePolicyDeleteError(failure));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const allSelected = paging.pageItems.length > 0 && paging.pageItems.every((policy) => selected.has(policy.id));
+  const toggleSelected = (id: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    const pageIDs = new Set(paging.pageItems.map((policy) => policy.id));
+    setSelected((current) => {
+      const next = new Set(current);
+      if (paging.pageItems.every((policy) => next.has(policy.id))) {
+        pageIDs.forEach((id) => next.delete(id));
+      } else {
+        pageIDs.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  // 批量删除逐条调用现有接口，失败项保留在列表中并汇总原因。
+  const removeSelected = async () => {
+    const targets = items.filter((policy) => selected.has(policy.id));
+    if (targets.length === 0) {
+      return;
+    }
+    setBusy(true);
+    setBatchError(null);
+    const failures: string[] = [];
+    for (const policy of targets) {
+      try {
+        await mutate<void>(`/api/v1/model-policies/${policy.id}`, "DELETE");
+      } catch (failure) {
+        failures.push(`${policy.name}：${describePolicyDeleteError(failure)}`);
+      }
+    }
+    setBusy(false);
+    setBatchOpen(false);
+    setSelected(new Set());
+    policies.reload();
+    if (failures.length > 0) {
+      setBatchError(`部分规则未能删除：${failures.join("；")}`);
     }
   };
 
@@ -279,23 +344,96 @@ export default function PoliciesPage() {
         />
       ) : null}
 
-      <Card title="已有规则" description="状态为“已发布”的规则才能被助手选择。">
+      {viewing ? (
+        <Card
+          title={`规则详情：${viewing.name}`}
+          description={`第 ${viewing.version} 版 · 创建于 ${formatDateTime(viewing.created_at)} · 更新于 ${formatDateTime(viewing.updated_at)}`}
+          actions={<Button size="sm" variant="secondary" onClick={() => setViewing(null)}>关闭详情</Button>}
+        >
+          <div className="grid gap-4 md:grid-cols-2">
+            <dl className="grid grid-cols-2 gap-2 text-xs">
+              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <dt className="text-muted">状态</dt>
+                <dd className="mt-1"><Badge tone={statusTone(viewing.status)}>{statusLabel(viewing.status)}</Badge></dd>
+              </div>
+              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <dt className="text-muted">最低上下文</dt>
+                <dd className="mt-1 text-ink">{viewing.min_context_tokens.toLocaleString("zh-CN")} Token</dd>
+              </div>
+              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <dt className="text-muted">候选模型</dt>
+                <dd className="mt-1 text-ink">{viewing.candidates.length} 个</dd>
+              </div>
+              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <dt className="text-muted">规则 ID</dt>
+                <dd className="mt-1 break-all font-mono text-[11px] text-ink-soft">{viewing.id}</dd>
+              </div>
+            </dl>
+            <div className="rounded-[3px] border border-line bg-paper-deep/40 p-3">
+              <p className="text-xs font-medium text-ink">模型出场顺序</p>
+              {viewing.candidates.length === 0 ? (
+                <p className="mt-2 text-xs text-muted">还没有候选模型。</p>
+              ) : (
+                <ol className="mt-2 flex flex-col gap-1 text-xs">
+                  {viewing.candidates.map((candidate, index) => (
+                    <li key={candidate.model_id} className="flex items-center justify-between gap-2 rounded-[2px] bg-paper-raised px-2 py-1.5">
+                      <span className="text-ink-soft">{slotLabel(index)}</span>
+                      <span className="truncate text-ink">{modelNames.get(candidate.model_id) ?? candidate.model_id}</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </div>
+          <div className="mt-4">
+            <p className="text-xs font-medium text-ink">附加规则 JSON</p>
+            <pre className="mt-1 max-h-64 overflow-auto rounded-[3px] border border-line bg-paper-deep/30 p-3 font-mono text-[11px] text-ink-soft">{JSON.stringify(viewing.rules ?? {}, null, 2)}</pre>
+          </div>
+        </Card>
+      ) : null}
+
+      <Card
+        title="已有规则"
+        description={`状态为“已发布”的规则才能被助手选择。共 ${items.length} 条。`}
+        actions={
+          selected.size > 0 ? (
+            <>
+              <span className="text-xs text-muted">已选 {selected.size} 项</span>
+              <Button size="sm" variant="danger" onClick={() => setBatchOpen(true)}>批量删除</Button>
+            </>
+          ) : null
+        }
+      >
         {policies.loading ? (
           <LoadingState />
         ) : policies.data && policies.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
-            {policies.data.items.map((policy) => (
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选当前页规则" />
+              全选当前页
+            </div>
+            {paging.pageItems.map((policy) => (
               <article key={policy.id} className="rounded-[3px] border border-line bg-paper-raised p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-lg text-ink">{policy.name}</h2>
-                      <Badge tone="neutral">v{policy.version}</Badge>
-                      <Badge tone={statusTone(policy.status)}>{statusLabel(policy.status)}</Badge>
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      className="mt-1.5"
+                      checked={selected.has(policy.id)}
+                      onChange={() => toggleSelected(policy.id)}
+                      aria-label={`选择规则 ${policy.name}`}
+                    />
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="text-lg text-ink">{policy.name}</h2>
+                        <Badge tone="neutral">v{policy.version}</Badge>
+                        <Badge tone={statusTone(policy.status)}>{statusLabel(policy.status)}</Badge>
+                      </div>
+                      <p className="mt-1 text-xs text-muted">最低上下文 {policy.min_context_tokens.toLocaleString("zh-CN")} Token · 更新于 {formatDateTime(policy.updated_at)}</p>
                     </div>
-                    <p className="mt-1 text-xs text-muted">最低上下文 {policy.min_context_tokens.toLocaleString("zh-CN")} Token · 更新于 {formatDateTime(policy.updated_at)}</p>
                   </div>
                   <div className="flex flex-wrap gap-2">
+                    <Button size="sm" variant="secondary" onClick={() => setViewing(policy)}>查看详情</Button>
                     {policy.status === "draft" ? (
                       <>
                         <Button size="sm" variant="secondary" onClick={() => setEditing(policy)}>继续编辑</Button>
@@ -305,7 +443,7 @@ export default function PoliciesPage() {
                       <Button size="sm" variant="secondary" loading={busy} onClick={() => void runAction(() => mutate(`/api/v1/model-policies/${policy.id}/versions`, "POST", undefined, crypto.randomUUID()))}>创建新版本</Button>
                     )}
                     {/* 删除入口对所有状态可见；是否允许删除由后端按引用关系判定。 */}
-                    <Button size="sm" variant="danger" onClick={() => { setDeleting(policy); setDeleteError(null); }}>删除</Button>
+                    <Button size="sm" variant="danger" disabled={busy} onClick={() => { setDeleting(policy); setDeleteError(null); }}>删除</Button>
                   </div>
                 </div>
 
@@ -329,6 +467,7 @@ export default function PoliciesPage() {
                 ) : null}
               </article>
             ))}
+            <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </div>
         ) : (
           <EmptyState
@@ -349,6 +488,17 @@ export default function PoliciesPage() {
         onConfirm={() => void remove()}
       >
         {deleteError ? <p role="alert" className="text-xs text-rust">{deleteError}</p> : null}
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={batchOpen}
+        title={`删除选中的 ${selected.size} 条规则？`}
+        description="删除会逐条执行。被助手引用的规则会失败并列出原因，其余规则仍会正常删除。"
+        confirmLabel="批量删除"
+        busy={busy}
+        onCancel={() => setBatchOpen(false)}
+        onConfirm={() => void removeSelected()}
+      >
+        {batchError ? <p role="alert" className="text-xs text-rust">{batchError}</p> : null}
       </ConfirmDialog>
     </div>
   );

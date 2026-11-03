@@ -120,6 +120,52 @@ func TestUserRepositoryAndRLSIsolation(t *testing.T) {
 	}
 }
 
+// TestUserRepositoryListUsersSystemScope 验证管理员目录的系统只读作用域、筛选与游标分页。
+func TestUserRepositoryListUsersSystemScope(t *testing.T) {
+	admin := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	app := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	auth := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	repository := NewUserRepository(app, auth)
+	ctx := context.Background()
+	prefix := "directory_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+	var created []biz.User
+	for index := 0; index < 2; index++ {
+		user, err := repository.CreateUser(ctx, biz.User{
+			Username: prefix + "_" + string(rune('a'+index)), PasswordHash: "hash",
+			Role: biz.RoleUser, Status: biz.UserStatusActive, CredentialVersion: 1,
+		}, testOutboxEvent(uuid.Nil, "test.register.directory"))
+		if err != nil {
+			t.Fatalf("create user %d: %v", index, err)
+		}
+		created = append(created, user)
+		deferredID := user.ID
+		defer admin.Exec("DELETE FROM users WHERE id = ?", deferredID)
+	}
+
+	first, err := repository.ListUsers(ctx, biz.UserFilter{Status: biz.UserStatusActive, Search: prefix}, 1, "")
+	if err != nil {
+		t.Fatalf("list first page: %v", err)
+	}
+	if len(first.Items) != 1 || first.NextCursor == "" {
+		t.Fatalf("unexpected first page: %#v", first)
+	}
+	second, err := repository.ListUsers(ctx, biz.UserFilter{Status: biz.UserStatusActive, Search: prefix}, 1, first.NextCursor)
+	if err != nil || len(second.Items) != 1 || second.NextCursor != "" || second.Items[0].ID == first.Items[0].ID {
+		t.Fatalf("unexpected second page: %#v, %v", second, err)
+	}
+	seen := map[uuid.UUID]bool{first.Items[0].ID: true, second.Items[0].ID: true}
+	if !seen[created[0].ID] || !seen[created[1].ID] {
+		t.Fatalf("pages did not cover created users: %v", seen)
+	}
+	disabled, err := repository.ListUsers(ctx, biz.UserFilter{Status: biz.UserStatusDisabled, Search: prefix}, 10, "")
+	if err != nil || len(disabled.Items) != 0 {
+		t.Fatalf("disabled filter returned %#v, %v", disabled, err)
+	}
+	if _, err := repository.ListUsers(ctx, biz.UserFilter{Search: prefix}, 10, "not-a-cursor"); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("invalid cursor error = %v", err)
+	}
+}
+
 func TestRefreshTokenAtomicRotationAndRevocation(t *testing.T) {
 	admin := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
 	app := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))

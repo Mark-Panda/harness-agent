@@ -54,6 +54,14 @@ func NormalizeUsername(username string) string {
 	return strings.ToLower(strings.TrimSpace(username))
 }
 
+// UserFilter 是管理员用户目录的筛选条件。
+type UserFilter struct {
+	// Status 账号状态；空串表示全部状态。
+	Status UserStatus
+	// Search 用户名关键字，按规范化用户名做包含匹配。
+	Search string
+}
+
 // UserRepository 定义用户持久化契约。
 type UserRepository interface {
 	// CreateUser 创建用户并与审计事件同事务提交。
@@ -64,4 +72,8 @@ type UserRepository interface {
 	GetUserByNormalizedUsername(ctx context.Context, normalized string) (User, error)
 	// UpdateUser 更新密码哈希、状态与凭据版本；只能作用于当前用户且写入审计事件。
 	UpdateUser(ctx context.Context, user User, event OutboxEvent) (User, error)
+	// UpdateUserRole 由管理员更新目标用户角色，并与审计事件同事务提交。
+	UpdateUserRole(ctx context.Context, userID uuid.UUID, role Role, event OutboxEvent) error
+	// ListUsers 在系统作用域下按状态与用户名筛选用户，按创建时间游标分页。
+	ListUsers(ctx context.Context, filter UserFilter, limit int, cursor string) (Page[User], error)
 }

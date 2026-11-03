@@ -1,10 +1,10 @@
 // MCP 接入管理：仅允许 HTTPS 公网端点，凭证只写不读，风险等级决定审批策略。
 import { useState } from "react";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea } from "../../components/ui";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select, Textarea } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { MCP, MCPStatus, Page } from "../../lib/types";
 
 interface MCPFormState {
@@ -135,6 +135,8 @@ export default function MCPsPage() {
   const [deleting, setDeleting] = useState<MCP | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const mcpItems = mcps.data?.items ?? [];
+  const paging = useClientPage(mcpItems, 10);
 
   const remove = async () => {
     if (!deleting) {
@@ -163,10 +165,11 @@ export default function MCPsPage() {
       />
       {mcps.error ? <ErrorBanner message={mcps.error} onRetry={mcps.reload} /> : null}
       {editing ? <MCPForm initial={editing === "new" ? null : editing} onCancel={() => setEditing(null)} onSaved={() => { setEditing(null); mcps.reload(); }} /> : null}
-      <Card title="已接入工具" description={`共 ${mcps.data?.items.length ?? 0} 个工具`}>
+      <Card title="已接入工具" description={`共 ${mcpItems.length} 个工具`}>
         {mcps.loading ? (
           <LoadingState />
         ) : mcps.data && mcps.data.items.length > 0 ? (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[820px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
@@ -181,7 +184,7 @@ export default function MCPsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {mcps.data.items.map((mcp) => (
+                {paging.pageItems.map((mcp) => (
                   <tr key={mcp.id}>
                     <td className="py-3 pr-4 font-medium text-ink">{mcp.name}</td>
                     <td className="max-w-[260px] truncate py-3 pr-4 font-mono text-xs text-muted">{mcp.endpoint}</td>
@@ -200,6 +203,8 @@ export default function MCPsPage() {
               </tbody>
             </table>
           </div>
+          <Pager page={paging.page} totalPages={paging.totalPages} total={mcpItems.length} onChange={paging.setPage} />
+          </>
         ) : (
           <EmptyState title="还没有外部工具" description="接入工具服务后，创建助手时即可勾选使用。" action={<Button size="sm" onClick={() => setEditing("new")}>接入外部工具</Button>} />
         )}

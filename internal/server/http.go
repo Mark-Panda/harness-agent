@@ -89,9 +89,15 @@ func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimit
 		mux.HandleFunc("POST /api/v1/auth/logout-all", authHandler.requireAuth(authHandler.logoutAll))
 		mux.HandleFunc("POST /api/v1/auth/password", authHandler.requireAuth(authHandler.changePassword))
 		mux.HandleFunc("POST /api/v1/auth/password/reset", authHandler.resetPassword)
+		// 网页飞书登录：state 防重放，回调成功后按浏览器 Cookie 模式签发会话。
+		mux.HandleFunc("GET /api/v1/auth/feishu/status", authHandler.feishuStatus)
+		mux.HandleFunc("GET /api/v1/auth/feishu/start", authHandler.feishuStart)
+		mux.HandleFunc("GET /api/v1/auth/feishu/callback", authHandler.feishuCallback)
 		mux.HandleFunc("POST /api/v1/admin/users/{id}/status", authHandler.requireAuth(authHandler.setUserStatus))
 		mux.HandleFunc("POST /api/v1/admin/users/{id}/password-reset", authHandler.requireAuth(authHandler.issuePasswordReset))
 		mux.HandleFunc("POST /api/v1/admin/users", authHandler.requireAuth(authHandler.createUser))
+		mux.HandleFunc("GET /api/v1/admin/users", authHandler.requireAuth(authHandler.listUsers))
+		mux.HandleFunc("POST /api/v1/admin/users/{id}/role", authHandler.requireAuth(authHandler.setUserRole))
 	}
 	mux.HandleFunc("GET /health/live", healthHandler("alive"))
 	mux.HandleFunc("GET /health/ready", readinessHandler)

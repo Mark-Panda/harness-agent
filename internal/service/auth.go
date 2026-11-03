@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -22,6 +23,10 @@ var (
 	ErrInvalidUsername     = errors.New("username must contain between 3 and 64 characters")
 	// ErrRegistrationDisabled 开放注册已关闭，需要管理员邀请。
 	ErrRegistrationDisabled = errors.New("open registration is disabled")
+	// ErrFeishuLoginUnavailable 未配置飞书网页登录。
+	ErrFeishuLoginUnavailable = errors.New("feishu login unavailable")
+	// ErrFeishuLoginFailed 飞书登录校验或身份映射失败。
+	ErrFeishuLoginFailed = errors.New("feishu login failed")
 )
 
 type PublicUser struct {
@@ -29,6 +34,16 @@ type PublicUser struct {
 	Username string         `json:"username"`
 	Role     biz.Role       `json:"role"`
 	Status   biz.UserStatus `json:"status"`
+}
+
+// AdminUser 是管理员用户目录条目，包含时间信息但不含密码哈希。
+type AdminUser struct {
+	ID        uuid.UUID      `json:"id"`
+	Username  string         `json:"username"`
+	Role      biz.Role       `json:"role"`
+	Status    biz.UserStatus `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
 }
 
 type TokenPair struct {
@@ -58,6 +73,20 @@ type AuthService struct {
 	resets biz.PasswordResetRepository
 	// registrationEnabled 是否允许开放注册，默认开启。
 	registrationEnabled bool
+	// feishuLogin 网页飞书登录客户端；为空表示未启用。
+	feishuLogin FeishuLoginClient
+	// feishuIdentities 飞书 open_id 到内部用户的映射。
+	feishuIdentities biz.FeishuIdentityStore
+	// feishuRedirectURL 飞书授权回调地址。
+	feishuRedirectURL string
+}
+
+// FeishuLoginClient 抽象飞书网页登录授权码交换，便于测试替换。
+type FeishuLoginClient interface {
+	// AuthorizeURL 生成授权页地址。
+	AuthorizeURL(redirectURI, state string) string
+	// Exchange 用授权码换取 open_id 与租户标识。
+	Exchange(ctx context.Context, code, redirectURI string) (openID, tenantKey, name string, err error)
 }
 
 // PasswordResetTTL 是一次性密码重置令牌有效期。
@@ -112,6 +141,18 @@ func WithRegistrationEnabled(enabled bool) AuthServiceOption {
 	}
 }
 
+// WithFeishuLogin 启用网页飞书登录；缺少客户端、身份映射或回调地址时保持关闭。
+func WithFeishuLogin(client FeishuLoginClient, identities biz.FeishuIdentityStore, redirectURL string) AuthServiceOption {
+	return func(service *AuthService) {
+		if client == nil || identities == nil || strings.TrimSpace(redirectURL) == "" {
+			return
+		}
+		service.feishuLogin = client
+		service.feishuIdentities = identities
+		service.feishuRedirectURL = strings.TrimSpace(redirectURL)
+	}
+}
+
 func NewAuthService(users biz.UserRepository, tokens biz.RefreshTokenRepository, jwtManager *auth.JWTManager, pepper []byte, timeSource clock.Clock, options ...AuthServiceOption) (*AuthService, error) {
 	if users == nil || tokens == nil || jwtManager == nil || len(pepper) < 32 {
 		return nil, errors.New("auth service dependencies are required")
@@ -148,6 +189,39 @@ func (s *AuthService) Register(ctx context.Context, username, password string) (
 	return s.issueSession(ctx, user, uuid.New(), nil)
 }
 
+// FeishuLoginEnabled 返回是否已配置网页飞书登录。
+func (s *AuthService) FeishuLoginEnabled() bool {
+	return s != nil && s.feishuLogin != nil && s.feishuIdentities != nil && s.feishuRedirectURL != ""
+}
+
+// FeishuAuthorizeURL 生成飞书授权地址；未启用时返回 false。
+func (s *AuthService) FeishuAuthorizeURL(state string) (string, bool) {
+	if !s.FeishuLoginEnabled() || strings.TrimSpace(state) == "" {
+		return "", false
+	}
+	return s.feishuLogin.AuthorizeURL(s.feishuRedirectURL, state), true
+}
+
+// LoginWithFeishu 用飞书授权码换取 open_id，映射内部用户后签发会话。
+func (s *AuthService) LoginWithFeishu(ctx context.Context, code string) (AuthResult, error) {
+	if !s.FeishuLoginEnabled() {
+		return AuthResult{}, ErrFeishuLoginUnavailable
+	}
+	openID, tenantKey, _, err := s.feishuLogin.Exchange(ctx, code, s.feishuRedirectURL)
+	if err != nil || strings.TrimSpace(openID) == "" || strings.TrimSpace(tenantKey) == "" {
+		return AuthResult{}, ErrFeishuLoginFailed
+	}
+	identity, err := s.feishuIdentities.Resolve(ctx, tenantKey, openID)
+	if err != nil || identity.UserID == uuid.Nil {
+		return AuthResult{}, ErrFeishuLoginFailed
+	}
+	user, err := s.users.GetUserByID(ctx, identity.UserID)
+	if err != nil || user.Status != biz.UserStatusActive {
+		return AuthResult{}, ErrFeishuLoginFailed
+	}
+	return s.issueSession(ctx, user, uuid.New(), nil)
+}
+
 // CreateUser 由管理员邀请创建普通用户；不签发令牌，初始密码通过安全渠道交付。
 func (s *AuthService) CreateUser(ctx context.Context, actor biz.Principal, username, password string) (PublicUser, error) {
 	if actor.UserID == uuid.Nil || actor.Role != biz.RoleAdmin {
@@ -171,6 +245,62 @@ func (s *AuthService) CreateUser(ctx context.Context, actor biz.Principal, usern
 		return PublicUser{}, err
 	}
 	return PublicUser{ID: user.ID, Username: user.Username, Role: user.Role, Status: user.Status}, nil
+}
+
+// SetUserRole 由管理员调整目标用户角色；禁止移除自己的管理员角色以避免误锁死管理入口。
+func (s *AuthService) SetUserRole(ctx context.Context, actor biz.Principal, targetID uuid.UUID, role biz.Role, reason string) error {
+	if actor.UserID == uuid.Nil || actor.Role != biz.RoleAdmin {
+		return biz.ErrForbidden
+	}
+	if role != biz.RoleUser && role != biz.RoleAdmin {
+		return fmt.Errorf("%w: unsupported user role", biz.ErrInvalidConfig)
+	}
+	if targetID == actor.UserID && role != biz.RoleAdmin {
+		return fmt.Errorf("%w: cannot remove your own admin role", biz.ErrInvalidConfig)
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	user, err := s.users.GetUserByID(ctx, targetID)
+	if err != nil || user.Status == biz.UserStatusDeleted {
+		return biz.ErrUserNotFound
+	}
+	event := authEvent(user.ID, "auth.user.role_changed", "user", user.ID.String(),
+		"auth.user.role:"+user.ID.String()+":"+uuid.NewString(), "success")
+	event.Payload["role"] = string(role)
+	event.Payload["actor_id"] = actor.UserID.String()
+	if reason != "" {
+		event.Payload["reason"] = reason
+	}
+	return s.users.UpdateUserRole(ctx, targetID, role, event)
+}
+
+// ListUsers 由管理员分页读取用户目录，支持按状态和用户名关键字筛选。
+func (s *AuthService) ListUsers(ctx context.Context, actor biz.Principal, filter biz.UserFilter, limit int, cursor string) (biz.Page[AdminUser], error) {
+	if actor.UserID == uuid.Nil || actor.Role != biz.RoleAdmin {
+		return biz.Page[AdminUser]{}, biz.ErrForbidden
+	}
+	switch filter.Status {
+	case "", biz.UserStatusActive, biz.UserStatusDisabled, biz.UserStatusDeleted:
+	default:
+		return biz.Page[AdminUser]{}, fmt.Errorf("%w: unsupported user status", biz.ErrInvalidConfig)
+	}
+	filter.Search = strings.TrimSpace(filter.Search)
+	if len(filter.Search) > 64 {
+		return biz.Page[AdminUser]{}, fmt.Errorf("%w: search keyword is too long", biz.ErrInvalidConfig)
+	}
+	page, err := s.users.ListUsers(ctx, filter, limit, cursor)
+	if err != nil {
+		return biz.Page[AdminUser]{}, err
+	}
+	result := biz.Page[AdminUser]{NextCursor: page.NextCursor, Items: make([]AdminUser, 0, len(page.Items))}
+	for _, user := range page.Items {
+		result.Items = append(result.Items, AdminUser{
+			ID: user.ID, Username: user.Username, Role: user.Role, Status: user.Status,
+			CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+		})
+	}
+	return result, nil
 }
 
 // Login 校验用户名密码并签发令牌。
