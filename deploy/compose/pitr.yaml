@@ -1,0 +1,30 @@
+# PITR 覆盖配置：启用 WAL 归档，保留最近 WAL 供时间点恢复。
+# 用法：docker compose -f docker-compose.yml -f deploy/compose/pitr.yaml up -d postgres
+services:
+  # 卷默认由 root 创建，先用一次性容器把归档目录交给 postgres 用户（uid 999）。
+  wal-archive-init:
+    image: alpine:3.22
+    command: ["sh", "-c", "mkdir -p /wal-archive && chown -R 999:999 /wal-archive && chmod 700 /wal-archive"]
+    volumes:
+      - wal-archive:/wal-archive
+    restart: "no"
+
+  postgres:
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=60
+      - -c
+      - archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f
+    volumes:
+      - wal-archive:/var/lib/postgresql/wal-archive
+    depends_on:
+      wal-archive-init:
+        condition: service_completed_successfully
+
+volumes:
+  wal-archive:

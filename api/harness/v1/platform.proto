@@ -1,0 +1,638 @@
+syntax = "proto3";
+
+package harness.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Mark-Panda/harness-agent/api/harness/v1;harnessv1";
+
+// ============================================================================
+// 平台配置契约：供应商、模型目录、路由策略、Agent、会话与消息。
+// 身份一律来自 Bearer Token，所有请求体不接受客户端自报 user_id。
+// 时间字段统一使用 UTC；密钥字段只写不读。
+// ============================================================================
+
+// Provider 是 LLM 供应商连接的对外视图，不包含明文密钥。
+message Provider {
+  // id 供应商唯一标识。
+  string id = 1;
+  // name 供应商名称，全局唯一。
+  string name = 2;
+  // provider_type 供应商标识类型，当前固定为 openai_compatible。
+  string provider_type = 3;
+  // base_url HTTPS 服务基础地址。
+  string base_url = 4;
+  // key_version 当前 API Key 密文的密钥版本。
+  string key_version = 5;
+  // status 启停状态：enabled/disabled。
+  string status = 6;
+  // data_region 数据区域，用于合规路由过滤。
+  string data_region = 7;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 8;
+  // updated_at 最后更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// CreateProviderRequest 是创建供应商的入参。
+message CreateProviderRequest {
+  // name 供应商名称，1-128 字符。
+  string name = 1;
+  // base_url HTTPS 基础地址，禁止携带凭据、查询串或片段。
+  string base_url = 2;
+  // api_key 明文密钥，仅用于写入加密，响应永不回显。
+  string api_key = 3;
+  // status 启停状态，留空默认 enabled。
+  string status = 4;
+  // data_region 数据区域。
+  string data_region = 5;
+}
+
+// UpdateProviderRequest 是更新供应商的入参。
+message UpdateProviderRequest {
+  // id 供应商 ID。
+  string id = 1;
+  // name 供应商名称。
+  string name = 2;
+  // base_url HTTPS 基础地址。
+  string base_url = 3;
+  // api_key 可选；缺省表示保留原密钥，填写则触发密钥轮换。
+  optional string api_key = 4;
+  // status 启停状态。
+  string status = 5;
+  // data_region 数据区域。
+  string data_region = 6;
+}
+
+// GetProviderRequest 是读取供应商的入参。
+message GetProviderRequest {
+  // id 供应商 ID。
+  string id = 1;
+}
+
+// DeleteProviderRequest 是删除供应商的入参。
+message DeleteProviderRequest {
+  // id 供应商 ID。
+  string id = 1;
+}
+
+// ListProvidersRequest 是列出供应商的入参（无参数）。
+message ListProvidersRequest {}
+
+// ListProvidersResponse 是供应商列表出参。
+message ListProvidersResponse {
+  // items 供应商列表。
+  repeated Provider items = 1;
+}
+
+// ModelCapabilities 描述模型支持的协议能力。
+message ModelCapabilities {
+  // streaming 是否支持流式输出。
+  bool streaming = 1;
+  // tools 是否支持工具调用。
+  bool tools = 2;
+  // structured_output 是否支持结构化 JSON 输出。
+  bool structured_output = 3;
+}
+
+// Model 是供应商下具体模型部署的对外视图。
+message Model {
+  // id 模型唯一标识。
+  string id = 1;
+  // provider_id 所属供应商 ID。
+  string provider_id = 2;
+  // remote_model_name 供应商侧真实模型名。
+  string remote_model_name = 3;
+  // kind 模型用途：chat/embedding/rerank。
+  string kind = 4;
+  // context_window_tokens 上下文窗口 Token 数，chat 必须大于等于 1M。
+  int64 context_window_tokens = 5;
+  // max_output_tokens 最大输出 Token 数。
+  int32 max_output_tokens = 6;
+  // capabilities 协议能力。
+  ModelCapabilities capabilities = 7;
+  // input_price_per_million 每百万输入 Token 价格。
+  double input_price_per_million = 8;
+  // output_price_per_million 每百万输出 Token 价格。
+  double output_price_per_million = 9;
+  // data_region 数据区域。
+  string data_region = 10;
+  // verification_source 元数据核验来源，启用时必填。
+  string verification_source = 11;
+  // verified_at 管理员核验时间，启用时必填。
+  optional google.protobuf.Timestamp verified_at = 12;
+  // status 启停状态。
+  string status = 13;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 14;
+  // updated_at 更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 15;
+}
+
+// CreateModelRequest 是创建模型的入参。
+message CreateModelRequest {
+  // provider_id 所属供应商 ID。
+  string provider_id = 1;
+  // remote_model_name 供应商侧真实模型名。
+  string remote_model_name = 2;
+  // kind 模型用途：chat/embedding/rerank。
+  string kind = 3;
+  // context_window_tokens 上下文窗口；chat 小于 1M 将被拒绝。
+  int64 context_window_tokens = 4;
+  // max_output_tokens 最大输出 Token 数。
+  int32 max_output_tokens = 5;
+  // capabilities 协议能力。
+  ModelCapabilities capabilities = 6;
+  // input_price_per_million 输入价格。
+  double input_price_per_million = 7;
+  // output_price_per_million 输出价格。
+  double output_price_per_million = 8;
+  // data_region 数据区域。
+  string data_region = 9;
+  // verification_source 元数据核验来源，启用时必填。
+  string verification_source = 10;
+  // verified_at 核验时间，启用时必填。
+  optional google.protobuf.Timestamp verified_at = 11;
+  // status 启停状态，留空默认 disabled。
+  string status = 12;
+}
+
+// UpdateModelRequest 是更新模型的入参。
+message UpdateModelRequest {
+  // id 模型 ID。
+  string id = 1;
+  // provider_id 所属供应商 ID。
+  string provider_id = 2;
+  // remote_model_name 供应商侧真实模型名。
+  string remote_model_name = 3;
+  // kind 模型用途。
+  string kind = 4;
+  // context_window_tokens 上下文窗口。
+  int64 context_window_tokens = 5;
+  // max_output_tokens 最大输出 Token 数。
+  int32 max_output_tokens = 6;
+  // capabilities 协议能力。
+  ModelCapabilities capabilities = 7;
+  // input_price_per_million 输入价格。
+  double input_price_per_million = 8;
+  // output_price_per_million 输出价格。
+  double output_price_per_million = 9;
+  // data_region 数据区域。
+  string data_region = 10;
+  // verification_source 元数据核验来源。
+  string verification_source = 11;
+  // verified_at 核验时间。
+  optional google.protobuf.Timestamp verified_at = 12;
+  // status 启停状态。
+  string status = 13;
+}
+
+// GetModelRequest 是读取模型的入参。
+message GetModelRequest {
+  // id 模型 ID。
+  string id = 1;
+}
+
+// DeleteModelRequest 是删除模型的入参。
+message DeleteModelRequest {
+  // id 模型 ID。
+  string id = 1;
+}
+
+// ListModelsRequest 是列出模型的入参。
+message ListModelsRequest {
+  // provider_id 可选，按供应商过滤。
+  optional string provider_id = 1;
+}
+
+// ListModelsResponse 是模型列表出参。
+message ListModelsResponse {
+  // items 模型列表。
+  repeated Model items = 1;
+}
+
+// PolicyCandidate 是路由策略中的单个候选。
+message PolicyCandidate {
+  // model_id 候选模型 ID。
+  string model_id = 1;
+  // priority 显式优先级，数值越小越优先，同一策略内唯一。
+  int32 priority = 2;
+  // constraints 单候选约束，如数据区域与成本上限。
+  google.protobuf.Struct constraints = 3;
+}
+
+// ModelPolicy 是版本化路由策略的对外视图。
+message ModelPolicy {
+  // id 策略版本 ID。
+  string id = 1;
+  // name 策略名称，与版本共同唯一。
+  string name = 2;
+  // version 策略版本号。
+  int32 version = 3;
+  // min_context_tokens 最小上下文窗口，不得低于 1M。
+  int64 min_context_tokens = 4;
+  // rules 路由规则。
+  google.protobuf.Struct rules = 5;
+  // status 生命周期：draft/published/disabled。
+  string status = 6;
+  // candidates 有序候选列表。
+  repeated PolicyCandidate candidates = 7;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 8;
+  // updated_at 更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// CreatePolicyRequest 是创建策略草稿的入参。
+message CreatePolicyRequest {
+  // name 策略名称。
+  string name = 1;
+  // min_context_tokens 最小上下文；留空默认 1M。
+  int64 min_context_tokens = 2;
+  // rules 路由规则。
+  google.protobuf.Struct rules = 3;
+  // candidates 候选模型列表，最多 16 个。
+  repeated PolicyCandidate candidates = 4;
+}
+
+// UpdatePolicyRequest 是更新策略草稿的入参。
+message UpdatePolicyRequest {
+  // id 策略版本 ID。
+  string id = 1;
+  // min_context_tokens 最小上下文。
+  int64 min_context_tokens = 2;
+  // rules 路由规则。
+  google.protobuf.Struct rules = 3;
+  // candidates 候选模型列表。
+  repeated PolicyCandidate candidates = 4;
+}
+
+// GetPolicyRequest 是读取策略的入参。
+message GetPolicyRequest {
+  // id 策略版本 ID。
+  string id = 1;
+}
+
+// DeletePolicyRequest 是删除策略的入参。
+message DeletePolicyRequest {
+  // id 策略版本 ID。
+  string id = 1;
+}
+
+// PublishPolicyRequest 是发布策略的入参。
+message PublishPolicyRequest {
+  // id 草稿策略 ID。
+  string id = 1;
+}
+
+// CreatePolicyVersionRequest 是基于现有策略创建新版本的入参。
+message CreatePolicyVersionRequest {
+  // id 源策略版本 ID。
+  string id = 1;
+}
+
+// ListPoliciesRequest 是列出策略的入参（无参数）。
+message ListPoliciesRequest {}
+
+// ListPoliciesResponse 是策略列表出参。
+message ListPoliciesResponse {
+  // items 策略列表。
+  repeated ModelPolicy items = 1;
+}
+
+// Agent 是用户私有 Agent 版本的对外视图。
+message Agent {
+  // id Agent 版本 ID。
+  string id = 1;
+  // user_id 所属用户 ID（服务端注入，只读）。
+  string user_id = 2;
+  // name Agent 名称。
+  string name = 3;
+  // description Agent 描述。
+  string description = 4;
+  // mode 编排模式：react/plan/super。
+  string mode = 5;
+  // model_policy_id 引用的策略 ID，草稿可为空。
+  optional string model_policy_id = 6;
+  // model_policy_version 引用的策略版本。
+  optional int32 model_policy_version = 7;
+  // version Agent 版本号。
+  int32 version = 8;
+  // config_snapshot 发布时固化的配置快照。
+  google.protobuf.Struct config_snapshot = 9;
+  // skill_ids 绑定的 Skill 列表。
+  repeated string skill_ids = 10;
+  // mcp_ids 绑定的 MCP 列表。
+  repeated string mcp_ids = 11;
+  // status 生命周期：draft/published/disabled。
+  string status = 12;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 13;
+  // updated_at 更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 14;
+}
+
+// CreateAgentRequest 是创建 Agent 草稿的入参。
+message CreateAgentRequest {
+  // name Agent 名称。
+  string name = 1;
+  // description Agent 描述。
+  string description = 2;
+  // mode 编排模式。
+  string mode = 3;
+  // model_policy_id 可选策略 ID，与版本必须成对出现。
+  optional string model_policy_id = 4;
+  // model_policy_version 可选策略版本。
+  optional int32 model_policy_version = 5;
+  // skill_ids 绑定的 Skill 列表。
+  repeated string skill_ids = 6;
+  // mcp_ids 绑定的 MCP 列表。
+  repeated string mcp_ids = 7;
+}
+
+// UpdateAgentRequest 是更新 Agent 草稿的入参；名称与版本由服务端保持。
+message UpdateAgentRequest {
+  // id Agent 版本 ID。
+  string id = 1;
+  // description Agent 描述。
+  string description = 2;
+  // mode 编排模式。
+  string mode = 3;
+  // model_policy_id 可选策略 ID。
+  optional string model_policy_id = 4;
+  // model_policy_version 可选策略版本。
+  optional int32 model_policy_version = 5;
+  // skill_ids 绑定的 Skill 列表。
+  repeated string skill_ids = 6;
+  // mcp_ids 绑定的 MCP 列表。
+  repeated string mcp_ids = 7;
+}
+
+// GetAgentRequest 是读取 Agent 的入参。
+message GetAgentRequest {
+  // id Agent 版本 ID。
+  string id = 1;
+}
+
+// DeleteAgentRequest 是删除草稿 Agent 的入参。
+message DeleteAgentRequest {
+  // id Agent 版本 ID。
+  string id = 1;
+}
+
+// PublishAgentRequest 是发布 Agent 的入参。
+message PublishAgentRequest {
+  // id 草稿 Agent 版本 ID。
+  string id = 1;
+}
+
+// CreateAgentVersionRequest 是基于现有版本创建新草稿的入参。
+message CreateAgentVersionRequest {
+  // id 源 Agent 版本 ID。
+  string id = 1;
+}
+
+// ListAgentsRequest 是列出 Agent 的入参。
+message ListAgentsRequest {
+  // limit 页大小，1-100，默认 20。
+  int32 limit = 1;
+  // cursor 游标，空串表示第一页。
+  string cursor = 2;
+}
+
+// ListAgentsResponse 是 Agent 列表出参。
+message ListAgentsResponse {
+  // items 当前页 Agent。
+  repeated Agent items = 1;
+  // next_cursor 下一页游标，空串表示末页。
+  string next_cursor = 2;
+}
+
+// Session 是用户私有会话的对外视图。
+message Session {
+  // id 会话 ID。
+  string id = 1;
+  // agent_id 绑定的已发布 Agent，可为空。
+  optional string agent_id = 2;
+  // title 会话标题。
+  string title = 3;
+  // source 来源渠道：web/feishu/api。
+  string source = 4;
+  // status 生命周期：active/archived/deleted。
+  string status = 5;
+  // version 乐观锁版本号。
+  int64 version = 6;
+  // last_message_at 最近消息时间。
+  optional google.protobuf.Timestamp last_message_at = 7;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 8;
+  // updated_at 更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 9;
+  // memory_policy 记忆策略：private 私有、group 群聊话题、disabled 禁用记忆。
+  string memory_policy = 10;
+}
+
+// UpdateSessionMemoryPolicyRequest 是更新会话记忆策略的入参。
+message UpdateSessionMemoryPolicyRequest {
+  // id 会话 ID。
+  string id = 1;
+  // memory_policy 目标策略：private/group/disabled。
+  string memory_policy = 2;
+}
+
+// UpdateSessionMemoryPolicyResponse 是更新会话记忆策略的出参。
+message UpdateSessionMemoryPolicyResponse {
+  // session 更新后的会话。
+  Session session = 1;
+}
+
+// CreateSessionRequest 是创建会话的入参。
+message CreateSessionRequest {
+  // agent_id 可选，绑定的 Agent 必须是已发布版本。
+  optional string agent_id = 1;
+  // title 会话标题，最多 200 字节。
+  string title = 2;
+  // source 来源渠道，留空默认 web。
+  string source = 3;
+}
+
+// GetSessionRequest 是读取会话的入参。
+message GetSessionRequest {
+  // id 会话 ID。
+  string id = 1;
+}
+
+// ArchiveSessionRequest 是归档会话的入参。
+message ArchiveSessionRequest {
+  // id 会话 ID。
+  string id = 1;
+}
+
+// ListSessionsRequest 是列出会话的入参。
+message ListSessionsRequest {
+  // limit 页大小，1-100，默认 20。
+  int32 limit = 1;
+  // cursor 游标。
+  string cursor = 2;
+}
+
+// ListSessionsResponse 是会话列表出参。
+message ListSessionsResponse {
+  // items 当前页会话。
+  repeated Session items = 1;
+  // next_cursor 下一页游标。
+  string next_cursor = 2;
+}
+
+// ChatMessage 是会话消息的对外视图。
+message ChatMessage {
+  // id 消息 ID。
+  string id = 1;
+  // session_id 所属会话。
+  string session_id = 2;
+  // role 消息角色：system/user/assistant/tool。
+  string role = 3;
+  // content 消息正文。
+  string content = 4;
+  // tool_calls 工具调用元数据。
+  repeated google.protobuf.Struct tool_calls = 5;
+  // token_count Token 估算值。
+  int32 token_count = 6;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// AppendMessageRequest 是追加用户消息的入参；角色与用户身份由服务端强制。
+message AppendMessageRequest {
+  // session_id 目标会话 ID。
+  string session_id = 1;
+  // content 消息正文，1 字节至 4MB。
+  string content = 2;
+}
+
+// ListMessagesRequest 是列出消息的入参。
+message ListMessagesRequest {
+  // session_id 会话 ID。
+  string session_id = 1;
+  // limit 页大小，1-100，默认 20。
+  int32 limit = 2;
+  // cursor 游标。
+  string cursor = 3;
+}
+
+// ListMessagesResponse 是消息列表出参。
+message ListMessagesResponse {
+  // items 当前页消息。
+  repeated ChatMessage items = 1;
+  // next_cursor 下一页游标。
+  string next_cursor = 2;
+}
+
+// 以下为各写操作的出参包装，统一返回创建/更新后的完整实体。
+message CreateProviderResponse { Provider provider = 1; }
+message UpdateProviderResponse { Provider provider = 1; }
+message GetProviderResponse { Provider provider = 1; }
+message DeleteProviderResponse {}
+message CreateModelResponse { Model model = 1; }
+message UpdateModelResponse { Model model = 1; }
+message GetModelResponse { Model model = 1; }
+message DeleteModelResponse {}
+message CreatePolicyResponse { ModelPolicy policy = 1; }
+message UpdatePolicyResponse { ModelPolicy policy = 1; }
+message GetPolicyResponse { ModelPolicy policy = 1; }
+message DeletePolicyResponse {}
+message PublishPolicyResponse { ModelPolicy policy = 1; }
+message CreatePolicyVersionResponse { ModelPolicy policy = 1; }
+message CreateAgentResponse { Agent agent = 1; }
+message UpdateAgentResponse { Agent agent = 1; }
+message GetAgentResponse { Agent agent = 1; }
+message DeleteAgentResponse {}
+message PublishAgentResponse { Agent agent = 1; }
+message CreateAgentVersionResponse { Agent agent = 1; }
+message CreateSessionResponse { Session session = 1; }
+message GetSessionResponse { Session session = 1; }
+message ArchiveSessionResponse { Session session = 1; }
+message AppendMessageResponse { ChatMessage message = 1; }
+
+// ProviderService 管理 LLM 供应商连接，仅管理员可写，凭证只写不读。
+service ProviderService {
+  // CreateProvider 创建供应商并加密保存 API Key。
+  rpc CreateProvider(CreateProviderRequest) returns (CreateProviderResponse);
+  // UpdateProvider 更新供应商；可选轮换 API Key。
+  rpc UpdateProvider(UpdateProviderRequest) returns (UpdateProviderResponse);
+  // GetProvider 按 ID 读取供应商元数据。
+  rpc GetProvider(GetProviderRequest) returns (GetProviderResponse);
+  // DeleteProvider 删除供应商。
+  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
+  // ListProviders 列出全部供应商。
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+}
+
+// ModelCatalogService 管理模型目录，强制 1M+ 上下文与元数据核验准入。
+service ModelCatalogService {
+  // CreateModel 创建模型，默认停用，需显式核验后才能启用。
+  rpc CreateModel(CreateModelRequest) returns (CreateModelResponse);
+  // UpdateModel 更新模型元数据。
+  rpc UpdateModel(UpdateModelRequest) returns (UpdateModelResponse);
+  // GetModel 按 ID 读取模型。
+  rpc GetModel(GetModelRequest) returns (GetModelResponse);
+  // DeleteModel 删除模型。
+  rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
+  // ListModels 列出模型，可按供应商过滤。
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+}
+
+// ModelPolicyService 管理版本化路由策略。
+service ModelPolicyService {
+  // CreatePolicy 创建草稿策略。
+  rpc CreatePolicy(CreatePolicyRequest) returns (CreatePolicyResponse);
+  // UpdatePolicy 更新草稿策略。
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (UpdatePolicyResponse);
+  // GetPolicy 读取策略及候选。
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  // DeletePolicy 删除策略。
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse);
+  // PublishPolicy 发布草稿，校验候选均为已核验的 1M+ 生成模型。
+  rpc PublishPolicy(PublishPolicyRequest) returns (PublishPolicyResponse);
+  // CreatePolicyVersion 基于现有策略创建新草稿版本。
+  rpc CreatePolicyVersion(CreatePolicyVersionRequest) returns (CreatePolicyVersionResponse);
+  // ListPolicies 列出全部策略。
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+}
+
+// AgentService 管理当前用户的 Agent 草稿、版本与发布。
+service AgentService {
+  // CreateAgent 创建 Agent 草稿。
+  rpc CreateAgent(CreateAgentRequest) returns (CreateAgentResponse);
+  // UpdateAgent 更新 Agent 草稿。
+  rpc UpdateAgent(UpdateAgentRequest) returns (UpdateAgentResponse);
+  // GetAgent 读取当前用户的 Agent。
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+  // DeleteAgent 删除草稿版本。
+  rpc DeleteAgent(DeleteAgentRequest) returns (DeleteAgentResponse);
+  // PublishAgent 发布并固化不可变配置快照。
+  rpc PublishAgent(PublishAgentRequest) returns (PublishAgentResponse);
+  // CreateAgentVersion 基于现有版本创建新草稿。
+  rpc CreateAgentVersion(CreateAgentVersionRequest) returns (CreateAgentVersionResponse);
+  // ListAgents 游标分页列出当前用户的 Agent。
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+}
+
+// ConversationService 管理当前用户的会话与消息。
+service ConversationService {
+  // CreateSession 创建会话。
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  // GetSession 读取会话。
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // ArchiveSession 归档活跃会话。
+  rpc ArchiveSession(ArchiveSessionRequest) returns (ArchiveSessionResponse);
+  // UpdateSessionMemoryPolicy 更新会话记忆策略，用于关闭或收紧个人长期记忆注入。
+  rpc UpdateSessionMemoryPolicy(UpdateSessionMemoryPolicyRequest) returns (UpdateSessionMemoryPolicyResponse);
+  // ListSessions 游标分页列出会话。
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // AppendMessage 追加用户消息。
+  rpc AppendMessage(AppendMessageRequest) returns (AppendMessageResponse);
+  // ListMessages 游标分页列出会话消息。
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+}

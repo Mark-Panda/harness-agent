@@ -1,0 +1,12 @@
+# 灰度实例：使用已批准镜像在独立端口启动一个副本，Smoke 通过后再滚动替换主实例。
+# 用法：CANARY_IMAGE=<approved-image> docker compose -f docker-compose.yml -f deploy/compose/canary.yaml up -d app-canary
+services:
+  app-canary:
+    extends:
+      file: docker-compose.yml
+      service: app
+    container_name: harness-agent-canary
+    image: ${CANARY_IMAGE:?CANARY_IMAGE is required}
+    build: !reset null
+    ports: !override
+      - "8083:8080"

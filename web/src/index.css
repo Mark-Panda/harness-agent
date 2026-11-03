@@ -1,9 +1,34 @@
 @import "tailwindcss";
 
+/* 纸墨主题：暖纸底色、墨色文字、朱砂强调，避免通用深色后台观感。 */
+@theme {
+  --color-paper: #f4efe4;
+  --color-paper-raised: #fffaf1;
+  --color-paper-deep: #eae2d2;
+  --color-ink: #1f1b15;
+  --color-ink-soft: #4a4237;
+  --color-muted: #6b6051;
+  --color-line: #ded3c0;
+  --color-line-strong: #c6b9a3;
+  --color-accent: #b33a28;
+  --color-accent-soft: #f3ddd4;
+  --color-jade: #2e6a5c;
+  --color-jade-soft: #dcebe4;
+  --color-rust: #9c2f22;
+  --color-rust-soft: #f4ddd6;
+  --color-ochre: #7d5a10;
+  --color-ochre-soft: #f4e7c6;
+  --font-display: "Songti SC", "Noto Serif SC", "Source Han Serif SC", STSong, serif;
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+}
+
 :root {
-  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  color-scheme: dark;
+  font-family: var(--font-sans);
+  color-scheme: light;
   font-synthesis: none;
+  color: var(--color-ink);
+  background: var(--color-paper);
 }
 
 * {
@@ -13,4 +38,60 @@
 body {
   margin: 0;
   min-width: 320px;
+  min-height: 100vh;
+  background-color: var(--color-paper);
+  /* 极轻的网点纸纹，让大面积留白不显得像默认白底。 */
+  background-image: radial-gradient(circle at 1px 1px, rgb(31 27 21 / 0.045) 1px, transparent 0);
+  background-size: 18px 18px;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--color-paper-raised);
+}
+
+/* 页面入场：一次性错峰上浮，避免滚动时到处跳动。 */
+@keyframes page-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.page-rise {
+  animation: page-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.page-rise > * {
+  animation: page-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.page-rise > *:nth-child(2) {
+  animation-delay: 60ms;
+}
+
+.page-rise > *:nth-child(3) {
+  animation-delay: 120ms;
+}
+
+.page-rise > *:nth-child(4) {
+  animation-delay: 180ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-rise,
+  .page-rise > * {
+    animation: none;
+  }
 }

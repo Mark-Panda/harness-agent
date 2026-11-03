@@ -4,8 +4,11 @@ package harness.v1;
 
 option go_package = "github.com/Mark-Panda/harness-agent/api/harness/v1;harnessv1";
 
+// HealthRequest 是健康检查入参（无参数）。
 message HealthRequest {}
 
+// HealthResponse 是健康检查出参。
 message HealthResponse {
+  // status 服务状态，正常时为 ok。
   string status = 1;
 }

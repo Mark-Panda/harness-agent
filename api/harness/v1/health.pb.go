@@ -21,6 +21,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// HealthRequest 是健康检查入参（无参数）。
 type HealthRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -57,9 +58,11 @@ func (*HealthRequest) Descriptor() ([]byte, []int) {
 	return file_harness_v1_health_proto_rawDescGZIP(), []int{0}
 }
 
+// HealthResponse 是健康检查出参。
 type HealthResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// status 服务状态，正常时为 ok。
+	Status        string `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

@@ -1,0 +1,200 @@
+# promtool 告警触发测试：覆盖全部 Critical/High 告警。
+# 运行方式：promtool test rules deploy/prometheus/alerts_test.yaml
+rule_files:
+  - alerts.yaml
+evaluation_interval: 1m
+tests:
+  - name: availability budget burn triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_api_requests_total{method="GET",route="/api/v1/health",status="200"}'
+        values: '0+98x70'
+      - series: 'harness_api_requests_total{method="GET",route="/api/v1/health",status="500"}'
+        values: '0+2x70'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HarnessAvailabilityBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: harness-agent
+              slo: availability
+            exp_annotations:
+              summary: "Harness Agent 可用性错误预算快速消耗"
+              description: "过去 1 小时可用性低于 99.9% 的 14.4 倍燃烧率，请立即检查 5xx、依赖与最近发布。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessavailabilitybudgetburn"
+
+  - name: agent down triggers
+    interval: 1m
+    input_series:
+      - series: 'up{job="harness-agent"}'
+        values: '1 0+0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HarnessAgentDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: harness-agent
+              job: harness-agent
+            exp_annotations:
+              summary: "Harness Agent 实例不可达"
+              description: "Prometheus 无法抓取实例，检查 Pod/容器状态、readiness 与网络策略。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessagentdown"
+
+  - name: api 5xx ratio triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_api_requests_total{method="GET",route="/api/v1/runs",status="200"}'
+        values: '0+90x25'
+      - series: 'harness_api_requests_total{method="GET",route="/api/v1/runs",status="503"}'
+        values: '0+10x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarnessAPI5xxHigh
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              slo: availability
+            exp_annotations:
+              summary: "Harness Agent API 5xx 比例超过 5%"
+              description: "按 route 与 status 定位错误集中点，检查数据库、Redis、LLM Provider 与最近发布。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessapi5xxhigh"
+
+  - name: api latency triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_api_request_duration_seconds_bucket{le="1"}'
+        values: '0+0x25'
+      - series: 'harness_api_request_duration_seconds_bucket{le="2"}'
+        values: '0+0x25'
+      - series: 'harness_api_request_duration_seconds_bucket{le="5"}'
+        values: '0+100x25'
+      - series: 'harness_api_request_duration_seconds_bucket{le="+Inf"}'
+        values: '0+100x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarnessAPILatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              slo: latency
+            exp_annotations:
+              summary: "Harness Agent API P95 延迟超过 2 秒"
+              description: "检查慢查询、连接池耗尽、LLM/飞书慢调用与 Worker 排队。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessapilatencyhigh"
+
+  - name: db pool saturation triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_db_pool_in_use_connections{pool="app"}'
+        values: '0+3x25'
+      - series: 'harness_db_pool_max_open_connections{pool="app"}'
+        values: '30+0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarnessDBPoolSaturation
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              component: database
+              pool: app
+            exp_annotations:
+              summary: "数据库连接池使用率超过 90%"
+              description: "连接池接近耗尽会导致请求排队与 P99 延迟升高；检查慢查询、连接泄漏、数据库故障转移与 max_open_conns 配置。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/failure-degradation.md#harnessdbpoolsaturation"
+
+  - name: queue backlog triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_agent_jobs_inflight{type="agent.run"}'
+        values: '150+0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarnessQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              capacity: queue
+            exp_annotations:
+              summary: "Harness Agent 在途任务积压"
+              description: "队列在途任务超过 100，检查 Worker 副本数、租约恢复、Provider 限流与单任务耗时。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessqueuebacklog"
+
+  - name: outbox failures trigger
+    interval: 1m
+    input_series:
+      - series: 'harness_agent_outbox_events_total{event_type="audit.test",outcome="failure"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HarnessOutboxFailures
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              component: audit-outbox
+            exp_annotations:
+              summary: "审计 Outbox 派发持续失败"
+              description: "审计事件积压会破坏合规链路，检查 audit_logs 写入权限、Hash Chain 与数据库状态。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessoutboxfailures"
+
+  - name: llm cost spike triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_agent_llm_cost_total{mode="react"}'
+        values: '0+400x70'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: HarnessLLMCostSpike
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              slo: cost
+            exp_annotations:
+              summary: "LLM 费用速率异常升高"
+              description: "按 agent mode 与预算维度核对 Token/费用，检查异常重试、模型切换与单用户高频调用。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessllmcostspike"
+
+  - name: sse connection surge triggers
+    interval: 1m
+    input_series:
+      - series: 'harness_agent_sse_connections'
+        values: '600+0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HarnessSSEConnectionSurge
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              capacity: sse
+            exp_annotations:
+              summary: "SSE 并发连接超过容量阈值"
+              description: "检查客户端重连风暴、事件回放游标与实例副本数，必要时扩容或限流。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnesssseconnectionsurge"
+
+  - name: memory failures trigger
+    interval: 1m
+    input_series:
+      - series: 'harness_agent_memory_operations_total{operation="retrieve",outcome="success"}'
+        values: '0+70x25'
+      - series: 'harness_agent_memory_operations_total{operation="retrieve",outcome="failure"}'
+        values: '0+30x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HarnessMemoryFailures
+        exp_alerts:
+          - exp_labels:
+              severity: high
+              service: harness-agent
+              component: memory
+            exp_annotations:
+              summary: "记忆检索或摘要失败率超过 20%"
+              description: "记忆故障会降级上下文质量，检查向量表、Embedding Provider、摘要模型与数据库连接。"
+              runbook_url: "https://github.com/Mark-Panda/harness-agent/blob/main/docs/runbooks/harness-agent-alerts.md#harnessmemoryfailures"

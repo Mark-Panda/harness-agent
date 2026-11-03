@@ -1,3 +1,29 @@
+x-app-environment: &app-environment
+  APP_ENV: dev
+  DATABASE_URL: postgres://harness_app:harness@postgres:5432/harness?sslmode=disable
+  AUTH_DATABASE_URL: postgres://harness_auth:harness@postgres:5432/harness?sslmode=disable
+  REDIS_ADDR: redis:6379
+  REDIS_PASSWORD: harness
+  JWT_SIGNING_KEY_ID: dev
+  JWT_SIGNING_KEY_SECRET: dev-only-jwt-secret-01234567890123456789
+  REFRESH_TOKEN_PEPPER: dev-only-refresh-pepper-0123456789012345
+  AUDIT_PSEUDONYM_KEY: dev-only-audit-key-01234567890123456789
+  CREDENTIAL_ENCRYPTION_KEY_ID: dev
+  CREDENTIAL_ENCRYPTION_KEY_SECRET: dev-only-credential-key-01234567
+
+x-migrate-environment: &migrate-environment
+  APP_ENV: dev
+  DATABASE_URL: postgres://harness:harness@postgres:5432/harness?sslmode=disable
+  AUTH_DATABASE_URL: postgres://harness_auth:harness@postgres:5432/harness?sslmode=disable
+  REDIS_ADDR: redis:6379
+  REDIS_PASSWORD: harness
+  JWT_SIGNING_KEY_ID: dev
+  JWT_SIGNING_KEY_SECRET: dev-only-jwt-secret-01234567890123456789
+  REFRESH_TOKEN_PEPPER: dev-only-refresh-pepper-0123456789012345
+  AUDIT_PSEUDONYM_KEY: dev-only-audit-key-01234567890123456789
+  CREDENTIAL_ENCRYPTION_KEY_ID: dev
+  CREDENTIAL_ENCRYPTION_KEY_SECRET: dev-only-credential-key-01234567
+
 services:
   postgres:
     image: pgvector/pgvector:0.8.7-pg18
@@ -41,23 +67,53 @@ services:
       - "9090:9090"
     volumes:
       - ./deploy/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yaml:/etc/prometheus/alerts.yaml:ro
       - prometheus-data:/prometheus
+
+  # 外部合成监控：仅在 monitoring profile 中启用，避免默认本地开发拉起额外组件。
+  blackbox:
+    image: prom/blackbox-exporter:v0.27.0
+    profiles: ["monitoring"]
+    ports:
+      - "9115:9115"
+    volumes:
+      - ./deploy/prometheus/blackbox.yaml:/etc/blackbox_exporter/config.yml:ro
+
+  migrate:
+    build:
+      context: .
+    entrypoint: ["/app/harness-migrate"]
+    command: ["up"]
+    environment: *migrate-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   app:
     build:
       context: .
-    environment:
-      APP_ENV: dev
-      DATABASE_URL: postgres://harness:harness@postgres:5432/harness?sslmode=disable
-      REDIS_ADDR: redis:6379
-      REDIS_PASSWORD: harness
+    environment: *app-environment
     ports:
       - "8080:8080"
+      - "9190:9090"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # 只读根文件系统：应用不写本地磁盘，临时文件走 tmpfs。
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    cpus: 2
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
       interval: 5s

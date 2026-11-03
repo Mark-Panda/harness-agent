@@ -1,0 +1,12 @@
+# 两副本滚动发布覆盖配置：应用不绑定宿主端口，由负载均衡或 Kubernetes Service 访问。
+services:
+  app:
+    ports: []
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure

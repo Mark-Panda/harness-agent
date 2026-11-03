@@ -1,0 +1,123 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.10
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build and verify
+        run: make generate-check lint test-unit test-race test-coverage test-license
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          provenance: true
+          sbom: true
+
+      - name: Scan released image
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.67.0 image --skip-version-check \
+            --scanners vuln,secret,misconfig --exit-code 1 --severity HIGH,CRITICAL \
+            ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+
+      - name: Generate SBOM
+        run: |
+          mkdir -p artifacts/sbom
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.67.0 image --skip-version-check --format cyclonedx \
+            ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }} > artifacts/sbom/image.cdx.json
+          docker run --rm -v "$PWD:/src:ro" \
+            aquasec/trivy:0.67.0 fs --skip-version-check --format spdx-json /src > artifacts/sbom/repo.spdx.json
+
+      - name: Generate provenance
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": f"ghcr.io/{os.environ['GITHUB_REPOSITORY']}", "digest": {"sha256": os.environ["IMAGE_DIGEST"].split(":")[1]}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+              "buildDefinition": {
+                "buildType": "https://github.com/Mark-Panda/harness-agent/build/v1",
+                "externalParameters": {"workflow": os.environ["GITHUB_WORKFLOW"], "ref": os.environ["GITHUB_REF"]},
+                "resolvedDependencies": [{"uri": "git+https://github.com/" + os.environ["GITHUB_REPOSITORY"], "digest": {"gitCommit": os.environ["GITHUB_SHA"]}}],
+              },
+              "runDetails": {"builder": {"id": "https://github.com/" + os.environ["GITHUB_REPOSITORY"] + "/actions"}, "metadata": {"buildStartedOn": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
+            },
+          }
+          json.dump(statement, open("artifacts/provenance.json", "w"), indent=2)
+          PY
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image and attest provenance
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGE"
+          cosign attest --yes --predicate artifacts/provenance.json --type slsaprovenance "$IMAGE"
+
+      - name: Verify signature
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          cosign verify-attestation "$IMAGE" \
+            --type slsaprovenance \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Upload supply chain artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-${{ github.ref_name }}
+          path: artifacts/

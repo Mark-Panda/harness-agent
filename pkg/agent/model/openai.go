@@ -1,0 +1,351 @@
+// Package model 提供 OpenAI-compatible 模型适配器与路由所需的类型定义。
+package model
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// 模型调用错误分类，供上层决定重试或故障切换。
+var (
+	// ErrContextExceeded 请求超出模型上下文窗口，禁止重试。
+	ErrContextExceeded = errors.New("model context window exceeded")
+	// ErrCapability 模型缺少所需能力（流式、工具或结构化输出）。
+	ErrCapability = errors.New("model capability mismatch")
+	// ErrRateLimited 供应商限流或配额耗尽，可按 Retry-After 等待。
+	ErrRateLimited = errors.New("model rate limited")
+	// ErrRetryable 连接错误、超时或可重试 5xx。
+	ErrRetryable = errors.New("model call retryable")
+	// ErrAuthentication 供应商返回 401/403，当前 Endpoint 凭证失效。
+	ErrAuthentication = errors.New("model authentication failed")
+	// ErrPermanent 400、内容审核拒绝等不可重试错误。
+	ErrPermanent = errors.New("model call failed permanently")
+)
+
+// ResponseError 是供应商非 2xx 响应的结构化错误，保留状态码与 Retry-After 供路由层决策。
+// 通过 Unwrap 暴露底层分类，调用方仍可使用 errors.Is 判断错误类别。
+type ResponseError struct {
+	// StatusCode 供应商 HTTP 状态码。
+	StatusCode int
+	// RetryAfter 供应商建议的等待时长，仅 429 等场景携带。
+	RetryAfter time.Duration
+	// Class 错误分类，指向 ErrRateLimited、ErrRetryable、ErrAuthentication 或 ErrPermanent。
+	Class error
+	// Message 已脱敏的响应摘要，禁止包含凭证或用户正文。
+	Message string
+}
+
+// Error 返回稳定且可读的错误文本；429 时附带 Retry-After 秒数便于排障。
+func (e *ResponseError) Error() string {
+	suffix := ""
+	if e.RetryAfter > 0 {
+		suffix = fmt.Sprintf(" (retry after %d seconds)", int(e.RetryAfter.Seconds()))
+	}
+	if e.Message == "" {
+		return fmt.Sprintf("provider status %d%s", e.StatusCode, suffix)
+	}
+	return fmt.Sprintf("%s: provider status %d: %s%s", e.Class.Error(), e.StatusCode, e.Message, suffix)
+}
+
+// Unwrap 暴露底层分类，使 errors.Is 能识别重试与切换规则。
+func (e *ResponseError) Unwrap() error { return e.Class }
+
+// ModelRef 是调用所需的模型元数据快照，Run 创建时固化，运行中不受目录变更影响。
+type ModelRef struct {
+	// ProviderID 供应商 ID，用于熔断与配额隔离。
+	ProviderID string
+	// ModelID 模型 ID。
+	ModelID string
+	// RemoteModelName 供应商侧模型名。
+	RemoteModelName string
+	// ContextWindowTokens 上下文窗口，生成类必须大于等于 1M。
+	ContextWindowTokens int64
+	// MaxOutputTokens 最大输出 Token 数。
+	MaxOutputTokens int
+	// Stream 是否要求流式能力。
+	Stream bool
+	// Tools 是否要求工具调用能力。
+	Tools bool
+	// StructuredOutput 是否要求结构化输出能力。
+	StructuredOutput bool
+}
+
+// ChatToolCall 是协议层的工具调用表示。
+type ChatToolCall struct {
+	// ID 调用 ID。
+	ID string `json:"id,omitempty"`
+	// Type 调用类型，固定 function。
+	Type string `json:"type,omitempty"`
+	// Function 函数名与参数。
+	Function ChatFunction `json:"function"`
+}
+
+// ChatFunction 是工具调用的函数名与 JSON 参数。
+type ChatFunction struct {
+	// Name 函数名。
+	Name string `json:"name"`
+	// Arguments JSON 参数字符串。
+	Arguments string `json:"arguments"`
+}
+
+// ChatMessage 是发往模型的单条消息，仅包含协议字段。
+type ChatMessage struct {
+	// Role 角色：system/user/assistant/tool。
+	Role string `json:"role"`
+	// Content 文本内容。
+	Content string `json:"content,omitempty"`
+	// ToolCallID 工具消息对应的调用 ID。
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	// ToolCalls 助手消息携带的工具调用。
+	ToolCalls []ChatToolCall `json:"tool_calls,omitempty"`
+}
+
+// ToolDefinition 是暴露给模型的 JSON Schema 工具定义。
+type ToolDefinition struct {
+	// Name 工具名。
+	Name string
+	// Description 工具用途说明。
+	Description string
+	// Parameters JSON Schema。
+	Parameters json.RawMessage
+}
+
+// ChatRequest 是一次模型调用的入参。
+type ChatRequest struct {
+	// Model 模型元数据快照。
+	Model ModelRef
+	// Messages 规范上下文消息。
+	Messages []ChatMessage
+	// Tools 暴露给模型的工具定义。
+	Tools []ToolDefinition
+	// Temperature 采样温度。
+	Temperature float64
+	// MaxOutputTokens 本请求的输出上限，受模型上限约束。
+	MaxOutputTokens int
+}
+
+// ToolCall 是模型返回的工具调用。
+type ToolCall struct {
+	// ID 工具调用 ID。
+	ID string `json:"id"`
+	// Name 工具名。
+	Name string `json:"name"`
+	// Arguments JSON 参数原文，由执行层严格校验。
+	Arguments string `json:"arguments"`
+}
+
+// ChatResponse 是模型调用结果，刻意不包含隐藏思维链。
+type ChatResponse struct {
+	// Content 最终文本。
+	Content string
+	// ToolCalls 工具调用列表。
+	ToolCalls []ToolCall
+	// FinishReason 结束原因。
+	FinishReason string
+	// InputTokens 输入 Token 数。
+	InputTokens int
+	// OutputTokens 输出 Token 数。
+	OutputTokens int
+	// ProviderRequestID 供应商请求 ID，用于排障与对账。
+	ProviderRequestID string
+}
+
+// Client 调用 OpenAI-compatible Chat Completions 接口。
+type Client struct {
+	baseURL string
+	apiKey  string
+	http    *http.Client
+}
+
+// NewClient 构造适配器；HTTP 客户端禁用重定向且设置总超时，避免凭证被转发到其他主机。
+func NewClient(baseURL, apiKey string, timeout time.Duration) (*Client, error) {
+	if strings.TrimSpace(baseURL) == "" || apiKey == "" {
+		return nil, errors.New("model base URL and API key are required")
+	}
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	return &Client{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		apiKey:  apiKey,
+		http: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}, nil
+}
+
+// EstimateTokens 使用字符数的保守估算（约 4 字节/Tokens），用于调用前上下文预算。
+func EstimateTokens(messages []ChatMessage) int64 {
+	total := 0
+	for _, message := range messages {
+		total += len(message.Content) + len(message.ToolCallID) + len(message.Role)
+	}
+	if total == 0 {
+		return 0
+	}
+	return int64((total+3)/4 + len(messages)*4)
+}
+
+// Chat 执行一次非流式调用；调用前校验上下文与能力，错误按可重试性分类且不泄露凭证。
+func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, error) {
+	if request.Model.ContextWindowTokens < 1_000_000 {
+		return ChatResponse{}, fmt.Errorf("%w: context window below 1M", ErrContextExceeded)
+	}
+	if request.Model.Stream {
+		// 流式输出由 SSE 执行层负责；此适配器只提供非流式调用，避免静默降级。
+		return ChatResponse{}, fmt.Errorf("%w: streaming requires the SSE executor", ErrCapability)
+	}
+	if len(request.Tools) > 0 && !request.Model.Tools {
+		// 工具调用能力是硬准入条件，缺少能力时必须在路由阶段切换到其他候选。
+		return ChatResponse{}, fmt.Errorf("%w: model does not support tool calls", ErrCapability)
+	}
+	inputTokens := EstimateTokens(request.Messages)
+	outputBudget := request.MaxOutputTokens
+	if outputBudget <= 0 {
+		outputBudget = request.Model.MaxOutputTokens
+	}
+	if outputBudget > request.Model.MaxOutputTokens {
+		outputBudget = request.Model.MaxOutputTokens
+	}
+	if inputTokens+int64(outputBudget) > request.Model.ContextWindowTokens {
+		return ChatResponse{}, fmt.Errorf("%w: estimated %d input + %d output exceeds %d", ErrContextExceeded, inputTokens, outputBudget, request.Model.ContextWindowTokens)
+	}
+
+	body := map[string]any{
+		"model":       request.Model.RemoteModelName,
+		"messages":    request.Messages,
+		"max_tokens":  outputBudget,
+		"temperature": request.Temperature,
+	}
+	if len(request.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(request.Tools))
+		for _, tool := range request.Tools {
+			parameters := tool.Parameters
+			if len(parameters) == 0 {
+				parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+			}
+			tools = append(tools, map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": tool.Name, "description": tool.Description, "parameters": parameters},
+			})
+		}
+		body["tools"] = tools
+		body["tool_choice"] = "auto"
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("%w: encode request: %v", ErrPermanent, err)
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(encoded))
+	if err != nil {
+		return ChatResponse{}, fmt.Errorf("%w: build request: %v", ErrPermanent, err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	response, err := c.http.Do(httpRequest)
+	if err != nil {
+		// 用户取消与 Run Deadline 属于控制流错误，必须原样上抛，不能误判为可重试故障。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ChatResponse{}, ctxErr
+		}
+		return ChatResponse{}, fmt.Errorf("%w: transport error: %w", ErrRetryable, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusTooManyRequests {
+		// 保留 Retry-After 供路由层判断等待是否在可接受预算内。
+		return ChatResponse{}, &ResponseError{
+			StatusCode: response.StatusCode,
+			RetryAfter: RetryAfter(response.Header.Get("Retry-After"), 0),
+			Class:      ErrRateLimited,
+			Message:    "rate limited",
+		}
+	}
+	if response.StatusCode >= 500 {
+		return ChatResponse{}, &ResponseError{StatusCode: response.StatusCode, Class: ErrRetryable, Message: "provider server error"}
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		// 鉴权失败表示当前 Endpoint 凭证不可用，路由层应熔断该 Endpoint 并切换其他合规供应商。
+		return ChatResponse{}, &ResponseError{
+			StatusCode: response.StatusCode, Class: ErrAuthentication, Message: c.redactedError(response.Body),
+		}
+	}
+	if response.StatusCode != http.StatusOK {
+		return ChatResponse{}, &ResponseError{
+			StatusCode: response.StatusCode, Class: ErrPermanent, Message: c.redactedError(response.Body),
+		}
+	}
+
+	var payload struct {
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload); err != nil {
+		return ChatResponse{}, fmt.Errorf("%w: decode response: %v", ErrRetryable, err)
+	}
+	if len(payload.Choices) == 0 {
+		return ChatResponse{}, fmt.Errorf("%w: provider returned no choices", ErrRetryable)
+	}
+	choice := payload.Choices[0]
+	result := ChatResponse{
+		Content: choice.Message.Content, FinishReason: choice.FinishReason,
+		InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens,
+		ProviderRequestID: payload.ID, ToolCalls: make([]ToolCall, 0, len(choice.Message.ToolCalls)),
+	}
+	for _, call := range choice.Message.ToolCalls {
+		result.ToolCalls = append(result.ToolCalls, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
+	}
+	return result, nil
+}
+
+// redactedError 读取并截断供应商错误体，防止超长内容或回显敏感信息进入日志。
+func (c *Client) redactedError(body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, 4096))
+	if err != nil {
+		return "unreadable error body"
+	}
+	message := strings.TrimSpace(string(raw))
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	message = strings.ReplaceAll(message, c.apiKey, "[REDACTED]")
+	return message
+}
+
+// RetryAfter 解析 Retry-After 响应头，非法或缺失时返回默认退避时间。
+func RetryAfter(header string, fallback time.Duration) time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(header))
+	if err != nil || seconds <= 0 || seconds > 300 {
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
+}

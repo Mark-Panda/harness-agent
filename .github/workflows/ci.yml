@@ -14,11 +14,14 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          # Buf Breaking 需要与目标分支的 merge-base，浅克隆无法解析基线。
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.25.11
+          go-version: 1.26.10
           cache: true
 
       - name: Set up Node.js
@@ -31,8 +34,10 @@ jobs:
       - name: Set up Buf
         uses: bufbuild/buf-setup-action@v1
 
-      - name: Install protobuf generator
-        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+      - name: Install code generators
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+          go install go.uber.org/mock/mockgen@v0.6.0
 
       - name: Check generated code
         run: make generate-check
@@ -40,14 +45,27 @@ jobs:
       - name: Lint
         run: make lint
 
+      - name: Migration guard
+        run: make test-migration
+
       - name: Unit tests
         run: make test-unit
 
       - name: Race tests
         run: make test-race
 
+      - name: Coverage gates
+        run: make test-coverage
+
       - name: Contract tests
         run: make test-contract
+
+      - name: Fetch base branch for Buf breaking
+        if: github.event_name == 'pull_request'
+        run: git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+      - name: Buf breaking change check
+        run: make test-breaking
 
       - name: Web tests
         run: make test-web
@@ -58,8 +76,14 @@ jobs:
       - name: Start development stack
         run: make docker-up
 
+      - name: Database integration tests
+        run: REQUIRE_DATABASE=true make test-integration
+
       - name: Smoke test
         run: make smoke
+
+      - name: Verify migration version
+        run: docker compose run --rm --no-deps migrate version
 
       - name: Verify pgvector
         run: docker compose exec -T postgres psql -U harness -d harness -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
@@ -67,3 +91,37 @@ jobs:
       - name: Stop development stack
         if: always()
         run: docker compose down
+
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.10
+          cache: true
+
+      - name: Install security tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: SAST, dependency and fuzz scan
+        run: FUZZ_TIME=5s SECURITY_FAIL_ON_HIGH=true make test-security
+
+      - name: License compliance
+        run: make test-license
+
+      - name: Build image
+        run: docker build -t harness-agent-ci .
+
+      - name: Container image scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.67.0 image --skip-version-check \
+            --scanners vuln,secret,misconfig --exit-code 1 --severity HIGH,CRITICAL harness-agent-ci

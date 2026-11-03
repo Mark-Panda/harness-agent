@@ -4,11 +4,31 @@ server:
   http:
     addr: 0.0.0.0:8080
     timeout: 15s
+    # 应用层 TLS 默认关闭；生产由覆盖配置启用并注入证书。
+    tls:
+      enabled: false
+      min_version: 1.3
+  grpc:
+    addr: 0.0.0.0:9090
   shutdown_timeout: 10s
+  # SSE 容量与慢消费者保护：超过连接上限返回 503，单次写入超时后断开。
+  sse:
+    max_connections: 500
+    write_timeout: 10s
+  # API 多维限流；0 表示关闭该维度，生产按容量与公平性要求调整。
+  api_rate_limit:
+    global_per_minute: 12000
+    per_user_per_minute: 600
+    per_ip_per_minute: 1200
+  # 可信反向代理网段；为空时只使用直连地址并忽略 X-Forwarded-For。
+  trusted_proxies: []
+  # 刷新令牌与 CSRF Cookie 的 Secure 标记；本地 HTTP 开发关闭，生产必须开启。
+  cookie_secure: false
 
 data:
   postgres:
     dsn: ${DATABASE_URL}
+    auth_dsn: ${AUTH_DATABASE_URL}
     max_open_conns: 30
   redis:
     addr: ${REDIS_ADDR}
@@ -31,15 +51,186 @@ agent:
     default_capture_mode: redacted
     max_inline_payload_bytes: 262144
     retain_partial_response: true
+  worker:
+    enabled: true
+    worker_id: ${WORKER_ID}
+    concurrency: 2
+    poll_interval: 1s
+    lease: 60s
+    heartbeat: 20s
+    cancel_poll: 2s
+    request_timeout: 120s
+    max_output_tokens: 8192
+    backoff_base: 200ms
+    max_backoff: 2s
+    max_retry_after: 30s
+    temperature: 0.2
+    mcp_timeout: 30s
+    approval_poll: 5s
+    global_concurrency: 100
+    per_user_concurrency: 2
+    per_provider_concurrency: 20
+    concurrency_lease: 6m
+  sandbox:
+    # 生产环境要求高风险工具必须走独立 Sandbox Runner；本地未配置时关闭强制执行。
+    require_for_high_risk: ${SANDBOX_REQUIRED}
+    endpoint: ${SANDBOX_ENDPOINT}
+    token: ${SANDBOX_TOKEN}
+    allow_insecure: ${SANDBOX_ALLOW_INSECURE}
+    timeout: 30s
+    max_response_bytes: 1048576
+  budgets:
+    user_daily_tokens: 50000000
+    user_daily_cost: 20
+    agent_daily_tokens: 20000000
+    agent_daily_cost: 8
+    provider_daily_tokens: 200000000
+    provider_daily_cost: 100
+    alert_threshold: 0.8
+  memory:
+    hot_window_messages: 100
+    hot_window_ttl: 24h
+    summary:
+      enabled: true
+      trigger_messages: 24
+      keep_recent: 12
+      max_source_messages: 10000
+      max_input_bytes: 131072
+      max_message_bytes: 8192
+      max_output_tokens: 1024
+      max_summary_bytes: 65536
+      temperature: 0.1
+      request_timeout: 60s
+      concurrency: 1
+      poll_interval: 1s
+      lease: 90s
+      heartbeat: 30s
+    vector:
+      enabled: true
+      retriever_top_k: 30
+      mmr_top: 8
+      mmr_lambda: 0.7
+      min_similarity: 0.2
+      embedding_timeout: 60s
+      recent_messages: 32
+      batch_size: 16
+      concurrency: 2
+      poll_interval: 1s
+      lease: 90s
+      heartbeat: 30s
+      maintenance_enabled: true
+      maintenance_interval: 1m
+      coverage_threshold: 0.95
+      backfill_batch: 200
+    facts:
+      enabled: true
+      min_confidence: 0.6
+      correction_guard: 0.9
+      max_facts_per_user: 100
+      recent_messages: 16
+      min_messages: 4
+      max_facts: 20
+      max_message_bytes: 8192
+      max_output_tokens: 2048
+      temperature: 0.1
+      request_timeout: 60s
+      concurrency: 1
+      poll_interval: 1s
+      lease: 90s
+      heartbeat: 30s
+
+auth:
+  jwt_issuer: harness-agent
+  jwt_signing_key_id: ${JWT_SIGNING_KEY_ID}
+  jwt_signing_key_secret: ${JWT_SIGNING_KEY_SECRET}
+  jwt_verification_keys: []
+  refresh_token_pepper: ${REFRESH_TOKEN_PEPPER}
+  # 开放注册开关；关闭后仅管理员可通过管理接口邀请创建用户。
+  registration_enabled: true
+  login_rate_limit:
+    max_attempts: 5
+    window: 5m
+
+credentials:
+  active_key_id: ${CREDENTIAL_ENCRYPTION_KEY_ID}
+  active_key_secret: ${CREDENTIAL_ENCRYPTION_KEY_SECRET}
+  previous_keys: []
+
+quotas:
+  max_agents_per_user: 50
+  max_sessions_per_user: 200
+
+# 结构化日志默认 JSON 输出到 stdout，级别与格式可由环境变量覆盖；
+# 日志保留期由部署侧采集管道与容器日志轮转统一管理，避免多副本写本地文件产生冲突。
+logging:
+  level: ${LOG_LEVEL}
+  format: ${LOG_FORMAT}
+
+# 保留期只控制脱敏执行载荷与审计数据的清理，不删除用户会话与业务事实；
+# 清理任务需要数据库保留期特权，由部署侧定时以受控任务执行。
+retention:
+  execution_records: 2160h
+  audit_logs: 8760h
+  # 飞书事件回执仅用于短期重放，超期后删除原始事件载荷，避免正文长期驻留。
+  feishu_events: 168h
 
 observability:
   include_execution_payloads: false
+  # OpenTelemetry 默认关闭；启用时由环境变量注入 OTLP 端点与采样比例。
+  # 约束：导出头仅承载出口认证，Trace 不采集 Prompt/Completion/工具原文。
+  tracing:
+    enabled: ${OTEL_TRACING_ENABLED}
+    service_name: harness-agent
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+    insecure: ${OTEL_EXPORTER_OTLP_INSECURE}
+    sample_ratio: ${OTEL_TRACING_SAMPLE_RATIO}
+    batch_timeout: 5s
+    export_timeout: 10s
+    headers:
+      authorization: "${OTEL_EXPORTER_OTLP_AUTH_HEADER}"
+    resource_attributes:
+      deployment.name: "${DEPLOYMENT_NAME}"
 
 audit:
   synchronous_critical_writes: true
   hash_chain_enabled: true
+  pseudonym_key: ${AUDIT_PSEUDONYM_KEY}
 
 feishu:
+  # 飞书接入默认关闭，开启时由环境变量注入应用凭据与事件密钥。
+  enabled: ${FEISHU_ENABLED}
+  app_id: ${FEISHU_APP_ID}
+  app_secret: ${FEISHU_APP_SECRET}
+  verification_token: ${FEISHU_VERIFICATION_TOKEN}
+  # 加密密钥列表：首个为当前密钥，轮换期可在环境覆盖文件中追加历史密钥。
+  encrypt_keys:
+    - id: ${FEISHU_ENCRYPT_KEY_ID}
+      secret: ${FEISHU_ENCRYPT_KEY_SECRET}
+  # 事件时间戳重放窗口，默认 5 分钟。
+  event_window: 5m
+  # 单次回调请求体上限，默认 1 MiB。
+  max_body_bytes: 1048576
+  bot_open_id: ${FEISHU_BOT_OPEN_ID}
+  bot_name: ${FEISHU_BOT_NAME}
+  default_agent_id: ${FEISHU_DEFAULT_AGENT_ID}
+  default_agent_version: ${FEISHU_DEFAULT_AGENT_VERSION}
+  mode: react
+  worker:
+    concurrency: 2
+    poll_interval: 1s
+    lease: 30s
+  reply:
+    concurrency: 2
+    poll_interval: 1s
+    lease: 30s
+    poll_run_interval: 2s
+    run_wait_timeout: 10m
+    max_text_bytes: 4096
+    # 同一卡片两次增量更新的最小间隔，避免放大飞书卡片更新限流。
+    card_update_interval: 5s
+    # 单个 chat / 用户的并发投递上限，防止单会话突发流量触发平台限流。
+    max_concurrent_per_chat: 1
+    max_concurrent_per_user: 2
   group:
     require_topic: true
     auto_reply_in_bound_topic: true
