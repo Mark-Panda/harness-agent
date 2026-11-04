@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { SafeMarkdown } from "../components/SafeMarkdown";
+import { useToast } from "../components/Toast";
 import { Badge, Button, Card, EmptyState, ErrorBanner, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
 import { mutate, requestJSON, streamRunEvents } from "../lib/api";
 import { describeError } from "../lib/errors";
@@ -60,6 +61,17 @@ function toolCallNames(value: unknown): string[] {
   });
 }
 
+// approvalFields 把审批参数转成可读的键值对，避免整段 JSON 难以扫读。
+function approvalFields(value: Record<string, unknown> | null): Array<[string, string]> {
+  if (!value) {
+    return [];
+  }
+  return Object.entries(value).map(([key, item]) => {
+    const text = typeof item === "string" ? item : JSON.stringify(item);
+    return [key, text ?? String(item)];
+  });
+}
+
 interface LiveMessage {
   // key 使用事件序号去重。
   key: string;
@@ -90,6 +102,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export default function ChatPage() {
   const { sessionId = "" } = useParams();
+  const toast = useToast();
   const session = useRemote(() => requestJSON<Session>(`/api/v1/sessions/${sessionId}`), [sessionId]);
   const messages = useRemote(() => requestJSON<Page<Message>>(`/api/v1/sessions/${sessionId}/messages?limit=100`), [sessionId]);
   // 保留已归档助手，仅用于展示会话绑定的助手名称；发送能力仍要求已发布状态。
@@ -369,8 +382,8 @@ export default function ChatPage() {
     };
   }, [activeRun?.id, messagesReload, refreshApprovals]);
 
-  const send = async () => {
-    const content = draft.trim();
+  const send = async (contentOverride?: string) => {
+    const content = (contentOverride ?? draft).trim();
     if (!content || sending || runActive) {
       return;
     }
@@ -386,7 +399,10 @@ export default function ChatPage() {
     setShowJump(false);
     try {
       await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", { content }, crypto.randomUUID());
-      setDraft("");
+      // 重试上一轮时保留输入框内容，避免用户正在编辑的新内容被清空。
+      if (contentOverride === undefined) {
+        setDraft("");
+      }
       messagesReload();
       const run = await mutate<Run>(`/api/v1/sessions/${sessionId}/runs`, "POST", {
         agent_id: agent?.id ?? null,
@@ -427,6 +443,7 @@ export default function ChatPage() {
       await refreshApprovals(activeRun.id);
       const current = await requestJSON<Run>(`/api/v1/runs/${activeRun.id}`);
       setActiveRun(current);
+      toast.show(decision === "approve" ? "已批准，助手继续执行" : "已拒绝该工具调用", decision === "approve" ? "success" : "info");
     } catch (failure) {
       setActionError(describeError(failure));
     } finally {
@@ -436,6 +453,24 @@ export default function ChatPage() {
 
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const persistedMessages = (messages.data?.items ?? []).slice().reverse();
+
+  // 最近一条用户消息用于失败后的“重试本轮”和“编辑后重发”。
+  const lastUserContent = useMemo(() => {
+    for (let index = persistedMessages.length - 1; index >= 0; index -= 1) {
+      if (persistedMessages[index].role === "user") {
+        return persistedMessages[index].content;
+      }
+    }
+    return null;
+  }, [persistedMessages]);
+
+  const latestRun = runs.data?.items[0] ?? null;
+  // 当前没有运行中的任务时，才把失败结果展示在主对话区；优先使用本轮状态，避免历史列表短暂滞后。
+  const failedRun = runActive
+    ? null
+    : activeRun
+      ? (activeRun.status === "failed" ? activeRun : null)
+      : (latestRun?.status === "failed" ? latestRun : null);
 
   // 新内容到达时只在用户停留在底部才自动滚动，向上翻阅历史时不打断阅读。
   useEffect(() => {
@@ -493,16 +528,9 @@ export default function ChatPage() {
         title={session.data?.title ?? "加载对话…"}
         description={session.data ? `${statusLabel(session.data.status)} · 来自${sourceLabel(session.data.source)} · 最近消息 ${formatRelative(session.data.last_message_at)}` : undefined}
         actions={
-          <>
-            <Link to="/sessions" className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
-              返回对话列表
-            </Link>
-            {session.data ? (
-              <Link to={`/audit?session=${session.data.id}`} className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
-                查看运行记录
-              </Link>
-            ) : null}
-          </>
+          <Link to="/sessions" className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
+            返回对话列表
+          </Link>
         }
       />
       {session.error ? <ErrorBanner message={session.error} onRetry={session.reload} /> : null}
@@ -510,23 +538,15 @@ export default function ChatPage() {
       {actionError ? <ErrorBanner message={actionError} /> : null}
       {streamError ? <ErrorBanner message={`事件流中断：${streamError}`} /> : null}
 
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start">
       <Card
         title={agent?.name ?? "对话"}
         description={canRun ? `${modeLabel(agent?.mode)} · 消息会自动保存，处理过程可随时回看` : "这个对话没有绑定可用助手，只能查看历史消息。"}
-        actions={
-          <>
-            {runActive ? <Badge tone="warning">正在处理</Badge> : null}
-            {session.data ? (
-              <Link to={`/audit?session=${session.data.id}`} className="text-xs text-muted underline underline-offset-4 hover:text-accent">
-                处理记录
-              </Link>
-            ) : null}
-          </>
-        }
+        actions={runActive ? <Badge tone="warning">正在处理</Badge> : null}
       >
         <div
           ref={messageListRef}
-          className="flex max-h-[58vh] min-h-[320px] flex-col gap-4 overflow-y-auto rounded-[3px] border border-line bg-paper/60 px-4 py-5"
+          className="flex max-h-[calc(100vh-24rem)] min-h-[340px] flex-col gap-4 overflow-y-auto rounded-[3px] border border-line bg-paper/60 px-4 py-5"
           role="log"
           aria-live="polite"
           onScroll={onMessageScroll}
@@ -591,6 +611,36 @@ export default function ChatPage() {
               ))}
             </>
           )}
+          {failedRun ? (
+            <div role="alert" className="rounded-[3px] border border-rust bg-rust-soft/60 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm font-medium text-rust">本轮处理失败</p>
+                <Link to={`/runs/${failedRun.id}`} className="text-xs text-accent underline underline-offset-2">
+                  查看完整过程
+                </Link>
+              </div>
+              <p className="mt-1 break-all text-xs leading-5 text-rust">
+                {failedRun.error_code ? `${failedRun.error_code}：` : ""}{failedRun.error_message || "未返回具体原因，可打开运行详情查看执行步骤。"}
+              </p>
+              {lastUserContent ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => void send(lastUserContent)} disabled={!canRun || runActive || sending}>
+                    重试本轮
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setDraft(lastUserContent);
+                      document.getElementById("chat-composer")?.focus();
+                    }}
+                  >
+                    编辑后重发
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {runActive ? (
             <p className="flex items-center gap-2 text-xs text-muted" role="status">
               <span className="flex gap-1" aria-hidden>
@@ -619,26 +669,49 @@ export default function ChatPage() {
               <p className="text-xs text-muted">高风险工具在继续执行前需要你的批准。</p>
             </div>
             <div className="mt-3 flex flex-col gap-2">
-              {pendingApprovals.map((approval) => (
-                <div key={approval.id} className="rounded-[3px] border border-ochre/60 bg-paper-raised p-3 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="font-medium text-ink">{approval.tool_name}</p>
-                    <Badge tone={approval.risk_level === "high" ? "danger" : "warning"}>{approval.risk_level === "high" ? "高风险" : approval.risk_level === "medium" ? "需留意" : "低风险"}</Badge>
+              {pendingApprovals.map((approval) => {
+                const fields = approvalFields(approval.arguments);
+                return (
+                  <div key={approval.id} className="rounded-[3px] border border-ochre/60 bg-paper-raised p-3 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="font-medium text-ink">{approval.tool_name}</p>
+                      <Badge tone={approval.risk_level === "high" ? "danger" : "warning"}>{approval.risk_level === "high" ? "高风险" : approval.risk_level === "medium" ? "需留意" : "低风险"}</Badge>
+                    </div>
+                    {fields.length > 0 ? (
+                      <div className="mt-2 max-h-40 overflow-auto rounded bg-paper-deep/40 p-2">
+                        <div className="flex flex-col gap-1">
+                          {fields.map(([key, value]) => (
+                            <div key={key} className="grid grid-cols-[110px_1fr] gap-2 text-[11px]">
+                              <span className="font-mono text-muted">{key}</span>
+                              <span className="break-all font-mono text-ink-soft">{value}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-[11px] text-muted">这个工具没有参数。</p>
+                    )}
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button size="sm" loading={deciding === approval.id} onClick={() => void decide(approval, "approve")}>批准并继续</Button>
+                      <Button size="sm" variant="danger" loading={deciding === approval.id} onClick={() => void decide(approval, "deny")}>拒绝</Button>
+                      {approval.arguments ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => void copyMessage(`approval-${approval.id}`, JSON.stringify(approval.arguments, null, 2))}
+                        >
+                          {copiedKey === `approval-${approval.id}` ? "已复制" : "复制参数"}
+                        </Button>
+                      ) : null}
+                    </div>
                   </div>
-                  {approval.arguments ? (
-                    <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-paper-deep/40 p-2 font-mono text-[11px] text-muted">{JSON.stringify(approval.arguments, null, 2)}</pre>
-                  ) : null}
-                  <div className="mt-2 flex gap-2">
-                    <Button size="sm" loading={deciding === approval.id} onClick={() => void decide(approval, "approve")}>批准并继续</Button>
-                    <Button size="sm" variant="danger" loading={deciding === approval.id} onClick={() => void decide(approval, "deny")}>拒绝</Button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ) : null}
 
-        <div className="mt-4 rounded-[3px] border border-line-strong bg-paper-raised p-3 focus-within:border-accent">
+        <div className="sticky bottom-3 z-10 mt-4 rounded-[3px] border border-line-strong bg-paper-raised/95 p-3 shadow-[0_-6px_20px_rgb(31_27_21/0.06)] backdrop-blur focus-within:border-accent">
           <Textarea
             id="chat-composer"
             value={draft}
@@ -674,56 +747,84 @@ export default function ChatPage() {
         </div>
       </Card>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <Card title="处理过程" description="当前状态、连接情况与每一步在做什么。">
+        <div className="flex flex-col gap-4 xl:sticky xl:top-20">
+        <Card title="处理过程" description="默认收起。摘要会显示当前进度，展开后才能查看每一步。">
           {activeRun ? (
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-wrap items-center gap-2">
+            <details className="group rounded-[3px] border border-line bg-paper-raised">
+              <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[3px] px-3 py-2 text-xs transition hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
                 <Badge tone={statusTone(activeRun.status)}>{statusLabel(activeRun.status)}</Badge>
-                <span className="text-xs text-muted">{{ idle: "未开始", connecting: "连接中", streaming: "实时接收", reconnecting: "重连中", closed: "已结束" }[connection]}</span>
-                <span className="text-xs text-muted">{modeLabel(activeRun.mode)} · 尝试 {activeRun.attempt_no} 次</span>
+                {runActive ? (
+                  <span className="flex items-center gap-1.5 text-accent">
+                    <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-accent" />
+                    第 {activeRun.current_step_seq || 1} 步
+                  </span>
+                ) : (
+                  <span className="text-ink">共 {activeRun.current_step_seq || 0} 步</span>
+                )}
+                <span className="text-muted">{timeline.length} 条过程记录</span>
+                <span className="ml-auto text-accent group-open:hidden">展开</span>
+                <span className="ml-auto hidden text-accent group-open:inline">收起</span>
+              </summary>
+              <div className="flex flex-col gap-3 border-t border-line p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-muted">{{ idle: "未开始", connecting: "连接中", streaming: "实时接收", reconnecting: "重连中", closed: "已结束" }[connection]}</span>
+                  <span className="text-xs text-muted">{modeLabel(activeRun.mode)} · 尝试 {activeRun.attempt_no} 次</span>
+                </div>
+                {activeRun.error_message ? <p className="rounded-[3px] border border-rust bg-rust-soft px-2 py-1 text-xs text-rust">{activeRun.error_code}: {activeRun.error_message}</p> : null}
+                {timeline.length > 0 ? (
+                  <ol className="flex max-h-72 flex-col gap-2 overflow-y-auto" aria-label="处理时间线">
+                    {timeline.map((entry) => (
+                      <li key={entry.key} className="flex items-start gap-2 text-xs">
+                        <span className={cn("mt-1 size-1.5 shrink-0 rounded-full", entry.tone === "success" ? "bg-accent" : entry.tone === "danger" ? "bg-rust" : entry.tone === "warning" ? "bg-ochre" : "bg-jade")} />
+                        <div>
+                          <p className="text-ink">
+                            <Link to={`/runs/${activeRun.id}`} className="underline-offset-2 hover:text-accent hover:underline">
+                              {entry.label}
+                            </Link>
+                          </p>
+                          {entry.detail ? <p className="break-all text-[11px] text-muted">{entry.detail}</p> : null}
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="text-xs text-muted">等待执行事件…</p>
+                )}
               </div>
-              {activeRun.error_message ? <p className="rounded-[3px] border border-rust bg-rust-soft px-2 py-1 text-xs text-rust">{activeRun.error_code}: {activeRun.error_message}</p> : null}
-              {timeline.length > 0 ? (
-                <ol className="flex max-h-72 flex-col gap-2 overflow-y-auto border-t border-line pt-3" aria-label="处理时间线">
-                  {timeline.map((entry) => (
-                    <li key={entry.key} className="flex items-start gap-2 text-xs">
-                      <span className={cn("mt-1 size-1.5 shrink-0 rounded-full", entry.tone === "success" ? "bg-accent" : entry.tone === "danger" ? "bg-rust" : entry.tone === "warning" ? "bg-ochre" : "bg-jade")} />
-                      <div>
-                        <p className="text-ink">{entry.label}</p>
-                        {entry.detail ? <p className="break-all text-[11px] text-muted">{entry.detail}</p> : null}
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <p className="text-xs text-muted">等待执行事件…</p>
-              )}
-            </div>
+            </details>
           ) : (
             <p className="text-xs leading-5 text-muted">发送消息后，这里会实时显示思考步骤、工具调用和错误原因；SSE 断线会自动重连。</p>
           )}
         </Card>
 
-        <Card title="历史处理记录" description="最近 20 次处理。点“查看过程”可以看到模型切换与完整输入输出。">
+        <Card title="历史处理记录" description="默认收起。展开后点“查看过程”可以看完整输入输出。">
           {runs.loading ? (
             <LoadingState />
           ) : runs.data && runs.data.items.length > 0 ? (
-            <div className="flex flex-col divide-y divide-line">
-              {runs.data.items.map((run) => (
-                <div key={run.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
-                  <div className="flex items-center gap-2">
-                    <Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge>
-                    <span className="text-xs text-muted">{modeLabel(run.mode)} · {formatDateTime(run.created_at)}</span>
+            <details className="group rounded-[3px] border border-line bg-paper-raised">
+              <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[3px] px-3 py-2 text-xs transition hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
+                <span className="text-ink">最近 {runs.data.items.length} 次处理</span>
+                <span className="text-muted">展开查看</span>
+                <span className="ml-auto text-accent group-open:hidden">展开</span>
+                <span className="ml-auto hidden text-accent group-open:inline">收起</span>
+              </summary>
+              <div className="flex flex-col divide-y divide-line border-t border-line px-3">
+                {runs.data.items.map((run) => (
+                  <div key={run.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
+                    <div className="flex items-center gap-2">
+                      <Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge>
+                      <span className="text-xs text-muted">{modeLabel(run.mode)} · {formatDateTime(run.created_at)}</span>
+                    </div>
+                    <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
                   </div>
-                  <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </details>
           ) : (
             <EmptyState title="还没有处理记录" description="发送第一条消息后，这里会显示完整处理过程。" />
           )}
         </Card>
+        </div>
       </div>
     </div>
   );
@@ -752,6 +853,7 @@ function MessageBubble({
   onCopy: (key: string, content: string) => Promise<void>;
 }) {
   const toolNames = toolCallNames(toolCalls);
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
   if (role === "system") {
     return <div className="mx-auto max-w-[90%] rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2 text-center text-[11px] leading-5 text-muted">{content}</div>;
   }
@@ -771,6 +873,54 @@ function MessageBubble({
         <details className="rounded-[3px] border border-line bg-paper-deep/50 px-3 py-2 text-xs text-muted">
           <summary className="cursor-pointer text-muted">工具结果{name ? ` · ${name}` : ""}{toolCalls ? "（含调用记录）" : ""}</summary>
           <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]">{content}</pre>
+        </details>
+      </div>
+    );
+  }
+  // 带工具调用的助手消息属于中间思考过程，默认折叠，只保留最终回答展开。
+  if (hasToolCalls) {
+    return (
+      <div className="flex gap-3">
+        <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-line-strong bg-paper-raised font-display text-sm text-accent">
+          助
+        </span>
+        <details className="group min-w-0 max-w-[85%] flex-1 rounded-[4px] border border-line bg-paper-raised">
+          <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[4px] px-4 py-3 text-[11px] text-muted [&::-webkit-details-marker]:hidden">
+            <span className="text-sm font-medium text-ink-soft">助手思考</span>
+            {live ? (
+              <span className="flex items-center gap-1 text-accent">
+                <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-accent" />
+                实时接收
+              </span>
+            ) : null}
+            <span>调用 {toolNames.length} 个工具</span>
+            {createdAt ? <span>{formatDateTime(createdAt)}</span> : null}
+            <span className="ml-auto text-accent group-open:hidden">展开</span>
+            <span className="ml-auto hidden text-accent group-open:inline">收起</span>
+          </summary>
+          <div className="border-t border-line px-4 py-3 text-sm leading-6">
+            {content ? (
+              <SafeMarkdown content={content} />
+            ) : (
+              <p className="text-xs text-muted">正在调用工具，等待结果…</p>
+            )}
+            {toolNames.length > 0 ? (
+              <p className="mt-2 flex flex-wrap items-center gap-1 text-[11px] text-muted">
+                调用工具：
+                {toolNames.map((toolName, index) => (
+                  <span key={`${toolName}-${index}`} className="rounded-[2px] border border-line bg-paper-deep/50 px-1.5 py-0.5 font-mono">
+                    {toolName}
+                  </span>
+                ))}
+              </p>
+            ) : null}
+            {hasToolCalls ? (
+              <details className="mt-2 text-[11px] text-muted">
+                <summary className="cursor-pointer">工具调用记录（{toolCalls.length}）</summary>
+                <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-paper-deep/40 p-2 font-mono">{JSON.stringify(toolCalls, null, 2)}</pre>
+              </details>
+            ) : null}
+          </div>
         </details>
       </div>
     );

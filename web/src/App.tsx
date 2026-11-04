@@ -2,6 +2,7 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AdminRoute, AppShell, ProtectedRoute } from "./components/AppShell";
 import { EmptyState } from "./components/ui";
+import { ToastProvider } from "./components/Toast";
 import { AuthProvider } from "./lib/auth";
 import AgentWizardPage from "./pages/AgentWizardPage";
 import AgentsPage from "./pages/AgentsPage";
@@ -24,8 +25,9 @@ import FeishuBotsPage from "./pages/admin/FeishuBotsPage";
 export default function App() {
   return (
     <AuthProvider>
-      <BrowserRouter>
-        <Routes>
+      <ToastProvider>
+        <BrowserRouter>
+          <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route
@@ -53,8 +55,9 @@ export default function App() {
             <Route path="/admin/agents" element={<AdminRoute><AdminAgentsPage /></AdminRoute>} />
             <Route path="*" element={<EmptyState title="页面不存在" description="请从顶部导航重新进入所需功能。" />} />
           </Route>
-        </Routes>
-      </BrowserRouter>
+          </Routes>
+        </BrowserRouter>
+      </ToastProvider>
     </AuthProvider>
   );
 }

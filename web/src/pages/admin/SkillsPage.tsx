@@ -5,7 +5,7 @@ import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { parseSkillPackage } from "../../lib/skillPackage";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
 import type { Page, Skill, SkillStatus } from "../../lib/types";
 
 interface SkillFormState {
@@ -99,6 +99,7 @@ function SkillForm({ initial, onSaved, onCancel }: { initial: Skill | null; onSa
 export default function SkillsPage() {
   const skills = useRemote(() => requestJSON<Page<Skill>>("/api/v1/skills"), []);
   const [editing, setEditing] = useState<Skill | null | "new">(null);
+  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Skill | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

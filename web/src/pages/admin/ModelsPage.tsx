@@ -4,7 +4,7 @@ import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Inp
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, formatNumber, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
 import type { Model, ModelHealth, ModelKind, Page, Provider, RemoteModel } from "../../lib/types";
 
 interface ModelFormState {
@@ -281,6 +281,7 @@ export default function ModelsPage() {
   );
   const health = useRemote(() => requestJSON<{ items: ModelHealth[] }>("/api/v1/model-routing/health"), []);
   const [editing, setEditing] = useState<Model | null | "new">(null);
+  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Model | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

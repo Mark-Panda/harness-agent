@@ -113,3 +113,12 @@ export function useCursorStack(): CursorStack {
     reset: () => setCursors([null]),
   };
 }
+
+// useScrollToTop 在编辑表单出现时回到页面顶部，避免表单渲染在视口外。
+export function useScrollToTop(active: boolean) {
+  useEffect(() => {
+    if (active) {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [active]);
+}

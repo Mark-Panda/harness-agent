@@ -321,6 +321,20 @@ export function ConfirmDialog({
 }) {
   const titleID = useId();
   const descriptionID = useId();
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const restoreRef = useRef<HTMLElement | null>(null);
+
+  // 打开时记住原焦点，关闭后还回去；Tab 在弹窗内循环，避免焦点跑到背景页。
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    restoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      restoreRef.current?.focus();
+    };
+  }, [open]);
+
   if (!open) {
     return null;
   }
@@ -330,9 +344,29 @@ export function ConfirmDialog({
       onCancel();
     }
   };
+  const trapFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Tab") {
+      return;
+    }
+    const nodes = Array.from(panelRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])') ?? [])
+      .filter((node) => !node.hasAttribute("disabled"));
+    if (nodes.length === 0) {
+      return;
+    }
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 p-4" role="presentation" onClick={requestCancel}>
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleID}
@@ -340,6 +374,7 @@ export function ConfirmDialog({
         className="w-full max-w-md rounded-[4px] border border-line-strong bg-paper-raised p-6 shadow-[0_20px_60px_rgb(31_27_21/0.25)]"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
+          trapFocus(event);
           if (event.key === "Escape") {
             requestCancel();
           }

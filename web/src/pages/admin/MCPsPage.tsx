@@ -4,7 +4,7 @@ import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Inp
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
 import type { MCP, MCPInput, MCPStatus, MCPTool, Page } from "../../lib/types";
 
 interface MCPFormState {
@@ -147,6 +147,7 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
 export default function MCPsPage() {
   const mcps = useRemote(() => requestJSON<Page<MCP>>("/api/v1/mcps"), []);
   const [editing, setEditing] = useState<MCP | null | "new">(null);
+  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<MCP | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [testingID, setTestingID] = useState<string | null>(null);

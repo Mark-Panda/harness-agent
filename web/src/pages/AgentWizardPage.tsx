@@ -5,8 +5,9 @@ import { useAuth } from "../lib/auth";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { useRemote } from "../lib/hooks";
+import { useToast } from "../components/Toast";
 import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill } from "../lib/types";
-import { Badge, Button, Callout, Card, ChoiceCard, ErrorBanner, Field, Input, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
+import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
 
 const modes: Array<{ value: AgentMode; title: string; description: string; badge?: string }> = [
   {
@@ -32,6 +33,7 @@ const stepTitles = ["基本情况", "工作方式", "模型与能力", "检查�
 export default function AgentWizardPage() {
   const { agentId } = useParams();
   const navigate = useNavigate();
+  const toast = useToast();
   const { user } = useAuth();
   const isEditing = Boolean(agentId);
   const editing = useRemote(
@@ -52,6 +54,7 @@ export default function AgentWizardPage() {
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"draft" | "publish" | null>(null);
+  const [confirmLeave, setConfirmLeave] = useState(false);
 
   const publishedPolicies = (policies.data?.items ?? []).filter((policy) => policy.status === "published");
   const activeSkills = (skills.data?.items ?? []).filter((skill) => skill.status === "published");
@@ -82,6 +85,38 @@ export default function AgentWizardPage() {
 
   const canLeaveBasics = name.trim().length >= 2;
   const canLeaveModel = selectedPolicy !== null;
+  // 有未保存内容时，关闭浏览器和返回列表前都先确认，避免整页填写白费。
+  const defaultPolicyID = publishedPolicies[0]?.id ?? "";
+  const dirty = useMemo(() => {
+    if (isEditing && editing.data) {
+      const sameIDs = (left: string[], right: string[]) => [...left].sort().join() === [...right].sort().join();
+      return name.trim() !== editing.data.name
+        || description !== editing.data.description
+        || mode !== editing.data.mode
+        || policyID !== (editing.data.model_policy_id ?? "")
+        || !sameIDs(skillIDs, editing.data.skill_ids ?? [])
+        || !sameIDs(mcpIDs, editing.data.mcp_ids ?? []);
+    }
+    return name.trim().length > 0
+      || description.trim().length > 0
+      || mode !== "react"
+      || policyID !== defaultPolicyID
+      || skillIDs.length > 0
+      || mcpIDs.length > 0;
+  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, mcpIDs]);
+
+  useEffect(() => {
+    if (!dirty) {
+      return;
+    }
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [dirty]);
+
   // 步骤门槛：先填名称，选好模型规则后才能进入检查与发布。
   const canVisitStep = (index: number) => {
     if (index === 0) {
@@ -124,6 +159,7 @@ export default function AgentWizardPage() {
       if (publish) {
         await mutate(`/api/v1/agents/${saved.id}/publish`, "POST", undefined, crypto.randomUUID());
       }
+      toast.show(publish ? "助手已发布，可以在对话页使用" : "草稿已保存", "success");
       navigate("/agents");
     } catch (failure) {
       setError(describeError(failure));
@@ -158,9 +194,19 @@ export default function AgentWizardPage() {
         title={isEditing ? `编辑「${editing.data?.name ?? name}」` : "一步一步创建你的助手"}
         description="不需要懂“编排”。只要回答四个问题：它是谁、怎么工作、用哪些模型和工具，最后确认发布。"
         actions={
-          <Link to="/agents" className="text-sm text-muted underline underline-offset-4 hover:text-accent">
+          <button
+            type="button"
+            onClick={() => {
+              if (dirty) {
+                setConfirmLeave(true);
+              } else {
+                navigate("/agents");
+              }
+            }}
+            className="text-sm text-muted underline underline-offset-4 hover:text-accent"
+          >
             返回助手列表
-          </Link>
+          </button>
         }
       />
 
@@ -381,6 +427,18 @@ export default function AgentWizardPage() {
           ) : null}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmLeave}
+        title="放弃未保存的修改？"
+        description="当前填写的内容还没有保存，离开后会丢失。"
+        confirmLabel="放弃并离开"
+        onCancel={() => setConfirmLeave(false)}
+        onConfirm={() => {
+          setConfirmLeave(false);
+          navigate("/agents");
+        }}
+      />
     </div>
   );
 }

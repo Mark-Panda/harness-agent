@@ -4,7 +4,7 @@ import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Inp
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
 import type { Page, Provider } from "../../lib/types";
 
 interface ProviderFormState {
@@ -93,6 +93,7 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
 export default function ProvidersPage() {
   const { data, loading, error, reload } = useRemote(() => requestJSON<Page<Provider>>("/api/v1/providers"), []);
   const [editing, setEditing] = useState<Provider | null | "new">(null);
+  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Provider | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

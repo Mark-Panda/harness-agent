@@ -1,6 +1,7 @@
 // 会话列表：创建、打开、归档、导出与异步删除，并提供长期记忆数据操作。
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useToast } from "../components/Toast";
 import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, DropdownMenu, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Select } from "../components/ui";
 import { downloadJSON, mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
@@ -27,6 +28,7 @@ async function waitForDeletion(id: string): Promise<DeletionRequest> {
 export default function SessionsPage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
+  const toast = useToast();
   const preselectedAgent = params.get("agent") ?? "";
   const paging = useCursorStack();
   const sessions = useRemote(
@@ -34,6 +36,7 @@ export default function SessionsPage() {
     [paging.cursor],
   );
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100"), []);
+  const [query, setQuery] = useState("");
   const [title, setTitle] = useState("新对话");
   const [agentID, setAgentID] = useState(preselectedAgent);
   const [creating, setCreating] = useState(false);
@@ -48,6 +51,10 @@ export default function SessionsPage() {
   const defaultAgentID = publishedAgents[0]?.id ?? "";
   // 从助手卡片带入的 agent 可能已下架，回退到第一个可用助手，避免提交无效 ID。
   const selectedAgentID = publishedAgents.some((agent) => agent.id === agentID) ? agentID : defaultAgentID;
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleSessions = (sessions.data?.items ?? []).filter((session) =>
+    normalizedQuery === "" || session.title.toLowerCase().includes(normalizedQuery),
+  );
 
   const create = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -76,8 +83,10 @@ export default function SessionsPage() {
     try {
       await mutate<Session>(`/api/v1/sessions/${session.id}/archive`, "POST", undefined, crypto.randomUUID());
       sessions.reload();
+      toast.show(`「${session.title}」已归档`, "success");
     } catch (failure) {
       setActionError(describeError(failure));
+      toast.show("归档失败", "danger");
     } finally {
       setBusy(false);
     }
@@ -89,30 +98,34 @@ export default function SessionsPage() {
       await downloadJSON(`/api/v1/sessions/${session.id}/export`, `session-${session.id}.json`);
     } catch (failure) {
       setActionError(describeError(failure));
+      toast.show("导出失败", "danger");
     }
   };
 
+  // 删除请求入队后立即关闭弹窗，清理在后台完成，避免用户盯着进度条等待。
   const deleteSession = async () => {
     if (!deleting) {
       return;
     }
+    const target = deleting;
     setBusy(true);
     setActionError(null);
-    setDeleteStage("正在创建删除请求…");
     try {
-      const request = await mutate<DeletionRequest>(`/api/v1/sessions/${deleting.id}/deletion?source=web`, "POST", undefined, crypto.randomUUID());
-      setDeleteStage("删除任务已排队，等待清理完成…");
+      const request = await mutate<DeletionRequest>(`/api/v1/sessions/${target.id}/deletion?source=web`, "POST", undefined, crypto.randomUUID());
+      setDeleting(null);
+      setBusy(false);
+      toast.show("删除任务已排队，完成后会自动刷新列表", "info");
       const result = await waitForDeletion(request.id);
       if (result.status !== "completed") {
         throw new Error(result.last_error || "删除任务失败，请稍后重试");
       }
-      setDeleting(null);
       sessions.reload();
+      toast.show(`「${target.title}」已删除`, "success");
     } catch (failure) {
       setActionError(failure instanceof Error && failure.message ? failure.message : describeError(failure));
+      toast.show("会话删除失败", "danger");
     } finally {
       setBusy(false);
-      setDeleteStage(null);
     }
   };
 
@@ -120,8 +133,10 @@ export default function SessionsPage() {
     setActionError(null);
     try {
       await downloadJSON("/api/v1/memory/export", "memory-export.json");
+      toast.show("记忆已导出", "success");
     } catch (failure) {
       setActionError(describeError(failure));
+      toast.show("导出记忆失败", "danger");
     }
   };
 
@@ -136,8 +151,10 @@ export default function SessionsPage() {
         throw new Error(result.last_error || "记忆删除失败，请稍后重试");
       }
       setConfirmMemory(false);
+      toast.show("长期记忆已清空", "success");
     } catch (failure) {
       setActionError(failure instanceof Error && failure.message ? failure.message : describeError(failure));
+      toast.show("清除记忆失败", "danger");
     } finally {
       setBusy(false);
       setDeleteStage(null);
@@ -150,11 +167,6 @@ export default function SessionsPage() {
         eyebrow="对话"
         title="对话"
         description="选一个助手，像和同事说话一样描述目标。每次发送都会生成一条可回看的运行记录。"
-        actions={
-          <Button variant="secondary" onClick={() => void exportMemory()}>
-            导出我的记忆
-          </Button>
-        }
       />
       {sessions.error ? <ErrorBanner message={sessions.error} onRetry={sessions.reload} /> : null}
       {actionError ? <ErrorBanner message={actionError} /> : null}
@@ -179,10 +191,26 @@ export default function SessionsPage() {
         </form>
         {creatingError ? <p role="alert" className="mt-3 text-xs text-rust">{creatingError}</p> : null}
       </Card>
-      <Card title="我的对话" description={`本页 ${sessions.data?.items.length ?? 0} 个会话，按最近更新排序。`}>
+      <Card
+        title="我的对话"
+        description={`本页 ${sessions.data?.items.length ?? 0} 个会话，按最近更新排序。搜索只匹配当前页标题。`}
+        actions={
+          <div className="w-56">
+            <Input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索本页标题"
+              aria-label="搜索本页会话标题"
+            />
+          </div>
+        }
+      >
         {sessions.loading ? (
           <LoadingState />
         ) : sessions.data && sessions.data.items.length > 0 ? (
+          visibleSessions.length === 0 ? (
+            <EmptyState title="没有匹配的会话" description="当前页没有标题包含该关键字的会话，可清空搜索或翻到其他页。" />
+          ) : (
           <>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[860px] text-left text-sm">
@@ -197,7 +225,7 @@ export default function SessionsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {sessions.data.items.map((session) => (
+                {visibleSessions.map((session) => (
                   <tr key={session.id}>
                     <td className="py-3 pr-4">
                       <Link to={`/sessions/${session.id}`} className="font-medium text-ink underline-offset-2 hover:text-jade hover:underline">
@@ -246,6 +274,7 @@ export default function SessionsPage() {
             onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
           />
           </>
+          )
         ) : (
           <EmptyState title="还没有对话" description="创建第一个对话后，就可以和助手交流并查看处理过程。" />
         )}
@@ -259,14 +288,12 @@ export default function SessionsPage() {
       <ConfirmDialog
         open={deleting !== null}
         title={`删除会话 ${deleting?.title ?? ""}？`}
-        description="删除后会话不可恢复，关联网关、消息、摘要与向量记忆会被清理。"
+        description="删除后会话不可恢复，关联网关、消息、摘要与向量记忆会被清理。提交后清理在后台进行。"
         confirmLabel="确认删除"
         busy={busy}
         onCancel={() => setDeleting(null)}
         onConfirm={() => void deleteSession()}
-      >
-        {deleteStage ? <p role="status" className="text-xs text-muted">{deleteStage}</p> : null}
-      </ConfirmDialog>
+      />
       <ConfirmDialog
         open={confirmMemory}
         title="删除全部长期记忆？"

@@ -4,7 +4,7 @@ import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, F
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote } from "../../lib/hooks";
+import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
 import type { FeishuBot, FeishuBotInput, FeishuBotStatus } from "../../lib/types";
 
 interface BotFormState {
@@ -100,6 +100,7 @@ function BotForm({ initial, onSaved, onCancel }: { initial: FeishuBot | null; on
 export default function FeishuBotsPage() {
   const bots = useRemote(() => requestJSON<{ items: FeishuBot[] }>("/api/v1/admin/feishu-bots"), []);
   const [editing, setEditing] = useState<FeishuBot | null | "new">(null);
+  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<FeishuBot | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [testingID, setTestingID] = useState<string | null>(null);
