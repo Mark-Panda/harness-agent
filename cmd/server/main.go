@@ -119,6 +119,7 @@ func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, appID strin
 
 // feishuBotTester 使用应用凭据换取 Tenant Access Token，验证连通性。
 type feishuBotTester struct{}
+
 // TestBot 调用飞书开放平台获取访问令牌；错误由上层截断后展示。
 func (feishuBotTester) TestBot(ctx context.Context, appID, appSecret string) error {
 	client, err := feishu.NewClient(feishu.ClientConfig{AppID: appID, AppSecret: appSecret})

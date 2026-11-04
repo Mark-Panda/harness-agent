@@ -90,6 +90,8 @@ type MCP struct {
 	RiskLevel string `json:"risk_level"`
 	// Status MCP 状态，发布 Agent 只能绑定 enabled。
 	Status string `json:"status"`
+	// ToolTimeouts 按原始工具名或前缀覆盖单次超时，单位秒；未配置时使用默认超时。
+	ToolTimeouts map[string]int `json:"tool_timeouts"`
 	// CreatedAt 创建时间（UTC）。
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt 更新时间（UTC）。

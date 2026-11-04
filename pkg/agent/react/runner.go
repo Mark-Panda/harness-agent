@@ -356,7 +356,14 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 				continue
 			}
 			emit(sink, "tool.started", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "risk_level": tool.RiskLevel()})
-			toolContext, toolCancel := context.WithTimeout(runContext, r.limits.ToolTimeout)
+			// 工具可通过 Timeout() 声明自身超时；未声明或返回非正值时使用执行层默认值。
+			toolTimeout := r.limits.ToolTimeout
+			if provider, ok := tool.(interface{ Timeout() time.Duration }); ok {
+				if custom := provider.Timeout(); custom > 0 {
+					toolTimeout = custom
+				}
+			}
+			toolContext, toolCancel := context.WithTimeout(runContext, toolTimeout)
 			// 注入调用元数据，审批包装器据此把审批绑定到具体 tool_call_id。
 			toolContext = WithToolCall(toolContext, call.ID, call.Name)
 			// 工具 Span 只记录名称、风险等级与结果状态，不记录入参、结果或错误原文。

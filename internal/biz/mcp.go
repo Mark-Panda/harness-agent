@@ -35,6 +35,8 @@ type MCPInput struct {
 	RiskLevel string
 	// Status 启停状态。
 	Status MCPStatus
+	// ToolTimeouts 按原始工具名或前缀覆盖单次超时，单位秒；留空使用执行层默认超时。
+	ToolTimeouts map[string]int
 }
 
 // MCPRepository 定义 MCP 持久化契约，凭证以密文保存。
@@ -243,7 +245,27 @@ func validateMCP(id uuid.UUID, input MCPInput) (MCP, error) {
 	if err != nil {
 		return MCP{}, err
 	}
-	return MCP{ID: id, Name: name, Endpoint: normalizedEndpoint, AuthType: input.AuthType, RiskLevel: input.RiskLevel, Status: string(status)}, nil
+	timeouts, err := validateToolTimeouts(input.ToolTimeouts)
+	if err != nil {
+		return MCP{}, err
+	}
+	return MCP{
+		ID: id, Name: name, Endpoint: normalizedEndpoint, AuthType: input.AuthType,
+		RiskLevel: input.RiskLevel, Status: string(status), ToolTimeouts: timeouts,
+	}, nil
+}
+
+// validateToolTimeouts 校验工具超时覆盖：键为工具名或前缀，值为 1～300 秒。
+func validateToolTimeouts(values map[string]int) (map[string]int, error) {
+	result := make(map[string]int, len(values))
+	for name, seconds := range values {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" || len(trimmed) > 128 || seconds < 1 || seconds > 300 {
+			return nil, invalid("tool timeout overrides require a name and 1-300 seconds")
+		}
+		result[trimmed] = seconds
+	}
+	return result, nil
 }
 
 // validateMCPSsrf 只允许 HTTPS 公网端点，拒绝内网、回环、链路本地与元数据地址。

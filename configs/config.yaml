@@ -1,241 +1,413 @@
+# 运行环境标识：development / staging / production；决定叠加的 configs/config.<env>.yaml 覆盖文件。
 environment: development
 
 server:
   http:
+    # HTTP 服务监听地址。
     addr: 0.0.0.0:8080
+    # 单个 HTTP 请求的最长处理时间，超时后终止处理。
     timeout: 15s
-    # 应用层 TLS 默认关闭；生产由覆盖配置启用并注入证书。
+    # 应用层 TLS 配置；默认关闭，生产通常由反向代理终止 TLS。
     tls:
+      # 是否由应用直接监听 HTTPS；开启时必须提供证书与私钥。
       enabled: false
+      # 允许的最低 TLS 版本，可选 1.2 或 1.3。
       min_version: 1.3
   grpc:
+    # gRPC 服务监听地址。
     addr: 0.0.0.0:9090
+  # 进程优雅退出时等待在途请求完成的最长时间。
   shutdown_timeout: 10s
-  # SSE 容量与慢消费者保护：超过连接上限返回 503，单次写入超时后断开。
+  # SSE 容量与慢消费者保护。
   sse:
+    # 单实例允许同时保持的 SSE 连接数，超出返回 503。
     max_connections: 500
+    # 单次 SSE 写入超时，慢消费者超时后断开。
     write_timeout: 10s
-  # API 多维限流；0 表示关闭该维度，生产按容量与公平性要求调整。
+  # API 多维限流；任一维度填 0 表示关闭该维度限流。
   api_rate_limit:
+    # 全实例每分钟请求总量上限。
     global_per_minute: 12000
+    # 单用户每分钟请求上限。
     per_user_per_minute: 600
+    # 单 IP 每分钟请求上限。
     per_ip_per_minute: 1200
-  # 可信反向代理网段；为空时只使用直连地址并忽略 X-Forwarded-For。
+  # 可信反向代理网段；为空时忽略 X-Forwarded-For，仅使用直连地址。
   trusted_proxies: []
-  # 刷新令牌与 CSRF Cookie 的 Secure 标记；本地 HTTP 开发关闭，生产必须开启。
+  # 刷新令牌与 CSRF Cookie 是否带 Secure 标记；本地 HTTP 开发可关闭，生产必须开启。
   cookie_secure: false
 
 data:
   postgres:
+    # 业务数据库连接串，由环境变量注入。
     dsn: ${DATABASE_URL}
+    # 鉴权数据库连接串，使用独立低权限账号。
     auth_dsn: ${AUTH_DATABASE_URL}
+    # 数据库连接池最大连接数。
     max_open_conns: 30
   redis:
+    # Redis 地址，用于会话热数据、限流与任务协调。
     addr: ${REDIS_ADDR}
+    # Redis 密码；空值表示无密码。
     password: ${REDIS_PASSWORD}
 
 agent:
+  # 模型路由与 Token 预算。
   model_routing:
+    # 参与路由的生成模型最低上下文窗口（100 万 Token）。
     min_context_tokens: 1000000
+    # 单次请求 Prompt 允许占用的最大 Token 数。
     max_prompt_tokens: 300000
+    # 为模型输出预留的 Token 数，不计入 Prompt 预算。
     reserve_output_tokens: 16384
+    # 分词差异的安全余量，避免 Prompt 恰好超窗。
     safety_margin_tokens: 4096
+    # 同一模型在单次 Run 内的最多尝试次数（含重试）。
     max_attempts_per_model: 2
-    max_attempts_per_run: 6
+    # 单次 Run 允许的模型调用总次数；ReAct 每轮工具循环都会消耗一次，过低会导致执行提前耗尽。
+    max_attempts_per_run: 20
+    # 单次 Run 允许切换模型的次数上限。
     max_switches_per_run: 2
+    # 供应商故障熔断器。
     circuit_breaker:
+      # 连续失败多少次后打开熔断。
       failure_threshold: 3
+      # 失败次数统计窗口。
       window: 30s
+      # 熔断打开后的保持时长，到期进入半开探测。
       open_for: 30s
+  # 执行记录捕获策略。
   execution_records:
+    # 默认捕获模式：redacted（脱敏）或 full（完整）。
     default_capture_mode: redacted
+    # 单条内联载荷允许的最大字节数，超出转为外部存储引用。
     max_inline_payload_bytes: 262144
+    # 模型失败时是否保留已产生的部分回答。
     retain_partial_response: true
+  # Run 执行 Worker 配置。
   worker:
+    # 是否在当前进程启动执行 Worker。
     enabled: true
+    # Worker 实例标识；多副本部署必须唯一，为空时启动自动生成。
     worker_id: ${WORKER_ID}
+    # 单实例并发执行的 Run 数。
     concurrency: 2
+    # 无待执行任务时的轮询间隔。
     poll_interval: 1s
+    # 任务与 Run 的执行租约时长，超时后可被其他实例接管。
     lease: 60s
+    # 租约续约间隔，必须小于 lease。
     heartbeat: 20s
+    # 取消状态轮询间隔。
     cancel_poll: 2s
+    # 单次模型 HTTP 调用超时。
     request_timeout: 120s
+    # 单次模型调用的最大输出 Token 数。
     max_output_tokens: 8192
+    # 可重试错误的基础退避时长。
     backoff_base: 200ms
+    # 指数退避的最大时长。
     max_backoff: 2s
+    # 可接受的上游 Retry-After 最大时长，超出按此截断。
     max_retry_after: 30s
+    # 模型采样温度，越低输出越稳定。
     temperature: 0.2
-    mcp_timeout: 30s
-    # 允许连接管理员登记的内网 MCP 端点（例如公司内的 contextforge）；回环与元数据地址仍会被拒绝。
+    # MCP 工具发现与调用的默认超时；单个工具可在「外部工具」界面按工具名或前缀单独调大，未配置时使用该默认值。
+    mcp_timeout: 60s
+    # 是否允许连接管理员登记的内网 MCP 端点；回环与云元数据地址始终拒绝。
     allow_private_mcp_endpoints: ${MCP_ALLOW_PRIVATE_ENDPOINTS}
+    # 等待人工审批时的任务轮询间隔。
     approval_poll: 5s
+    # 跨副本全局 Run 并发上限。
     global_concurrency: 100
+    # 单用户 Run 并发上限。
     per_user_concurrency: 2
+    # 单供应商模型调用并发上限。
     per_provider_concurrency: 20
+    # 并发槽位租约，超时后自动回收崩溃实例占用的槽位。
     concurrency_lease: 6m
+  # 高风险工具的 Sandbox Runner 配置。
   sandbox:
-    # 生产环境要求高风险工具必须走独立 Sandbox Runner；本地未配置时关闭强制执行。
+    # 是否强制高风险工具必须在独立 Sandbox Runner 中执行；本地未配置时关闭。
     require_for_high_risk: ${SANDBOX_REQUIRED}
+    # Sandbox Runner HTTP 端点。
     endpoint: ${SANDBOX_ENDPOINT}
+    # 调用 Sandbox Runner 的出口认证令牌。
     token: ${SANDBOX_TOKEN}
+    # 是否允许明文 HTTP 连接 Sandbox Runner，仅限内网调试。
     allow_insecure: ${SANDBOX_ALLOW_INSECURE}
+    # 单次 Sandbox 调用超时。
     timeout: 30s
+    # Sandbox 响应允许的最大字节数。
     max_response_bytes: 1048576
+  # 用户、Agent 与供应商的每日预算上限；填 0 表示该维度不限制。
   budgets:
+    # 单用户每日 Token 上限。
     user_daily_tokens: 50000000
+    # 单用户每日费用上限。
     user_daily_cost: 20
+    # 单 Agent 每日 Token 上限。
     agent_daily_tokens: 20000000
+    # 单 Agent 每日费用上限。
     agent_daily_cost: 8
+    # 单供应商每日 Token 上限。
     provider_daily_tokens: 200000000
+    # 单供应商每日费用上限。
     provider_daily_cost: 100
+    # 预算告警阈值，占上限的比例，取值 (0,1]。
     alert_threshold: 0.8
+  # 分层记忆配置。
   memory:
+    # Redis 热窗口保留的最大消息条数。
     hot_window_messages: 100
+    # 热窗口过期时间，过期后由 PG 与摘要重建。
     hot_window_ttl: 24h
+    # 短期记忆：异步滚动摘要。
     summary:
+      # 是否启用异步摘要任务与摘要规划。
       enabled: true
+      # 会话消息总数达到该值后触发摘要。
       trigger_messages: 24
+      # 始终保留在最近窗口、不参与摘要的消息条数。
       keep_recent: 12
+      # 单个摘要任务最多包含的新增消息数。
       max_source_messages: 10000
+      # 单次摘要模型调用输入上限，超出后自动分块归并。
       max_input_bytes: 131072
+      # 单条消息纳入摘要的最大字节数。
       max_message_bytes: 8192
+      # 摘要输出的 Token 上限。
       max_output_tokens: 1024
+      # 单份摘要落库的最大字节数。
       max_summary_bytes: 65536
+      # 摘要采样温度。
       temperature: 0.1
+      # 单次摘要模型调用超时。
       request_timeout: 60s
+      # 单实例并发摘要任务数。
       concurrency: 1
+      # 无摘要任务时的轮询间隔。
       poll_interval: 1s
+      # 摘要任务租约时长。
       lease: 90s
+      # 摘要任务租约续约间隔。
       heartbeat: 30s
+    # 长期记忆：向量索引与语义检索。
     vector:
+      # 是否启用长期记忆向量索引与检索。
       enabled: true
+      # 向量检索的候选数量。
       retriever_top_k: 30
+      # MMR 去重后最终返回的记忆条数。
       mmr_top: 8
+      # MMR 相关性与多样性的权衡权重。
       mmr_lambda: 0.7
+      # 入选记忆的最低余弦相似度。
       min_similarity: 0.2
+      # 单次 embedding 调用超时。
       embedding_timeout: 60s
+      # 消息写入触发时最多检查的最近消息数。
       recent_messages: 32
+      # 单次 embedding 请求包含的最大文本数。
       batch_size: 16
+      # 单实例并发向量化任务数。
       concurrency: 2
+      # 无向量化任务时的轮询间隔。
       poll_interval: 1s
+      # 向量化任务租约时长。
       lease: 90s
+      # 向量化任务租约续约间隔。
       heartbeat: 30s
+      # 是否启用后台索引维护与历史回填。
       maintenance_enabled: true
+      # 后台维护的轮询间隔。
       maintenance_interval: 1m
+      # staging 索引切换为 active 所需的最低覆盖比例。
       coverage_threshold: 0.95
+      # 单次回填扫描的最大消息数。
       backfill_batch: 200
+    # 结构化记忆：LLM 事实提取。
     facts:
+      # 是否启用结构化事实提取。
       enabled: true
+      # 候选事实写入的最低置信度。
       min_confidence: 0.6
+      # 用户显式纠正后的覆盖保护阈值。
       correction_guard: 0.9
+      # 单用户保留的生效事实上限。
       max_facts_per_user: 100
+      # 触发提取时最多检查的最近消息数。
       recent_messages: 16
+      # 触发提取所需的最少消息数。
       min_messages: 4
+      # 单次提取允许的最大事实数。
       max_facts: 20
+      # 单条消息进入提示词的最大字节数。
       max_message_bytes: 8192
+      # 事实 JSON 输出的 Token 上限。
       max_output_tokens: 2048
+      # 事实提取采样温度。
       temperature: 0.1
+      # 单次事实提取调用超时。
       request_timeout: 60s
+      # 单实例并发事实提取任务数。
       concurrency: 1
+      # 无事实任务时的轮询间隔。
       poll_interval: 1s
+      # 事实任务租约时长。
       lease: 90s
+      # 事实任务租约续约间隔。
       heartbeat: 30s
 
 auth:
+  # JWT 签发者标识，用于校验签发来源。
   jwt_issuer: harness-agent
+  # 当前 JWT 签名密钥的版本标识，用于密钥轮换。
   jwt_signing_key_id: ${JWT_SIGNING_KEY_ID}
+  # 当前 JWT 签名密钥，必须由环境变量注入。
   jwt_signing_key_secret: ${JWT_SIGNING_KEY_SECRET}
+  # 历史 JWT 验签公钥或密钥列表，轮换期间保留旧密钥以兼容存量 Token。
   jwt_verification_keys: []
+  # 刷新令牌哈希的 Pepper，用于防止离线碰撞。
   refresh_token_pepper: ${REFRESH_TOKEN_PEPPER}
   # 开放注册开关；关闭后仅管理员可通过管理接口邀请创建用户。
   registration_enabled: true
+  # 登录失败限流。
   login_rate_limit:
+    # 窗口内允许的最大登录尝试次数。
     max_attempts: 5
+    # 登录尝试计数窗口。
     window: 5m
 
 credentials:
+  # 当前凭证加密密钥版本标识。
   active_key_id: ${CREDENTIAL_ENCRYPTION_KEY_ID}
+  # 当前凭证加密密钥，用于加密供应商密钥与 MCP 凭证。
   active_key_secret: ${CREDENTIAL_ENCRYPTION_KEY_SECRET}
+  # 历史加密密钥列表，轮换期用于解密旧密文。
   previous_keys: []
 
 quotas:
+  # 单用户可创建的 Agent 版本总数上限。
   max_agents_per_user: 50
+  # 单用户可创建的会话总数上限。
   max_sessions_per_user: 200
 
-# 结构化日志默认 JSON 输出到 stdout，级别与格式可由环境变量覆盖；
-# 日志保留期由部署侧采集管道与容器日志轮转统一管理，避免多副本写本地文件产生冲突。
+# 结构化日志配置；日志保留期由部署侧采集管道与容器日志轮转统一管理。
 logging:
+  # 日志级别：debug / info / warn / error。
   level: ${LOG_LEVEL}
+  # 日志输出格式：json / text。
   format: ${LOG_FORMAT}
 
-# 保留期只控制脱敏执行载荷与审计数据的清理，不删除用户会话与业务事实；
-# 清理任务需要数据库保留期特权，由部署侧定时以受控任务执行。
+# 保留期只控制脱敏执行载荷与审计数据的清理，不删除用户会话与业务事实。
 retention:
+  # 执行载荷保留期，超期删除脱敏载荷但保留 Run 与步骤元数据。
   execution_records: 2160h
+  # 审计日志与检查点保留期，清理需要数据库保留期特权。
   audit_logs: 8760h
-  # 飞书事件回执仅用于短期重放，超期后删除原始事件载荷，避免正文长期驻留。
+  # 飞书原始事件回执保留期，用于限制重放载荷中的正文驻留时间。
   feishu_events: 168h
 
 observability:
+  # 是否在管理端执行记录中包含完整执行载荷；生产建议保持 false。
   include_execution_payloads: false
-  # OpenTelemetry 默认关闭；启用时由环境变量注入 OTLP 端点与采样比例。
-  # 约束：导出头仅承载出口认证，Trace 不采集 Prompt/Completion/工具原文。
+  # OpenTelemetry 链路追踪；默认关闭，启用时由环境变量注入 OTLP 端点。
   tracing:
+    # 是否启用 Trace 导出。
     enabled: ${OTEL_TRACING_ENABLED}
+    # 写入 Trace 的 service.name。
     service_name: harness-agent
+    # OTLP HTTP 端点，支持 host:port 或完整 URL。
     endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+    # host:port 形式下是否允许明文 HTTP，仅限内网或本地调试。
     insecure: ${OTEL_EXPORTER_OTLP_INSECURE}
+    # 采样比例，取值 (0,1]。
     sample_ratio: ${OTEL_TRACING_SAMPLE_RATIO}
+    # 批量导出间隔。
     batch_timeout: 5s
+    # 单次导出超时。
     export_timeout: 10s
+    # 导出请求头，仅用于网关或 Collector 出口认证，禁止写入用户标识。
     headers:
       authorization: "${OTEL_EXPORTER_OTLP_AUTH_HEADER}"
+    # 附加的低基数资源属性。
     resource_attributes:
       deployment.name: "${DEPLOYMENT_NAME}"
 
 audit:
+  # 关键写操作是否同步落审计日志，保证审计不丢。
   synchronous_critical_writes: true
+  # 是否启用审计日志哈希链，防止历史记录被篡改。
   hash_chain_enabled: true
+  # 审计主体假名化密钥，用于脱敏用户标识。
   pseudonym_key: ${AUDIT_PSEUDONYM_KEY}
 
+# 飞书集成配置；未启用时仅校验群聊策略，不影响本地开发。
 feishu:
-  # 飞书接入默认关闭，开启时由环境变量注入应用凭据与事件密钥。
+  # 是否启用飞书事件接入与 Worker。
   enabled: ${FEISHU_ENABLED}
+  # 飞书应用 App ID。
   app_id: ${FEISHU_APP_ID}
+  # 飞书应用 App Secret。
   app_secret: ${FEISHU_APP_SECRET}
-  # 网页飞书登录回调地址，例如 https://your-domain/api/v1/auth/feishu/callback；留空则不展示飞书登录。
+  # 网页飞书登录回调地址；留空则不展示飞书登录入口。
   login_redirect_url: ${FEISHU_LOGIN_REDIRECT_URL}
+  # 事件订阅 Verification Token，用于校验回调来源。
   verification_token: ${FEISHU_VERIFICATION_TOKEN}
-  # 加密密钥列表：首个为当前密钥，轮换期可在环境覆盖文件中追加历史密钥。
+  # 事件加密密钥列表：首个为当前密钥，轮换期可追加历史密钥。
   encrypt_keys:
+    # 密钥版本标识，用于轮换与排查。
     - id: ${FEISHU_ENCRYPT_KEY_ID}
+      # 飞书控制台配置的 Encrypt Key 原文。
       secret: ${FEISHU_ENCRYPT_KEY_SECRET}
   # 事件时间戳重放窗口，默认 5 分钟。
   event_window: 5m
   # 单次回调请求体上限，默认 1 MiB。
   max_body_bytes: 1048576
+  # 机器人 open_id，用于精确判断群聊是否被 @。
   bot_open_id: ${FEISHU_BOT_OPEN_ID}
+  # 机器人显示名，open_id 未配置时的后备 @ 判断。
   bot_name: ${FEISHU_BOT_NAME}
+  # 飞书事件默认使用的已发布 Agent ID。
   default_agent_id: ${FEISHU_DEFAULT_AGENT_ID}
+  # 默认 Agent 的版本号。
   default_agent_version: ${FEISHU_DEFAULT_AGENT_VERSION}
+  # 默认编排模式：react / plan / super。
   mode: react
+  # 飞书事件消费 Worker。
   worker:
+    # 单实例并发消费数。
     concurrency: 2
+    # 无事件任务时的轮询间隔。
     poll_interval: 1s
+    # 事件任务租约时长。
     lease: 30s
+  # 外发回复 Worker。
   reply:
+    # 并发投递数。
     concurrency: 2
+    # 无回复任务时的轮询间隔。
     poll_interval: 1s
+    # 外发记录租约时长。
     lease: 30s
+    # Run 尚未结束时再次检查的间隔。
     poll_run_interval: 2s
+    # Run 长时间未完成时的降级阈值。
     run_wait_timeout: 10m
+    # 单条回复文本上限，按 UTF-8 边界截断。
     max_text_bytes: 4096
     # 同一卡片两次增量更新的最小间隔，避免放大飞书卡片更新限流。
     card_update_interval: 5s
-    # 单个 chat / 用户的并发投递上限，防止单会话突发流量触发平台限流。
+    # 单个飞书会话的并发投递上限。
     max_concurrent_per_chat: 1
+    # 单个用户的并发投递上限。
     max_concurrent_per_user: 2
+  # 群聊话题与回复策略。
   group:
+    # 群聊中是否要求先建立话题再回复。
     require_topic: true
+    # 已绑定话题中是否自动回复。
     auto_reply_in_bound_topic: true
+    # 是否允许在群聊根消息下直接回复作为兜底。
     allow_root_reply_fallback: false

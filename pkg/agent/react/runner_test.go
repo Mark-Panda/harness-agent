@@ -30,11 +30,12 @@ func (m *scriptedModel) Complete(_ context.Context, messages []Message, _ []Tool
 
 // fakeTool 是可配置结果的测试工具。
 type fakeTool struct {
-	name   string
-	delay  time.Duration
-	output json.RawMessage
-	err    error
-	calls  int
+	name    string
+	delay   time.Duration
+	output  json.RawMessage
+	err     error
+	calls   int
+	timeout time.Duration
 }
 
 func (t *fakeTool) Spec() ToolSpec {
@@ -52,6 +53,9 @@ func (t *fakeTool) Invoke(ctx context.Context, _ json.RawMessage) (json.RawMessa
 	return t.output, t.err
 }
 func (t *fakeTool) RiskLevel() string { return "low" }
+
+// Timeout 返回工具自身超时声明，零值表示使用执行层默认超时。
+func (t *fakeTool) Timeout() time.Duration { return t.timeout }
 
 // mapRegistry 是测试用工具注册表。
 type mapRegistry struct {
@@ -247,6 +251,28 @@ func TestRunnerToolTimeoutAndUnknownTool(t *testing.T) {
 	}
 	if statuses["slow"] != `{"error":"timeout"}` || statuses["missing"] != `{"error":"unknown_tool"}` {
 		t.Fatalf("unexpected tool messages: %#v", statuses)
+	}
+}
+
+// TestRunnerToolTimeoutOverride 验证工具可通过 Timeout() 声明更长超时。
+func TestRunnerToolTimeoutOverride(t *testing.T) {
+	slow := &fakeTool{name: "mcp_contextforge_codewiki_search", delay: 60 * time.Millisecond, output: json.RawMessage(`{"ok":true}`), timeout: time.Second}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{{ID: "1", Name: slow.name, Arguments: json.RawMessage(`{}`)}}},
+		{Content: "final", FinishReason: "stop"},
+	}}
+	runner, _ := NewRunner(model, newTestRegistry(slow), Limits{ToolTimeout: 10 * time.Millisecond})
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "tools"}}}, nil)
+	if err != nil || result.Content != "final" {
+		t.Fatalf("Run() = %#v, %v", result, err)
+	}
+	if slow.calls != 1 {
+		t.Fatalf("slow tool calls = %d", slow.calls)
+	}
+	for _, message := range result.Messages {
+		if message.Role == RoleTool && message.Content != `{"ok":true}` {
+			t.Fatalf("tool result = %q", message.Content)
+		}
 	}
 }
 

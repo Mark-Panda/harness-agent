@@ -5,7 +5,7 @@ import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
 import { useClientPage, useRemote } from "../../lib/hooks";
-import type { MCP, MCPStatus, MCPTool, Page } from "../../lib/types";
+import type { MCP, MCPInput, MCPStatus, MCPTool, Page } from "../../lib/types";
 
 interface MCPFormState {
   name: string;
@@ -17,6 +17,20 @@ interface MCPFormState {
 }
 
 const emptyMCP: MCPFormState = { name: "", endpoint: "", authType: "none", credentials: "", riskLevel: "low", status: "enabled" };
+
+// inheritedTimeout 按最长前缀匹配已保存的超时，与服务端执行层的匹配规则保持一致。
+function inheritedTimeout(overrides: Record<string, number>, toolName: string): { prefix: string; seconds: number } | null {
+  let matched: { prefix: string; seconds: number } | null = null;
+  for (const [prefix, seconds] of Object.entries(overrides ?? {})) {
+    if (seconds <= 0 || !toolName.startsWith(prefix)) {
+      continue;
+    }
+    if (!matched || prefix.length > matched.prefix.length) {
+      matched = { prefix, seconds };
+    }
+  }
+  return matched;
+}
 
 function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved: () => void; onCancel: () => void }) {
   const [form, setForm] = useState<MCPFormState>(
@@ -45,13 +59,14 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
     }
     setBusy(true);
     try {
-      const body = {
+      const body: MCPInput = {
         name: form.name.trim(),
         endpoint: form.endpoint.trim(),
         auth_type: form.authType,
         credentials: form.credentials,
         risk_level: form.riskLevel,
         status: form.status,
+        tool_timeouts: initial?.tool_timeouts ?? {},
       };
       if (initial) {
         await mutate<MCP>(`/api/v1/mcps/${initial.id}`, "PUT", body, crypto.randomUUID());
@@ -140,6 +155,10 @@ export default function MCPsPage() {
   const [tools, setTools] = useState<MCPTool[]>([]);
   const [toolsMessage, setToolsMessage] = useState<string | null>(null);
   const [toolsBusy, setToolsBusy] = useState(false);
+  // timeouts 保存界面上按原始工具名填写的超时秒数；留空表示跟随默认。
+  const [timeouts, setTimeouts] = useState<Record<string, string>>({});
+  const [timeoutBusy, setTimeoutBusy] = useState(false);
+  const [timeoutError, setTimeoutError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const mcpItems = mcps.data?.items ?? [];
   const paging = useClientPage(mcpItems, 10);
@@ -168,9 +187,21 @@ export default function MCPsPage() {
     setToolsBusy(true);
     setToolsMessage(null);
     setTools([]);
+    setTimeouts({});
+    setTimeoutError(null);
     try {
       const result = await requestJSON<{ ok: boolean; message: string; items: MCPTool[]; count: number }>(`/api/v1/mcps/${mcp.id}/tools`);
-      setTools(result.items ?? []);
+      const items = result.items ?? [];
+      // 仅把精确工具名的覆盖回填到输入框，前缀覆盖以提示形式展示，避免保存时被展开成大量键。
+      const exact: Record<string, string> = {};
+      for (const tool of items) {
+        const seconds = mcp.tool_timeouts?.[tool.name];
+        if (seconds) {
+          exact[tool.name] = String(seconds);
+        }
+      }
+      setTimeouts(exact);
+      setTools(items);
       setToolsMessage(result.message);
       if (!result.ok) {
         setTools([]);
@@ -180,6 +211,64 @@ export default function MCPsPage() {
     } finally {
       setToolsBusy(false);
     }
+  };
+
+  // persistTimeouts 保存工具超时覆盖；未填写的工具回退到默认或已配置的前缀覆盖。
+  const persistTimeouts = async (next: Record<string, number>) => {
+    if (!toolsFor) {
+      return;
+    }
+    setTimeoutBusy(true);
+    setTimeoutError(null);
+    try {
+      const updated = await mutate<MCP>(
+        `/api/v1/mcps/${toolsFor.id}`,
+        "PUT",
+        {
+          name: toolsFor.name,
+          endpoint: toolsFor.endpoint,
+          auth_type: toolsFor.auth_type,
+          credentials: "",
+          risk_level: toolsFor.risk_level,
+          status: toolsFor.status,
+          tool_timeouts: next,
+        } satisfies MCPInput,
+        crypto.randomUUID(),
+      );
+      setToolsFor(updated);
+      mcps.reload();
+    } catch (failure) {
+      setTimeoutError(describeError(failure));
+    } finally {
+      setTimeoutBusy(false);
+    }
+  };
+
+  const saveTimeouts = async () => {
+    if (!toolsFor) {
+      return;
+    }
+    // 以已保存的配置为基线，只改动精确工具名对应的键。
+    const next: Record<string, number> = { ...(toolsFor.tool_timeouts ?? {}) };
+    for (const tool of tools) {
+      delete next[tool.name];
+      const raw = (timeouts[tool.name] ?? "").trim();
+      if (!raw) {
+        continue;
+      }
+      const seconds = Number(raw);
+      if (!Number.isInteger(seconds) || seconds < 1 || seconds > 300) {
+        setTimeoutError(`工具 ${tool.name} 的超时必须是 1-300 之间的整数秒。`);
+        return;
+      }
+      next[tool.name] = seconds;
+    }
+    await persistTimeouts(next);
+  };
+
+  const resetTimeouts = async () => {
+    setTimeouts({});
+    await persistTimeouts({});
   };
 
   const remove = async () => {
@@ -213,35 +302,61 @@ export default function MCPsPage() {
         <Card
           title={`${toolsFor.name} 的工具能力`}
           description={toolsMessage ?? "正在读取工具列表…"}
-          actions={<Button size="sm" variant="secondary" onClick={() => setToolsFor(null)}>关闭</Button>}
+          actions={
+            <>
+              <Button size="sm" variant="secondary" loading={timeoutBusy} onClick={() => void resetTimeouts()}>全部恢复默认</Button>
+              <Button size="sm" loading={timeoutBusy} onClick={() => void saveTimeouts()}>保存超时设置</Button>
+              <Button size="sm" variant="secondary" onClick={() => setToolsFor(null)}>关闭</Button>
+            </>
+          }
         >
+          {timeoutError ? <p role="alert" className="mb-3 rounded-lg border border-rust bg-rust-soft px-3 py-2 text-xs text-rust">{timeoutError}</p> : null}
           {toolsBusy ? (
             <LoadingState />
           ) : tools.length > 0 ? (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[720px] text-left text-sm">
+              <table className="w-full min-w-[900px] text-left text-sm">
                 <thead className="text-xs uppercase tracking-wide text-muted">
                   <tr>
                     <th className="pb-3 pr-4 font-medium">工具名</th>
                     <th className="pb-3 pr-4 font-medium">说明</th>
+                    <th className="pb-3 pr-4 font-medium">超时（秒）</th>
                     <th className="pb-3 font-medium">参数 Schema</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {tools.map((tool) => (
-                    <tr key={tool.name} className="align-top">
-                      <td className="py-3 pr-4 font-mono text-xs text-ink">{tool.name}</td>
-                      <td className="py-3 pr-4 text-xs text-ink-soft">{tool.description || "—"}</td>
-                      <td className="py-3 text-xs text-muted">
-                        <details>
-                          <summary className="cursor-pointer hover:text-accent">查看参数</summary>
-                          <pre className="mt-2 max-h-48 overflow-auto rounded-[3px] border border-line bg-paper-deep/40 p-2 font-mono text-[11px] text-ink-soft">
-                            {JSON.stringify(tool.input_schema ?? {}, null, 2)}
-                          </pre>
-                        </details>
-                      </td>
-                    </tr>
-                  ))}
+                  {tools.map((tool) => {
+                    const inherited = inheritedTimeout(toolsFor.tool_timeouts ?? {}, tool.name);
+                    return (
+                      <tr key={tool.name} className="align-top">
+                        <td className="py-3 pr-4 font-mono text-xs text-ink">{tool.name}</td>
+                        <td className="py-3 pr-4 text-xs text-ink-soft">{tool.description || "—"}</td>
+                        <td className="py-3 pr-4">
+                          <Input
+                            type="number"
+                            min={1}
+                            max={300}
+                            className="w-24"
+                            aria-label={`${tool.name} 超时秒数`}
+                            value={timeouts[tool.name] ?? ""}
+                            placeholder={inherited ? String(inherited.seconds) : "默认"}
+                            onChange={(event) => setTimeouts({ ...timeouts, [tool.name]: event.target.value })}
+                          />
+                          <p className="mt-1 text-[11px] text-muted">
+                            {inherited ? `继承前缀 ${inherited.prefix}：${inherited.seconds} 秒` : "留空使用默认 60 秒"}
+                          </p>
+                        </td>
+                        <td className="py-3 text-xs text-muted">
+                          <details>
+                            <summary className="cursor-pointer hover:text-accent">查看参数</summary>
+                            <pre className="mt-2 max-h-48 overflow-auto rounded-[3px] border border-line bg-paper-deep/40 p-2 font-mono text-[11px] text-ink-soft">
+                              {JSON.stringify(tool.input_schema ?? {}, null, 2)}
+                            </pre>
+                          </details>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

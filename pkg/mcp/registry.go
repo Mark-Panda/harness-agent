@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -33,6 +34,8 @@ type Server struct {
 	RiskLevel string
 	// Client 已构造的 MCP 客户端。
 	Client *Client
+	// ToolTimeouts 原始工具名或前缀到单次超时的映射；未配置时使用 ReAct 默认超时。
+	ToolTimeouts map[string]time.Duration
 }
 
 // binding 是规范工具名到原始服务与工具的映射。
@@ -154,6 +157,21 @@ func (b binding) Spec() react.ToolSpec { return b.spec }
 
 // RiskLevel 返回服务风险等级，供上层审批门禁判断是否需要人工确认。
 func (b binding) RiskLevel() string { return b.server.RiskLevel }
+
+// Timeout 返回管理界面为该工具配置的超时；最长前缀优先，零值表示使用执行层默认超时。
+func (b binding) Timeout() time.Duration {
+	timeout := time.Duration(0)
+	longest := -1
+	for prefix, value := range b.server.ToolTimeouts {
+		if value <= 0 || len(prefix) <= longest {
+			continue
+		}
+		if strings.HasPrefix(b.tool.Name, prefix) {
+			timeout, longest = value, len(prefix)
+		}
+	}
+	return timeout
+}
 
 // Invoke 调用 MCP 工具并把返回内容编码为不可信 JSON 数据。
 // 审批恢复路径会在 Context 中注入幂等键，这里通过 _meta 透传，供远端服务去重副作用。

@@ -1619,7 +1619,20 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 			secret = string(plaintext)
 		}
 		headers := mcp.AuthHeaders(live.AuthType, secret)
-		client, err := w.mcpClient(endpoint, headers, w.config.MCPTimeout, w.config.MCPAllowPrivateNetwork)
+		// 把管理界面配置的秒数转换为执行层时长，并确保 HTTP 客户端超时覆盖最长工具超时。
+		serverTimeouts := make(map[string]time.Duration, len(live.ToolTimeouts))
+		clientTimeout := w.config.MCPTimeout
+		for toolName, seconds := range live.ToolTimeouts {
+			if seconds <= 0 {
+				continue
+			}
+			timeout := time.Duration(seconds) * time.Second
+			serverTimeouts[toolName] = timeout
+			if timeout > clientTimeout {
+				clientTimeout = timeout
+			}
+		}
+		client, err := w.mcpClient(endpoint, headers, clientTimeout, w.config.MCPAllowPrivateNetwork)
 		if err != nil {
 			w.logger.Warn("invalid MCP endpoint", "mcp", live.Name, "error", err)
 			continue
@@ -1628,7 +1641,7 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 		if name == "" {
 			name = live.Name
 		}
-		servers = append(servers, mcp.Server{Name: name, RiskLevel: riskLevel, Client: client})
+		servers = append(servers, mcp.Server{Name: name, RiskLevel: riskLevel, Client: client, ToolTimeouts: serverTimeouts})
 	}
 	if len(servers) == 0 {
 		return emptyToolRegistry{}

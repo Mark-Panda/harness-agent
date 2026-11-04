@@ -271,6 +271,8 @@ type mcpRequest struct {
 	RiskLevel string `json:"risk_level"`
 	// Status 启停状态。
 	Status biz.MCPStatus `json:"status"`
+	// ToolTimeouts 按原始工具名或前缀覆盖单次超时，单位秒。
+	ToolTimeouts map[string]int `json:"tool_timeouts"`
 }
 
 // feishuBotRequest 是飞书机器人创建/更新请求体，密钥字段只写不读。
@@ -1045,6 +1047,7 @@ func mcpInput(request mcpRequest) biz.MCPInput {
 	return biz.MCPInput{
 		Name: request.Name, Endpoint: request.Endpoint, AuthType: request.AuthType,
 		Credentials: request.Credentials, RiskLevel: request.RiskLevel, Status: request.Status,
+		ToolTimeouts: request.ToolTimeouts,
 	}
 }
 
@@ -1062,7 +1065,8 @@ func mcpResponse(mcp biz.MCP) map[string]any {
 	return map[string]any{
 		"id": mcp.ID, "name": mcp.Name, "endpoint": mcp.Endpoint, "auth_type": mcp.AuthType,
 		"key_version": mcp.KeyVersion, "risk_level": mcp.RiskLevel, "status": mcp.Status,
-		"created_at": mcp.CreatedAt, "updated_at": mcp.UpdatedAt,
+		"tool_timeouts": mcp.ToolTimeouts,
+		"created_at":    mcp.CreatedAt, "updated_at": mcp.UpdatedAt,
 	}
 }
 

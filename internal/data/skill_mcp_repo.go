@@ -55,6 +55,8 @@ type mcpRecordModel struct {
 	RiskLevel string
 	// Status 启停状态。
 	Status string
+	// ToolTimeoutsJSON 工具超时覆盖：原始工具名或前缀映射到秒数。
+	ToolTimeoutsJSON datatypes.JSON `gorm:"column:tool_timeouts"`
 	// CreatedAt 创建时间。
 	CreatedAt time.Time
 	// UpdatedAt 更新时间。
@@ -157,7 +159,8 @@ func (r *CatalogRepository) ListSkills(ctx context.Context) ([]biz.SkillTemplate
 // CreateMCP 创建 MCP 配置并加密保存凭证。
 func (r *CatalogRepository) CreateMCP(ctx context.Context, actorID uuid.UUID, mcp biz.MCP, credential *biz.ProviderCredential, event biz.OutboxEvent) (biz.MCP, error) {
 	record := mcpRecordModel{
-		ID: mcp.ID, Name: mcp.Name, Endpoint: mcp.Endpoint, AuthType: mcp.AuthType, RiskLevel: mcp.RiskLevel, Status: mcp.Status,
+		ID: mcp.ID, Name: mcp.Name, Endpoint: mcp.Endpoint, AuthType: mcp.AuthType,
+		RiskLevel: mcp.RiskLevel, Status: mcp.Status, ToolTimeoutsJSON: marshalToolTimeouts(mcp.ToolTimeouts),
 	}
 	if credential != nil {
 		record.AuthCredentialsEncrypted = credential.Encrypted
@@ -179,7 +182,8 @@ func (r *CatalogRepository) CreateMCP(ctx context.Context, actorID uuid.UUID, mc
 func (r *CatalogRepository) UpdateMCP(ctx context.Context, actorID uuid.UUID, mcp biz.MCP, credential *biz.ProviderCredential, event biz.OutboxEvent) (biz.MCP, error) {
 	updates := map[string]any{
 		"name": mcp.Name, "endpoint": mcp.Endpoint, "auth_type": mcp.AuthType,
-		"risk_level": mcp.RiskLevel, "status": mcp.Status, "updated_at": time.Now().UTC(),
+		"risk_level": mcp.RiskLevel, "status": mcp.Status,
+		"tool_timeouts": marshalToolTimeouts(mcp.ToolTimeouts), "updated_at": time.Now().UTC(),
 	}
 	if credential != nil {
 		updates["auth_credentials_encrypted"] = credential.Encrypted
@@ -271,11 +275,27 @@ func toBizSkill(record skillRecordModel) (biz.SkillTemplate, error) {
 
 // toBizMCP 将数据库行转换为 MCP 领域实体，刻意不映射凭证密文。
 func toBizMCP(record mcpRecordModel) biz.MCP {
+	timeouts := map[string]int{}
+	if len(record.ToolTimeoutsJSON) > 0 {
+		_ = json.Unmarshal(record.ToolTimeoutsJSON, &timeouts)
+	}
 	return biz.MCP{
 		ID: record.ID, Name: record.Name, Endpoint: record.Endpoint, AuthType: record.AuthType,
 		KeyVersion: record.KeyVersion, RiskLevel: record.RiskLevel, Status: record.Status,
-		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+		ToolTimeouts: timeouts, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
+}
+
+// marshalToolTimeouts 把工具超时覆盖编码为 JSON；nil 视为空对象。
+func marshalToolTimeouts(values map[string]int) datatypes.JSON {
+	if values == nil {
+		values = map[string]int{}
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return datatypes.JSON([]byte("{}"))
+	}
+	return datatypes.JSON(encoded)
 }
 
 // GetMCPCredential 读取 MCP 元数据与加密凭证，仅供执行 Worker 解密使用。

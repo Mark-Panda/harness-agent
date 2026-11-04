@@ -128,6 +128,7 @@ export interface MCP {
   key_version: number;
   risk_level: string;
   status: MCPStatus;
+  tool_timeouts: Record<string, number>;
   created_at: string;
   updated_at: string;
 }
@@ -139,6 +140,7 @@ export interface MCPInput {
   credentials: string;
   risk_level: string;
   status: MCPStatus;
+  tool_timeouts: Record<string, number>;
 }
 
 // MCPTool 是 MCP 服务暴露的单个工具能力。
