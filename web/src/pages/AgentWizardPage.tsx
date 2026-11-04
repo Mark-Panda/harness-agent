@@ -82,10 +82,25 @@ export default function AgentWizardPage() {
 
   const canLeaveBasics = name.trim().length >= 2;
   const canLeaveModel = selectedPolicy !== null;
+  // 步骤门槛：先填名称，选好模型规则后才能进入检查与发布。
+  const canVisitStep = (index: number) => {
+    if (index === 0) {
+      return true;
+    }
+    if (!canLeaveBasics) {
+      return false;
+    }
+    return index === 1 || canLeaveModel;
+  };
 
   const toggle = (values: string[], id: string) => (values.includes(id) ? values.filter((value) => value !== id) : [...values, id]);
 
   const submit = async (publish: boolean) => {
+    if (!canLeaveBasics) {
+      setError("请先填写助手名称（至少 2 个字符）。");
+      setStep(0);
+      return;
+    }
     if (!selectedPolicy) {
       setError("请先选择一个选模规则。若列表为空，请联系管理员完成平台配置。");
       setStep(2);
@@ -152,23 +167,31 @@ export default function AgentWizardPage() {
       {editing.error ? <ErrorBanner message={editing.error} onRetry={editing.reload} /> : null}
       {policies.error ? <ErrorBanner message={policies.error} onRetry={policies.reload} /> : null}
 
-      <nav aria-label="创建步骤" className="flex flex-wrap gap-2">
-        {stepTitles.map((title, index) => (
-          <button
-            key={title}
-            type="button"
-            onClick={() => setStep(index)}
-            disabled={index > 0 && index < 3 && (index === 1 ? !canLeaveBasics : !canLeaveModel)}
-            className={cn(
-              "flex items-center gap-2 rounded-[3px] border px-3 py-2 text-xs transition disabled:cursor-not-allowed disabled:opacity-50",
-              step === index ? "border-accent bg-accent-soft/50 text-accent" : "border-line bg-paper-raised text-muted hover:border-line-strong",
-            )}
-          >
-            <span className="font-display text-sm">{String(index + 1).padStart(2, "0")}</span>
-            {title}
-          </button>
-        ))}
-      </nav>
+      <div className="flex flex-col gap-2">
+        <nav aria-label="创建步骤" className="flex flex-wrap gap-2">
+          {stepTitles.map((title, index) => (
+            <button
+              key={title}
+              type="button"
+              aria-current={step === index ? "step" : undefined}
+              onClick={() => setStep(index)}
+              disabled={!canVisitStep(index)}
+              className={cn(
+                "flex items-center gap-2 rounded-[3px] border px-3 py-2 text-xs transition disabled:cursor-not-allowed disabled:opacity-50",
+                step === index ? "border-accent bg-accent-soft/50 text-accent" : "border-line bg-paper-raised text-muted hover:border-line-strong",
+              )}
+            >
+              <span className="font-display text-sm">{String(index + 1).padStart(2, "0")}</span>
+              {title}
+            </button>
+          ))}
+        </nav>
+        {!canVisitStep(stepTitles.length - 1) ? (
+          <p className="text-[11px] leading-5 text-muted">
+            灰色步骤暂不可进入：{!canLeaveBasics ? "先填写助手名称（至少 2 个字符）" : "先选择一套选模规则"}。
+          </p>
+        ) : null}
+      </div>
 
       {error ? <ErrorBanner message={error} /> : null}
 
@@ -183,11 +206,6 @@ export default function AgentWizardPage() {
                 <Textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={512} placeholder="例如：把零散需求整理成结构化结论；先给结论，再列依据；不确定时主动说明。" />
               </Field>
             </div>
-          </div>
-          <div className="mt-6 flex justify-end">
-            <Button disabled={!canLeaveBasics} onClick={() => setStep(1)}>
-              下一步：它是怎么工作的
-            </Button>
           </div>
         </Card>
       ) : null}
@@ -205,10 +223,6 @@ export default function AgentWizardPage() {
                 onSelect={() => setMode(item.value)}
               />
             ))}
-          </div>
-          <div className="mt-6 flex justify-between">
-            <Button variant="secondary" onClick={() => setStep(0)}>上一步</Button>
-            <Button onClick={() => setStep(2)}>下一步：用哪个模型</Button>
           </div>
         </Card>
       ) : null}
@@ -303,11 +317,6 @@ export default function AgentWizardPage() {
               </div>
             )}
           </Card>
-
-          <div className="flex justify-between">
-            <Button variant="secondary" onClick={() => setStep(1)}>上一步</Button>
-            <Button disabled={!canLeaveModel} onClick={() => setStep(3)}>下一步：检查并发布</Button>
-          </div>
         </div>
       ) : null}
 
@@ -343,20 +352,35 @@ export default function AgentWizardPage() {
             <li>· 如果之后想改配置，从助手卡片点“创建新版本”，旧版本仍可用于已有会话。</li>
             <li>· 高风险外部工具在第一次执行前会请求你审批。</li>
           </ol>
+        </Card>
+      ) : null}
 
-          <div className="mt-6 flex flex-wrap justify-between gap-3">
-            <Button variant="secondary" onClick={() => setStep(2)}>上一步</Button>
-            <div className="flex flex-wrap gap-2">
+      <div className="sticky bottom-3 z-20 flex flex-wrap items-center justify-between gap-3 rounded-[4px] border border-line-strong bg-paper-raised/95 px-4 py-3 shadow-[0_10px_30px_rgb(31_27_21/0.10)] backdrop-blur">
+        {step === 0 ? (
+          <p className="text-xs text-muted">填写助手名称后即可继续。</p>
+        ) : (
+          <Button variant="secondary" onClick={() => setStep(step - 1)}>上一步</Button>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {step === 0 ? (
+            <Button disabled={!canLeaveBasics} onClick={() => setStep(1)}>下一步：它是怎么工作的</Button>
+          ) : null}
+          {step === 1 ? <Button onClick={() => setStep(2)}>下一步：用哪个模型</Button> : null}
+          {step === 2 ? (
+            <Button disabled={!canLeaveModel} onClick={() => setStep(3)}>下一步：检查并发布</Button>
+          ) : null}
+          {step === 3 ? (
+            <>
               <Button variant="secondary" loading={busy === "draft"} disabled={busy !== null} onClick={() => void submit(false)}>
                 先保存草稿
               </Button>
-              <Button loading={busy === "publish"} disabled={busy !== null || !selectedPolicy} onClick={() => void submit(true)}>
+              <Button loading={busy === "publish"} disabled={busy !== null} onClick={() => void submit(true)}>
                 发布并使用
               </Button>
-            </div>
-          </div>
-        </Card>
-      ) : null}
+            </>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 }

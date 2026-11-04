@@ -1,7 +1,7 @@
 // 会话列表：创建、打开、归档、导出与异步删除，并提供长期记忆数据操作。
 import { useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select } from "../components/ui";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, DropdownMenu, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Select } from "../components/ui";
 import { downloadJSON, mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/format";
@@ -26,6 +26,7 @@ async function waitForDeletion(id: string): Promise<DeletionRequest> {
 
 export default function SessionsPage() {
   const [params] = useSearchParams();
+  const navigate = useNavigate();
   const preselectedAgent = params.get("agent") ?? "";
   const paging = useCursorStack();
   const sessions = useRemote(
@@ -61,7 +62,7 @@ export default function SessionsPage() {
         title: title.trim(),
         source: "web",
       }, crypto.randomUUID());
-      window.location.assign(`/sessions/${session.id}`);
+      navigate(`/sessions/${session.id}`);
     } catch (failure) {
       setCreatingError(failure instanceof Error && failure.message === "请先在助手页创建并发布一个助手" ? failure.message : describeError(failure));
     } finally {
@@ -192,7 +193,7 @@ export default function SessionsPage() {
                   <th className="pb-3 pr-4 font-medium">来源</th>
                   <th className="pb-3 pr-4 font-medium">最近消息</th>
                   <th className="pb-3 pr-4 font-medium">创建时间</th>
-                  <th className="pb-3 font-medium">操作</th>
+                  <th className="pb-3 text-right font-medium">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
@@ -208,17 +209,29 @@ export default function SessionsPage() {
                     <td className="py-3 pr-4 text-ink-soft">{session.source}</td>
                     <td className="py-3 pr-4 text-xs text-muted">{formatRelative(session.last_message_at)}</td>
                     <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(session.created_at)}</td>
-                    <td className="py-3">
-                      <div className="flex flex-wrap gap-2">
-                        <Link to={`/sessions/${session.id}`} className="inline-flex h-8 items-center rounded-lg border border-line-strong bg-paper-raised px-3 text-xs text-ink hover:border-accent">
-                          打开
-                        </Link>
+                    <td className="py-3 text-right">
+                      <DropdownMenu
+                        label={`更多操作：${session.title}`}
+                        triggerLabel="更多操作"
+                        trigger={<span aria-hidden className="font-display text-base leading-none">⋯</span>}
+                        triggerClassName="w-8 border border-line-strong bg-paper-raised text-base text-ink hover:border-accent"
+                        panelClassName="w-40"
+                      >
                         {session.status === "active" ? (
-                          <Button size="sm" variant="secondary" loading={busy} onClick={() => void archive(session)}>归档</Button>
+                          <MenuItem disabled={busy} onClick={() => void archive(session)}>归档对话</MenuItem>
                         ) : null}
-                        <Button size="sm" variant="secondary" onClick={() => void exportSession(session)}>导出</Button>
-                        <Button size="sm" variant="danger" onClick={() => { setDeleting(session); setActionError(null); }}>删除</Button>
-                      </div>
+                        <MenuItem disabled={busy} onClick={() => void exportSession(session)}>导出 JSON</MenuItem>
+                        <MenuItem
+                          danger
+                          disabled={busy}
+                          onClick={() => {
+                            setDeleting(session);
+                            setActionError(null);
+                          }}
+                        >
+                          删除对话
+                        </MenuItem>
+                      </DropdownMenu>
                     </td>
                   </tr>
                 ))}

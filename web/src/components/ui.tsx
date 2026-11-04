@@ -1,6 +1,8 @@
 // 纸墨风格 UI 原语：暖纸底、墨色文字、朱砂强调，统一焦点与可访问语义。
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
-import { useId } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { NavLink } from "react-router-dom";
 
 // cn 合并条件类名。
 export function cn(...values: Array<string | false | null | undefined>): string {
@@ -362,5 +364,237 @@ export function ConfirmDialog({
         </div>
       </div>
     </div>
+  );
+}
+
+// menuItems 返回面板内可聚焦的菜单项。
+function menuItems(panel: HTMLDivElement | null): HTMLElement[] {
+  return Array.from(panel?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+}
+
+// DropdownMenu 是统一的下拉菜单：点击外部、Escape 或选择菜单项后关闭，方向键在项间移动。
+export function DropdownMenu({
+  label,
+  triggerLabel,
+  trigger,
+  indicator = false,
+  align = "right",
+  triggerClassName,
+  panelClassName,
+  children,
+}: {
+  label: string;
+  triggerLabel?: string;
+  trigger: ReactNode;
+  indicator?: boolean;
+  align?: "left" | "right";
+  triggerClassName?: string;
+  panelClassName?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // focusTarget 记录“用键盘打开菜单”时焦点应该落到第一项还是最后一项。
+  const [focusTarget, setFocusTarget] = useState<"first" | "last" | null>(null);
+  // 面板通过 Portal 渲染到 body，避免被表格滚动容器裁切。
+  const [position, setPosition] = useState<{ top?: number; bottom?: number; left?: number; right?: number } | null>(null);
+  const panelID = useId();
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    // 等定位完成、面板真正挂载后再把焦点送到菜单项。
+    const frame = window.requestAnimationFrame(() => {
+      if (!focusTarget) {
+        return;
+      }
+      const items = menuItems(panelRef.current);
+      (focusTarget === "last" ? items[items.length - 1] : items[0])?.focus();
+      setFocusTarget(null);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, focusTarget]);
+
+  // 收起时清掉旧坐标，避免再次打开时先在旧位置闪一下。
+  useEffect(() => {
+    if (!open) {
+      setPosition(null);
+    }
+  }, [open]);
+
+  // 跟随触发器定位；下方空间不足时向上展开。
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const place = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+      const alignStyle = align === "right"
+        ? { right: Math.max(8, window.innerWidth - rect.right) }
+        : { left: Math.max(8, rect.left) };
+      if (window.innerHeight - rect.bottom < 320 && rect.top > 360) {
+        setPosition({ ...alignStyle, bottom: window.innerHeight - rect.top + 8 });
+      } else {
+        setPosition({ ...alignStyle, top: rect.bottom + 8 });
+      }
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, align]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !panelRef.current?.contains(target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  // 触发器上按上下方向键直接打开菜单，并把焦点送到菜单项。
+  const handleTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+      return;
+    }
+    event.preventDefault();
+    setFocusTarget(event.key === "ArrowDown" ? "first" : "last");
+    setOpen(true);
+  };
+
+  const handlePanelKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const items = menuItems(panelRef.current);
+    if (items.length === 0) {
+      return;
+    }
+    const current = items.indexOf(document.activeElement as HTMLElement);
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      items[(current + 1) % items.length]?.focus();
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      items[(current - 1 + items.length) % items.length]?.focus();
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      items[0]?.focus();
+    } else if (event.key === "End") {
+      event.preventDefault();
+      items[items.length - 1]?.focus();
+    } else if (event.key === "Tab") {
+      // Tab 保留浏览器默认顺序，但先把菜单收起。
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        ref={triggerRef}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? panelID : undefined}
+        aria-label={triggerLabel}
+        onClick={() => setOpen((value) => !value)}
+        onKeyDown={handleTriggerKeyDown}
+        className={cn(
+          "inline-flex h-8 items-center justify-center gap-2 rounded-[3px] text-xs font-medium tracking-wide transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
+          triggerClassName,
+        )}
+      >
+        {trigger}
+        {indicator ? <span aria-hidden className="text-[10px]">{open ? "▴" : "▾"}</span> : null}
+      </button>
+      {open && position
+        ? createPortal(
+            <div
+              id={panelID}
+              ref={panelRef}
+              role="menu"
+              aria-label={label}
+              style={{ position: "fixed", ...position }}
+              className={cn(
+                "z-50 rounded-[3px] border border-line bg-paper-raised p-2 shadow-[0_16px_40px_rgb(31_27_21/0.18)]",
+                panelClassName,
+              )}
+              onClick={(event) => {
+                if ((event.target as HTMLElement).closest('[role="menuitem"]')) {
+                  window.requestAnimationFrame(() => setOpen(false));
+                }
+              }}
+              onKeyDown={handlePanelKeyDown}
+            >
+              {children}
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+}
+
+// MenuItem 统一菜单项语义；to 存在时渲染为导航链接，否则渲染为命令按钮。
+export function MenuItem({
+  to,
+  onClick,
+  danger = false,
+  disabled = false,
+  className,
+  children,
+}: {
+  to?: string;
+  onClick?: () => void;
+  danger?: boolean;
+  disabled?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const classes = cn(
+    "block w-full rounded-[2px] px-2 py-2 text-left text-xs transition hover:bg-paper-deep focus-visible:bg-paper-deep focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50",
+    danger ? "text-rust" : "text-ink",
+    className,
+  );
+  if (to) {
+    return (
+      <NavLink
+        to={to}
+        role="menuitem"
+        tabIndex={-1}
+        onClick={onClick}
+        className={({ isActive }) => cn(classes, isActive ? "bg-paper-deep" : "")}
+      >
+        {children}
+      </NavLink>
+    );
+  }
+  return (
+    <button type="button" role="menuitem" tabIndex={-1} disabled={disabled} onClick={onClick} className={classes}>
+      {children}
+    </button>
   );
 }
