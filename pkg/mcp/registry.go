@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // ErrEmptyRegistry 表示没有可执行的低风险 MCP 工具。
@@ -46,6 +48,8 @@ type binding struct {
 	tool Tool
 	// spec 暴露给模型的工具定义。
 	spec react.ToolSpec
+	// schema 本地参数校验 Schema；为空表示远端未提供或无法编译，退化为由 MCP 服务端校验。
+	schema *jsonschema.Schema
 }
 
 // Registry 汇总多个 MCP 服务的低风险工具，实现 react.Registry。
@@ -124,7 +128,9 @@ func (r *Registry) Prepare(ctx context.Context) error {
 			if len(tool.InputSchema) > 0 {
 				spec.Parameters = tool.InputSchema
 			}
-			r.bindings[canonical] = binding{server: server, tool: tool, spec: spec}
+			// 提前编译参数 Schema；编译失败时保留工具，退化为由 MCP 服务端校验，避免因个别 Schema 特性不可用而丢失工具。
+			compiled, _ := compileToolSchema(tool.InputSchema)
+			r.bindings[canonical] = binding{server: server, tool: tool, spec: spec, schema: compiled}
 			r.specs = append(r.specs, spec)
 		}
 	}
@@ -176,6 +182,12 @@ func (b binding) Timeout() time.Duration {
 // Invoke 调用 MCP 工具并把返回内容编码为不可信 JSON 数据。
 // 审批恢复路径会在 Context 中注入幂等键，这里通过 _meta 透传，供远端服务去重副作用。
 func (b binding) Invoke(ctx context.Context, arguments json.RawMessage) (json.RawMessage, error) {
+	// 调用前先做本地 Schema 校验，非法参数直接回填模型修正，避免无效请求打到远端服务。
+	if b.schema != nil {
+		if err := validateToolArguments(b.schema, arguments); err != nil {
+			return nil, err
+		}
+	}
 	meta := map[string]any{}
 	if key := IdempotencyKeyFromContext(ctx); key != "" {
 		meta["idempotency_key"] = key
@@ -200,6 +212,49 @@ func (b binding) Invoke(ctx context.Context, arguments json.RawMessage) (json.Ra
 		return encoded, ErrToolBusiness
 	}
 	return encoded, nil
+}
+
+// compileToolSchema 编译 MCP 工具的参数 Schema；空 Schema 或编译失败返回 nil。
+func compileToolSchema(raw json.RawMessage) (*jsonschema.Schema, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	document, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	compiler := jsonschema.NewCompiler()
+	// 禁止 Schema 编译阶段访问外部 URL，避免恶意 MCP 通过 $ref 触发内网请求或 SSRF。
+	compiler.UseLoader(noExternalSchemaLoader{})
+	const location = "https://harness.local/tool-schema.json"
+	if err := compiler.AddResource(location, document); err != nil {
+		return nil, err
+	}
+	return compiler.Compile(location)
+}
+
+// noExternalSchemaLoader 拒绝所有未在本地注册的 Schema 引用，防止编译阶段发起外部请求。
+type noExternalSchemaLoader struct{}
+
+// Load 实现 jsonschema.URLLoader，始终返回错误。
+func (noExternalSchemaLoader) Load(url string) (any, error) {
+	return nil, fmt.Errorf("external schema reference is not allowed: %s", url)
+}
+
+// validateToolArguments 用本地 Schema 校验模型生成的参数，返回可回填模型的错误详情。
+func validateToolArguments(schema *jsonschema.Schema, arguments json.RawMessage) error {
+	var value any
+	if err := json.Unmarshal(arguments, &value); err != nil {
+		return &react.InvalidArgumentsError{Detail: "arguments are not valid JSON"}
+	}
+	if err := schema.Validate(value); err != nil {
+		detail := err.Error()
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
+		return &react.InvalidArgumentsError{Detail: detail}
+	}
+	return nil
 }
 
 // canonicalToolName 生成符合模型函数名约束的稳定工具名。

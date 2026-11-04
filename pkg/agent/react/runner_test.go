@@ -143,6 +143,31 @@ func TestRunnerTrimsContextPerStep(t *testing.T) {
 	}
 }
 
+// TestRunnerInvalidArgumentsBecomesObservation 验证参数校验失败会作为可纠正观察结果回填，而非终止 Run。
+func TestRunnerInvalidArgumentsBecomesObservation(t *testing.T) {
+	tool := &fakeTool{name: "search", err: &InvalidArgumentsError{Detail: "missing properties/query"}}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{{ID: "call-1", Name: "search", Arguments: json.RawMessage(`{}`)}}, Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+		{Content: "fixed", FinishReason: "stop", Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+	}}
+	runner, _ := NewRunner(model, newTestRegistry(tool), Limits{})
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	found := false
+	for _, message := range result.Messages {
+		if message.Role == RoleTool && strings.Contains(message.Content, "invalid_arguments") &&
+			strings.Contains(message.Content, "missing properties/query") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("invalid arguments observation missing: %#v", result.Messages)
+	}
+}
+
 // TestRunnerToolCallThenAnswer 验证工具结果回填模型并继续执行。
 func TestRunnerToolCallThenAnswer(t *testing.T) {
 	tool := &fakeTool{name: "search", output: json.RawMessage(`{"result":"x"}`)}

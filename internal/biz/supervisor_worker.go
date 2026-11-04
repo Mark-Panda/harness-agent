@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,33 @@ JSON 结构：{"workers":[{"name":"Worker 名称","task":"子任务描述","tool
 2. 每个 Worker 只执行一个独立子任务，任务描述必须自包含。
 3. tools 只能从主 Agent 可用工具中选择；不得请求中高风险工具或越权访问其他用户数据。
 4. 不得输出密钥、凭证、隐藏推理或与任务无关的内容。`
+
+// supervisorPlannerSystem 在固定规划指令后追加真实可用工具清单，避免模型猜测或简写工具名。
+func supervisorPlannerSystem(specs []react.ToolSpec) string {
+	var builder strings.Builder
+	builder.WriteString(supervisorPlannerInstruction)
+	if len(specs) == 0 {
+		builder.WriteString("\n当前没有可用工具；workers[].tools 必须为空数组。")
+		return builder.String()
+	}
+	builder.WriteString("\n可用工具（workers[].tools 必须逐字使用以下完整名称，禁止简写、改写或猜测）：\n")
+	for index, spec := range specs {
+		if index >= 80 {
+			builder.WriteString("- ……其余工具已省略\n")
+			break
+		}
+		description := strings.TrimSpace(spec.Description)
+		if len(description) > 100 {
+			description = description[:100] + "…"
+		}
+		if description == "" {
+			builder.WriteString("- " + spec.Name + "\n")
+			continue
+		}
+		builder.WriteString("- " + spec.Name + "：" + description + "\n")
+	}
+	return builder.String()
+}
 
 // supervisorWorkerInstruction 是子 Agent 的系统指令，强调权限与数据边界。
 const supervisorWorkerInstruction = `你是 Supervisor 委派的子 Agent，只完成分配给你的子任务并输出结果。
@@ -50,7 +78,7 @@ func (w *ExecutionWorker) executeSupervisor(ctx context.Context, run Run, fence 
 		return react.Result{}, err
 	}
 	if len(tasks) == 0 {
-		draft, draftUsage, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, &attempts, messages)
+		draft, draftUsage, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools)
 		if err != nil {
 			return react.Result{}, err
 		}
@@ -70,9 +98,9 @@ func (w *ExecutionWorker) executeSupervisor(ctx context.Context, run Run, fence 
 }
 
 // generateSupervision 调用 Supervisor 模型生成 Worker 委派。
-func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message) (SupervisorDraft, react.Completion, error) {
+func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry) (SupervisorDraft, react.Completion, error) {
 	planMessages := make([]react.Message, 0, len(messages)+2)
-	planMessages = append(planMessages, react.Message{Role: react.RoleSystem, Content: supervisorPlannerInstruction})
+	planMessages = append(planMessages, react.Message{Role: react.RoleSystem, Content: supervisorPlannerSystem(tools.List())})
 	start := 0
 	if len(messages) > 16 {
 		start = len(messages) - 16
@@ -88,38 +116,107 @@ func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fenc
 		planMessages = append(planMessages, react.Message{Role: message.Role, Content: content, Name: message.Name, ToolCallID: message.ToolCallID})
 	}
 	planMessages = append(planMessages, react.Message{Role: react.RoleUser, Content: "请输出 Worker 委派 JSON。"})
-	completion, err := w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, planMessages, nil)
-	if err != nil {
-		return SupervisorDraft{}, react.Completion{}, err
+	complete := func(messages []react.Message) (react.Completion, error) {
+		return w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, messages, nil)
 	}
-	draft, err := ParseSupervisorDraft(completion.Content, w.config.SupervisorMaxWorkers)
-	if err != nil {
-		return SupervisorDraft{}, react.Completion{}, err
-	}
-	return draft, completion, nil
+	return planSupervisorDraft(planMessages, complete, w.config.SupervisorMaxWorkers, tools)
 }
 
-// persistSupervisorTasks 创建子会话、持久化子任务并写入审计事件。
-func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, fence RunFence, tools react.Registry, draft SupervisorDraft) ([]SupervisorTask, error) {
+// planSupervisorDraft 生成并校验委派；工具校验失败时把具体原因回传模型修正一次，仍失败才终止。
+func planSupervisorDraft(planMessages []react.Message, complete func([]react.Message) (react.Completion, error), maxWorkers int, tools react.Registry) (SupervisorDraft, react.Completion, error) {
+	completion, err := complete(planMessages)
+	if err != nil {
+		return SupervisorDraft{}, react.Completion{}, err
+	}
+	draft, err := ParseSupervisorDraft(completion.Content, maxWorkers)
+	if err != nil {
+		return SupervisorDraft{}, react.Completion{}, err
+	}
+	validationErr := validateSupervisorDraft(draft, tools)
+	if validationErr == nil {
+		return draft, completion, nil
+	}
+	// 只允许一次自修复，避免模型反复生成无效委派消耗预算。
+	repairMessages := append([]react.Message(nil), planMessages...)
+	repairMessages = append(repairMessages,
+		react.Message{Role: react.RoleAssistant, Content: completion.Content},
+		react.Message{Role: react.RoleUser, Content: "委派校验失败：" + validationErr.Error() +
+			"\n请只输出修正后的 JSON；workers[].tools 必须逐字使用系统消息中的完整工具名。"},
+	)
+	repairCompletion, err := complete(repairMessages)
+	if err != nil {
+		return SupervisorDraft{}, react.Completion{}, err
+	}
+	repaired, err := ParseSupervisorDraft(repairCompletion.Content, maxWorkers)
+	if err != nil {
+		return SupervisorDraft{}, react.Completion{}, err
+	}
+	if err := validateSupervisorDraft(repaired, tools); err != nil {
+		return SupervisorDraft{}, react.Completion{}, fmt.Errorf("%w: planner repair failed: %v", ErrSupervisorInvalid, err)
+	}
+	return repaired, repairCompletion, nil
+}
+
+// validateSupervisorDraft 校验 Worker 请求的工具必须存在且为低风险；错误信息包含候选名称供模型修正。
+func validateSupervisorDraft(draft SupervisorDraft, tools react.Registry) error {
 	available := make(map[string]string)
 	for _, spec := range tools.List() {
 		if tool, ok := tools.Lookup(spec.Name); ok {
 			available[spec.Name] = tool.RiskLevel()
 		}
 	}
+	issues := make([]string, 0)
+	for _, worker := range draft.Workers {
+		for _, name := range worker.Tools {
+			risk, ok := available[name]
+			if !ok {
+				issues = append(issues, fmt.Sprintf("worker %q requested unavailable tool %q%s", worker.Name, name, supervisorToolSuggestions(name, available)))
+				continue
+			}
+			// 委派不得提升工具权限：需要审批的工具不允许下放到 Worker。
+			if risk != "low" {
+				issues = append(issues, fmt.Sprintf("worker %q requested approval-required tool %q", worker.Name, name))
+			}
+		}
+	}
+	if len(issues) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrSupervisorInvalid, strings.Join(issues, "; "))
+}
+
+// supervisorToolSuggestions 返回最多 3 个包含请求名称的真实工具名，帮助规划模型快速修正。
+func supervisorToolSuggestions(requested string, available map[string]string) string {
+	if requested == "" {
+		return ""
+	}
+	matches := make([]string, 0, len(available))
+	for name := range available {
+		if strings.HasSuffix(name, "_"+requested) || strings.Contains(name, requested) {
+			matches = append(matches, name)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	if len(matches) > 3 {
+		matches = matches[:3]
+	}
+	return "；可能是: " + strings.Join(matches, ", ")
+}
+
+// persistSupervisorTasks 创建子会话、持久化子任务并写入审计事件。
+func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, fence RunFence, tools react.Registry, draft SupervisorDraft) ([]SupervisorTask, error) {
+	// 持久化前再次校验，防止修复后的委派被绕过或注册表在生成期间发生变化。
+	if err := validateSupervisorDraft(draft, tools); err != nil {
+		return nil, err
+	}
 	now := w.clock()
 	tasks := make([]SupervisorTask, 0, len(draft.Workers))
 	for index, worker := range draft.Workers {
 		scope := make([]string, 0, len(worker.Tools))
 		for _, name := range worker.Tools {
-			risk, ok := available[name]
-			if !ok {
-				return nil, fmt.Errorf("%w: worker %q requested unavailable tool %q", ErrSupervisorInvalid, worker.Name, name)
-			}
-			// 委派不得提升工具权限：需要审批的工具不允许下放到 Worker。
-			if risk != "low" {
-				return nil, fmt.Errorf("%w: worker %q requested approval-required tool %q", ErrSupervisorInvalid, worker.Name, name)
-			}
 			scope = append(scope, name)
 		}
 		sessionID := uuid.New()

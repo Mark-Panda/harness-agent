@@ -352,3 +352,110 @@ func TestSupervisorParentCancellation(t *testing.T) {
 		}
 	}
 }
+
+// plannerTestRegistry 是规划校验用的最小工具注册表。
+type plannerTestRegistry struct {
+	tools map[string]plannerTestTool
+	specs []react.ToolSpec
+}
+
+// plannerTestTool 是带风险等级的假工具。
+type plannerTestTool struct{ risk string }
+
+// Spec 返回测试工具定义。
+func (t plannerTestTool) Spec() react.ToolSpec {
+	return react.ToolSpec{Name: "test", Description: "test tool"}
+}
+
+// Invoke 模拟工具执行。
+func (t plannerTestTool) Invoke(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return nil, nil
+}
+
+// RiskLevel 返回测试风险等级。
+func (t plannerTestTool) RiskLevel() string { return t.risk }
+
+// Lookup 按名称查找测试工具。
+func (r plannerTestRegistry) Lookup(name string) (react.Tool, bool) {
+	tool, ok := r.tools[name]
+	return tool, ok
+}
+
+// List 返回测试工具定义。
+func (r plannerTestRegistry) List() []react.ToolSpec { return r.specs }
+
+// TestPlanSupervisorDraftRepairsInvalidToolOnce 验证非法工具名会把校验错误回传模型并修正一次。
+func TestPlanSupervisorDraftRepairsInvalidToolOnce(t *testing.T) {
+	validName := "mcp_contextforge_mcp-codewiki-search-code-graph"
+	registry := plannerTestRegistry{
+		tools: map[string]plannerTestTool{validName: {risk: "low"}},
+		specs: []react.ToolSpec{{Name: validName}},
+	}
+	first := `{"workers":[{"name":"代码检索员","task":"检索代码","tools":["search_codebase"]}]}`
+	second := `{"workers":[{"name":"代码检索员","task":"检索代码","tools":["` + validName + `"]}]}`
+	calls := 0
+	repairPrompt := ""
+	complete := func(messages []react.Message) (react.Completion, error) {
+		calls++
+		if calls == 1 {
+			return react.Completion{Content: first}, nil
+		}
+		for _, message := range messages {
+			if message.Role == react.RoleUser && strings.Contains(message.Content, "委派校验失败") {
+				repairPrompt = message.Content
+			}
+		}
+		return react.Completion{Content: second}, nil
+	}
+	draft, _, err := planSupervisorDraft([]react.Message{{Role: react.RoleUser, Content: "请处理"}}, complete, 4, registry)
+	if err != nil {
+		t.Fatalf("repair failed: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("planner calls = %d, want 2", calls)
+	}
+	if !strings.Contains(repairPrompt, "unavailable tool") || !strings.Contains(repairPrompt, "search_codebase") {
+		t.Fatalf("repair prompt missing validation detail: %s", repairPrompt)
+	}
+	if len(draft.Workers) != 1 || len(draft.Workers[0].Tools) != 1 || draft.Workers[0].Tools[0] != validName {
+		t.Fatalf("repaired draft = %#v", draft)
+	}
+}
+
+// TestPlanSupervisorDraftRejectsApprovalRequiredTool 验证中高风险工具不能被委派，且修复失败会被拒绝。
+func TestPlanSupervisorDraftRejectsApprovalRequiredTool(t *testing.T) {
+	name := "mcp_contextforge_dangerous"
+	registry := plannerTestRegistry{
+		tools: map[string]plannerTestTool{name: {risk: "medium"}},
+		specs: []react.ToolSpec{{Name: name}},
+	}
+	invalid := `{"workers":[{"name":"执行员","task":"执行","tools":["` + name + `"]}]}`
+	complete := func([]react.Message) (react.Completion, error) {
+		return react.Completion{Content: invalid}, nil
+	}
+	if _, _, err := planSupervisorDraft(nil, complete, 4, registry); !errors.Is(err, ErrSupervisorInvalid) {
+		t.Fatalf("approval-required tool error = %v", err)
+	}
+}
+
+// TestSupervisorPlannerSystemListsExactTools 验证规划提示携带真实工具全名，避免模型猜测简写名称。
+func TestSupervisorPlannerSystemListsExactTools(t *testing.T) {
+	system := supervisorPlannerSystem([]react.ToolSpec{
+		{Name: "mcp_contextforge_mcp-codewiki-search-code-graph", Description: "检索代码关系图"},
+		{Name: "mcp_contextforge_mcp-archery-archery-query", Description: ""},
+	})
+	for _, name := range []string{
+		"mcp_contextforge_mcp-codewiki-search-code-graph",
+		"mcp_contextforge_mcp-archery-archery-query",
+	} {
+		if !strings.Contains(system, name) {
+			t.Fatalf("planner system missing tool %q: %s", name, system)
+		}
+	}
+	if !strings.Contains(system, "禁止简写") {
+		t.Fatalf("planner system missing exact-name constraint: %s", system)
+	}
+	if empty := supervisorPlannerSystem(nil); !strings.Contains(empty, "tools 必须为空数组") {
+		t.Fatalf("empty registry instruction = %s", empty)
+	}
+}

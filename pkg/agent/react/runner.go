@@ -265,6 +265,21 @@ type Result struct {
 	Messages []Message
 }
 
+// InvalidArgumentsError 表示工具参数未通过本地 Schema 校验。
+// 执行器会把校验详情作为可纠正的工具观察结果回填模型，而不是直接终止 Run。
+type InvalidArgumentsError struct {
+	// Detail 是脱敏后的校验失败原因，仅包含字段路径与约束说明。
+	Detail string
+}
+
+// Error 实现 error 接口。
+func (e *InvalidArgumentsError) Error() string {
+	if e == nil || e.Detail == "" {
+		return "invalid tool arguments"
+	}
+	return "invalid tool arguments: " + e.Detail
+}
+
 // RunnerOption 注入执行器的可选能力，便于上层在不引入包依赖的情况下提供上下文裁剪。
 type RunnerOption func(*Runner)
 
@@ -423,7 +438,11 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 					return result, toolErr
 				}
 				status := "failed"
-				if errors.Is(toolErr, context.DeadlineExceeded) {
+				var invalidArgs *InvalidArgumentsError
+				switch {
+				case errors.As(toolErr, &invalidArgs):
+					status = "invalid_arguments"
+				case errors.Is(toolErr, context.DeadlineExceeded):
 					status = "timeout"
 					toolErr = fmt.Errorf("%w: %s", ErrToolTimeout, call.Name)
 				}
@@ -433,7 +452,11 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 				toolSpan.End()
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": status, "error": sanitizeError(toolErr)})
 				// 工具错误以不可信数据回填模型，由模型决定下一步，不直接终止 Run。
-				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: fmt.Sprintf(`{"error":%q}`, status)})
+				content := fmt.Sprintf(`{"error":%q}`, status)
+				if invalidArgs != nil {
+					content = fmt.Sprintf(`{"error":"invalid_arguments","detail":%q}`, sanitizeError(invalidArgs))
+				}
+				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: content})
 				continue
 			}
 			// 工具结果超过上限时拒绝进入上下文，避免挤占 Token 预算或注入超长内容。
