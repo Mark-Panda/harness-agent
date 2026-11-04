@@ -315,6 +315,8 @@ type WorkerConfig struct {
 	Temperature float64 `yaml:"temperature"`
 	// MCPTimeout 单次 MCP 工具发现或调用的超时。
 	MCPTimeout Duration `yaml:"mcp_timeout"`
+	// AllowPrivateMCPEndpoints 允许连接管理员登记的内网 MCP 端点；回环与元数据地址始终拒绝。
+	AllowPrivateMCPEndpoints bool `yaml:"allow_private_mcp_endpoints"`
 	// ApprovalPoll 等待人工审批时的任务轮询间隔。
 	ApprovalPoll Duration `yaml:"approval_poll"`
 	// GlobalConcurrency 跨副本全局 Run 并发上限。

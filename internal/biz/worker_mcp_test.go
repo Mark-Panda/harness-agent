@@ -127,8 +127,8 @@ func TestWorkerExecutesLowRiskMCPTool(t *testing.T) {
 			ID: uuid.MustParse(mcpID), Name: "docs", Endpoint: mcpServer.URL,
 			AuthType: "none", RiskLevel: "low", Status: "enabled",
 		}},
-		MCPClientFactory: func(endpoint, header, value string, timeout time.Duration) (*mcp.Client, error) {
-			return mcp.NewClient(endpoint, header, value, timeout, mcp.WithHTTPClient(mcpServer.Client()))
+		MCPClientFactory: func(endpoint string, headers http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error) {
+			return mcp.NewClientWithHeaders(endpoint, headers, timeout, mcp.WithHTTPClient(mcpServer.Client()), mcp.WithAllowPrivateEndpoints(allowPrivate))
 		},
 	}, biz.WorkerConfig{
 		WorkerID: "worker-1", Concurrency: 1, PollInterval: time.Millisecond,

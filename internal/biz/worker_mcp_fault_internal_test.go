@@ -87,7 +87,7 @@ func TestPrepareMCPToolsFailsClosedOnSlowOrUnavailableServer(t *testing.T) {
 				mcps:   faultMCPRepository{record: test.record},
 				logger: slog.Default(),
 				config: WorkerConfig{MCPTimeout: 20 * time.Millisecond}.normalize(),
-				mcpClient: func(endpoint, header, value string, timeout time.Duration) (*mcp.Client, error) {
+				mcpClient: func(endpoint string, headers http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error) {
 					return test.factory(endpoint)
 				},
 			}
@@ -106,7 +106,7 @@ func TestPrepareMCPToolsSkipsCredentialReadFailure(t *testing.T) {
 		mcps:      faultMCPRepository{err: context.DeadlineExceeded},
 		logger:    slog.Default(),
 		config:    WorkerConfig{MCPTimeout: time.Second}.normalize(),
-		mcpClient: func(string, string, string, time.Duration) (*mcp.Client, error) { return nil, nil },
+		mcpClient: func(string, http.Header, time.Duration, bool) (*mcp.Client, error) { return nil, nil },
 	}
 	run := mcpRunWithSnapshot(uuid.NewString())
 	if tools := worker.prepareMCPTools(context.Background(), run).List(); len(tools) != 0 {

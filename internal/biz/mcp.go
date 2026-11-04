@@ -2,6 +2,8 @@ package biz
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"strings"
@@ -56,10 +58,39 @@ type MCPCredentialRepository interface {
 	GetMCPCredential(ctx context.Context, mcpID uuid.UUID) (MCP, ProviderCredential, error)
 }
 
+// MCPTool 是 MCP 服务暴露的单个工具摘要，用于管理台展示能力列表。
+type MCPTool struct {
+	// Name 原始工具名。
+	Name string
+	// Description 工具用途。
+	Description string
+	// InputSchema 参数 JSON Schema。
+	InputSchema json.RawMessage
+}
+
+// MCPProber 抽象 MCP 连通性测试与工具发现，生产实现通过安全 HTTPS 客户端握手并调用 tools/list。
+type MCPProber interface {
+	// ListTools 初始化 MCP 会话并返回服务端工具列表。
+	ListTools(ctx context.Context, endpoint, authType, secret string) ([]MCPTool, error)
+}
+
+// MCPInspection 是一次连通性探测结果，Message 已脱敏且可直接展示。
+type MCPInspection struct {
+	// OK 是否连通成功。
+	OK bool
+	// Message 成功或失败的简短说明。
+	Message string
+	// Tools 成功时返回的工具列表。
+	Tools []MCPTool
+}
+
 // MCPService 实现 MCP 管理，强制 HTTPS、阻止内网与元数据地址，并加密凭证。
 type MCPService struct {
-	repo   MCPRepository
-	cipher CredentialCipher
+	repo        MCPRepository
+	cipher      CredentialCipher
+	credentials MCPCredentialRepository
+	opener      CredentialOpener
+	prober      MCPProber
 }
 
 // NewMCPService 构造 MCP 服务。
@@ -68,6 +99,14 @@ func NewMCPService(repo MCPRepository, cipher CredentialCipher) (*MCPService, er
 		return nil, invalid("MCP repository and credential cipher are required")
 	}
 	return &MCPService{repo: repo, cipher: cipher}, nil
+}
+
+// WithProber 启用 MCP 连通性测试与工具列表查询能力。
+func (s *MCPService) WithProber(credentials MCPCredentialRepository, opener CredentialOpener, prober MCPProber) *MCPService {
+	s.credentials = credentials
+	s.opener = opener
+	s.prober = prober
+	return s
 }
 
 // Create 创建 MCP，端点通过 SSRF 准入且凭证加密后落库。
@@ -134,6 +173,33 @@ func (s *MCPService) List(ctx context.Context, principal Principal) ([]MCP, erro
 		return nil, err
 	}
 	return s.repo.ListMCPs(ctx)
+}
+
+// Inspect 使用已保存的加密凭证初始化 MCP 会话并读取工具列表，用于连通性测试与能力展示。
+func (s *MCPService) Inspect(ctx context.Context, principal Principal, mcpID uuid.UUID) (MCPInspection, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return MCPInspection{}, err
+	}
+	if s.prober == nil || s.opener == nil || s.credentials == nil {
+		return MCPInspection{}, fmt.Errorf("%w: MCP prober is not configured", ErrInvalidConfig)
+	}
+	live, credential, err := s.credentials.GetMCPCredential(ctx, mcpID)
+	if err != nil {
+		return MCPInspection{}, err
+	}
+	secret := ""
+	if live.AuthType != "none" && len(credential.Encrypted) > 0 {
+		plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+		if err != nil {
+			return MCPInspection{OK: false, Message: "凭证无法解密，请重新填写鉴权信息。"}, nil
+		}
+		secret = string(plaintext)
+	}
+	tools, err := s.prober.ListTools(ctx, live.Endpoint, live.AuthType, secret)
+	if err != nil {
+		return MCPInspection{OK: false, Message: truncateError("连通失败："+err.Error(), 512)}, nil
+	}
+	return MCPInspection{OK: true, Message: fmt.Sprintf("连接成功，发现 %d 个工具。", len(tools)), Tools: tools}, nil
 }
 
 // sealCredential 仅在需要鉴权时加密凭证，none 类型必须留空。

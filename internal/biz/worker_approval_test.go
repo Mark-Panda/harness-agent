@@ -72,14 +72,14 @@ func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, mcpServer
 	// mcpServer 为空时构造不带 MCP 的 Worker，用于只验证审批状态机的场景。
 	providerCredential := biz.ProviderCredential{KeyVersion: "v1", Encrypted: []byte("ciphertext")}
 	var mcpCredentials biz.MCPCredentialRepository
-	var clientFactory func(endpoint, authHeader, authValue string, timeout time.Duration) (*mcp.Client, error)
+	var clientFactory func(endpoint string, headers http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
 	if mcpServer != nil {
 		mcpCredentials = fakeMCPCredentials{record: biz.MCP{
 			ID: uuid.New(), Name: "admin", Endpoint: mcpServer.URL, AuthType: "none",
 			RiskLevel: riskLevel, Status: "enabled",
 		}}
-		clientFactory = func(endpoint, header, value string, timeout time.Duration) (*mcp.Client, error) {
-			return mcp.NewClient(endpoint, header, value, timeout, mcp.WithHTTPClient(mcpServer.Client()))
+		clientFactory = func(endpoint string, headers http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error) {
+			return mcp.NewClientWithHeaders(endpoint, headers, timeout, mcp.WithHTTPClient(mcpServer.Client()), mcp.WithAllowPrivateEndpoints(allowPrivate))
 		}
 	}
 	steps.EXPECT().StartStep(gomock.Any(), gomock.Any()).DoAndReturn(

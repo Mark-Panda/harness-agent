@@ -24,6 +24,7 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/Mark-Panda/harness-agent/pkg/metrics"
 	"github.com/Mark-Panda/harness-agent/pkg/sandbox"
 	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
@@ -118,7 +119,6 @@ func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, appID strin
 
 // feishuBotTester 使用应用凭据换取 Tenant Access Token，验证连通性。
 type feishuBotTester struct{}
-
 // TestBot 调用飞书开放平台获取访问令牌；错误由上层截断后展示。
 func (feishuBotTester) TestBot(ctx context.Context, appID, appSecret string) error {
 	client, err := feishu.NewClient(feishu.ClientConfig{AppID: appID, AppSecret: appSecret})
@@ -127,6 +127,35 @@ func (feishuBotTester) TestBot(ctx context.Context, appID, appSecret string) err
 	}
 	_, err = client.TenantAccessToken(ctx)
 	return err
+}
+
+// mcpProber 使用安全 HTTPS 客户端初始化 MCP 会话并读取工具列表。
+type mcpProber struct {
+	// allowPrivate 是否允许连接内网 MCP 端点。
+	allowPrivate bool
+	// timeout 单次探测超时。
+	timeout time.Duration
+}
+
+// ListTools 返回 MCP 服务暴露的工具摘要；调用方负责展示脱敏后的错误。
+func (p mcpProber) ListTools(ctx context.Context, endpoint, authType, secret string) ([]biz.MCPTool, error) {
+	headers := mcp.AuthHeaders(authType, secret)
+	client, err := mcp.NewClientWithHeaders(endpoint, headers, p.timeout, mcp.WithAllowPrivateEndpoints(p.allowPrivate))
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Initialize(ctx); err != nil {
+		return nil, err
+	}
+	tools, err := client.ListTools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]biz.MCPTool, 0, len(tools))
+	for _, tool := range tools {
+		result = append(result, biz.MCPTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema})
+	}
+	return result, nil
 }
 
 func run() error {
@@ -295,6 +324,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	mcpService.WithProber(catalogRepository, credentialKeys, mcpProber{
+		allowPrivate: cfg.Agent.Worker.AllowPrivateMCPEndpoints,
+		timeout:      cfg.Agent.Worker.MCPTimeout.Duration,
+	})
 	quotaLimits := biz.QuotaLimits{MaxAgentsPerUser: cfg.Quotas.MaxAgentsPerUser, MaxSessionsPerUser: cfg.Quotas.MaxSessionsPerUser}
 	agentRepository := data.NewAgentRepository(appDB)
 	agentService, err := biz.NewAgentService(agentRepository, quotaLimits)
@@ -634,6 +667,7 @@ func run() error {
 			RetainPartialResponse:     cfg.Agent.ExecutionRecords.RetainPartialResponse,
 			RequireSandboxForHighRisk: cfg.Agent.Sandbox.RequireForHighRisk,
 			MCPTimeout:                cfg.Agent.Worker.MCPTimeout.Duration,
+			MCPAllowPrivateNetwork:    cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 			ApprovalPoll:              cfg.Agent.Worker.ApprovalPoll.Duration,
 			PromptTokenBudget:         int(cfg.Agent.ModelRouting.MaxPromptTokens),
 			Routing: model.RouterConfig{

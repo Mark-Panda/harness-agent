@@ -5,7 +5,7 @@ import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
 import { useClientPage, useRemote } from "../../lib/hooks";
-import type { MCP, MCPStatus, Page } from "../../lib/types";
+import type { MCP, MCPStatus, MCPTool, Page } from "../../lib/types";
 
 interface MCPFormState {
   name: string;
@@ -67,7 +67,7 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
   };
 
   return (
-    <Card title={initial ? `编辑外部工具：${initial.name}` : "接入外部工具"} description="外部工具让助手能查询或操作其他系统。地址必须是 HTTPS 公网地址，内网地址会被拒绝。">
+    <Card title={initial ? `编辑外部工具：${initial.name}` : "接入外部工具"} description="外部工具让助手能查询或操作其他系统。默认只允许 HTTPS 公网地址；内网地址需由服务端显式放行。">
       <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
         <Field label="工具名称" hint="例如“知识库检索”“工单查询”。">
           <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} />
@@ -134,9 +134,53 @@ export default function MCPsPage() {
   const [editing, setEditing] = useState<MCP | null | "new">(null);
   const [deleting, setDeleting] = useState<MCP | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [testingID, setTestingID] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string; tool_count: number }>>({});
+  const [toolsFor, setToolsFor] = useState<MCP | null>(null);
+  const [tools, setTools] = useState<MCPTool[]>([]);
+  const [toolsMessage, setToolsMessage] = useState<string | null>(null);
+  const [toolsBusy, setToolsBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const mcpItems = mcps.data?.items ?? [];
   const paging = useClientPage(mcpItems, 10);
+
+  // 测试连通：服务端解密凭证后握手 tools/list，不在前端暴露密钥。
+  const testMCP = async (mcp: MCP) => {
+    setTestingID(mcp.id);
+    try {
+      const result = await mutate<{ ok: boolean; message: string; tool_count: number }>(
+        `/api/v1/mcps/${mcp.id}/test`,
+        "POST",
+        undefined,
+        crypto.randomUUID(),
+      );
+      setTestResults((current) => ({ ...current, [mcp.id]: result }));
+    } catch (failure) {
+      setTestResults((current) => ({ ...current, [mcp.id]: { ok: false, message: describeError(failure), tool_count: 0 } }));
+    } finally {
+      setTestingID(null);
+    }
+  };
+
+  // 查看工具：加载服务端返回的工具名、说明与参数 Schema。
+  const openTools = async (mcp: MCP) => {
+    setToolsFor(mcp);
+    setToolsBusy(true);
+    setToolsMessage(null);
+    setTools([]);
+    try {
+      const result = await requestJSON<{ ok: boolean; message: string; items: MCPTool[]; count: number }>(`/api/v1/mcps/${mcp.id}/tools`);
+      setTools(result.items ?? []);
+      setToolsMessage(result.message);
+      if (!result.ok) {
+        setTools([]);
+      }
+    } catch (failure) {
+      setToolsMessage(describeError(failure));
+    } finally {
+      setToolsBusy(false);
+    }
+  };
 
   const remove = async () => {
     if (!deleting) {
@@ -165,6 +209,47 @@ export default function MCPsPage() {
       />
       {mcps.error ? <ErrorBanner message={mcps.error} onRetry={mcps.reload} /> : null}
       {editing ? <MCPForm initial={editing === "new" ? null : editing} onCancel={() => setEditing(null)} onSaved={() => { setEditing(null); mcps.reload(); }} /> : null}
+      {toolsFor ? (
+        <Card
+          title={`${toolsFor.name} 的工具能力`}
+          description={toolsMessage ?? "正在读取工具列表…"}
+          actions={<Button size="sm" variant="secondary" onClick={() => setToolsFor(null)}>关闭</Button>}
+        >
+          {toolsBusy ? (
+            <LoadingState />
+          ) : tools.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="pb-3 pr-4 font-medium">工具名</th>
+                    <th className="pb-3 pr-4 font-medium">说明</th>
+                    <th className="pb-3 font-medium">参数 Schema</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-line">
+                  {tools.map((tool) => (
+                    <tr key={tool.name} className="align-top">
+                      <td className="py-3 pr-4 font-mono text-xs text-ink">{tool.name}</td>
+                      <td className="py-3 pr-4 text-xs text-ink-soft">{tool.description || "—"}</td>
+                      <td className="py-3 text-xs text-muted">
+                        <details>
+                          <summary className="cursor-pointer hover:text-accent">查看参数</summary>
+                          <pre className="mt-2 max-h-48 overflow-auto rounded-[3px] border border-line bg-paper-deep/40 p-2 font-mono text-[11px] text-ink-soft">
+                            {JSON.stringify(tool.input_schema ?? {}, null, 2)}
+                          </pre>
+                        </details>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState title="没有可用工具" description={toolsMessage ?? "服务端没有返回工具列表。"} />
+          )}
+        </Card>
+      ) : null}
       <Card title="已接入工具" description={`共 ${mcpItems.length} 个工具`}>
         {mcps.loading ? (
           <LoadingState />
@@ -186,14 +271,23 @@ export default function MCPsPage() {
               <tbody className="divide-y divide-line">
                 {paging.pageItems.map((mcp) => (
                   <tr key={mcp.id}>
-                    <td className="py-3 pr-4 font-medium text-ink">{mcp.name}</td>
+                    <td className="py-3 pr-4 font-medium text-ink">
+                      {mcp.name}
+                      {testResults[mcp.id] ? (
+                        <p role="status" className={`mt-1 text-[11px] font-normal ${testResults[mcp.id].ok ? "text-accent" : "text-rust"}`}>
+                          {testResults[mcp.id].message}
+                        </p>
+                      ) : null}
+                    </td>
                     <td className="max-w-[260px] truncate py-3 pr-4 font-mono text-xs text-muted">{mcp.endpoint}</td>
                     <td className="py-3 pr-4 text-ink-soft">{mcp.auth_type}</td>
                     <td className="py-3 pr-4"><Badge tone={mcp.risk_level === "high" ? "danger" : mcp.risk_level === "medium" ? "warning" : "neutral"}>{mcp.risk_level === "high" ? "高风险" : mcp.risk_level === "medium" ? "需留意" : "低风险"}</Badge></td>
                     <td className="py-3 pr-4 text-ink-soft">v{mcp.key_version}</td>
                     <td className="py-3 pr-4"><Badge tone={statusTone(mcp.status)}>{statusLabel(mcp.status)}</Badge></td>
                     <td className="py-3">
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" variant="secondary" loading={testingID === mcp.id} onClick={() => void testMCP(mcp)}>测试连通</Button>
+                        <Button size="sm" variant="secondary" onClick={() => void openTools(mcp)}>查看工具</Button>
                         <Button size="sm" variant="secondary" onClick={() => setEditing(mcp)}>编辑</Button>
                         <Button size="sm" variant="danger" onClick={() => { setDeleting(mcp); setDeleteError(null); }}>删除</Button>
                       </div>

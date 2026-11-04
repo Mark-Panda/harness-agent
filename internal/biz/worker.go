@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -64,6 +65,8 @@ type WorkerConfig struct {
 	RequireSandboxForHighRisk bool
 	// MCPTimeout 单次 MCP 工具发现或调用的超时，默认 30 秒。
 	MCPTimeout time.Duration
+	// MCPAllowPrivateNetwork 允许连接内网 MCP 端点；仅服务端显式配置时开启，回环与元数据地址始终拒绝。
+	MCPAllowPrivateNetwork bool
 	// ApprovalPoll 等待人工审批时的任务轮询间隔，默认 5 秒。
 	ApprovalPoll time.Duration
 	// PromptTokenBudget 单次模型请求的上下文 Token 预算，零表示不裁剪。
@@ -168,7 +171,7 @@ type ExecutionWorkerDependencies struct {
 	// MCPs MCP 凭证读取端口，可为空表示不加载远端工具。
 	MCPs MCPCredentialRepository
 	// MCPClientFactory 构造 MCP 客户端，可为空使用默认 HTTPS 安全拨号实现。
-	MCPClientFactory func(endpoint, authHeader, authValue string, timeout time.Duration) (*mcp.Client, error)
+	MCPClientFactory func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
 	// Sandbox 高风险工具执行器；RequireSandboxForHighRisk 为真时高风险工具缺少它会拒绝执行。
 	Sandbox sandbox.Runner
 	// GlobalLimiter 全局 Run 并发舱壁，可为空表示不限制。
@@ -205,7 +208,7 @@ type ExecutionWorker struct {
 	facts           FactReader
 	factTrigger     FactTrigger
 	mcps            MCPCredentialRepository
-	mcpClient       func(endpoint, authHeader, authValue string, timeout time.Duration) (*mcp.Client, error)
+	mcpClient       func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
 	sandbox         sandbox.Runner
 	globalLimiter   model.ConcurrencyLimiter
 	userLimiter     model.ConcurrencyLimiter
@@ -234,8 +237,8 @@ func NewExecutionWorker(dependencies ExecutionWorkerDependencies, config WorkerC
 	}
 	mcpClient := dependencies.MCPClientFactory
 	if mcpClient == nil {
-		mcpClient = func(endpoint, authHeader, authValue string, timeout time.Duration) (*mcp.Client, error) {
-			return mcp.NewClient(endpoint, authHeader, authValue, timeout)
+		mcpClient = func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error) {
+			return mcp.NewClientWithHeaders(endpoint, authHeaders, timeout, mcp.WithAllowPrivateEndpoints(allowPrivate))
 		}
 	}
 	return &ExecutionWorker{
@@ -1615,8 +1618,8 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 			}
 			secret = string(plaintext)
 		}
-		header, value := mcp.AuthHeader(live.AuthType, secret)
-		client, err := w.mcpClient(endpoint, header, value, w.config.MCPTimeout)
+		headers := mcp.AuthHeaders(live.AuthType, secret)
+		client, err := w.mcpClient(endpoint, headers, w.config.MCPTimeout, w.config.MCPAllowPrivateNetwork)
 		if err != nil {
 			w.logger.Warn("invalid MCP endpoint", "mcp", live.Name, "error", err)
 			continue

@@ -10,6 +10,8 @@ x-app-environment: &app-environment
   AUDIT_PSEUDONYM_KEY: dev-only-audit-key-01234567890123456789
   CREDENTIAL_ENCRYPTION_KEY_ID: dev
   CREDENTIAL_ENCRYPTION_KEY_SECRET: dev-only-credential-key-01234567
+  # 本地开发允许访问公司内网 MCP（例如 contextforge）；生产按实际网络策略显式开启。
+  MCP_ALLOW_PRIVATE_ENDPOINTS: "true"
 
 x-migrate-environment: &migrate-environment
   APP_ENV: dev

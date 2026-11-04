@@ -31,36 +31,86 @@ var (
 // maxResponseBytes 限制单次 MCP 响应大小，避免恶意服务耗尽内存。
 const maxResponseBytes = 8 << 20
 
-// AuthHeader 根据鉴权类型与凭证构造请求头，凭证永不写入日志。
+// AuthHeader 根据鉴权类型与凭证构造单个请求头，凭证永不写入日志。
+// 需要多个请求头时使用 AuthHeaders，凭证可传 JSON 对象。
 func AuthHeader(authType, credential string) (string, string) {
-	switch authType {
-	case "bearer", "oauth":
-		if credential == "" {
-			return "", ""
-		}
-		return "Authorization", "Bearer " + credential
-	case "header":
-		parts := strings.SplitN(credential, ":", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" {
-			return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-		}
-		if credential != "" {
-			return "X-MCP-Key", credential
+	headers := AuthHeaders(authType, credential)
+	for name, values := range headers {
+		if len(values) > 0 {
+			return name, values[0]
 		}
 	}
 	return "", ""
+}
+
+// AuthHeaders 根据鉴权类型与凭证构造完整请求头集合。
+// header 类型的凭证支持两种格式：单个 "Name: value" 字符串，或 JSON 对象 {"Name":"value"}。
+func AuthHeaders(authType, credential string) http.Header {
+	headers := make(http.Header)
+	switch authType {
+	case "bearer", "oauth":
+		if strings.TrimSpace(credential) != "" {
+			setMCPHeader(headers, "Authorization", "Bearer "+strings.TrimSpace(credential))
+		}
+	case "header":
+		trimmed := strings.TrimSpace(credential)
+		if trimmed == "" {
+			return headers
+		}
+		// 优先按 JSON 对象解析多请求头，满足需要 Authorization 与业务自定义头的 MCP 服务。
+		var bundle map[string]string
+		if json.Unmarshal([]byte(trimmed), &bundle) == nil && len(bundle) > 0 {
+			for name, value := range bundle {
+				if validMCPHeader(name, value) {
+					setMCPHeader(headers, name, value)
+				}
+			}
+			if len(headers) > 0 {
+				return headers
+			}
+		}
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" {
+			name, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			if validMCPHeader(name, value) {
+				setMCPHeader(headers, name, value)
+			}
+			return headers
+		}
+		setMCPHeader(headers, "X-MCP-Key", trimmed)
+	}
+	return headers
+}
+
+// setMCPHeader 直接写入请求头并保留调用方大小写，HTTP 协议本身按大小写不敏感匹配。
+func setMCPHeader(headers http.Header, name, value string) {
+	headers[strings.TrimSpace(name)] = []string{value}
+}
+
+// validMCPHeader 校验请求头名称与值，阻止换行注入与非法头名。
+func validMCPHeader(name, value string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.ContainsAny(value, "\r\n") {
+		return false
+	}
+	for _, char := range name {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // Client 调用 MCP Streamable HTTP 端点，支持 JSON 与单事件 SSE 响应。
 type Client struct {
 	// endpoint 已校验的 HTTPS 端点。
 	endpoint string
-	// authHeader 鉴权头名称。
-	authHeader string
-	// authValue 鉴权头值，仅在内存中存在。
-	authValue string
+	// authHeaders 鉴权头集合，仅在内存中存在。
+	authHeaders http.Header
 	// http 禁用重定向的 HTTP 客户端。
 	http *http.Client
+	// allowPrivate 允许连接内网 MCP 端点；仅管理员显式配置时开启。
+	allowPrivate bool
 	// mu 串行化初始化与请求编号，避免会话状态竞争。
 	mu sync.Mutex
 	// initialized 是否已完成 initialize 握手。
@@ -71,7 +121,7 @@ type Client struct {
 	nextID int64
 }
 
-// Option 用于注入测试 HTTP 客户端。
+// Option 用于注入测试 HTTP 客户端与网络策略。
 type Option func(*Client)
 
 // WithHTTPClient 覆写 HTTP 客户端，测试可注入信任自签证书的 Transport。
@@ -83,8 +133,25 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
-// NewClient 构造 MCP 客户端；端点必须是 HTTPS 且不包含用户信息。
+// WithAllowPrivateEndpoints 允许连接 RFC1918 内网地址；回环、链路本地与元数据地址仍被拒绝。
+// 该开关只应由管理员通过服务端配置开启，禁止由普通用户请求参数控制。
+func WithAllowPrivateEndpoints(allow bool) Option {
+	return func(c *Client) {
+		c.allowPrivate = allow
+	}
+}
+
+// NewClient 构造 MCP 客户端，兼容单请求头调用方。
 func NewClient(endpoint, authHeader, authValue string, timeout time.Duration, options ...Option) (*Client, error) {
+	headers := make(http.Header)
+	if authHeader != "" && authValue != "" {
+		setMCPHeader(headers, authHeader, authValue)
+	}
+	return NewClientWithHeaders(endpoint, headers, timeout, options...)
+}
+
+// NewClientWithHeaders 使用完整鉴权头集合构造 MCP 客户端；端点必须是 HTTPS 且不包含用户信息。
+func NewClientWithHeaders(endpoint string, authHeaders http.Header, timeout time.Duration, options ...Option) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimSpace(endpoint))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, ErrInvalidEndpoint
@@ -95,16 +162,17 @@ func NewClient(endpoint, authHeader, authValue string, timeout time.Duration, op
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// MCP 不允许通过代理访问，且拨号阶段再次校验解析后的 IP，防御 DNS 重绑定与内网探测。
 	transport.Proxy = nil
-	transport.DialContext = safeDialContext(timeout)
-	client := &Client{
-		endpoint: parsed.String(), authHeader: authHeader, authValue: authValue,
-		http: &http.Client{
-			Timeout:   timeout,
-			Transport: transport,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				// 禁止重定向，避免凭证被转发到未准入的地址。
-				return http.ErrUseLastResponse
-			},
+	client := &Client{endpoint: parsed.String(), authHeaders: authHeaders.Clone()}
+	// 拨号策略在构造完成后读取 allowPrivate，确保 WithAllowPrivateEndpoints 能生效。
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return safeDialContextWithPolicy(timeout, client.allowPrivate)(ctx, network, address)
+	}
+	client.http = &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			// 禁止重定向，避免凭证被转发到未准入的地址。
+			return http.ErrUseLastResponse
 		},
 	}
 	for _, option := range options {
@@ -113,9 +181,14 @@ func NewClient(endpoint, authHeader, authValue string, timeout time.Duration, op
 	return client, nil
 }
 
-// safeDialContext 在拨号前解析并校验目标 IP，拒绝回环、私网、链路本地与元数据地址。
-// 通过直接拨号已校验的 IP，避免 DNS 重绑定把连接导向内网。
+// safeDialContext 在拨号前解析并校验目标 IP，默认拒绝内网、回环、链路本地与元数据地址。
 func safeDialContext(timeout time.Duration) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return safeDialContextWithPolicy(timeout, false)
+}
+
+// safeDialContextWithPolicy 按管理员配置决定是否允许 RFC1918 内网地址；
+// 回环、链路本地与云元数据地址始终拒绝，避免开放内网能力后仍可访问本机与元数据服务。
+func safeDialContextWithPolicy(timeout time.Duration, allowPrivate bool) func(ctx context.Context, network, address string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
@@ -123,7 +196,7 @@ func safeDialContext(timeout time.Duration) func(ctx context.Context, network, a
 			return nil, fmt.Errorf("%w: invalid address", ErrInvalidEndpoint)
 		}
 		if ip := net.ParseIP(host); ip != nil {
-			if !isPublicIP(ip) {
+			if !allowedMCPIP(ip, allowPrivate) {
 				return nil, fmt.Errorf("%w: private or metadata address", ErrInvalidEndpoint)
 			}
 			return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -133,7 +206,7 @@ func safeDialContext(timeout time.Duration) func(ctx context.Context, network, a
 			return nil, fmt.Errorf("%w: resolve host", ErrTransport)
 		}
 		for _, resolved := range ips {
-			if !isPublicIP(resolved.IP) {
+			if !allowedMCPIP(resolved.IP, allowPrivate) {
 				continue
 			}
 			conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
@@ -141,8 +214,20 @@ func safeDialContext(timeout time.Duration) func(ctx context.Context, network, a
 				return conn, nil
 			}
 		}
-		return nil, fmt.Errorf("%w: no public address available", ErrInvalidEndpoint)
+		return nil, fmt.Errorf("%w: no address available", ErrInvalidEndpoint)
 	}
+}
+
+// allowedMCPIP 判断地址是否允许连接；allowPrivate 只放开 RFC1918，不放开回环与元数据网段。
+func allowedMCPIP(ip net.IP, allowPrivate bool) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	if ip.IsPrivate() {
+		return allowPrivate
+	}
+	return true
 }
 
 // isPublicIP 判断地址是否为公网可路由地址。
@@ -389,8 +474,10 @@ func (c *Client) callLocked(ctx context.Context, method string, params any, requ
 
 // applyAuth 设置鉴权头；头名称与值均来自内存中的已解密凭证。
 func (c *Client) applyAuth(request *http.Request) {
-	if c.authHeader != "" && c.authValue != "" {
-		request.Header.Set(c.authHeader, c.authValue)
+	for name, values := range c.authHeaders {
+		for _, value := range values {
+			request.Header.Set(name, value)
+		}
 	}
 }
 

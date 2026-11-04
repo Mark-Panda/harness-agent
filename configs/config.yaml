@@ -66,6 +66,8 @@ agent:
     max_retry_after: 30s
     temperature: 0.2
     mcp_timeout: 30s
+    # 允许连接管理员登记的内网 MCP 端点（例如公司内的 contextforge）；回环与元数据地址仍会被拒绝。
+    allow_private_mcp_endpoints: ${MCP_ALLOW_PRIVATE_ENDPOINTS}
     approval_poll: 5s
     global_concurrency: 100
     per_user_concurrency: 2

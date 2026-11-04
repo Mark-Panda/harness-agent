@@ -138,6 +138,81 @@ func TestClientParsesSSEAndRPCError(t *testing.T) {
 	}
 }
 
+// TestClientSendsMultipleAuthHeaders 验证握手请求携带完整的多请求头凭证。
+func TestClientSendsMultipleAuthHeaders(t *testing.T) {
+	server := mockRPCServer(t, func(method string, _ json.RawMessage, request *http.Request, response http.ResponseWriter) (any, bool) {
+		switch method {
+		case "initialize":
+			if request.Header.Get("Authorization") != "Bearer token" ||
+				request.Header.Get("X-Archery-Username") != "maxianfei" ||
+				request.Header.Get("X-Archery-Password") != "secret" {
+				t.Errorf("missing multi auth headers: %v", request.Header)
+			}
+			response.Header().Set("Mcp-Session-Id", "session-multi")
+			return map[string]any{"protocolVersion": "2025-06-18"}, true
+		case "notifications/initialized":
+			return nil, false
+		default:
+			return map[string]any{}, true
+		}
+	})
+	headers := AuthHeaders("header", `{"Authorization":"Bearer token","X-Archery-Username":"maxianfei","X-Archery-Password":"secret"}`)
+	client, err := NewClientWithHeaders(server.URL, headers, 5*time.Second, WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+}
+
+// TestAllowedMCPIPPolicy 验证内网开关只放开 RFC1918，回环与元数据地址始终拒绝。
+func TestAllowedMCPIPPolicy(t *testing.T) {
+	cases := []struct {
+		ip           string
+		allowPrivate bool
+		allowed      bool
+	}{
+		{"8.8.8.8", false, true},
+		{"10.8.8.69", false, false},
+		{"10.8.8.69", true, true},
+		{"127.0.0.1", true, false},
+		{"169.254.169.254", true, false},
+		{"::1", true, false},
+	}
+	for _, test := range cases {
+		if got := allowedMCPIP(net.ParseIP(test.ip), test.allowPrivate); got != test.allowed {
+			t.Fatalf("allowedMCPIP(%s, %t) = %t, want %t", test.ip, test.allowPrivate, got, test.allowed)
+		}
+	}
+}
+
+// TestAuthHeadersSupportsJSONBundle 验证多请求头凭证与非法头名/换行注入过滤。
+func TestAuthHeadersSupportsJSONBundle(t *testing.T) {
+	headers := AuthHeaders("header", `{"Authorization":"Bearer token","X-Archery-Username":"maxianfei","X-Archery-Password":"secret","Bad Header":"x","Injected":"ok\r\nX-Evil: 1"}`)
+	if got := headers.Get("Authorization"); got != "Bearer token" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := headers.Get("X-Archery-Username"); got != "maxianfei" {
+		t.Fatalf("X-Archery-Username = %q", got)
+	}
+	if got := headers.Get("X-Archery-Password"); got != "secret" {
+		t.Fatalf("X-Archery-Password = %q", got)
+	}
+	if headers.Get("Bad Header") != "" || headers.Get("Injected") != "" {
+		t.Fatalf("invalid headers were accepted: %#v", headers)
+	}
+	// 单请求头字符串格式保持兼容。
+	single := AuthHeaders("header", "X-Key: secret")
+	if single.Get("X-Key") != "secret" {
+		t.Fatalf("single header = %#v", single)
+	}
+	// bearer 与 oauth 保持原有行为。
+	if AuthHeaders("bearer", "abc").Get("Authorization") != "Bearer abc" {
+		t.Fatalf("bearer header = %#v", AuthHeaders("bearer", "abc"))
+	}
+}
+
 // TestAuthHeaderVariants 验证不同鉴权类型生成正确的请求头。
 func TestAuthHeaderVariants(t *testing.T) {
 	tests := []struct {

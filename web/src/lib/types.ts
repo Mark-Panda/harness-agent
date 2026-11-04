@@ -141,6 +141,13 @@ export interface MCPInput {
   status: MCPStatus;
 }
 
+// MCPTool 是 MCP 服务暴露的单个工具能力。
+export interface MCPTool {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown> | null;
+}
+
 export type AgentMode = "react" | "plan" | "super";
 export type AgentStatus = "draft" | "published" | "disabled" | "archived";
 

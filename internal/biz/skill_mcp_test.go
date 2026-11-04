@@ -3,6 +3,7 @@ package biz_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -78,7 +79,67 @@ func TestSkillServiceLifecycleAndImmutability(t *testing.T) {
 	}
 }
 
-// TestMCPServiceSSRFAndCredentialHandling 验证端点准入、凭证加密与只写不读语义。
+// fakeMCPProber 记录探测参数并返回预设工具或错误。
+type fakeMCPProber struct {
+	tools    []biz.MCPTool
+	err      error
+	endpoint string
+	authType string
+	secret   string
+}
+
+func (f *fakeMCPProber) ListTools(_ context.Context, endpoint, authType, secret string) ([]biz.MCPTool, error) {
+	f.endpoint, f.authType, f.secret = endpoint, authType, secret
+	return f.tools, f.err
+}
+
+// fakeMCPOpener 返回固定明文凭证。
+type fakeMCPOpener struct {
+	plain []byte
+	err   error
+}
+
+func (f fakeMCPOpener) Open(string, []byte) ([]byte, error) { return f.plain, f.err }
+
+// TestMCPServiceInspectConnectivityAndTools 验证连通性测试、工具列表与脱敏错误展示。
+func TestMCPServiceInspectConnectivityAndTools(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockMCPRepository(ctrl)
+	cipher := mocks.NewMockCredentialCipher(ctrl)
+	admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+	service, err := biz.NewMCPService(repo, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpID := uuid.New()
+	live := biz.MCP{ID: mcpID, Name: "contextforge", Endpoint: "https://tools.example.com/mcp", AuthType: "header", Status: string(biz.MCPEnabled)}
+	prober := &fakeMCPProber{tools: []biz.MCPTool{{Name: "query", Description: "查询"}}}
+	credentials := mocks.NewMockMCPCredentialRepository(ctrl)
+	service.WithProber(credentials, fakeMCPOpener{plain: []byte(`{"Authorization":"Bearer token"}`)}, prober)
+	credentials.EXPECT().GetMCPCredential(gomock.Any(), mcpID).Return(live, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil)
+	result, err := service.Inspect(context.Background(), admin, mcpID)
+	if err != nil || !result.OK || len(result.Tools) != 1 || prober.authType != "header" || prober.secret != `{"Authorization":"Bearer token"}` {
+		t.Fatalf("inspect = %#v, %v, prober=%#v", result, err, prober)
+	}
+	if !strings.Contains(result.Message, "1") {
+		t.Fatalf("message = %q", result.Message)
+	}
+
+	prober.err = errors.New("mcp handshake unavailable")
+	credentials.EXPECT().GetMCPCredential(gomock.Any(), mcpID).Return(live, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil)
+	failed, err := service.Inspect(context.Background(), admin, mcpID)
+	if err != nil || failed.OK || !strings.Contains(failed.Message, "连通失败") {
+		t.Fatalf("failed inspect = %#v, %v", failed, err)
+	}
+	if _, err := service.Inspect(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, mcpID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("non-admin inspect error = %v", err)
+	}
+	noProber, _ := biz.NewMCPService(repo, cipher)
+	if _, err := noProber.Inspect(context.Background(), admin, mcpID); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("missing prober error = %v", err)
+	}
+}
+
 func TestMCPServiceSSRFAndCredentialHandling(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	repo := mocks.NewMockMCPRepository(ctrl)

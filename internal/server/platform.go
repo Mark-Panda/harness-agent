@@ -59,6 +59,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("GET /api/v1/mcps/{id}", handler.getMCP)
 	handle("PUT /api/v1/mcps/{id}", handler.updateMCP)
 	handle("DELETE /api/v1/mcps/{id}", handler.deleteMCP)
+	handleWrite("POST /api/v1/mcps/{id}/test", "mcp", handler.testMCP)
+	handle("GET /api/v1/mcps/{id}/tools", handler.listMCPTools)
 	// 用户接口：Agent 与会话消息，按 Token 中的 user_id 隔离。
 	handleWrite("POST /api/v1/agents", "agent", handler.createAgent)
 	handle("GET /api/v1/agents", handler.listAgents)
@@ -397,6 +399,44 @@ func (h *platformHTTPHandler) getMCP(w http.ResponseWriter, r *http.Request) {
 func (h *platformHTTPHandler) listMCPs(w http.ResponseWriter, r *http.Request) {
 	mcps, err := h.service.MCPs.List(r.Context(), requestPrincipal(r))
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(mcps, mcpResponse)}, err)
+}
+
+// testMCP 处理 POST /api/v1/mcps/{id}/test：验证 MCP 连通性并返回工具数量。
+func (h *platformHTTPHandler) testMCP(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.service.MCPs.Inspect(r.Context(), requestPrincipal(r), id)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{
+		"ok": result.OK, "message": result.Message, "tool_count": len(result.Tools),
+	}, nil)
+}
+
+// listMCPTools 处理 GET /api/v1/mcps/{id}/tools：列出 MCP 暴露的工具与参数 Schema。
+func (h *platformHTTPHandler) listMCPTools(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.service.MCPs.Inspect(r.Context(), requestPrincipal(r), id)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(result.Tools))
+	for _, tool := range result.Tools {
+		items = append(items, map[string]any{
+			"name": tool.Name, "description": tool.Description, "input_schema": tool.InputSchema,
+		})
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{
+		"ok": result.OK, "message": result.Message, "items": items, "count": len(items),
+	}, nil)
 }
 
 // createFeishuBot 处理 POST /api/v1/admin/feishu-bots：管理员登记飞书机器人。
