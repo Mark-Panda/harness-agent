@@ -63,6 +63,8 @@ type WorkerConfig struct {
 	RetainPartialResponse bool
 	// RequireSandboxForHighRisk 高风险工具必须通过独立 Sandbox Runner 执行。
 	RequireSandboxForHighRisk bool
+	// ReactMaxSteps 单次 ReAct Run 允许的最大模型步数，默认 12。
+	ReactMaxSteps int
 	// MCPTimeout 单次 MCP 工具发现或调用的超时，默认 30 秒。
 	MCPTimeout time.Duration
 	// MCPAllowPrivateNetwork 允许连接内网 MCP 端点；仅服务端显式配置时开启，回环与元数据地址始终拒绝。
@@ -103,6 +105,9 @@ func (c WorkerConfig) normalize() WorkerConfig {
 	}
 	if c.MaxPayloadBytes <= 0 {
 		c.MaxPayloadBytes = 256 * 1024
+	}
+	if c.ReactMaxSteps <= 0 {
+		c.ReactMaxSteps = react.DefaultLimits().MaxSteps
 	}
 	if c.MCPTimeout <= 0 {
 		c.MCPTimeout = 30 * time.Second
@@ -701,7 +706,9 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	if run.Mode != AgentModeReact {
 		return react.Result{}, fmt.Errorf("%w: run mode %s is not implemented", ErrInvalidConfig, run.Mode)
 	}
-	runner, err := react.NewRunner(router, registry, react.DefaultLimits())
+	limits := react.DefaultLimits()
+	limits.MaxSteps = w.config.ReactMaxSteps
+	runner, err := react.NewRunner(router, registry, limits)
 	if err != nil {
 		return react.Result{}, err
 	}

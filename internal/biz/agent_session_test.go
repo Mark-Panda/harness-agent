@@ -11,6 +11,44 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+// TestAgentListAllRequiresAdmin 验证跨用户助手视图只对管理员开放。
+func TestAgentListAllRequiresAdmin(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ListAll(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, biz.AdminAgentFilter{}, 10, ""); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("non-admin ListAll() error = %v, want forbidden", err)
+	}
+	adminID := uuid.New()
+	repo.EXPECT().ListAllAgents(gomock.Any(), biz.AdminAgentFilter{}, 10, "").Return(biz.Page[biz.AdminAgent]{}, nil)
+	if _, err := service.ListAll(context.Background(), biz.Principal{UserID: adminID, Role: biz.RoleAdmin}, biz.AdminAgentFilter{}, 10, ""); err != nil {
+		t.Fatalf("admin ListAll() error = %v", err)
+	}
+}
+
+// TestAgentAdminDeleteRequiresAdmin 验证跨用户删除助手只对管理员开放。
+func TestAgentAdminDeleteRequiresAdmin(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID := uuid.New()
+	if err := service.AdminDelete(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, agentID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("non-admin AdminDelete() error = %v, want forbidden", err)
+	}
+	ownerID := uuid.New()
+	repo.EXPECT().GetAgentAdmin(gomock.Any(), agentID).Return(biz.Agent{ID: agentID, UserID: ownerID, Name: "assistant", Status: biz.AgentPublished}, nil)
+	repo.EXPECT().DeleteAgentAdmin(gomock.Any(), gomock.Any(), agentID, gomock.Any()).Return(nil)
+	if err := service.AdminDelete(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, agentID); err != nil {
+		t.Fatalf("admin AdminDelete() error = %v", err)
+	}
+}
+
 func TestAgentServiceVersionsAndImmutablePublication(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	repo := mocks.NewMockAgentRepository(ctrl)

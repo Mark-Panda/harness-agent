@@ -314,6 +314,9 @@ func (r *Router) Complete(ctx context.Context, messages []react.Message, tools [
 			record.OutputTokens = response.OutputTokens
 			record.ResponseText = response.Content
 			record.EstimatedCost = estimateCost(candidate, response.InputTokens, response.OutputTokens)
+			// attempts 只统计当前模型连续失败的尝试次数；成功即结束本轮失败序列，
+			// 否则 ReAct 多轮调用会把历史成功次数累加，导致一次瞬时 429 被误判为重试超限。
+			r.attempts = 0
 			// 健康状态写入失败不应抹掉已成功的模型结果，仅影响后续熔断统计。
 			r.recordSuccess(ctx, candidate)
 			if err := r.finished(ctx, record); err != nil {

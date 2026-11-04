@@ -421,8 +421,45 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 		}
 		result.Messages = messages
 	}
-	emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})
-	return result, fmt.Errorf("%w: %d steps", ErrStepLimit, r.limits.MaxSteps)
+	// 步数耗尽时追加一次禁止工具的收尾调用，让模型基于已获得的工具结果生成结论，
+	// 避免“最后一步刚查到数据、却没有下一轮模型调用汇总”导致整轮失败。
+	finalStep := r.limits.MaxSteps + 1
+	finalMessages := append(append([]Message(nil), messages...), Message{Role: RoleUser, Content: "已达到工具调用步数上限。请不要再调用任何工具，直接基于上面已获得的信息给出最终结论；若关键信息缺失，请明确说明缺少什么。"})
+	emit(sink, "step.started", map[string]any{"step": finalStep, "final": true})
+	completion, err := r.model.Complete(runContext, finalMessages, nil)
+	if err != nil {
+		emit(sink, "step.failed", map[string]any{"step": finalStep, "final": true, "error": sanitizeError(err)})
+		emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})
+		return result, fmt.Errorf("%w: final summary failed: %v", ErrStepLimit, err)
+	}
+	totalTokens += completion.Usage.InputTokens + completion.Usage.OutputTokens
+	if completion.EstimatedCost > 0 {
+		cost += completion.EstimatedCost
+	} else {
+		cost += float64(completion.Usage.InputTokens)*request.InputPricePerMillion/1_000_000 +
+			float64(completion.Usage.OutputTokens)*request.OutputPricePerMillion/1_000_000
+	}
+	result.Steps = finalStep
+	result.TotalTokens = totalTokens
+	result.EstimatedCost = cost
+	if totalTokens > r.limits.MaxTotalTokens || cost > r.limits.MaxCost {
+		emit(sink, "run.failed", map[string]any{"reason": "budget_exceeded", "total_tokens": totalTokens, "estimated_cost": cost})
+		return result, fmt.Errorf("%w: tokens=%d cost=%.4f", ErrBudgetExceeded, totalTokens, cost)
+	}
+	emit(sink, "step.completed", map[string]any{
+		"step": finalStep, "final": true, "finish_reason": completion.FinishReason,
+		"input_tokens": completion.Usage.InputTokens, "output_tokens": completion.Usage.OutputTokens,
+	})
+	content := strings.TrimSpace(completion.Content)
+	if content == "" {
+		emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})
+		return result, fmt.Errorf("%w: %d steps (final summary empty)", ErrStepLimit, r.limits.MaxSteps)
+	}
+	appendMessage(Message{Role: RoleAssistant, Content: content})
+	result.Content = content
+	result.Messages = messages
+	emit(sink, "run.completed", map[string]any{"steps": finalStep, "total_tokens": totalTokens, "finalized": true})
+	return result, nil
 }
 
 // toolCallHash 计算工具调用的稳定指纹，用于连续重复检测。

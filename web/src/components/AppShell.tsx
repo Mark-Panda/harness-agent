@@ -21,6 +21,7 @@ const adminItems = [
   { to: "/admin/mcps", label: "外部工具", detail: "助手能调用的能力" },
   { to: "/admin/feishu-bots", label: "飞书机器人", detail: "机器人登记与绑定" },
   { to: "/admin/users", label: "用户", detail: "账号、禁用与重置密码" },
+  { to: "/admin/agents", label: "全部助手", detail: "跨用户只读审计" },
 ];
 
 function TopNavItem({ to, label, detail }: { to: string; label: string; detail: string }) {

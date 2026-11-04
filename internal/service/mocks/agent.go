@@ -86,6 +86,20 @@ func (mr *MockAgentRepositoryMockRecorder) DeleteAgent(ctx, userID, agentID, eve
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteAgent", reflect.TypeOf((*MockAgentRepository)(nil).DeleteAgent), ctx, userID, agentID, event)
 }
 
+// DeleteAgentAdmin mocks base method.
+func (m *MockAgentRepository) DeleteAgentAdmin(ctx context.Context, actorID, agentID uuid.UUID, event biz.OutboxEvent) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteAgentAdmin", ctx, actorID, agentID, event)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteAgentAdmin indicates an expected call of DeleteAgentAdmin.
+func (mr *MockAgentRepositoryMockRecorder) DeleteAgentAdmin(ctx, actorID, agentID, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteAgentAdmin", reflect.TypeOf((*MockAgentRepository)(nil).DeleteAgentAdmin), ctx, actorID, agentID, event)
+}
+
 // GetAgent mocks base method.
 func (m *MockAgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUID) (biz.Agent, error) {
 	m.ctrl.T.Helper()
@@ -99,6 +113,21 @@ func (m *MockAgentRepository) GetAgent(ctx context.Context, userID, agentID uuid
 func (mr *MockAgentRepositoryMockRecorder) GetAgent(ctx, userID, agentID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAgent", reflect.TypeOf((*MockAgentRepository)(nil).GetAgent), ctx, userID, agentID)
+}
+
+// GetAgentAdmin mocks base method.
+func (m *MockAgentRepository) GetAgentAdmin(ctx context.Context, agentID uuid.UUID) (biz.Agent, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetAgentAdmin", ctx, agentID)
+	ret0, _ := ret[0].(biz.Agent)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetAgentAdmin indicates an expected call of GetAgentAdmin.
+func (mr *MockAgentRepositoryMockRecorder) GetAgentAdmin(ctx, agentID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAgentAdmin", reflect.TypeOf((*MockAgentRepository)(nil).GetAgentAdmin), ctx, agentID)
 }
 
 // GetPolicy mocks base method.
@@ -129,6 +158,21 @@ func (m *MockAgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, 
 func (mr *MockAgentRepositoryMockRecorder) ListAgents(ctx, userID, includeArchived, limit, cursor any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAgents", reflect.TypeOf((*MockAgentRepository)(nil).ListAgents), ctx, userID, includeArchived, limit, cursor)
+}
+
+// ListAllAgents mocks base method.
+func (m *MockAgentRepository) ListAllAgents(ctx context.Context, filter biz.AdminAgentFilter, limit int, cursor string) (biz.Page[biz.AdminAgent], error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListAllAgents", ctx, filter, limit, cursor)
+	ret0, _ := ret[0].(biz.Page[biz.AdminAgent])
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListAllAgents indicates an expected call of ListAllAgents.
+func (mr *MockAgentRepositoryMockRecorder) ListAllAgents(ctx, filter, limit, cursor any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAllAgents", reflect.TypeOf((*MockAgentRepository)(nil).ListAllAgents), ctx, filter, limit, cursor)
 }
 
 // ListMCPsByIDs mocks base method.

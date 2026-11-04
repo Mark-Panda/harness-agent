@@ -98,6 +98,22 @@ type MCP struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// AdminAgentFilter 是管理员全局助手列表的筛选条件。
+type AdminAgentFilter struct {
+	// UserID 只查看指定用户的助手；为空表示全部用户。
+	UserID *uuid.UUID
+	// Status 按生命周期状态过滤；为空表示全部状态。
+	Status AgentStatus
+}
+
+// AdminAgent 是跨用户助手条目，附带所有者用户名，仅供管理员只读审计。
+type AdminAgent struct {
+	// Agent 助手聚合本体。
+	Agent Agent
+	// Username 所有者用户名。
+	Username string
+}
+
 // AgentRepository 定义用户私有 Agent 的持久化契约，所有方法强制携带 userID。
 type AgentRepository interface {
 	// CreateAgent 创建 Agent 版本及绑定并写入审计事件。
@@ -112,6 +128,12 @@ type AgentRepository interface {
 	GetAgent(ctx context.Context, userID, agentID uuid.UUID) (Agent, error)
 	// ListAgents 按用户游标分页列出 Agent；includeArchived 为 false 时排除已归档版本。
 	ListAgents(ctx context.Context, userID uuid.UUID, includeArchived bool, limit int, cursor string) (Page[Agent], error)
+	// ListAllAgents 跨用户游标分页列出助手，仅供管理员只读审计。
+	ListAllAgents(ctx context.Context, filter AdminAgentFilter, limit int, cursor string) (Page[AdminAgent], error)
+	// GetAgentAdmin 以 system scope 读取任意用户的助手，仅供管理员审计与删除。
+	GetAgentAdmin(ctx context.Context, agentID uuid.UUID) (Agent, error)
+	// DeleteAgentAdmin 以 system scope 删除任意用户的助手版本，历史记录由外键保留。
+	DeleteAgentAdmin(ctx context.Context, actorID, agentID uuid.UUID, event OutboxEvent) error
 	// NextAgentVersion 返回同名 Agent 的下一个版本号。
 	NextAgentVersion(ctx context.Context, userID uuid.UUID, name string) (int, error)
 	// GetPolicy 读取引用的模型策略。
@@ -297,6 +319,35 @@ func (s *AgentService) List(ctx context.Context, principal Principal, includeArc
 		return Page[Agent]{}, ErrForbidden
 	}
 	return s.repo.ListAgents(ctx, principal.UserID, includeArchived, limit, cursor)
+}
+
+// ListAll 跨用户列出助手，仅管理员可用；返回只读摘要，不包含绑定明细。
+func (s *AgentService) ListAll(ctx context.Context, principal Principal, filter AdminAgentFilter, limit int, cursor string) (Page[AdminAgent], error) {
+	if err := RequireAdmin(principal); err != nil {
+		return Page[AdminAgent]{}, err
+	}
+	switch filter.Status {
+	case "", AgentDraft, AgentPublished, AgentDisabled, AgentArchived:
+	default:
+		return Page[AdminAgent]{}, invalid("unsupported agent status filter")
+	}
+	return s.repo.ListAllAgents(ctx, filter, limit, cursor)
+}
+
+// AdminDelete 允许管理员删除任意用户的助手版本；历史会话与运行记录保留，仅解除助手归属。
+func (s *AgentService) AdminDelete(ctx context.Context, principal Principal, agentID uuid.UUID) error {
+	if err := RequireAdmin(principal); err != nil {
+		return err
+	}
+	agent, err := s.repo.GetAgentAdmin(ctx, agentID)
+	if err != nil {
+		return err
+	}
+	event := mutationEvent(principal.UserID, "agent.admin_deleted", "agent", agent.ID)
+	event.Payload["target_user_id"] = agent.UserID.String()
+	event.Payload["agent_name"] = agent.Name
+	event.Payload["agent_status"] = string(agent.Status)
+	return s.repo.DeleteAgentAdmin(ctx, principal.UserID, agent.ID, event)
 }
 
 // checkQuota 校验用户 Agent 版本总数是否达到上限。

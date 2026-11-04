@@ -12,14 +12,16 @@ import (
 
 // scriptedModel 按顺序返回预设结果，用于驱动 ReAct 循环分支。
 type scriptedModel struct {
-	completions []Completion
-	calls       int
-	received    [][]Message
+	completions   []Completion
+	calls         int
+	received      [][]Message
+	receivedTools [][]ToolSpec
 }
 
 // Complete 返回脚本中的下一条结果，越界后重复最后一条。
-func (m *scriptedModel) Complete(_ context.Context, messages []Message, _ []ToolSpec) (Completion, error) {
+func (m *scriptedModel) Complete(_ context.Context, messages []Message, tools []ToolSpec) (Completion, error) {
 	m.received = append(m.received, append([]Message(nil), messages...))
+	m.receivedTools = append(m.receivedTools, append([]ToolSpec(nil), tools...))
 	index := m.calls
 	if index >= len(m.completions) {
 		index = len(m.completions) - 1
@@ -196,6 +198,38 @@ func TestRunnerStepLimit(t *testing.T) {
 	runner, _ := NewRunner(&variantModel{}, newTestRegistry(&fakeTool{name: "search", output: json.RawMessage(`{}`)}), Limits{MaxSteps: 3})
 	if _, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil); !errors.Is(err, ErrStepLimit) {
 		t.Fatalf("step limit error = %v", err)
+	}
+}
+
+// TestRunnerStepLimitFinalizesWithSummary 验证步数耗尽后追加一次禁止工具的收尾调用，
+// 并把模型总结作为最终回答返回，而不是直接失败。
+func TestRunnerStepLimitFinalizesWithSummary(t *testing.T) {
+	tool := &fakeTool{name: "search", output: json.RawMessage(`{"result":"x"}`)}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{{ID: "call-1", Name: "search", Arguments: json.RawMessage(`{"q":"a"}`)}}, Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+		{ToolCalls: []ToolCall{{ID: "call-2", Name: "search", Arguments: json.RawMessage(`{"q":"b"}`)}}, Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+		{Content: "基于已查到的信息给出结论", FinishReason: "stop", Usage: Usage{InputTokens: 2, OutputTokens: 2}},
+	}}
+	runner, _ := NewRunner(model, newTestRegistry(tool), Limits{MaxSteps: 2})
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatalf("finalized run returned error: %v", err)
+	}
+	if result.Content != "基于已查到的信息给出结论" || result.Steps != 3 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(model.receivedTools[len(model.receivedTools)-1]) != 0 {
+		t.Fatalf("final summary call must not expose tools: %#v", model.receivedTools[len(model.receivedTools)-1])
+	}
+	lastMessages := model.received[len(model.received)-1]
+	if len(lastMessages) == 0 || !strings.Contains(lastMessages[len(lastMessages)-1].Content, "不要再调用任何工具") {
+		t.Fatalf("final summary instruction missing: %#v", lastMessages)
+	}
+	// 收尾指令只用于模型调用，不应作为用户消息写入会话历史。
+	for _, message := range result.Messages {
+		if strings.Contains(message.Content, "不要再调用任何工具") {
+			t.Fatalf("finalization instruction leaked into history: %#v", result.Messages)
+		}
 	}
 }
 

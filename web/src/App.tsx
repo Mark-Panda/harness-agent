@@ -12,6 +12,7 @@ import LoginPage from "./pages/LoginPage";
 import RegisterPage from "./pages/RegisterPage";
 import RunPage from "./pages/RunPage";
 import SessionsPage from "./pages/SessionsPage";
+import AdminAgentsPage from "./pages/admin/AdminAgentsPage";
 import MCPsPage from "./pages/admin/MCPsPage";
 import ModelsPage from "./pages/admin/ModelsPage";
 import PoliciesPage from "./pages/admin/PoliciesPage";
@@ -49,6 +50,7 @@ export default function App() {
             <Route path="/admin/mcps" element={<AdminRoute><MCPsPage /></AdminRoute>} />
             <Route path="/admin/feishu-bots" element={<AdminRoute><FeishuBotsPage /></AdminRoute>} />
             <Route path="/admin/users" element={<AdminRoute><UsersPage /></AdminRoute>} />
+            <Route path="/admin/agents" element={<AdminRoute><AdminAgentsPage /></AdminRoute>} />
             <Route path="*" element={<EmptyState title="页面不存在" description="请从顶部导航重新进入所需功能。" />} />
           </Route>
         </Routes>

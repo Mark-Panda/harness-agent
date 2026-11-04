@@ -313,6 +313,8 @@ type WorkerConfig struct {
 	MaxRetryAfter Duration `yaml:"max_retry_after"`
 	// Temperature 采样温度。
 	Temperature float64 `yaml:"temperature"`
+	// ReactMaxSteps 单次 ReAct Run 允许的最大模型步数；零值使用执行层默认 12，建议不超过总尝试预算。
+	ReactMaxSteps int `yaml:"react_max_steps"`
 	// MCPTimeout 单次 MCP 工具发现或调用的超时。
 	MCPTimeout Duration `yaml:"mcp_timeout"`
 	// AllowPrivateMCPEndpoints 允许连接管理员登记的内网 MCP 端点；回环与元数据地址始终拒绝。
@@ -615,6 +617,13 @@ func (c Config) Validate() error {
 		}
 		if worker.MCPTimeout.Duration <= 0 {
 			return fmt.Errorf("agent.worker.mcp_timeout must be positive")
+		}
+		if worker.ReactMaxSteps < 0 || worker.ReactMaxSteps > 100 {
+			return fmt.Errorf("agent.worker.react_max_steps must be within [0, 100]")
+		}
+		// 步数耗尽后的收尾总结也要消耗一次模型尝试，必须预留预算。
+		if worker.ReactMaxSteps > 0 && worker.ReactMaxSteps+1 > routing.MaxAttemptsPerRun {
+			return fmt.Errorf("agent.worker.react_max_steps must leave room in agent.model_routing.max_attempts_per_run for the final summary")
 		}
 		if worker.ApprovalPoll.Duration <= 0 {
 			return fmt.Errorf("agent.worker.approval_poll must be positive")

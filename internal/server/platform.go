@@ -99,6 +99,10 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("POST /api/v1/admin/break-glass", handler.breakGlass)
 	// 管理员全局运行审计：按用户与来源筛选。
 	handle("GET /api/v1/admin/runs", handler.listAdminRuns)
+	// 管理员全局助手视图：跨用户只读列表，不返回会话与配置快照明细。
+	handle("GET /api/v1/admin/agents", handler.listAdminAgents)
+	// 管理员跨用户删除助手版本：历史记录保留，仅解除助手归属。
+	handle("DELETE /api/v1/admin/agents/{id}", handler.adminDeleteAgent)
 	// Supervisor 执行树：展示 Worker 子任务、尝试次数、结果与失败原因。
 	handle("GET /api/v1/runs/{id}/supervisor-tasks", handler.runSupervisorTasks)
 	if platform.Routing != nil {
@@ -784,6 +788,43 @@ func (h *platformHTTPHandler) listAgents(w http.ResponseWriter, r *http.Request)
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(page.Items, agentResponse), "next_cursor": page.NextCursor}, err)
 }
 
+// listAdminAgents 处理 GET /api/v1/admin/agents：管理员跨用户只读查看助手列表。
+func (h *platformHTTPHandler) listAdminAgents(w http.ResponseWriter, r *http.Request) {
+	limit, cursor, ok := pageRequest(w, r)
+	if !ok {
+		return
+	}
+	filter := biz.AdminAgentFilter{Status: biz.AgentStatus(r.URL.Query().Get("status"))}
+	if raw := r.URL.Query().Get("user_id"); raw != "" {
+		parsed, err := uuid.Parse(raw)
+		if err != nil {
+			writeErrorCode(w, http.StatusBadRequest, "invalid_user_id")
+			return
+		}
+		filter.UserID = &parsed
+	}
+	page, err := h.service.Agents.ListAll(r.Context(), requestPrincipal(r), filter, limit, cursor)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(page.Items))
+	for _, summary := range page.Items {
+		items = append(items, adminAgentResponse(summary))
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items, "next_cursor": page.NextCursor}, nil)
+}
+
+// adminDeleteAgent 处理 DELETE /api/v1/admin/agents/{id}：管理员跨用户删除助手版本。
+func (h *platformHTTPHandler) adminDeleteAgent(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	err := h.service.Agents.AdminDelete(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, map[string]any{"deleted": true}, err)
+}
+
 // createAgentVersion 处理 POST /api/v1/agents/{id}/versions：创建新草稿版本。
 func (h *platformHTTPHandler) createAgentVersion(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r)
@@ -1135,6 +1176,17 @@ func agentResponse(agent biz.Agent) map[string]any {
 		"id": agent.ID, "user_id": agent.UserID, "name": agent.Name, "description": agent.Description, "mode": agent.Mode,
 		"model_policy_id": agent.ModelPolicyID, "model_policy_version": agent.ModelPolicyVersion, "version": agent.Version,
 		"config_snapshot": agent.ConfigSnapshot, "skill_ids": agent.SkillIDs, "mcp_ids": agent.MCPIDs, "status": agent.Status,
+		"created_at": agent.CreatedAt, "updated_at": agent.UpdatedAt,
+	}
+}
+
+// adminAgentResponse 构造管理员全局助手出参；只返回审计摘要，不暴露配置快照与绑定明细。
+func adminAgentResponse(summary biz.AdminAgent) map[string]any {
+	agent := summary.Agent
+	return map[string]any{
+		"id": agent.ID, "user_id": agent.UserID, "username": summary.Username,
+		"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "status": agent.Status,
+		"version": agent.Version, "model_policy_id": agent.ModelPolicyID, "model_policy_version": agent.ModelPolicyVersion,
 		"created_at": agent.CreatedAt, "updated_at": agent.UpdatedAt,
 	}
 }

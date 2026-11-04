@@ -667,6 +667,7 @@ func run() error {
 			MaxPayloadBytes:           cfg.Agent.ExecutionRecords.MaxInlinePayloadBytes,
 			RetainPartialResponse:     cfg.Agent.ExecutionRecords.RetainPartialResponse,
 			RequireSandboxForHighRisk: cfg.Agent.Sandbox.RequireForHighRisk,
+			ReactMaxSteps:             cfg.Agent.Worker.ReactMaxSteps,
 			MCPTimeout:                cfg.Agent.Worker.MCPTimeout.Duration,
 			MCPAllowPrivateNetwork:    cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 			ApprovalPoll:              cfg.Agent.Worker.ApprovalPoll.Duration,

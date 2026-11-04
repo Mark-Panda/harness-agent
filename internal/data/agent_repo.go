@@ -187,6 +187,33 @@ func (r *AgentRepository) DeleteAgent(ctx context.Context, userID, agentID uuid.
 	return catalogError("delete agent", err)
 }
 
+// GetAgentAdmin 以 system scope 读取任意用户的助手摘要，仅供管理员审计与删除。
+func (r *AgentRepository) GetAgentAdmin(ctx context.Context, agentID uuid.UUID) (biz.Agent, error) {
+	var record agentModel
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return tx.First(&record, "id = ?", agentID).Error
+	})
+	if err != nil {
+		return biz.Agent{}, catalogError("get agent", err)
+	}
+	return toBizAgent(record, nil, nil)
+}
+
+// DeleteAgentAdmin 以 system scope 删除任意用户的助手版本；会话与运行记录由外键 SET NULL 保留。
+func (r *AgentRepository) DeleteAgentAdmin(ctx context.Context, actorID, agentID uuid.UUID, event biz.OutboxEvent) error {
+	err := WithScope(ctx, r.db, Scope{System: true, UserID: actorID}, func(tx *gorm.DB) error {
+		result := tx.Delete(&agentModel{}, "id = ?", agentID)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return appendOutbox(tx, event)
+	})
+	return catalogError("delete agent", err)
+}
+
 // UpdateAgentStatus 按前置状态条件更新生命周期；条件不匹配说明状态已被并发修改。
 func (r *AgentRepository) UpdateAgentStatus(ctx context.Context, userID, agentID uuid.UUID, from, to biz.AgentStatus, clearSnapshot bool, event biz.OutboxEvent) error {
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
@@ -266,6 +293,71 @@ func (r *AgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, incl
 			return biz.Page[biz.Agent]{}, err
 		}
 		page.Items = append(page.Items, agent)
+	}
+	return page, nil
+}
+
+// ListAllAgents 跨用户游标分页列出助手并附带所有者用户名，仅供管理员只读审计。
+func (r *AgentRepository) ListAllAgents(ctx context.Context, filter biz.AdminAgentFilter, limit int, cursor string) (biz.Page[biz.AdminAgent], error) {
+	decoded, err := DecodeCursor(cursor)
+	if err != nil {
+		return biz.Page[biz.AdminAgent]{}, fmt.Errorf("%w: invalid agent cursor", biz.ErrInvalidConfig)
+	}
+	limit = NormalizeLimit(limit)
+	var records []agentModel
+	usernames := map[uuid.UUID]string{}
+	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		query := tx.Model(&agentModel{})
+		if filter.UserID != nil {
+			query = query.Where("user_id = ?", *filter.UserID)
+		}
+		if filter.Status != "" {
+			query = query.Where("status = ?", string(filter.Status))
+		}
+		if decoded.ID != uuid.Nil {
+			query = query.Where("(created_at < ? OR (created_at = ? AND id < ?))", decoded.CreatedAt, decoded.CreatedAt, decoded.ID)
+		}
+		if err := query.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&records).Error; err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return nil
+		}
+		userIDs := make([]uuid.UUID, 0, len(records))
+		seen := map[uuid.UUID]bool{}
+		for _, record := range records {
+			if !seen[record.UserID] {
+				seen[record.UserID] = true
+				userIDs = append(userIDs, record.UserID)
+			}
+		}
+		var users []userModel
+		if err := tx.Model(&userModel{}).Select("id", "username").Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+			return err
+		}
+		for _, user := range users {
+			usernames[user.ID] = user.Username
+		}
+		return nil
+	})
+	if err != nil {
+		return biz.Page[biz.AdminAgent]{}, catalogError("list all agents", err)
+	}
+	page := biz.Page[biz.AdminAgent]{Items: make([]biz.AdminAgent, 0, min(limit, len(records)))}
+	if len(records) > limit {
+		records = records[:limit]
+		last := records[len(records)-1]
+		page.NextCursor, err = EncodeCursor(Cursor{CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return biz.Page[biz.AdminAgent]{}, err
+		}
+	}
+	for _, record := range records {
+		agent, err := toBizAgent(record, nil, nil)
+		if err != nil {
+			return biz.Page[biz.AdminAgent]{}, catalogError("decode agent", err)
+		}
+		page.Items = append(page.Items, biz.AdminAgent{Agent: agent, Username: usernames[record.UserID]})
 	}
 	return page, nil
 }

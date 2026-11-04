@@ -304,7 +304,9 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	if err != nil {
 		return react.Result{}, 0, 0, 0, fmt.Errorf("%w: %v", ErrInvalidRunSnapshot, err)
 	}
-	runner, err := react.NewRunner(router, registry, react.DefaultLimits())
+	limits := react.DefaultLimits()
+	limits.MaxSteps = w.config.ReactMaxSteps
+	runner, err := react.NewRunner(router, registry, limits)
 	if err != nil {
 		return react.Result{}, 0, 0, 0, err
 	}

@@ -64,8 +64,8 @@ agent:
     safety_margin_tokens: 4096
     # 同一模型在单次 Run 内的最多尝试次数（含重试）。
     max_attempts_per_model: 2
-    # 单次 Run 允许的模型调用总次数；ReAct 每轮工具循环都会消耗一次，过低会导致执行提前耗尽。
-    max_attempts_per_run: 20
+    # 单次 Run 允许的模型调用总次数；ReAct 每轮工具循环都会消耗一次，需大于 react_max_steps 以保留重试与收尾余量。
+    max_attempts_per_run: 24
     # 单次 Run 允许切换模型的次数上限。
     max_switches_per_run: 2
     # 供应商故障熔断器。
@@ -112,6 +112,8 @@ agent:
     max_retry_after: 30s
     # 模型采样温度，越低输出越稳定。
     temperature: 0.2
+    # 单次 ReAct Run 允许的最大模型步数；用尽后会追加一次禁止工具的收尾调用，基于已获得信息生成结论。
+    react_max_steps: 20
     # MCP 工具发现与调用的默认超时；单个工具可在「外部工具」界面按工具名或前缀单独调大，未配置时使用该默认值。
     mcp_timeout: 60s
     # 是否允许连接管理员登记的内网 MCP 端点；回环与云元数据地址始终拒绝。

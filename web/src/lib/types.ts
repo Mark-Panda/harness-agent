@@ -279,6 +279,22 @@ export interface AdminRun extends Run {
   username: string;
 }
 
+// AdminAgent 是管理员全局助手视图条目，附带所有者用户名。
+export interface AdminAgent {
+  id: string;
+  user_id: string;
+  username: string;
+  name: string;
+  description: string;
+  mode: AgentMode;
+  status: AgentStatus;
+  version: number;
+  model_policy_id: string | null;
+  model_policy_version: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ExecutionStep {
   id: string;
   run_id: string;

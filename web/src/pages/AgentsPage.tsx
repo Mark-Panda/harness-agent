@@ -270,6 +270,11 @@ export default function AgentsPage() {
                     <Button size="sm" variant="secondary" onClick={() => setArchiving(agent)}>
                       归档
                     </Button>
+                    {agent.status === "published" ? (
+                      <Button size="sm" variant="danger" onClick={() => setDeleting(agent)}>
+                        删除
+                      </Button>
+                    ) : null}
                   </>
                 )}
               </div>
@@ -329,8 +334,12 @@ export default function AgentsPage() {
       />
       <ConfirmDialog
         open={deleting !== null}
-        title={`删除草稿「${deleting?.name ?? ""}」？`}
-        description="只有草稿可以删除。删除后无法恢复。"
+        title={`删除「${deleting?.name ?? ""}」？`}
+        description={
+          deleting?.status === "published"
+            ? "删除会先取消发布再移除该版本；历史对话与运行记录会保留，但不再关联此助手，飞书机器人绑定也会解除。删除后无法恢复。"
+            : "删除后无法恢复；历史对话与运行记录会保留，但不再关联此助手。"
+        }
         confirmLabel="确认删除"
         busy={busy}
         onCancel={() => setDeleting(null)}
@@ -340,6 +349,10 @@ export default function AgentsPage() {
           }
           const target = deleting;
           void runAction(async () => {
+            // 已发布版本需先回到草稿，后端才允许删除；两步在同一操作内完成。
+            if (target.status === "published") {
+              await mutate(`/api/v1/agents/${target.id}/unpublish`, "POST", undefined, crypto.randomUUID());
+            }
             await mutate<void>(`/api/v1/agents/${target.id}`, "DELETE");
             setDeleting(null);
           });

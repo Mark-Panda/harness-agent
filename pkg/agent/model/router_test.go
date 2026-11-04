@@ -172,6 +172,48 @@ func TestRouterPriorityStickiness(t *testing.T) {
 	}
 }
 
+// TestRouterRateLimitRetriesAfterPriorSuccess 验证多轮成功后的首次 429 仍按退避重试，
+// 历史成功次数不得被误算为当前模型的连续失败次数。
+func TestRouterRateLimitRetriesAfterPriorSuccess(t *testing.T) {
+	server := newChatServer(t, func(call int, w http.ResponseWriter, _ *http.Request) {
+		switch call {
+		case 3:
+			w.WriteHeader(http.StatusTooManyRequests)
+		case 1:
+			writeCompletion(w, "first")
+		case 2:
+			writeCompletion(w, "second")
+		default:
+			writeCompletion(w, "retried")
+		}
+	})
+	recorder := &attemptRecorder{}
+	sleeps := 0
+	router, err := NewRouter([]Candidate{candidateFor(server, "p1", "m1", 1_000_000)}, newFakeHealth(), testConfig(), recorder,
+		WithSleep(func(context.Context, time.Duration) error {
+			sleeps++
+			return nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"first", "second", "retried"} {
+		result, err := router.Complete(context.Background(), []react.Message{{Role: react.RoleUser, Content: "hi"}}, nil)
+		if err != nil || result.Content != want {
+			t.Fatalf("Complete() = %#v, %v; want %q", result, err, want)
+		}
+	}
+	if sleeps != 1 {
+		t.Fatalf("expected one in-model retry after rate limit, got %d sleeps", sleeps)
+	}
+	if len(recorder.switches) != 0 {
+		t.Fatalf("single candidate must retry instead of switching: %#v", recorder.switches)
+	}
+	if len(recorder.finished) != 4 || recorder.finished[2].ErrorClass != "rate_limited" || recorder.finished[3].Status != "succeeded" {
+		t.Fatalf("unexpected attempt records: %#v", recorder.finished)
+	}
+}
+
 // TestRouterRetryThenSwitch 验证可重试 5xx 先同模型退避重试，耗尽后切换下一候选。
 func TestRouterRetryThenSwitch(t *testing.T) {
 	first := newChatServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
