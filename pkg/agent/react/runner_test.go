@@ -111,6 +111,38 @@ func TestRunnerFinalAnswer(t *testing.T) {
 	}
 }
 
+// TestRunnerTrimsContextPerStep 验证每轮模型调用前按预算裁剪上下文，同时保留完整消息用于持久化。
+func TestRunnerTrimsContextPerStep(t *testing.T) {
+	tool := &fakeTool{name: "search", output: json.RawMessage(`{"result":"x"}`)}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{{ID: "call-1", Name: "search", Arguments: json.RawMessage(`{"q":"a"}`)}}, Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+		{Content: "done", FinishReason: "stop", Usage: Usage{InputTokens: 1, OutputTokens: 1}},
+	}}
+	budgets := make([]int, 0, 2)
+	trim := func(messages []Message, budget int) []Message {
+		budgets = append(budgets, budget)
+		if len(messages) > 2 {
+			return append([]Message(nil), messages[:2]...)
+		}
+		return append([]Message(nil), messages...)
+	}
+	runner, _ := NewRunner(model, newTestRegistry(tool), Limits{}, WithContextBudget(10, trim))
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(budgets) != 2 || budgets[0] != 10 {
+		t.Fatalf("context budget was not applied per step: %#v", budgets)
+	}
+	// 第二次调用前应收到裁剪后的消息，而结果仍保留完整会话序列。
+	if len(model.received[1]) > 2 {
+		t.Fatalf("model received untrimmed context: %#v", model.received[1])
+	}
+	if len(result.Messages) < 4 {
+		t.Fatalf("full message history was not preserved: %#v", result.Messages)
+	}
+}
+
 // TestRunnerToolCallThenAnswer 验证工具结果回填模型并继续执行。
 func TestRunnerToolCallThenAnswer(t *testing.T) {
 	tool := &fakeTool{name: "search", output: json.RawMessage(`{"result":"x"}`)}

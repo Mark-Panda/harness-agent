@@ -209,6 +209,15 @@ func WithSupervisorTasks(tasks SupervisorTaskRepository) RunServiceOption {
 	}
 }
 
+// WithRunDeadline 设置单次 Run 的总时长上限；零值使用默认 5 分钟。
+func WithRunDeadline(deadline time.Duration) RunServiceOption {
+	return func(s *RunService) {
+		if deadline > 0 {
+			s.deadline = deadline
+		}
+	}
+}
+
 // RunService 实现 Run 创建、查询、取消与事件读取。
 type RunService struct {
 	repo            RunRepository
@@ -221,6 +230,7 @@ type RunService struct {
 	calls           ModelCallRepository
 	supervisorTasks SupervisorTaskRepository
 	clock           func() time.Time
+	deadline        time.Duration
 }
 
 // NewRunService 构造 Run 服务；可选能力通过 Option 注入，便于单测替换依赖。
@@ -228,7 +238,7 @@ func NewRunService(repo RunRepository, sessions SessionRepository, options ...Ru
 	if repo == nil || sessions == nil {
 		return nil, invalid("run repository and session repository are required")
 	}
-	service := &RunService{repo: repo, sessions: sessions, clock: func() time.Time { return time.Now().UTC() }}
+	service := &RunService{repo: repo, sessions: sessions, clock: func() time.Time { return time.Now().UTC() }, deadline: 5 * time.Minute}
 	for _, option := range options {
 		option(service)
 	}
@@ -290,7 +300,7 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	if err != nil {
 		return Run{}, err
 	}
-	deadline := s.clock().Add(5 * time.Minute)
+	deadline := s.clock().Add(s.deadline)
 	run := Run{
 		ID: uuid.New(), SessionID: input.SessionID, UserID: principal.UserID,
 		AgentID: input.AgentID, AgentVersion: input.AgentVersion, Mode: input.Mode,

@@ -287,7 +287,7 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 			supervisorReply(t, w, "结果", http.StatusOK)
 		}
 	})
-	worker.config.PlanMaxTokens = 1
+	worker.config.SupervisorMaxTokens = 1
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
 	if _, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
 		[]react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{}); !errors.Is(err, ErrSupervisorBudget) {

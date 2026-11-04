@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -155,6 +156,9 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	metrics.AddSSEConnection(1)
 	defer metrics.AddSSEConnection(-1)
 
+	// Kratos 的全局 HTTP Timeout（15s）会给请求 Context 加截止时间；
+	// SSE 需要跨越多分钟执行，因此这里脱离该 Deadline，改用每轮查询超时 + 写失败检测。
+	streamCtx := context.WithoutCancel(r.Context())
 	deadline := time.Now().Add(5 * time.Minute)
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
@@ -162,7 +166,10 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	defer poll.Stop()
 
 	for {
-		events, listErr := h.service.Runs.ListEvents(r.Context(), requestPrincipal(r), runID, after, 200)
+		// 每轮数据库查询使用独立短超时，避免全局请求超时或慢查询无限占用连接。
+		queryCtx, cancelQuery := context.WithTimeout(streamCtx, 10*time.Second)
+		events, listErr := h.service.Runs.ListEvents(queryCtx, requestPrincipal(r), runID, after, 200)
+		cancelQuery()
 		if listErr != nil {
 			// 流已开始，只能以 run.failed 风格结束，避免写入非法 JSON 错误体。
 			writeSSE(w, after+1, "run.failed", map[string]any{"reason": "event_read_failed"})
@@ -178,7 +185,9 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 		if len(events) > 0 {
 			flusher.Flush()
 		}
-		current, getErr := h.service.Runs.Get(r.Context(), requestPrincipal(r), runID)
+		statusCtx, cancelStatus := context.WithTimeout(streamCtx, 10*time.Second)
+		current, getErr := h.service.Runs.Get(statusCtx, requestPrincipal(r), runID)
+		cancelStatus()
 		if getErr != nil {
 			return
 		}
@@ -190,9 +199,8 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		select {
-		case <-r.Context().Done():
-			return
 		case <-heartbeat.C:
+			// 心跳写失败说明客户端已断开；这是脱离请求 Context 后主要的断连检测手段。
 			if !writeSSE(w, 0, "heartbeat", map[string]any{"status": "ok"}) {
 				return
 			}

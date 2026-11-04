@@ -244,7 +244,7 @@ func (w *ExecutionWorker) runSupervisorTasks(ctx context.Context, run Run, fence
 				sharedInput.Add(inputTokens)
 				sharedOutput.Add(outputTokens)
 				addCost(cost)
-				if (w.config.PlanMaxTokens > 0 && sharedInput.Load()+sharedOutput.Load() > w.config.PlanMaxTokens) ||
+				if (w.config.SupervisorMaxTokens > 0 && sharedInput.Load()+sharedOutput.Load() > w.config.SupervisorMaxTokens) ||
 					(w.config.PlanMaxCost > 0 && currentCost() > w.config.PlanMaxCost) {
 					budgetExceeded.Store(true)
 					cancelTasks()
@@ -291,22 +291,30 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 		{Role: react.RoleSystem, Content: supervisorWorkerInstruction + "\n" + UntrustedContentInstruction},
 		{Role: react.RoleUser, Content: task.Task},
 	}
-	base := reserveSupervisorAttempts(attempts, 6)
+	// 子 Worker 的尝试预算随步数配置放大，保证长调查不会在第 6 次模型调用时提前耗尽。
+	childAttempts := w.config.ReactMaxSteps + 10
+	if childAttempts < 6 {
+		childAttempts = 6
+	}
+	base := reserveSupervisorAttempts(attempts, int64(childAttempts))
 	observer := &runAttemptObserver{
 		worker: w, run: run, fence: fence, policyVersion: policyVersion,
 		callIDs: map[int]uuid.UUID{}, stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
 	}
 	config := w.config.Routing
 	config.InitialAttemptNo = 0
-	config.MaxAttemptsPerRun = 6
-	config.MaxSwitchesPerRun = 1
+	config.MaxAttemptsPerRun = childAttempts
+	config.MaxSwitchesPerRun = 2
 	router, err := model.NewRouter(candidates, w.health, config, offsetAttemptObserver{inner: observer, offset: base})
 	if err != nil {
 		return react.Result{}, 0, 0, 0, fmt.Errorf("%w: %v", ErrInvalidRunSnapshot, err)
 	}
 	limits := react.DefaultLimits()
 	limits.MaxSteps = w.config.ReactMaxSteps
-	runner, err := react.NewRunner(router, registry, limits)
+	limits.Deadline = w.config.RunDeadline
+	limits.MaxTotalTokens = w.config.ReactMaxTotalTokens
+	limits.MaxCost = w.config.ReactMaxCost
+	runner, err := react.NewRunner(router, registry, limits, react.WithContextBudget(w.config.PromptTokenBudget, trimRunnerContext))
 	if err != nil {
 		return react.Result{}, 0, 0, 0, err
 	}

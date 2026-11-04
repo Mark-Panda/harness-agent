@@ -445,6 +445,7 @@ func run() error {
 		biz.WithBudgets(budgetService),
 		biz.WithModelCalls(data.NewModelCallRepository(appDB)),
 		biz.WithSupervisorTasks(data.NewSupervisorTaskRepository(appDB)),
+		biz.WithRunDeadline(cfg.Agent.Worker.RunDeadline.Duration),
 	)
 	if err != nil {
 		return err
@@ -668,6 +669,10 @@ func run() error {
 			RetainPartialResponse:     cfg.Agent.ExecutionRecords.RetainPartialResponse,
 			RequireSandboxForHighRisk: cfg.Agent.Sandbox.RequireForHighRisk,
 			ReactMaxSteps:             cfg.Agent.Worker.ReactMaxSteps,
+			RunDeadline:               cfg.Agent.Worker.RunDeadline.Duration,
+			ReactMaxTotalTokens:       cfg.Agent.Worker.ReactMaxTotalTokens,
+			ReactMaxCost:              cfg.Agent.Worker.ReactMaxCost,
+			SupervisorMaxTokens:       cfg.Agent.Worker.SupervisorMaxTokens,
 			MCPTimeout:                cfg.Agent.Worker.MCPTimeout.Duration,
 			MCPAllowPrivateNetwork:    cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 			ApprovalPoll:              cfg.Agent.Worker.ApprovalPoll.Duration,

@@ -265,19 +265,47 @@ type Result struct {
 	Messages []Message
 }
 
+// RunnerOption 注入执行器的可选能力，便于上层在不引入包依赖的情况下提供上下文裁剪。
+type RunnerOption func(*Runner)
+
+// WithContextBudget 在每轮模型调用前按 Token 预算裁剪送入模型的消息；
+// trim 必须保留 system 提示与当前轮次，避免拆散工具调用与结果。原消息序列仍完整保留用于会话持久化。
+func WithContextBudget(budget int, trim func([]Message, int) []Message) RunnerOption {
+	return func(r *Runner) {
+		if budget > 0 && trim != nil {
+			r.contextBudget = budget
+			r.trimContext = trim
+		}
+	}
+}
+
 // Runner 是 ReAct 执行器，并发安全依赖无共享可变状态。
 type Runner struct {
-	model    Model
-	registry Registry
-	limits   Limits
+	model         Model
+	registry      Registry
+	limits        Limits
+	contextBudget int
+	trimContext   func([]Message, int) []Message
 }
 
 // NewRunner 构造执行器；模型与注册表必填。
-func NewRunner(model Model, registry Registry, limits Limits) (*Runner, error) {
+func NewRunner(model Model, registry Registry, limits Limits, options ...RunnerOption) (*Runner, error) {
 	if model == nil || registry == nil {
 		return nil, errors.New("react model and tool registry are required")
 	}
-	return &Runner{model: model, registry: registry, limits: limits.Normalize()}, nil
+	runner := &Runner{model: model, registry: registry, limits: limits.Normalize()}
+	for _, option := range options {
+		option(runner)
+	}
+	return runner, nil
+}
+
+// messagesForModel 返回裁剪后的模型上下文；未配置预算时复用原序列。
+func (r *Runner) messagesForModel(messages []Message) []Message {
+	if r.trimContext == nil || r.contextBudget <= 0 {
+		return messages
+	}
+	return r.trimContext(messages, r.contextBudget)
 }
 
 // Run 执行有界 ReAct 循环：每步调用模型，工具结果回填后继续，直到无工具调用或触发上限。
@@ -305,7 +333,12 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 		result.Steps = step
 		// 步骤级事件只描述 ReAct 步，模型身份与 Attempt 事实由路由观察者写入。
 		emit(sink, "step.started", map[string]any{"step": step})
-		completion, err := r.model.Complete(runContext, messages, r.registry.List())
+		// 长任务会把历史工具结果持续带入上下文；每轮调用前按预算裁剪，避免超出模型窗口。
+		modelMessages := r.messagesForModel(messages)
+		if len(modelMessages) < len(messages) {
+			emit(sink, "context.trimmed", map[string]any{"step": step, "dropped_messages": len(messages) - len(modelMessages)})
+		}
+		completion, err := r.model.Complete(runContext, modelMessages, r.registry.List())
 		if err != nil {
 			emit(sink, "step.failed", map[string]any{"step": step, "error": sanitizeError(err)})
 			return result, err
@@ -426,7 +459,8 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 	finalStep := r.limits.MaxSteps + 1
 	finalMessages := append(append([]Message(nil), messages...), Message{Role: RoleUser, Content: "已达到工具调用步数上限。请不要再调用任何工具，直接基于上面已获得的信息给出最终结论；若关键信息缺失，请明确说明缺少什么。"})
 	emit(sink, "step.started", map[string]any{"step": finalStep, "final": true})
-	completion, err := r.model.Complete(runContext, finalMessages, nil)
+	summaryMessages := r.messagesForModel(finalMessages)
+	completion, err := r.model.Complete(runContext, summaryMessages, nil)
 	if err != nil {
 		emit(sink, "step.failed", map[string]any{"step": finalStep, "final": true, "error": sanitizeError(err)})
 		emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})

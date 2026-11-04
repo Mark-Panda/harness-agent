@@ -315,6 +315,14 @@ type WorkerConfig struct {
 	Temperature float64 `yaml:"temperature"`
 	// ReactMaxSteps 单次 ReAct Run 允许的最大模型步数；零值使用执行层默认 12，建议不超过总尝试预算。
 	ReactMaxSteps int `yaml:"react_max_steps"`
+	// RunDeadline 单次 Run 的总时长上限；零值使用默认 5 分钟。
+	RunDeadline Duration `yaml:"run_deadline"`
+	// ReactMaxTotalTokens 单次 ReAct Run 输入加输出的 Token 上限；零值使用默认 2,000,000。
+	ReactMaxTotalTokens int `yaml:"react_max_total_tokens"`
+	// ReactMaxCost 单次 ReAct Run 的估算费用上限；零值使用默认 5。
+	ReactMaxCost float64 `yaml:"react_max_cost"`
+	// SupervisorMaxTokens Supervisor 全部子任务共享的输入加输出 Token 上限；零值使用默认 20,000,000。
+	SupervisorMaxTokens int64 `yaml:"supervisor_max_tokens"`
 	// MCPTimeout 单次 MCP 工具发现或调用的超时。
 	MCPTimeout Duration `yaml:"mcp_timeout"`
 	// AllowPrivateMCPEndpoints 允许连接管理员登记的内网 MCP 端点；回环与元数据地址始终拒绝。
@@ -620,6 +628,12 @@ func (c Config) Validate() error {
 		}
 		if worker.ReactMaxSteps < 0 || worker.ReactMaxSteps > 100 {
 			return fmt.Errorf("agent.worker.react_max_steps must be within [0, 100]")
+		}
+		if worker.RunDeadline.Duration < 0 || (worker.RunDeadline.Duration > 0 && worker.RunDeadline.Duration < time.Minute) {
+			return fmt.Errorf("agent.worker.run_deadline must be positive and at least 1m")
+		}
+		if worker.ReactMaxTotalTokens < 0 || worker.ReactMaxCost < 0 || worker.SupervisorMaxTokens < 0 {
+			return fmt.Errorf("agent.worker token and cost budgets must not be negative")
 		}
 		// 步数耗尽后的收尾总结也要消耗一次模型尝试，必须预留预算。
 		if worker.ReactMaxSteps > 0 && worker.ReactMaxSteps+1 > routing.MaxAttemptsPerRun {
