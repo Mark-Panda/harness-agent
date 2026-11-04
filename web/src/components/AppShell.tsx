@@ -19,6 +19,7 @@ const adminItems = [
   { to: "/admin/policies", label: "选模规则", detail: "主选与替补顺序" },
   { to: "/admin/skills", label: "技能", detail: "可复用的做事说明" },
   { to: "/admin/mcps", label: "外部工具", detail: "助手能调用的能力" },
+  { to: "/admin/feishu-bots", label: "飞书机器人", detail: "机器人登记与绑定" },
   { to: "/admin/users", label: "用户", detail: "账号、禁用与重置密码" },
 ];
 

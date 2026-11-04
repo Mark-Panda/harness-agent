@@ -79,11 +79,11 @@ func TestAgentServiceVersionsAndImmutablePublication(t *testing.T) {
 
 	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, created.ID).Return(created, nil).Times(2)
 	repo.EXPECT().DeleteAgent(gomock.Any(), principal.UserID, created.ID, gomock.Any()).Return(nil)
-	repo.EXPECT().ListAgents(gomock.Any(), principal.UserID, 20, "cursor").Return(biz.Page[biz.Agent]{Items: []biz.Agent{created}}, nil)
+	repo.EXPECT().ListAgents(gomock.Any(), principal.UserID, false, 20, "cursor").Return(biz.Page[biz.Agent]{Items: []biz.Agent{created}}, nil)
 	if _, err := service.Get(context.Background(), principal, created.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.List(context.Background(), principal, 20, "cursor"); err != nil {
+	if _, err := service.List(context.Background(), principal, false, 20, "cursor"); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.Delete(context.Background(), principal, created.ID); err != nil {
@@ -103,6 +103,57 @@ func TestAgentServiceVersionsAndImmutablePublication(t *testing.T) {
 	repo.EXPECT().CountAgents(gomock.Any(), principal.UserID).Return(int64(1), nil)
 	if _, err := limited.Create(context.Background(), principal, input); !errors.Is(err, biz.ErrQuotaExceeded) {
 		t.Fatalf("agent quota error = %v", err)
+	}
+}
+
+// TestAgentServiceUnpublishAndArchive 验证已发布版本可取消发布或归档，并拒绝非法状态转换。
+func TestAgentServiceUnpublishAndArchive(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID := uuid.New()
+	published := biz.Agent{ID: agentID, UserID: principal.UserID, Name: "assistant", Version: 1, Status: biz.AgentPublished, ConfigSnapshot: map[string]any{"model_policy": map[string]any{}}}
+	draft := published
+	draft.Status = biz.AgentDraft
+	draft.ConfigSnapshot = nil
+	archived := published
+	archived.Status = biz.AgentArchived
+
+	// 取消发布：已发布 -> 草稿，并清空已失效的发布快照。
+	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, agentID).Return(published, nil)
+	repo.EXPECT().UpdateAgentStatus(gomock.Any(), principal.UserID, agentID, biz.AgentPublished, biz.AgentDraft, true, gomock.Any()).Return(nil)
+	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, agentID).Return(draft, nil)
+	unpublished, err := service.Unpublish(context.Background(), principal, agentID)
+	if err != nil || unpublished.Status != biz.AgentDraft || unpublished.ConfigSnapshot != nil {
+		t.Fatalf("Unpublish() = %#v, %v", unpublished, err)
+	}
+
+	// 归档：已发布 -> 已归档，保留历史快照。
+	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, agentID).Return(published, nil)
+	repo.EXPECT().UpdateAgentStatus(gomock.Any(), principal.UserID, agentID, biz.AgentPublished, biz.AgentArchived, false, gomock.Any()).Return(nil)
+	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, agentID).Return(archived, nil)
+	result, err := service.Archive(context.Background(), principal, agentID)
+	if err != nil || result.Status != biz.AgentArchived {
+		t.Fatalf("Archive() = %#v, %v", result, err)
+	}
+
+	// 草稿既不能取消发布，也不能归档。
+	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, agentID).Return(draft, nil).Times(2)
+	if _, err := service.Unpublish(context.Background(), principal, agentID); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("draft unpublish error = %v", err)
+	}
+	if _, err := service.Archive(context.Background(), principal, agentID); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("draft archive error = %v", err)
+	}
+	if _, err := service.Unpublish(context.Background(), biz.Principal{}, agentID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("anonymous unpublish error = %v", err)
+	}
+	if _, err := service.Archive(context.Background(), biz.Principal{}, agentID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("anonymous archive error = %v", err)
 	}
 }
 

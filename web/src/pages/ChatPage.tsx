@@ -92,7 +92,8 @@ export default function ChatPage() {
   const { sessionId = "" } = useParams();
   const session = useRemote(() => requestJSON<Session>(`/api/v1/sessions/${sessionId}`), [sessionId]);
   const messages = useRemote(() => requestJSON<Page<Message>>(`/api/v1/sessions/${sessionId}/messages?limit=100`), [sessionId]);
-  const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100"), []);
+  // 保留已归档助手，仅用于展示会话绑定的助手名称；发送能力仍要求已发布状态。
+  const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100&include_archived=true"), []);
   const messagesReload = messages.reload;
 
   const [runsVersion, setRunsVersion] = useState(0);

@@ -2,6 +2,7 @@ package biz
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -218,6 +219,8 @@ type FeishuOutbound struct {
 	SessionID uuid.UUID
 	// RunID 关联 Run。
 	RunID uuid.UUID
+	// AppID 接收消息的飞书应用，回复 Worker 据此选择机器人客户端。
+	AppID string
 	// ChatID 目标飞书会话。
 	ChatID string
 	// ThreadID 目标话题。
@@ -295,6 +298,9 @@ type FeishuIngestService struct {
 	enqueuer     FeishuEventEnqueuer
 	maxBodyBytes int64
 	now          func() time.Time
+	// botCredentials 与 opener 用于按机器人 ID 动态构造验签器；为空时只支持默认应用回调。
+	botCredentials FeishuBotCredentialReader
+	opener         CredentialOpener
 }
 
 // FeishuIngestResult 是回调处理结果。
@@ -324,27 +330,80 @@ func (s *FeishuIngestService) MaxBodyBytes() int64 {
 	return s.maxBodyBytes
 }
 
+// WithBotVerification 启用按机器人 ID 读取独立应用凭据的验签能力。
+func (s *FeishuIngestService) WithBotVerification(credentials FeishuBotCredentialReader, opener CredentialOpener) *FeishuIngestService {
+	s.botCredentials = credentials
+	s.opener = opener
+	return s
+}
+
 // Handle 校验并持久化事件，成功后仅入队异步任务，不在请求内调用模型。
 func (s *FeishuIngestService) Handle(ctx context.Context, request feishu.Request) (FeishuIngestResult, error) {
+	return s.handleWithVerifier(ctx, s.verifier, request)
+}
+
+// HandleForBot 使用管理员登记的机器人应用凭据验签并处理回调。
+func (s *FeishuIngestService) HandleForBot(ctx context.Context, botID uuid.UUID, request feishu.Request) (FeishuIngestResult, error) {
+	if botID == uuid.Nil {
+		return FeishuIngestResult{}, invalid("feishu bot id is required")
+	}
+	if s.botCredentials == nil || s.opener == nil {
+		return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot verification is not configured", ErrInvalidConfig)
+	}
+	bot, credential, err := s.botCredentials.GetFeishuBotCredential(ctx, botID)
+	if err != nil {
+		return FeishuIngestResult{}, err
+	}
+	if bot.Status != FeishuBotEnabled {
+		return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot is disabled", ErrResourceNotFound)
+	}
+	plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+	if err != nil {
+		return FeishuIngestResult{}, err
+	}
+	var secret FeishuBotSecret
+	if err := json.Unmarshal(plaintext, &secret); err != nil {
+		return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot credentials are invalid", ErrInvalidConfig)
+	}
+	if strings.TrimSpace(secret.AppSecret) == "" {
+		return FeishuIngestResult{}, invalid("feishu bot app secret is missing")
+	}
+	verifierConfig := feishu.VerifierConfig{VerificationToken: secret.VerificationToken}
+	if key := strings.TrimSpace(secret.EncryptKey); key != "" {
+		verifierConfig.EncryptKeys = []feishu.EncryptionKey{{ID: botID.String(), Secret: key}}
+	}
+	verifier, err := feishu.NewVerifier(verifierConfig)
+	if err != nil {
+		return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot verifier is invalid", ErrInvalidConfig)
+	}
+	return s.handleWithVerifier(ctx, verifier, request)
+}
+
+// handle 执行验签、解密、幂等入库与任务入队。
+func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
 	// 入站 Span 只记录事件类型与处理结果，原始事件体、签名头与用户正文禁止进入 Trace。
 	ctx, span := telemetry.Start(ctx, "feishu.ingest")
 	defer span.End()
-	result, err := s.handle(ctx, request)
+	if verifier == nil {
+		telemetry.Fail(span, "verifier_missing")
+		return FeishuIngestResult{}, fmt.Errorf("%w: feishu verifier is not configured", ErrInvalidConfig)
+	}
+	result, err := s.handle(ctx, verifier, request)
 	if err != nil {
 		telemetry.Fail(span, "ingest_failed")
 	}
 	return result, err
 }
 
-// handle 执行验签、解密、幂等入库与任务入队。
-func (s *FeishuIngestService) handle(ctx context.Context, request feishu.Request) (FeishuIngestResult, error) {
+// handle 使用指定验签器处理请求。
+func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
 	if len(request.Body) == 0 {
 		return FeishuIngestResult{}, invalid("feishu event body is empty")
 	}
 	if int64(len(request.Body)) > s.maxBodyBytes {
 		return FeishuIngestResult{}, invalid("feishu event body exceeds the limit")
 	}
-	plaintext, err := s.verifier.VerifyAndDecrypt(request)
+	plaintext, err := verifier.VerifyAndDecrypt(request)
 	if err != nil {
 		return FeishuIngestResult{}, err
 	}
@@ -355,7 +414,7 @@ func (s *FeishuIngestService) handle(ctx context.Context, request feishu.Request
 	telemetry.Annotate(trace.SpanFromContext(ctx), attribute.String(telemetry.AttrFeishuEventType, envelope.Header.EventType))
 	// URL 验证请求必须在验签后校验 Verification Token，再原样返回 challenge。
 	if envelope.IsURLVerification() {
-		if err := s.verifier.VerifyToken(envelope.Token); err != nil {
+		if err := verifier.VerifyToken(envelope.Token); err != nil {
 			return FeishuIngestResult{}, err
 		}
 		if strings.TrimSpace(envelope.Challenge) == "" {
@@ -363,7 +422,7 @@ func (s *FeishuIngestService) handle(ctx context.Context, request feishu.Request
 		}
 		return FeishuIngestResult{Challenge: envelope.Challenge, Accepted: true}, nil
 	}
-	if err := s.verifier.VerifyToken(envelope.Header.Token); err != nil {
+	if err := verifier.VerifyToken(envelope.Header.Token); err != nil {
 		return FeishuIngestResult{}, err
 	}
 	if envelope.Header.EventID == "" || envelope.Header.EventType == "" {

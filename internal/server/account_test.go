@@ -214,7 +214,7 @@ func TestAccountExportAndDeletionHTTP(t *testing.T) {
 		Return(biz.Session{ID: sessionID, UserID: principal.UserID, Title: "账号会话", Status: biz.SessionActive}, nil)
 	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, 100, "").
 		Return(biz.Page[biz.Message]{Items: []biz.Message{{Role: biz.MessageUser, Content: "你好"}}}, nil)
-	agentRepo.EXPECT().ListAgents(gomock.Any(), principal.UserID, 50, "").Return(biz.Page[biz.Agent]{
+	agentRepo.EXPECT().ListAgents(gomock.Any(), principal.UserID, true, 50, "").Return(biz.Page[biz.Agent]{
 		Items: []biz.Agent{{
 			ID: agentID, UserID: principal.UserID, Name: "账号助手", Mode: biz.AgentModeReact,
 			Version: 1, Status: biz.AgentPublished, CreatedAt: now, UpdatedAt: now,

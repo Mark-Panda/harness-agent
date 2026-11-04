@@ -837,6 +837,25 @@ func feishuJob(eventID string, attempts, maxAttempts int) biz.Job {
 	}
 }
 
+// feishuBotRouterStub 模拟机器人注册与绑定解析。
+type feishuBotRouterStub struct {
+	bot          biz.FeishuBot
+	botFound     bool
+	binding      biz.FeishuBotBinding
+	bindingFound bool
+	err          error
+	lookups      int
+}
+
+func (s *feishuBotRouterStub) LookupFeishuBot(context.Context, string) (biz.FeishuBot, bool, error) {
+	s.lookups++
+	return s.bot, s.botFound, s.err
+}
+
+func (s *feishuBotRouterStub) FindFeishuBotBinding(context.Context, uuid.UUID) (biz.FeishuBotBinding, bool, error) {
+	return s.binding, s.bindingFound, s.err
+}
+
 // feishuWorkerFixture 聚合事件 Worker 测试桩，便于注入各异常分支。
 type feishuWorkerFixture struct {
 	worker        *biz.FeishuEventWorker
@@ -848,6 +867,7 @@ type feishuWorkerFixture struct {
 	messages      *feishuMessagesStub
 	runs          *feishuRunCreatorStub
 	outbound      *feishuOutboundStub
+	bots          *feishuBotRouterStub
 	facts         *feishuFactTriggerStub
 	userID        uuid.UUID
 }
@@ -868,6 +888,7 @@ func newFeishuWorkerFixture(t *testing.T, record biz.FeishuEventRecord, job biz.
 		messages:      &feishuMessagesStub{created: true},
 		runs:          &feishuRunCreatorStub{run: biz.Run{ID: uuid.New(), Status: biz.RunQueued}},
 		outbound:      &feishuOutboundStub{},
+		bots:          &feishuBotRouterStub{},
 		facts:         &feishuFactTriggerStub{},
 	}
 	fixture.sessions.conversation = fixture.conversations
@@ -890,13 +911,79 @@ func (f *feishuWorkerFixture) buildWithConfig(t *testing.T, config biz.FeishuEve
 	worker, err := biz.NewFeishuEventWorker(biz.FeishuEventWorkerDependencies{
 		Jobs: f.jobs, Events: f.events, Identities: f.identities, Conversations: f.conversations,
 		Sessions: f.sessions, Messages: f.messages, Runs: f.runs, Outbound: f.outbound,
-		SpeakerFacts: f.facts,
+		Bots: f.bots, SpeakerFacts: f.facts,
 		Clock:        func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, config)
 	if err != nil {
 		t.Fatalf("new worker: %v", err)
 	}
 	f.worker = worker
+}
+
+// feishuBotCredentialStub 模拟按机器人 ID 读取加密凭据。
+type feishuBotCredentialStub struct {
+	bot        biz.FeishuBot
+	credential biz.ProviderCredential
+	err        error
+}
+
+func (s *feishuBotCredentialStub) GetFeishuBotCredential(context.Context, uuid.UUID) (biz.FeishuBot, biz.ProviderCredential, error) {
+	return s.bot, s.credential, s.err
+}
+
+// feishuTestOpener 去掉测试前缀后返回凭据 JSON。
+type feishuTestOpener struct{}
+
+func (feishuTestOpener) Open(_ string, ciphertext []byte) ([]byte, error) {
+	if !strings.HasPrefix(string(ciphertext), "sealed:") {
+		return nil, errors.New("invalid test ciphertext")
+	}
+	return []byte(strings.TrimPrefix(string(ciphertext), "sealed:")), nil
+}
+
+// TestFeishuIngestBotVerification 验证按机器人 ID 使用独立 Verification Token 验签。
+func TestFeishuIngestBotVerification(t *testing.T) {
+	verifier, err := feishu.NewVerifier(feishu.VerifierConfig{VerificationToken: "default-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &feishuBotCredentialStub{
+		bot: biz.FeishuBot{ID: uuid.New(), Name: "bot", AppID: "cli_bot", Status: biz.FeishuBotEnabled},
+		credential: biz.ProviderCredential{
+			Encrypted: []byte(`sealed:{"app_secret":"secret","verification_token":"bot-token"}`), KeyVersion: "v1",
+		},
+	}
+	service, err := biz.NewFeishuIngestService(verifier, &feishuEventStoreStub{}, &feishuEnqueuerStub{}, biz.FeishuIngestConfig{MaxBodyBytes: 2048})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithBotVerification(reader, feishuTestOpener{})
+
+	result, err := service.HandleForBot(context.Background(), reader.bot.ID, feishu.Request{
+		Body: []byte(`{"type":"url_verification","token":"bot-token","challenge":"challenge-1"}`),
+	})
+	if err != nil || result.Challenge != "challenge-1" {
+		t.Fatalf("bot verification = %#v, %v", result, err)
+	}
+	// 错误 Token 必须拒绝。
+	if _, err := service.HandleForBot(context.Background(), reader.bot.ID, feishu.Request{
+		Body: []byte(`{"type":"url_verification","token":"wrong","challenge":"x"}`),
+	}); !errors.Is(err, feishu.ErrSignatureInvalid) {
+		t.Fatalf("bad token error = %v", err)
+	}
+	// 停用机器人返回未找到，不暴露具体状态。
+	reader.bot.Status = biz.FeishuBotDisabled
+	if _, err := service.HandleForBot(context.Background(), reader.bot.ID, feishu.Request{
+		Body: []byte(`{"type":"url_verification","token":"bot-token","challenge":"x"}`),
+	}); !errors.Is(err, biz.ErrResourceNotFound) {
+		t.Fatalf("disabled bot error = %v", err)
+	}
+	reader.err = biz.ErrResourceNotFound
+	if _, err := service.HandleForBot(context.Background(), reader.bot.ID, feishu.Request{
+		Body: []byte(`{"type":"url_verification","token":"bot-token","challenge":"x"}`),
+	}); !errors.Is(err, biz.ErrResourceNotFound) {
+		t.Fatalf("unknown bot error = %v", err)
+	}
 }
 
 // TestFeishuIngestLimitsAndInvalidBody 覆盖请求体上限读取、空体、非法信封与入库失败。
@@ -1130,14 +1217,88 @@ func TestFeishuEventWorkerBindingAndPersistenceFailures(t *testing.T) {
 			}
 		})
 	}
-	// 缺少默认 Agent 时拒绝创建 Run，避免以空配置执行。
+	// 缺少默认 Agent 时忽略事件，避免在只使用注册机器人的部署中无限重试。
 	noAgent := newFeishuWorkerFixture(t, record, feishuJob("evt-om_1", 1, 3), biz.FeishuEventWorkerConfig{})
 	noAgent.buildWithConfig(t, biz.FeishuEventWorkerConfig{WorkerID: "worker-1"})
 	if _, err := noAgent.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("no agent process: %v", err)
 	}
-	if noAgent.jobs.failed != 1 || noAgent.runs.calls != 0 {
-		t.Fatalf("no agent failed=%d runs=%d", noAgent.jobs.failed, noAgent.runs.calls)
+	if noAgent.jobs.failed != 0 || noAgent.runs.calls != 0 || noAgent.events.statuses["evt-om_1"] != biz.FeishuEventIgnored {
+		t.Fatalf("no agent failed=%d runs=%d status=%q", noAgent.jobs.failed, noAgent.runs.calls, noAgent.events.statuses["evt-om_1"])
+	}
+}
+
+// TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent 验证机器人绑定路由、所有者限制与停用/未绑定忽略。
+func TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent(t *testing.T) {
+	body := buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1", messageID: "om_bound"})
+	record := biz.FeishuEventRecord{
+		EventID: "evt-bound", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant", AppID: "app_bot",
+		Payload: map[string]any{"body": body}, Status: biz.FeishuEventReceived,
+	}
+	botID, boundAgentID := uuid.New(), uuid.New()
+	boundVersion := 7
+	newFixture := func() *feishuWorkerFixture {
+		fixture := newFeishuWorkerFixture(t, record, feishuJob("evt-bound", 1, 3), biz.FeishuEventWorkerConfig{})
+		fixture.bots.bot = biz.FeishuBot{ID: botID, Name: "绑定机器人", AppID: "app_bot", Status: biz.FeishuBotEnabled}
+		fixture.bots.botFound = true
+		fixture.bots.binding = biz.FeishuBotBinding{
+			BotID: botID, BotName: "绑定机器人", UserID: fixture.userID, AgentID: boundAgentID,
+			AgentVersion: boundVersion, AgentStatus: biz.AgentPublished, AgentMode: biz.AgentModePlan,
+		}
+		fixture.bots.bindingFound = true
+		return fixture
+	}
+
+	bound := newFixture()
+	if _, err := bound.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("bound bot process: %v", err)
+	}
+	if bound.runs.calls != 1 || bound.runs.input.AgentID == nil || *bound.runs.input.AgentID != boundAgentID ||
+		bound.runs.input.AgentVersion == nil || *bound.runs.input.AgentVersion != boundVersion || bound.runs.input.Mode != biz.AgentModePlan {
+		t.Fatalf("bound route input = %#v", bound.runs.input)
+	}
+	if bound.outbound.created == nil || bound.outbound.created.AppID != "app_bot" {
+		t.Fatalf("outbound app = %#v", bound.outbound.created)
+	}
+
+	// 非助手所有者发消息时忽略，不能消费他人助手额度。
+	otherUser := newFixture()
+	otherUser.bots.binding.UserID = uuid.New()
+	if _, err := otherUser.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("other user process: %v", err)
+	}
+	if otherUser.runs.calls != 0 || otherUser.events.statuses["evt-bound"] != biz.FeishuEventIgnored {
+		t.Fatalf("other user runs=%d status=%q", otherUser.runs.calls, otherUser.events.statuses["evt-bound"])
+	}
+
+	// 机器人未绑定助手时忽略。
+	unbound := newFixture()
+	unbound.bots.bindingFound = false
+	if _, err := unbound.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("unbound bot process: %v", err)
+	}
+	if unbound.runs.calls != 0 || unbound.events.statuses["evt-bound"] != biz.FeishuEventIgnored {
+		t.Fatalf("unbound runs=%d status=%q", unbound.runs.calls, unbound.events.statuses["evt-bound"])
+	}
+
+	// 机器人停用时不处理事件。
+	disabled := newFixture()
+	disabled.bots.bot.Status = biz.FeishuBotDisabled
+	if _, err := disabled.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("disabled bot process: %v", err)
+	}
+	if disabled.runs.calls != 0 || disabled.events.statuses["evt-bound"] != biz.FeishuEventIgnored {
+		t.Fatalf("disabled runs=%d status=%q", disabled.runs.calls, disabled.events.statuses["evt-bound"])
+	}
+
+	// 绑定助手已取消发布时忽略，避免使用不可变快照之外的配置。
+	published := newFixture()
+	published.bots.binding.AgentStatus = biz.AgentDraft
+	if _, err := published.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("draft binding process: %v", err)
+	}
+	if published.runs.calls != 0 {
+		t.Fatalf("draft binding runs=%d", published.runs.calls)
 	}
 }
 

@@ -28,6 +28,8 @@ const (
 	AgentPublished AgentStatus = "published"
 	// AgentDisabled 已停用版本。
 	AgentDisabled AgentStatus = "disabled"
+	// AgentArchived 已归档版本，默认不出现在列表中，但保留历史 Run 引用。
+	AgentArchived AgentStatus = "archived"
 )
 
 // Agent 是用户私有 Agent 聚合，草稿与发布版本分离，Run 只引用不可变版本。
@@ -102,10 +104,12 @@ type AgentRepository interface {
 	UpdateAgent(ctx context.Context, agent Agent, event OutboxEvent) (Agent, error)
 	// DeleteAgent 删除草稿 Agent。
 	DeleteAgent(ctx context.Context, userID, agentID uuid.UUID, event OutboxEvent) error
+	// UpdateAgentStatus 按前置状态条件更新版本生命周期，防止并发下出现非法转换。
+	UpdateAgentStatus(ctx context.Context, userID, agentID uuid.UUID, from, to AgentStatus, clearSnapshot bool, event OutboxEvent) error
 	// GetAgent 按用户与 ID 读取 Agent。
 	GetAgent(ctx context.Context, userID, agentID uuid.UUID) (Agent, error)
-	// ListAgents 按用户游标分页列出 Agent。
-	ListAgents(ctx context.Context, userID uuid.UUID, limit int, cursor string) (Page[Agent], error)
+	// ListAgents 按用户游标分页列出 Agent；includeArchived 为 false 时排除已归档版本。
+	ListAgents(ctx context.Context, userID uuid.UUID, includeArchived bool, limit int, cursor string) (Page[Agent], error)
 	// NextAgentVersion 返回同名 Agent 的下一个版本号。
 	NextAgentVersion(ctx context.Context, userID uuid.UUID, name string) (int, error)
 	// GetPolicy 读取引用的模型策略。
@@ -223,6 +227,45 @@ func (s *AgentService) Publish(ctx context.Context, principal Principal, agentID
 	return s.repo.UpdateAgent(ctx, agent, mutationEvent(principal.UserID, "agent.published", "agent", agent.ID))
 }
 
+// Unpublish 取消发布：已发布版本回到草稿，允许继续编辑；历史 Run 与快照不受影响。
+func (s *AgentService) Unpublish(ctx context.Context, principal Principal, agentID uuid.UUID) (Agent, error) {
+	if principal.UserID == uuid.Nil {
+		return Agent{}, ErrForbidden
+	}
+	agent, err := s.repo.GetAgent(ctx, principal.UserID, agentID)
+	if err != nil {
+		return Agent{}, err
+	}
+	if agent.Status != AgentPublished {
+		return Agent{}, fmt.Errorf("%w: only published agents can be unpublished", ErrResourceConflict)
+	}
+	// 回到草稿后快照已失效，清空可避免展示过期的发布配置。
+	if err := s.repo.UpdateAgentStatus(ctx, principal.UserID, agentID, AgentPublished, AgentDraft, true,
+		mutationEvent(principal.UserID, "agent.unpublished", "agent", agent.ID)); err != nil {
+		return Agent{}, err
+	}
+	return s.repo.GetAgent(ctx, principal.UserID, agentID)
+}
+
+// Archive 归档已发布或已停用版本：从默认列表隐藏，历史对话与 Run 仍可追溯。
+func (s *AgentService) Archive(ctx context.Context, principal Principal, agentID uuid.UUID) (Agent, error) {
+	if principal.UserID == uuid.Nil {
+		return Agent{}, ErrForbidden
+	}
+	agent, err := s.repo.GetAgent(ctx, principal.UserID, agentID)
+	if err != nil {
+		return Agent{}, err
+	}
+	if agent.Status != AgentPublished && agent.Status != AgentDisabled {
+		return Agent{}, fmt.Errorf("%w: only published or disabled agents can be archived", ErrResourceConflict)
+	}
+	if err := s.repo.UpdateAgentStatus(ctx, principal.UserID, agentID, agent.Status, AgentArchived, false,
+		mutationEvent(principal.UserID, "agent.archived", "agent", agent.ID)); err != nil {
+		return Agent{}, err
+	}
+	return s.repo.GetAgent(ctx, principal.UserID, agentID)
+}
+
 // Delete 仅允许删除草稿，已发布版本用于历史 Run 复现。
 func (s *AgentService) Delete(ctx context.Context, principal Principal, agentID uuid.UUID) error {
 	if principal.UserID == uuid.Nil {
@@ -246,12 +289,12 @@ func (s *AgentService) Get(ctx context.Context, principal Principal, agentID uui
 	return s.repo.GetAgent(ctx, principal.UserID, agentID)
 }
 
-// List 按游标分页列出当前用户的 Agent。
-func (s *AgentService) List(ctx context.Context, principal Principal, limit int, cursor string) (Page[Agent], error) {
+// List 按游标分页列出当前用户的 Agent；默认隐藏已归档版本。
+func (s *AgentService) List(ctx context.Context, principal Principal, includeArchived bool, limit int, cursor string) (Page[Agent], error) {
 	if principal.UserID == uuid.Nil {
 		return Page[Agent]{}, ErrForbidden
 	}
-	return s.repo.ListAgents(ctx, principal.UserID, limit, cursor)
+	return s.repo.ListAgents(ctx, principal.UserID, includeArchived, limit, cursor)
 }
 
 // checkQuota 校验用户 Agent 版本总数是否达到上限。

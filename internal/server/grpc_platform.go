@@ -446,7 +446,7 @@ func (s *platformGRPCServer) ListAgents(ctx context.Context, request *harnessv1.
 	if limit < 1 || limit > 100 {
 		return nil, status.Error(codes.InvalidArgument, "invalid_page_limit")
 	}
-	page, err := s.platform.Agents.List(ctx, principal, limit, request.GetCursor())
+	page, err := s.platform.Agents.List(ctx, principal, false, limit, request.GetCursor())
 	if err != nil {
 		return nil, grpcError(err)
 	}

@@ -187,6 +187,29 @@ func (r *AgentRepository) DeleteAgent(ctx context.Context, userID, agentID uuid.
 	return catalogError("delete agent", err)
 }
 
+// UpdateAgentStatus 按前置状态条件更新生命周期；条件不匹配说明状态已被并发修改。
+func (r *AgentRepository) UpdateAgentStatus(ctx context.Context, userID, agentID uuid.UUID, from, to biz.AgentStatus, clearSnapshot bool, event biz.OutboxEvent) error {
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		updates := map[string]any{"status": string(to), "updated_at": time.Now().UTC()}
+		if clearSnapshot {
+			updates["config_snapshot"] = datatypes.JSON([]byte("{}"))
+		}
+		result := tx.Model(&agentModel{}).Where("id = ? AND user_id = ? AND status = ?", agentID, userID, string(from)).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("%w: agent is missing or status transition is not allowed", biz.ErrResourceConflict)
+		}
+		// 取消发布或归档后机器人不再指向该助手，同一事务解除绑定避免机器人被长期占用。
+		if err := tx.Delete(&agentFeishuBotModel{}, "agent_id = ? AND user_id = ?", agentID, userID).Error; err != nil {
+			return err
+		}
+		return appendOutbox(tx, event)
+	})
+	return catalogError("update agent status", err)
+}
+
 // GetAgent 读取 Agent 主记录及绑定；跨用户访问由 RLS 与本查询条件双重拦截。
 func (r *AgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUID) (biz.Agent, error) {
 	var record agentModel
@@ -207,8 +230,8 @@ func (r *AgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUI
 	return toBizAgent(record, skillIDs, mcpIDs)
 }
 
-// ListAgents 按创建时间与 ID 降序游标分页，多取一条用于判断是否还有下一页。
-func (r *AgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, limit int, cursor string) (biz.Page[biz.Agent], error) {
+// ListAgents 按创建时间与 ID 降序游标分页，多取一条用于判断是否还有下一页；默认排除已归档版本。
+func (r *AgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, includeArchived bool, limit int, cursor string) (biz.Page[biz.Agent], error) {
 	decoded, err := DecodeCursor(cursor)
 	if err != nil {
 		return biz.Page[biz.Agent]{}, fmt.Errorf("%w: invalid agent cursor", biz.ErrInvalidConfig)
@@ -217,6 +240,9 @@ func (r *AgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, limi
 	var records []agentModel
 	err = WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		query := tx.Where("user_id = ?", userID)
+		if !includeArchived {
+			query = query.Where("status <> ?", string(biz.AgentArchived))
+		}
 		if decoded.ID != uuid.Nil {
 			query = query.Where("(created_at < ? OR (created_at = ? AND id < ?))", decoded.CreatedAt, decoded.CreatedAt, decoded.ID)
 		}

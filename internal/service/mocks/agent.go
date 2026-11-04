@@ -117,18 +117,18 @@ func (mr *MockAgentRepositoryMockRecorder) GetPolicy(ctx, policyID any) *gomock.
 }
 
 // ListAgents mocks base method.
-func (m *MockAgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, limit int, cursor string) (biz.Page[biz.Agent], error) {
+func (m *MockAgentRepository) ListAgents(ctx context.Context, userID uuid.UUID, includeArchived bool, limit int, cursor string) (biz.Page[biz.Agent], error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ListAgents", ctx, userID, limit, cursor)
+	ret := m.ctrl.Call(m, "ListAgents", ctx, userID, includeArchived, limit, cursor)
 	ret0, _ := ret[0].(biz.Page[biz.Agent])
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ListAgents indicates an expected call of ListAgents.
-func (mr *MockAgentRepositoryMockRecorder) ListAgents(ctx, userID, limit, cursor any) *gomock.Call {
+func (mr *MockAgentRepositoryMockRecorder) ListAgents(ctx, userID, includeArchived, limit, cursor any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAgents", reflect.TypeOf((*MockAgentRepository)(nil).ListAgents), ctx, userID, limit, cursor)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAgents", reflect.TypeOf((*MockAgentRepository)(nil).ListAgents), ctx, userID, includeArchived, limit, cursor)
 }
 
 // ListMCPsByIDs mocks base method.
@@ -204,4 +204,18 @@ func (m *MockAgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, 
 func (mr *MockAgentRepositoryMockRecorder) UpdateAgent(ctx, agent, event any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateAgent", reflect.TypeOf((*MockAgentRepository)(nil).UpdateAgent), ctx, agent, event)
+}
+
+// UpdateAgentStatus mocks base method.
+func (m *MockAgentRepository) UpdateAgentStatus(ctx context.Context, userID, agentID uuid.UUID, from, to biz.AgentStatus, clearSnapshot bool, event biz.OutboxEvent) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateAgentStatus", ctx, userID, agentID, from, to, clearSnapshot, event)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateAgentStatus indicates an expected call of UpdateAgentStatus.
+func (mr *MockAgentRepositoryMockRecorder) UpdateAgentStatus(ctx, userID, agentID, from, to, clearSnapshot, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateAgentStatus", reflect.TypeOf((*MockAgentRepository)(nil).UpdateAgentStatus), ctx, userID, agentID, from, to, clearSnapshot, event)
 }

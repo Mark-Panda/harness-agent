@@ -87,6 +87,8 @@ type FeishuEventWorkerDependencies struct {
 	Runs FeishuRunCreator
 	// Outbound 外发回复仓储。
 	Outbound FeishuOutboundStore
+	// Bots 机器人注册与绑定解析端口；为空时退化为配置中的默认机器人。
+	Bots FeishuBotRouter
 	// SpeakerFacts 群聊发言人事实提取触发器；为空表示不提取个人事实。
 	SpeakerFacts FactTrigger
 	// Logger 结构化日志。
@@ -105,6 +107,7 @@ type FeishuEventWorker struct {
 	messages      FeishuInboundMessageStore
 	runs          FeishuRunCreator
 	outbound      FeishuOutboundStore
+	bots          FeishuBotRouter
 	config        FeishuEventWorkerConfig
 	clock         func() time.Time
 	logger        *slog.Logger
@@ -133,6 +136,7 @@ func NewFeishuEventWorker(dependencies FeishuEventWorkerDependencies, config Fei
 		jobs: dependencies.Jobs, events: dependencies.Events, identities: dependencies.Identities,
 		conversations: dependencies.Conversations, sessions: dependencies.Sessions,
 		messages: dependencies.Messages, runs: dependencies.Runs, outbound: dependencies.Outbound,
+		bots:   dependencies.Bots,
 		config: config.normalize(), clock: clock, logger: logger, speakerFacts: dependencies.SpeakerFacts,
 	}, nil
 }
@@ -257,8 +261,26 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		attribute.String(telemetry.AttrFeishuEventType, envelope.Header.EventType),
 		attribute.String(telemetry.AttrFeishuChatID, messageEvent.ChatID),
 	)
+	// 已登记的机器人按应用 App ID 解析；未登记时保持原有默认应用行为。
+	botOpenID := w.config.BotOpenID
+	botName := w.config.BotName
+	var routedBot *FeishuBot
+	if w.bots != nil && record.AppID != "" {
+		bot, found, err := w.bots.LookupFeishuBot(ctx, record.AppID)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			if bot.Status != FeishuBotEnabled {
+				return FeishuEventIgnored, nil
+			}
+			routedBot = &bot
+			botOpenID = bot.BotOpenID
+			botName = bot.Name
+		}
+	}
 	// 群聊只处理明确 @ 机器人的消息；单聊始终响应。
-	if messageEvent.ChatType == feishu.ChatTypeGroup && !messageEvent.Triggered(w.config.BotOpenID, w.config.BotName) {
+	if messageEvent.ChatType == feishu.ChatTypeGroup && !messageEvent.Triggered(botOpenID, botName) {
 		return FeishuEventIgnored, nil
 	}
 	text := messageEvent.Text()
@@ -280,6 +302,29 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	// 回填事件归属用户；账号删除据此清理可能包含正文的原始事件载荷。
 	if err := w.events.BindUser(ctx, record.EventID, identity.UserID); err != nil {
 		return "", err
+	}
+	// 机器人绑定只服务助手所属用户本人；其他飞书用户的消息直接忽略。
+	var routeAgentID *uuid.UUID
+	var routeAgentVersion *int
+	routeMode := w.config.Mode
+	if routedBot != nil {
+		binding, found, err := w.bots.FindFeishuBotBinding(ctx, routedBot.ID)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return FeishuEventIgnored, nil
+		}
+		if binding.UserID != identity.UserID {
+			return FeishuEventIgnored, nil
+		}
+		// 助手取消发布或归档后绑定会被解除；此处兜底避免旧绑定继续执行。
+		if binding.AgentStatus != AgentPublished {
+			return FeishuEventIgnored, nil
+		}
+		agentID, agentVersion := binding.AgentID, binding.AgentVersion
+		routeAgentID, routeAgentVersion = &agentID, &agentVersion
+		routeMode = binding.AgentMode
 	}
 	binding, found, err := w.conversations.FindConversation(ctx, record.TenantKey, messageEvent.ChatID, threadID, rootMessageID)
 	if err != nil {
@@ -325,16 +370,23 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 			w.logger.Warn("enqueue speaker fact extraction failed", "session_id", session.ID, "speaker_open_id", messageEvent.SenderOpenID, "error", err)
 		}
 	}
-	if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
-		return "", invalid("feishu default agent is not configured")
+	if routedBot == nil {
+		if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
+			// 未登记机器人且未配置默认助手时直接忽略，避免事件无限重试进入死信。
+			return FeishuEventIgnored, nil
+		}
+		routeAgentID, routeAgentVersion = w.config.DefaultAgentID, w.config.DefaultAgentVersion
+	}
+	if routeAgentID == nil || routeAgentVersion == nil {
+		return FeishuEventIgnored, nil
 	}
 	principal, err := NewPrincipal(binding.UserID, RoleUser)
 	if err != nil {
 		return "", err
 	}
 	run, err := w.runs.Create(ctx, principal, CreateRunInput{
-		SessionID: session.ID, AgentID: w.config.DefaultAgentID, AgentVersion: w.config.DefaultAgentVersion,
-		Mode: w.config.Mode, IdempotencyKey: "feishu:" + messageEvent.MessageID,
+		SessionID: session.ID, AgentID: routeAgentID, AgentVersion: routeAgentVersion,
+		Mode: routeMode, IdempotencyKey: "feishu:" + messageEvent.MessageID,
 	})
 	if err != nil {
 		return "", err
@@ -342,7 +394,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	ctx = telemetry.WithRunID(ctx, run.ID.String())
 	// 先创建外发记录占位，Run 完成后由回复 Worker 增量更新卡片。
 	err = w.outbound.CreateOutbound(ctx, FeishuOutbound{
-		ID: uuid.New(), UserID: binding.UserID, SessionID: session.ID, RunID: run.ID,
+		ID: uuid.New(), UserID: binding.UserID, SessionID: session.ID, RunID: run.ID, AppID: record.AppID,
 		ChatID: messageEvent.ChatID, ThreadID: threadID, ReplyToMessageID: messageEvent.MessageID,
 		Kind: "card", Status: "pending", DedupeKey: "feishu.run:" + run.ID.String(),
 	})

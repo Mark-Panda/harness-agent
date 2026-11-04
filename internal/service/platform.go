@@ -38,6 +38,17 @@ type PlatformService struct {
 	FeishuIngest *biz.FeishuIngestService
 	// FeishuBindings 飞书话题解绑服务；为空表示飞书未启用，解绑路由不会注册。
 	FeishuBindings *biz.FeishuBindingService
+	// FeishuBots 飞书机器人注册管理服务，仅管理员可写。
+	FeishuBots *biz.FeishuBotService
+	// FeishuBotBindings 助手绑定飞书机器人的用户侧服务。
+	FeishuBotBindings *biz.FeishuBotBindingService
+}
+
+// WithFeishuBots 附加飞书机器人注册与助手绑定能力。
+func (s *PlatformService) WithFeishuBots(bots *biz.FeishuBotService, bindings *biz.FeishuBotBindingService) *PlatformService {
+	s.FeishuBots = bots
+	s.FeishuBotBindings = bindings
+	return s
 }
 
 // WithFeishuIngest 附加飞书事件接入能力。

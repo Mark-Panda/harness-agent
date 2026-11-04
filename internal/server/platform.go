@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -66,6 +67,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("DELETE /api/v1/agents/{id}", handler.deleteAgent)
 	handleWrite("POST /api/v1/agents/{id}/versions", "agent", handler.createAgentVersion)
 	handleWrite("POST /api/v1/agents/{id}/publish", "agent", handler.publishAgent)
+	handleWrite("POST /api/v1/agents/{id}/unpublish", "agent", handler.unpublishAgent)
+	handleWrite("POST /api/v1/agents/{id}/archive", "agent", handler.archiveAgent)
 	handleWrite("POST /api/v1/sessions", "session", handler.createSession)
 	handle("GET /api/v1/sessions", handler.listSessions)
 	handle("GET /api/v1/sessions/{id}", handler.getSession)
@@ -123,10 +126,24 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		handle("GET /api/v1/memory/export", handler.exportMemory)
 		handle("GET /api/v1/account/export", handler.exportAccount)
 	}
+	// 飞书机器人注册与助手绑定：注册仅管理员可写，绑定要求助手已发布。
+	if platform.FeishuBots != nil && platform.FeishuBotBindings != nil {
+		handle("GET /api/v1/admin/feishu-bots", handler.listFeishuBots)
+		handleWrite("POST /api/v1/admin/feishu-bots", "feishu_bot", handler.createFeishuBot)
+		handle("GET /api/v1/admin/feishu-bots/{id}", handler.getFeishuBot)
+		handleWrite("PUT /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.updateFeishuBot)
+		handleWrite("DELETE /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.deleteFeishuBot)
+		handleWrite("POST /api/v1/admin/feishu-bots/{id}/test", "feishu_bot", handler.testFeishuBot)
+		handle("GET /api/v1/feishu/bots", handler.listFeishuBotOptions)
+		handleWrite("POST /api/v1/agents/{id}/feishu-bot", "agent", handler.bindFeishuBot)
+		handleWrite("DELETE /api/v1/agents/{id}/feishu-bot", "agent", handler.unbindFeishuBot)
+	}
 	// 飞书事件回调由请求自身签名与 Verification Token 校验，禁止套用用户 JWT 鉴权。
 	if platform.FeishuIngest != nil {
 		feishuHandler := &feishuHTTPHandler{ingest: platform.FeishuIngest}
 		mux.HandleFunc("POST /api/v1/feishu/events", feishuHandler.events)
+		// 每个机器人使用独立回调地址，接入层按路径中的机器人 ID 选择应用凭据验签。
+		mux.HandleFunc("POST /api/v1/feishu/events/{botID}", feishuHandler.events)
 	}
 }
 
@@ -254,6 +271,30 @@ type mcpRequest struct {
 	Status biz.MCPStatus `json:"status"`
 }
 
+// feishuBotRequest 是飞书机器人创建/更新请求体，密钥字段只写不读。
+type feishuBotRequest struct {
+	// Name 机器人展示名称。
+	Name string `json:"name"`
+	// AppID 飞书应用 App ID。
+	AppID string `json:"app_id"`
+	// AppSecret 应用密钥，更新时留空表示保留原值。
+	AppSecret string `json:"app_secret"`
+	// VerificationToken 事件订阅 Verification Token。
+	VerificationToken string `json:"verification_token"`
+	// EncryptKey 事件加密密钥。
+	EncryptKey string `json:"encrypt_key"`
+	// BotOpenID 机器人 open_id。
+	BotOpenID string `json:"bot_open_id"`
+	// Status 启停状态。
+	Status biz.FeishuBotStatus `json:"status"`
+}
+
+// feishuBotBindRequest 是助手绑定机器人的请求体。
+type feishuBotBindRequest struct {
+	// BotID 目标机器人 ID。
+	BotID uuid.UUID `json:"bot_id"`
+}
+
 // createSkill 处理 POST /api/v1/skills：创建 Skill 草稿。
 func (h *platformHTTPHandler) createSkill(w http.ResponseWriter, r *http.Request) {
 	var request skillRequest
@@ -356,6 +397,102 @@ func (h *platformHTTPHandler) getMCP(w http.ResponseWriter, r *http.Request) {
 func (h *platformHTTPHandler) listMCPs(w http.ResponseWriter, r *http.Request) {
 	mcps, err := h.service.MCPs.List(r.Context(), requestPrincipal(r))
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(mcps, mcpResponse)}, err)
+}
+
+// createFeishuBot 处理 POST /api/v1/admin/feishu-bots：管理员登记飞书机器人。
+func (h *platformHTTPHandler) createFeishuBot(w http.ResponseWriter, r *http.Request) {
+	var request feishuBotRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	bot, err := h.service.FeishuBots.Create(r.Context(), requestPrincipal(r), feishuBotInput(request))
+	writePlatformResult(w, http.StatusCreated, feishuBotResponse(bot), err)
+}
+
+// updateFeishuBot 处理 PUT /api/v1/admin/feishu-bots/{id}：更新机器人配置。
+func (h *platformHTTPHandler) updateFeishuBot(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request feishuBotRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	bot, err := h.service.FeishuBots.Update(r.Context(), requestPrincipal(r), id, feishuBotInput(request))
+	writePlatformResult(w, http.StatusOK, feishuBotResponse(bot), err)
+}
+
+// deleteFeishuBot 处理 DELETE /api/v1/admin/feishu-bots/{id}：删除机器人并解除绑定。
+func (h *platformHTTPHandler) deleteFeishuBot(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	writePlatformResult(w, http.StatusNoContent, nil, h.service.FeishuBots.Delete(r.Context(), requestPrincipal(r), id))
+}
+
+// getFeishuBot 处理 GET /api/v1/admin/feishu-bots/{id}：读取机器人元数据。
+func (h *platformHTTPHandler) getFeishuBot(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	bot, err := h.service.FeishuBots.Get(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, feishuBotResponse(bot), err)
+}
+
+// testFeishuBot 处理 POST /api/v1/admin/feishu-bots/{id}/test：验证应用凭据与飞书连通性。
+func (h *platformHTTPHandler) testFeishuBot(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.service.FeishuBots.Test(r.Context(), requestPrincipal(r), id)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{"ok": result.OK, "message": result.Message}, nil)
+}
+
+// listFeishuBots 处理 GET /api/v1/admin/feishu-bots：列出机器人及绑定助手。
+func (h *platformHTTPHandler) listFeishuBots(w http.ResponseWriter, r *http.Request) {
+	bots, err := h.service.FeishuBots.List(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(bots, feishuBotResponse)}, err)
+}
+
+// listFeishuBotOptions 处理 GET /api/v1/feishu/bots：返回当前用户可绑定的机器人。
+func (h *platformHTTPHandler) listFeishuBotOptions(w http.ResponseWriter, r *http.Request) {
+	options, err := h.service.FeishuBotBindings.List(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(options, feishuBotOptionResponse)}, err)
+}
+
+// bindFeishuBot 处理 POST /api/v1/agents/{id}/feishu-bot：把已发布助手绑定到机器人。
+func (h *platformHTTPHandler) bindFeishuBot(w http.ResponseWriter, r *http.Request) {
+	agentID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request feishuBotBindRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	err := h.service.FeishuBotBindings.Bind(r.Context(), requestPrincipal(r), agentID, request.BotID)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	writePlatformResult(w, http.StatusOK, map[string]string{"status": "bound"}, nil)
+}
+
+// unbindFeishuBot 处理 DELETE /api/v1/agents/{id}/feishu-bot：解除助手机器人绑定。
+func (h *platformHTTPHandler) unbindFeishuBot(w http.ResponseWriter, r *http.Request) {
+	agentID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	writePlatformResult(w, http.StatusNoContent, nil, h.service.FeishuBotBindings.Unbind(r.Context(), requestPrincipal(r), agentID))
 }
 
 // createProvider 处理 POST /api/v1/providers：创建供应商并加密保存密钥，响应脱敏。
@@ -593,13 +730,15 @@ func (h *platformHTTPHandler) getAgent(w http.ResponseWriter, r *http.Request) {
 	writePlatformResult(w, http.StatusOK, agentResponse(agent), err)
 }
 
-// listAgents 处理 GET /api/v1/agents：游标分页列出当前用户 Agent。
+// listAgents 处理 GET /api/v1/agents：游标分页列出当前用户 Agent，默认隐藏已归档版本。
 func (h *platformHTTPHandler) listAgents(w http.ResponseWriter, r *http.Request) {
 	limit, cursor, ok := pageRequest(w, r)
 	if !ok {
 		return
 	}
-	page, err := h.service.Agents.List(r.Context(), requestPrincipal(r), limit, cursor)
+	rawInclude := r.URL.Query().Get("include_archived")
+	includeArchived := rawInclude == "1" || strings.EqualFold(rawInclude, "true")
+	page, err := h.service.Agents.List(r.Context(), requestPrincipal(r), includeArchived, limit, cursor)
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(page.Items, agentResponse), "next_cursor": page.NextCursor}, err)
 }
 
@@ -620,6 +759,26 @@ func (h *platformHTTPHandler) publishAgent(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	agent, err := h.service.Agents.Publish(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, agentResponse(agent), err)
+}
+
+// unpublishAgent 处理 POST /api/v1/agents/{id}/unpublish：已发布版本回退为可编辑草稿。
+func (h *platformHTTPHandler) unpublishAgent(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	agent, err := h.service.Agents.Unpublish(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, agentResponse(agent), err)
+}
+
+// archiveAgent 处理 POST /api/v1/agents/{id}/archive：归档旧版本并从默认列表隐藏。
+func (h *platformHTTPHandler) archiveAgent(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	agent, err := h.service.Agents.Archive(r.Context(), requestPrincipal(r), id)
 	writePlatformResult(w, http.StatusOK, agentResponse(agent), err)
 }
 
@@ -864,6 +1023,35 @@ func mcpResponse(mcp biz.MCP) map[string]any {
 		"id": mcp.ID, "name": mcp.Name, "endpoint": mcp.Endpoint, "auth_type": mcp.AuthType,
 		"key_version": mcp.KeyVersion, "risk_level": mcp.RiskLevel, "status": mcp.Status,
 		"created_at": mcp.CreatedAt, "updated_at": mcp.UpdatedAt,
+	}
+}
+
+// feishuBotInput 把请求体转换为领域入参。
+func feishuBotInput(request feishuBotRequest) biz.FeishuBotInput {
+	return biz.FeishuBotInput{
+		Name: request.Name, AppID: request.AppID, AppSecret: request.AppSecret,
+		VerificationToken: request.VerificationToken, EncryptKey: request.EncryptKey,
+		BotOpenID: request.BotOpenID, Status: request.Status,
+	}
+}
+
+// feishuBotResponse 构造机器人出参，刻意不包含应用密钥、Verification Token 与 Encrypt Key。
+func feishuBotResponse(bot biz.FeishuBot) map[string]any {
+	return map[string]any{
+		"id": bot.ID, "name": bot.Name, "app_id": bot.AppID, "bot_open_id": bot.BotOpenID,
+		"key_version": bot.KeyVersion, "status": bot.Status,
+		"bound_user_id": bot.BoundUserID, "bound_username": bot.BoundUsername,
+		"bound_agent_id": bot.BoundAgentID, "bound_agent_name": bot.BoundAgentName,
+		"bound_agent_version": bot.BoundAgentVersion,
+		"created_at":          bot.CreatedAt, "updated_at": bot.UpdatedAt,
+	}
+}
+
+// feishuBotOptionResponse 构造普通用户可见的机器人选项出参。
+func feishuBotOptionResponse(option biz.FeishuBotOption) map[string]any {
+	return map[string]any{
+		"id": option.ID, "name": option.Name, "bot_open_id": option.BotOpenID, "status": option.Status,
+		"bound_agent_id": option.BoundAgentID, "bound_agent_name": option.BoundAgentName, "available": option.Available,
 	}
 }
 

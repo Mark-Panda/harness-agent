@@ -612,6 +612,8 @@ type feishuOutboundModel struct {
 	SessionID uuid.UUID `gorm:"type:uuid"`
 	// RunID 关联 Run。
 	RunID uuid.UUID `gorm:"type:uuid"`
+	// AppID 接收消息的飞书应用。
+	AppID string
 	// ChatID 目标会话。
 	ChatID string
 	// ThreadID 目标话题。
@@ -669,7 +671,7 @@ func (r *FeishuOutboundRepository) CreateOutbound(ctx context.Context, outbound 
 		return fmt.Errorf("%w: outbound requires dedupe key, chat and run", biz.ErrInvalidConfig)
 	}
 	record := feishuOutboundModel{
-		ID: outbound.ID, UserID: outbound.UserID, SessionID: outbound.SessionID, RunID: outbound.RunID,
+		ID: outbound.ID, UserID: outbound.UserID, SessionID: outbound.SessionID, RunID: outbound.RunID, AppID: outbound.AppID,
 		ChatID: outbound.ChatID, ThreadID: outbound.ThreadID, ReplyToMessageID: outbound.ReplyToMessageID,
 		Kind: outbound.Kind, Status: "pending", MaxAttempts: 8, AvailableAt: time.Now().UTC(),
 		DedupeKey: outbound.DedupeKey, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
@@ -690,6 +692,7 @@ func (r *FeishuOutboundRepository) ClaimOutbound(ctx context.Context, workerID s
 		UserID           uuid.UUID
 		SessionID        uuid.UUID
 		RunID            uuid.UUID
+		AppID            string
 		ChatID           string
 		ThreadID         string
 		ReplyToMessageID string
@@ -720,7 +723,7 @@ UPDATE feishu_outbound_messages SET status = 'sending', attempts = attempts + 1,
   lease_owner = ?, lease_expires_at = ?, updated_at = ?
 FROM candidate WHERE feishu_outbound_messages.id = candidate.id
 RETURNING feishu_outbound_messages.id, feishu_outbound_messages.user_id, feishu_outbound_messages.session_id,
-  feishu_outbound_messages.run_id, feishu_outbound_messages.chat_id, feishu_outbound_messages.thread_id,
+  feishu_outbound_messages.run_id, feishu_outbound_messages.app_id, feishu_outbound_messages.chat_id, feishu_outbound_messages.thread_id,
   feishu_outbound_messages.reply_to_message_id, feishu_outbound_messages.message_id, feishu_outbound_messages.kind,
   feishu_outbound_messages.status, feishu_outbound_messages.attempts, feishu_outbound_messages.max_attempts,
   feishu_outbound_messages.dedupe_key, feishu_outbound_messages.card_updated_at,
@@ -738,7 +741,7 @@ RETURNING feishu_outbound_messages.id, feishu_outbound_messages.user_id, feishu_
 		cardUpdatedAt = *record.CardUpdatedAt
 	}
 	return biz.FeishuOutbound{
-		ID: record.ID, UserID: record.UserID, SessionID: record.SessionID, RunID: record.RunID,
+		ID: record.ID, UserID: record.UserID, SessionID: record.SessionID, RunID: record.RunID, AppID: record.AppID,
 		ChatID: record.ChatID, ThreadID: record.ThreadID, ReplyToMessageID: record.ReplyToMessageID,
 		MessageID: record.MessageID, Kind: record.Kind, Status: record.Status, Attempts: record.Attempts,
 		MaxAttempts: record.MaxAttempts, DedupeKey: record.DedupeKey, CardUpdatedAt: cardUpdatedAt,

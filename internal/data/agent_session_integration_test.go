@@ -132,4 +132,32 @@ func TestAgentAndSessionRepositoriesEnforceOwnership(t *testing.T) {
 	if _, err := sessionService.AppendMessage(ctx, principalA, biz.Message{SessionID: second.ID, Content: "late"}); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("archived session append error = %v", err)
 	}
+
+	// 取消发布：已发布版本回到草稿并清空快照，不能再用于创建会话。
+	unpublished, err := agentService.Unpublish(ctx, principalA, agent.ID)
+	if err != nil || unpublished.Status != biz.AgentDraft || len(unpublished.ConfigSnapshot) != 0 {
+		t.Fatalf("Unpublish() = %#v, %v", unpublished, err)
+	}
+	if _, err := sessionService.Create(ctx, principalA, biz.Session{AgentID: &agent.ID, Title: "draft-session"}); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("draft agent session error = %v", err)
+	}
+	if _, err := agentService.Publish(ctx, principalA, agent.ID); err != nil {
+		t.Fatalf("re-publish error = %v", err)
+	}
+	// 归档后默认列表隐藏，显式 includeArchived 时可见，且不能再取消发布。
+	archived, err := agentService.Archive(ctx, principalA, agent.ID)
+	if err != nil || archived.Status != biz.AgentArchived {
+		t.Fatalf("Archive() = %#v, %v", archived, err)
+	}
+	activePage, err := agentService.List(ctx, principalA, false, 10, "")
+	if err != nil || len(activePage.Items) != 0 {
+		t.Fatalf("active agent page = %#v, %v", activePage, err)
+	}
+	allPage, err := agentService.List(ctx, principalA, true, 10, "")
+	if err != nil || len(allPage.Items) != 1 || allPage.Items[0].Status != biz.AgentArchived {
+		t.Fatalf("all agent page = %#v, %v", allPage, err)
+	}
+	if _, err := agentService.Unpublish(ctx, principalA, agent.ID); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("archived unpublish error = %v", err)
+	}
 }

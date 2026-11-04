@@ -130,7 +130,7 @@ func TestExportAccountIncludesAgentsAndRedactsConfig(t *testing.T) {
 	sessions.EXPECT().ListMessages(gomock.Any(), userID, sessionID, 100, "").
 		Return(biz.Page[biz.Message]{Items: []biz.Message{{Role: biz.MessageUser, Content: "你好"}}}, nil)
 	agents := mocks.NewMockAgentRepository(ctrl)
-	agents.EXPECT().ListAgents(gomock.Any(), userID, 50, "").Return(biz.Page[biz.Agent]{
+	agents.EXPECT().ListAgents(gomock.Any(), userID, true, 50, "").Return(biz.Page[biz.Agent]{
 		Items: []biz.Agent{{
 			ID: agentID, UserID: userID, Name: "助手", Mode: biz.AgentModeReact, Version: 1, Status: biz.AgentPublished,
 			ConfigSnapshot: map[string]any{"password": "hunter2", "model": "m1"},

@@ -142,7 +142,49 @@ export interface MCPInput {
 }
 
 export type AgentMode = "react" | "plan" | "super";
-export type AgentStatus = "draft" | "published" | "disabled";
+export type AgentStatus = "draft" | "published" | "disabled" | "archived";
+
+// FeishuBotStatus 飞书机器人启停状态。
+export type FeishuBotStatus = "enabled" | "disabled";
+
+// FeishuBot 管理员登记的飞书机器人；响应不包含应用密钥。
+export interface FeishuBot {
+  id: string;
+  name: string;
+  app_id: string;
+  bot_open_id: string;
+  key_version: string;
+  status: FeishuBotStatus;
+  bound_user_id: string | null;
+  bound_username: string;
+  bound_agent_id: string | null;
+  bound_agent_name: string;
+  bound_agent_version: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// FeishuBotOption 是普通用户可见的机器人绑定选项。
+export interface FeishuBotOption {
+  id: string;
+  name: string;
+  bot_open_id: string;
+  status: FeishuBotStatus;
+  bound_agent_id: string | null;
+  bound_agent_name: string;
+  available: boolean;
+}
+
+// FeishuBotInput 是机器人创建/更新的写请求；密钥留空表示更新时保留。
+export interface FeishuBotInput {
+  name: string;
+  app_id: string;
+  app_secret: string;
+  verification_token: string;
+  encrypt_key: string;
+  bot_open_id: string;
+  status: FeishuBotStatus;
+}
 
 export interface Agent {
   id: string;

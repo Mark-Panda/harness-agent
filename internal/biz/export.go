@@ -222,7 +222,7 @@ func (s *ExportService) ExportAccount(ctx context.Context, principal Principal) 
 	if s.agents != nil {
 		cursor = ""
 		for len(export.Agents) < 200 {
-			page, err := s.agents.ListAgents(ctx, principal.UserID, 50, cursor)
+			page, err := s.agents.ListAgents(ctx, principal.UserID, true, 50, cursor)
 			if err != nil {
 				return AccountExport{}, err
 			}

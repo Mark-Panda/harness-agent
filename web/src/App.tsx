@@ -18,6 +18,7 @@ import PoliciesPage from "./pages/admin/PoliciesPage";
 import ProvidersPage from "./pages/admin/ProvidersPage";
 import SkillsPage from "./pages/admin/SkillsPage";
 import UsersPage from "./pages/admin/UsersPage";
+import FeishuBotsPage from "./pages/admin/FeishuBotsPage";
 
 export default function App() {
   return (
@@ -46,6 +47,7 @@ export default function App() {
             <Route path="/admin/policies" element={<AdminRoute><PoliciesPage /></AdminRoute>} />
             <Route path="/admin/skills" element={<AdminRoute><SkillsPage /></AdminRoute>} />
             <Route path="/admin/mcps" element={<AdminRoute><MCPsPage /></AdminRoute>} />
+            <Route path="/admin/feishu-bots" element={<AdminRoute><FeishuBotsPage /></AdminRoute>} />
             <Route path="/admin/users" element={<AdminRoute><UsersPage /></AdminRoute>} />
             <Route path="*" element={<EmptyState title="页面不存在" description="请从顶部导航重新进入所需功能。" />} />
           </Route>

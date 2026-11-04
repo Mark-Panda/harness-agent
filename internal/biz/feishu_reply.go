@@ -118,8 +118,10 @@ type FeishuReplyWorkerDependencies struct {
 	Outbound FeishuOutboundStore
 	// Runs Run 读取端口，用于判断执行状态。
 	Runs RunRepository
-	// Sender 飞书回复发送端口。
+	// Sender 飞书回复发送端口，作为未登记机器人的默认客户端。
 	Sender FeishuReplySender
+	// Senders 按 App ID 解析机器人客户端；为空时全部使用默认客户端。
+	Senders FeishuReplySenderResolver
 	// Conversations 话题绑定仓储，用于把主时间线根消息别名升级为真实话题 ID；为空时跳过升级。
 	Conversations FeishuConversationRepository
 	// Logger 结构化日志。
@@ -133,6 +135,7 @@ type FeishuReplyWorker struct {
 	outbound      FeishuOutboundStore
 	runs          RunRepository
 	sender        FeishuReplySender
+	senders       FeishuReplySenderResolver
 	conversations FeishuConversationRepository
 	config        FeishuReplyWorkerConfig
 	clock         func() time.Time
@@ -158,7 +161,7 @@ func NewFeishuReplyWorker(dependencies FeishuReplyWorkerDependencies, config Fei
 		clock = func() time.Time { return time.Now().UTC() }
 	}
 	return &FeishuReplyWorker{
-		outbound: dependencies.Outbound, runs: dependencies.Runs, sender: dependencies.Sender,
+		outbound: dependencies.Outbound, runs: dependencies.Runs, sender: dependencies.Sender, senders: dependencies.Senders,
 		conversations: dependencies.Conversations,
 		config:        config.normalize(), clock: clock, logger: logger,
 		chatLimiter: newKeyedLimiter(), userLimiter: newKeyedLimiter(),
@@ -238,12 +241,31 @@ func isBootstrapAlias(outbound FeishuOutbound) bool {
 	return outbound.ThreadID != "" && outbound.ThreadID == outbound.ReplyToMessageID
 }
 
+// senderFor 选择外发记录所属机器人的客户端；未登记时回退默认应用客户端。
+func (w *FeishuReplyWorker) senderFor(ctx context.Context, outbound FeishuOutbound) (FeishuReplySender, error) {
+	if w.senders == nil || outbound.AppID == "" {
+		return w.sender, nil
+	}
+	sender, err := w.senders.ResolveSender(ctx, outbound.AppID)
+	if err != nil {
+		return nil, err
+	}
+	if sender == nil {
+		return w.sender, nil
+	}
+	return sender, nil
+}
+
 // sendCard 统一发送卡片：群聊话题内优先创建/复用话题，普通群不支持话题时降级为主时间线回复。
 func (w *FeishuReplyWorker) sendCard(ctx context.Context, outbound FeishuOutbound, card any) (string, error) {
-	if !shouldReplyInThread(outbound) {
-		return w.sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
+	sender, err := w.senderFor(ctx, outbound)
+	if err != nil {
+		return "", err
 	}
-	threaded, err := w.sender.ReplyCardInThread(ctx, outbound.ReplyToMessageID, card)
+	if !shouldReplyInThread(outbound) {
+		return sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
+	}
+	threaded, err := sender.ReplyCardInThread(ctx, outbound.ReplyToMessageID, card)
 	if err == nil {
 		// 主时间线首条回复由飞书创建话题，记录真实话题 ID 供后续追问复用同一 Session。
 		w.promoteThread(ctx, outbound, threaded.ThreadID)
@@ -258,15 +280,19 @@ func (w *FeishuReplyWorker) sendCard(ctx context.Context, outbound FeishuOutboun
 	}
 	// 普通群不支持话题能力：降级为主时间线普通回复，保证至少送达一次最终结果。
 	w.logger.Warn("create feishu thread failed, fallback to plain reply", "outbound_id", outbound.ID, "error", err)
-	return w.sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
+	return sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
 }
 
 // sendText 统一发送纯文本：话题内优先保持话题上下文，普通群不支持话题时降级为主时间线回复。
 func (w *FeishuReplyWorker) sendText(ctx context.Context, outbound FeishuOutbound, text string) (string, error) {
-	if !shouldReplyInThread(outbound) {
-		return w.sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
+	sender, err := w.senderFor(ctx, outbound)
+	if err != nil {
+		return "", err
 	}
-	threaded, err := w.sender.ReplyTextInThread(ctx, outbound.ReplyToMessageID, text)
+	if !shouldReplyInThread(outbound) {
+		return sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
+	}
+	threaded, err := sender.ReplyTextInThread(ctx, outbound.ReplyToMessageID, text)
 	if err == nil {
 		w.promoteThread(ctx, outbound, threaded.ThreadID)
 		return threaded.MessageID, nil
@@ -278,7 +304,7 @@ func (w *FeishuReplyWorker) sendText(ctx context.Context, outbound FeishuOutboun
 		return "", err
 	}
 	w.logger.Warn("reply feishu thread text failed, fallback to plain reply", "outbound_id", outbound.ID, "error", err)
-	return w.sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
+	return sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
 }
 
 // promoteThread 把根消息过渡别名升级为飞书真实话题 ID，失败只记录日志不影响回复送达。
@@ -388,7 +414,13 @@ func (w *FeishuReplyWorker) waitRun(ctx context.Context, outbound FeishuOutbound
 			return
 		}
 	}
-	if err := w.sender.UpdateCard(ctx, outbound.MessageID, card); err != nil {
+	sender, senderErr := w.senderFor(ctx, outbound)
+	if senderErr != nil {
+		w.logger.Warn("resolve feishu sender failed", "outbound_id", outbound.ID, "error", senderErr)
+		w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
+		return
+	}
+	if err := sender.UpdateCard(ctx, outbound.MessageID, card); err != nil {
 		// 非终态的增量更新失败只记录日志，等待下一轮或最终文本降级。
 		w.logger.Warn("update feishu card failed", "outbound_id", outbound.ID, "status", run.Status, "error", err)
 		w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
@@ -408,7 +440,11 @@ func (w *FeishuReplyWorker) sendFinal(ctx context.Context, outbound FeishuOutbou
 // sendOrUpdate 统一处理卡片更新与文本降级。
 func (w *FeishuReplyWorker) sendOrUpdate(ctx context.Context, outbound FeishuOutbound, title, text string) error {
 	if outbound.MessageID != "" {
-		err := w.sender.UpdateCard(ctx, outbound.MessageID, buildFeishuCard(title, text, w.config.MaxTextBytes))
+		sender, err := w.senderFor(ctx, outbound)
+		if err != nil {
+			return err
+		}
+		err = sender.UpdateCard(ctx, outbound.MessageID, buildFeishuCard(title, text, w.config.MaxTextBytes))
 		if err == nil {
 			// 终态卡片更新不受节流限制，但仍记录指纹与时间，便于排查重复投递。
 			if markErr := w.outbound.MarkOutboundCardUpdated(ctx, outbound.ID, cardFingerprint(title, text, w.config.MaxTextBytes), w.clock()); markErr != nil {
