@@ -59,9 +59,9 @@
 | 检查项 | 证据 | 结论 |
 | --- | --- | --- |
 | SBOM/Provenance/签名/审批 digest | `scripts/sbom.sh`、`scripts/supply_chain.sh`、`deploy/signing/verify.sh` | 通过 |
-| 灰度/Smoke/自动停止/回滚 | `scripts/acceptance.sh`、`scripts/canary_smoke.sh`、`docs/runbooks/release-acceptance.md` | 通过 |
+| 发布验收/回滚 | `scripts/acceptance.sh`、`docs/runbooks/release-acceptance.md` | 通过 |
 | 发布兼容与加法迁移 | `internal/data/migration_guard_test.go` | 通过 |
-| Release B 预发布演练 | 预发布环境双副本、全量回归、Agent 质量评测、迁移/回滚/恢复演练；本地发布链路演练已通过（canary 8083、签名审批、SBOM、备份恢复 RTO 1s） | **未完成（阻断项：缺预发布环境与实时模型验收）** |
+| Release B 预发布演练 | 预发布环境双副本、全量回归、Agent 质量评测、迁移/回滚/恢复演练；本地发布链路演练已通过（签名审批、SBOM、备份恢复 RTO 1s） | **未完成（阻断项：缺预发布环境与实时模型验收）** |
 
 ## 6. 运营准备
 

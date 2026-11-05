@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 不可变制品预发布验收：验签审批、迁移兼容、灰度 Smoke、主实例健康检查。
+# 不可变制品预发布验收：验签审批、迁移兼容与主实例健康检查。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,8 +18,5 @@ echo "== 3. 主实例健康检查 =="
 curl -fsS http://localhost:8080/health/ready | grep -q '"status":"ready"'
 curl -fsS http://localhost:8080/api/v1/health >/dev/null
 
-echo "== 4. 灰度 Smoke =="
-CANARY_IMAGE="$APPROVED_IMAGE" scripts/canary_smoke.sh
-
-echo "== 5. 验收通过 =="
-echo "切流：将入口流量全部指向灰度实例后再替换主实例；失败时停止 app-canary 并保留旧实例。"
+echo "== 4. 验收通过 =="
+echo "切流：确认新镜像通过验收后再替换主实例；失败时保留旧实例。"

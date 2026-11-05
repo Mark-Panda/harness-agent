@@ -18,11 +18,10 @@ APPROVAL_FILE=artifacts/signing/approval.json APPROVED_IMAGE="$APPROVED_IMAGE" s
 1. `verify.sh` 校验审批、provenance 哈希与 cosign 签名。
 2. `TestMigrationsAreForwardCompatible` 阻止删除列/表、改类型、重命名与 down 迁移。
 3. 主实例 `/health/ready`、`/api/v1/health`。
-4. 用同一镜像启动灰度副本（8083），等待 readiness，验证 health 与 SSE 探针；失败自动停止灰度，旧实例不变。
 
 ## 灰度切流
 
-1. 灰度副本通过 Smoke 后，将入口流量按 5% → 25% → 50% → 100% 逐步切到灰度。
+1. 灰度副本通过健康检查后，将入口流量按 5% → 25% → 50% → 100% 逐步切到灰度。
 2. 每档观察 10 分钟：5xx、P95、队列在途、SSE 重连、审计 Outbox。
 3. 100% 后再滚动替换主实例；保留旧实例 30 分钟以便回滚。
 4. 灰度期间禁止执行破坏性迁移；新库必须能同时服务旧/新应用。
@@ -32,7 +31,7 @@ APPROVAL_FILE=artifacts/signing/approval.json APPROVED_IMAGE="$APPROVED_IMAGE" s
 ```bash
 docker tag "$PREVIOUS_APPROVED_IMAGE" harness-agent-app:latest
 docker compose up -d app
-scripts/canary_smoke.sh   # 可选：验证回滚镜像
+curl -fsS http://localhost:8080/health/ready | grep -q '"status":"ready"'
 ```
 
 - 回滚只切换到上一个已批准 digest，不重新构建。

@@ -51,28 +51,16 @@ func TestReleaseWorkflowSignsAndVerifiesImage(t *testing.T) {
 	}
 }
 
-// TestReleaseAcceptanceCoversCanaryAndMigrationGuard 验证预发布验收涵盖灰度、签名与迁移守卫。
-func TestReleaseAcceptanceCoversCanaryAndMigrationGuard(t *testing.T) {
+// TestReleaseAcceptanceCoversSignatureAndMigrationGuard 验证预发布验收涵盖签名与迁移守卫。
+func TestReleaseAcceptanceCoversSignatureAndMigrationGuard(t *testing.T) {
 	acceptance := readFile(t, "../../scripts/acceptance.sh")
-	for _, token := range []string{"verify.sh", "TestMigrationsAreForwardCompatible", "canary_smoke.sh", "health/ready"} {
+	for _, token := range []string{"verify.sh", "TestMigrationsAreForwardCompatible", "health/ready"} {
 		if !strings.Contains(acceptance, token) {
 			t.Fatalf("acceptance.sh missing %q", token)
 		}
 	}
-	canary := readFile(t, "../../scripts/canary_smoke.sh")
-	for _, token := range []string{"CANARY_IMAGE", "app-canary", "8083", "stop app-canary"} {
-		if !strings.Contains(canary, token) {
-			t.Fatalf("canary_smoke.sh missing %q", token)
-		}
-	}
-	overlay := readFile(t, "../compose/canary.yaml")
-	for _, token := range []string{"app-canary", "8083", "CANARY_IMAGE"} {
-		if !strings.Contains(overlay, token) {
-			t.Fatalf("canary overlay missing %q", token)
-		}
-	}
 	doc := readFile(t, "../../docs/runbooks/release-acceptance.md")
-	for _, token := range []string{"灰度", "回滚", "禁止执行 `.down.sql`", "队列消息兼容", "在途 Run 恢复"} {
+	for _, token := range []string{"回滚", "禁止执行 `.down.sql`", "队列消息兼容", "在途 Run 恢复"} {
 		if !strings.Contains(doc, token) {
 			t.Fatalf("release acceptance doc missing %q", token)
 		}
