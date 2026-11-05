@@ -10,6 +10,7 @@ const workItems = [
   { to: "/", label: "工作台", detail: "从哪里开始" },
   { to: "/sessions", label: "对话", detail: "和助手聊天" },
   { to: "/agents", label: "助手", detail: "创建与发布" },
+  { to: "/memory", label: "记忆", detail: "知识图谱" },
   { to: "/audit", label: "运行记录", detail: "每一步做了什么" },
 ];
 

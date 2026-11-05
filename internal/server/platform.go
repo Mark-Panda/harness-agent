@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,6 +47,10 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	if platform.Vectors != nil {
 		handle("GET /api/v1/memory/vector-status", handler.vectorStatus)
 	}
+	// 个人记忆知识图谱：只读聚合当前用户的事实、摘要与长期记忆。
+	if platform.MemoryGraph != nil {
+		handle("GET /api/v1/memory/graph", handler.memoryGraph)
+	}
 	handleWrite("POST /api/v1/model-policies", "model_policy", handler.createPolicy)
 	handle("GET /api/v1/model-policies", handler.listPolicies)
 	handle("GET /api/v1/model-policies/{id}", handler.getPolicy)
@@ -82,6 +88,13 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("PUT /api/v1/sessions/{id}/memory-policy", "session", handler.updateSessionMemoryPolicy)
 	handleWrite("POST /api/v1/sessions/{id}/messages", "message", handler.appendMessage)
 	handle("GET /api/v1/sessions/{id}/messages", handler.listMessages)
+	// 附件接口：上传与查询绑定当前用户；下载需鉴权，避免直链泄露。
+	if platform.Attachments != nil {
+		handle("POST /api/v1/sessions/{id}/attachments", handler.uploadAttachment)
+		handle("GET /api/v1/sessions/{id}/attachments", handler.listAttachments)
+		handle("GET /api/v1/attachments/{id}", handler.getAttachment)
+		handle("GET /api/v1/attachments/{id}/download", handler.downloadAttachment)
+	}
 	// 飞书话题生命周期：仅装配飞书能力时注册，仅会话所有者可操作。
 	if platform.FeishuBindings != nil {
 		handleWrite("POST /api/v1/sessions/{id}/feishu-unbind", "feishu_binding", handler.unbindFeishu)
@@ -243,6 +256,8 @@ type sessionRequest struct {
 type messageRequest struct {
 	// Content 消息正文。
 	Content string `json:"content"`
+	// AttachmentIDs 随消息发送的附件，必须先通过上传接口创建。
+	AttachmentIDs []uuid.UUID `json:"attachment_ids"`
 }
 
 // memoryPolicyRequest 是更新会话记忆策略的请求体。
@@ -670,6 +685,12 @@ func (h *platformHTTPHandler) vectorStatus(w http.ResponseWriter, r *http.Reques
 	writePlatformResult(w, http.StatusOK, status, err)
 }
 
+// memoryGraph 处理 GET /api/v1/memory/graph：返回当前用户的个人记忆知识图谱。
+func (h *platformHTTPHandler) memoryGraph(w http.ResponseWriter, r *http.Request) {
+	graph, err := h.service.MemoryGraph.Graph(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusOK, graph, err)
+}
+
 // createPolicy 处理 POST /api/v1/model-policies：创建草稿策略。
 func (h *platformHTTPHandler) createPolicy(w http.ResponseWriter, r *http.Request) {
 	var request policyRequest
@@ -977,11 +998,33 @@ func (h *platformHTTPHandler) appendMessage(w http.ResponseWriter, r *http.Reque
 	if !decodeJSON(w, r, &request, 4*1024*1024+64*1024) {
 		return
 	}
-	message, err := h.service.Sessions.AppendMessage(r.Context(), requestPrincipal(r), biz.Message{SessionID: id, Content: request.Content})
-	writePlatformResult(w, http.StatusCreated, messageResponse(message), err)
+	principal := requestPrincipal(r)
+	if len(request.AttachmentIDs) > 0 {
+		if h.service.Attachments == nil {
+			writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+			return
+		}
+		// 先校验归属与未绑定状态，避免消息落库后才发现附件不可用。
+		if err := h.service.Attachments.ValidateForMessage(r.Context(), principal, id, request.AttachmentIDs); err != nil {
+			writePlatformError(w, err)
+			return
+		}
+	}
+	message, err := h.service.Sessions.AppendMessage(r.Context(), principal, biz.Message{SessionID: id, Content: request.Content})
+	if err != nil {
+		writePlatformResult(w, http.StatusCreated, messageResponse(message), err)
+		return
+	}
+	if len(request.AttachmentIDs) > 0 {
+		if err := h.service.Attachments.AttachToMessage(r.Context(), principal, id, message.ID, request.AttachmentIDs); err != nil {
+			writePlatformError(w, err)
+			return
+		}
+	}
+	writePlatformResult(w, http.StatusCreated, messageResponse(message), nil)
 }
 
-// listMessages 处理 GET /api/v1/sessions/{id}/messages：游标分页列出会话消息。
+// listMessages 处理 GET /api/v1/sessions/{id}/messages：游标分页列出会话消息，并附带已绑定附件。
 func (h *platformHTTPHandler) listMessages(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r)
 	if !ok {
@@ -991,8 +1034,127 @@ func (h *platformHTTPHandler) listMessages(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	page, err := h.service.Sessions.ListMessages(r.Context(), requestPrincipal(r), id, limit, cursor)
-	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(page.Items, messageResponse), "next_cursor": page.NextCursor}, err)
+	principal := requestPrincipal(r)
+	page, err := h.service.Sessions.ListMessages(r.Context(), principal, id, limit, cursor)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	grouped := map[uuid.UUID][]biz.Attachment{}
+	if h.service.Attachments != nil {
+		attachments, listErr := h.service.Attachments.ListBySession(r.Context(), principal, id)
+		if listErr != nil {
+			writePlatformResult(w, http.StatusOK, nil, listErr)
+			return
+		}
+		for _, attachment := range attachments {
+			if attachment.MessageID == nil {
+				continue
+			}
+			grouped[*attachment.MessageID] = append(grouped[*attachment.MessageID], attachment)
+		}
+	}
+	items := mapItems(page.Items, func(message biz.Message) map[string]any {
+		return messageResponseWithAttachments(message, grouped[message.ID])
+	})
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items, "next_cursor": page.NextCursor}, nil)
+}
+
+// uploadAttachment 处理 POST /api/v1/sessions/{id}/attachments：接收 multipart 单文件并保存。
+func (h *platformHTTPHandler) uploadAttachment(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	if h.service.Attachments == nil {
+		writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+		return
+	}
+	// 请求体上限略高于单文件限制，预留 multipart 边界与头部的开销。
+	r.Body = http.MaxBytesReader(w, r.Body, biz.MaxAttachmentBytes+1<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErrorCode(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+			return
+		}
+		writeErrorCode(w, http.StatusBadRequest, "invalid_multipart")
+		return
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "file_field_required")
+		return
+	}
+	defer func() { _ = file.Close() }()
+	// 多读 1 字节用于判断是否超过上限，避免把超大文件整体读入内存。
+	data, err := io.ReadAll(io.LimitReader(file, biz.MaxAttachmentBytes+1))
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "read_file_failed")
+		return
+	}
+	if len(data) > biz.MaxAttachmentBytes {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge, "attachment_too_large")
+		return
+	}
+	attachment, err := h.service.Attachments.Upload(r.Context(), requestPrincipal(r), sessionID,
+		header.Filename, header.Header.Get("Content-Type"), data)
+	writePlatformResult(w, http.StatusCreated, attachmentResponse(attachment), err)
+}
+
+// listAttachments 处理 GET /api/v1/sessions/{id}/attachments：列出会话附件元数据。
+func (h *platformHTTPHandler) listAttachments(w http.ResponseWriter, r *http.Request) {
+	sessionID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	if h.service.Attachments == nil {
+		writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+		return
+	}
+	attachments, err := h.service.Attachments.ListBySession(r.Context(), requestPrincipal(r), sessionID)
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(attachments, attachmentResponse)}, err)
+}
+
+// getAttachment 处理 GET /api/v1/attachments/{id}：读取单个附件元数据。
+func (h *platformHTTPHandler) getAttachment(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	if h.service.Attachments == nil {
+		writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+		return
+	}
+	attachment, err := h.service.Attachments.Get(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, attachmentResponse(attachment), err)
+}
+
+// downloadAttachment 处理 GET /api/v1/attachments/{id}/download：鉴权后流式返回文件内容。
+func (h *platformHTTPHandler) downloadAttachment(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	if h.service.Attachments == nil {
+		writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+		return
+	}
+	attachment, data, err := h.service.Attachments.Open(r.Context(), requestPrincipal(r), id)
+	if err != nil {
+		writePlatformError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", attachment.MimeType)
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(data)), 10))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": attachment.FileName}))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write(data); writeErr != nil {
+		return
+	}
 }
 
 // requestPrincipal 从 Context 读取鉴权中间件注入的身份。
@@ -1216,6 +1378,24 @@ func messageResponse(message biz.Message) map[string]any {
 	return map[string]any{
 		"id": message.ID, "session_id": message.SessionID, "role": message.Role, "content": message.Content,
 		"tool_calls": message.ToolCalls, "token_count": message.TokenCount, "created_at": message.CreatedAt,
+	}
+}
+
+// messageResponseWithAttachments 构造带附件列表的消息出参。
+func messageResponseWithAttachments(message biz.Message, attachments []biz.Attachment) map[string]any {
+	response := messageResponse(message)
+	response["attachments"] = mapItems(attachments, attachmentResponse)
+	return response
+}
+
+// attachmentResponse 构造附件元数据出参，不包含二进制内容。
+func attachmentResponse(attachment biz.Attachment) map[string]any {
+	return map[string]any{
+		"id": attachment.ID, "session_id": attachment.SessionID, "message_id": attachment.MessageID,
+		"file_name": attachment.FileName, "mime_type": attachment.MimeType, "size_bytes": attachment.SizeBytes,
+		"sha256": attachment.SHA256, "text_extracted": attachment.TextExtracted,
+		"text_chars": attachment.TextChars, "text_truncated": attachment.TextTruncated,
+		"created_at": attachment.CreatedAt, "download_url": "/api/v1/attachments/" + attachment.ID.String() + "/download",
 	}
 }
 

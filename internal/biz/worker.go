@@ -193,6 +193,8 @@ type ExecutionWorkerDependencies struct {
 	MemoryTrigger MemoryTrigger
 	// Facts 结构化事实读取端口，可为空表示不注入用户事实。
 	Facts FactReader
+	// Attachments 会话附件文本读取端口，可为空表示不注入附件内容。
+	Attachments AttachmentTextReader
 	// FactTrigger 事实提取任务触发端口，可为空表示不触发事实提取。
 	FactTrigger FactTrigger
 	// MCPs MCP 凭证读取端口，可为空表示不加载远端工具。
@@ -233,6 +235,7 @@ type ExecutionWorker struct {
 	memory          MemoryRetrieverPort
 	memoryTrigger   MemoryTrigger
 	facts           FactReader
+	attachments     AttachmentTextReader
 	factTrigger     FactTrigger
 	mcps            MCPCredentialRepository
 	mcpClient       func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
@@ -278,6 +281,7 @@ func NewExecutionWorker(dependencies ExecutionWorkerDependencies, config WorkerC
 		summaries: dependencies.Summaries, summary: dependencies.SummaryTrigger,
 		memory: dependencies.Memory, memoryTrigger: dependencies.MemoryTrigger,
 		facts: dependencies.Facts, factTrigger: dependencies.FactTrigger,
+		attachments:   dependencies.Attachments,
 		globalLimiter: dependencies.GlobalLimiter, userLimiter: dependencies.UserLimiter,
 		health: dependencies.Health, config: config.normalize(), clock: clock, logger: logger,
 	}, nil
@@ -818,6 +822,17 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 			systemPrompt += "\n" + text
 		}
 	}
+	// 附件抽取文本按消息注入到对应轮次，与记忆策略无关；读取失败只降级为无附件内容。
+	attachmentText := map[uuid.UUID]string{}
+	if w.attachments != nil {
+		items, err := w.attachments.ListTextContexts(ctx, run.UserID, run.SessionID)
+		if err != nil {
+			w.logger.Warn("load attachment texts failed; continuing without them", "run_id", run.ID, "error", err)
+			degradations = append(degradations, "attachments")
+		} else {
+			attachmentText = formatAttachmentContext(items)
+		}
+	}
 	messages := make([]react.Message, 0, len(history)+3)
 	messages = append(messages, react.Message{Role: react.RoleSystem, Content: systemPrompt})
 	// 长期记忆来自历史对话，属于不可信数据，只能作为背景参考；群聊话题与禁用记忆的会话不得注入。
@@ -853,7 +868,11 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 	for _, message := range history {
 		switch message.Role {
 		case MessageUser:
-			messages = append(messages, react.Message{Role: react.RoleUser, Content: message.Content})
+			content := message.Content
+			if text := attachmentText[message.ID]; text != "" {
+				content += "\n\n" + text
+			}
+			messages = append(messages, react.Message{Role: react.RoleUser, Content: content})
 		case MessageAssistant:
 			converted := react.Message{Role: react.RoleAssistant, Content: message.Content}
 			converted.ToolCalls = messageToolCalls(message.ToolCalls)

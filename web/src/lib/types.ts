@@ -239,6 +239,21 @@ export interface Session {
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
+export interface Attachment {
+  id: string;
+  session_id: string;
+  message_id: string | null;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  sha256: string;
+  text_extracted: boolean;
+  text_chars: number;
+  text_truncated: boolean;
+  created_at: string;
+  download_url: string;
+}
+
 export interface Message {
   id: string;
   session_id: string;
@@ -247,6 +262,7 @@ export interface Message {
   tool_calls: unknown[] | null;
   token_count: number | null;
   created_at: string;
+  attachments?: Attachment[];
 }
 
 export type RunStatus = string;
@@ -354,6 +370,49 @@ export interface ModelHealth {
   status: "healthy" | "degraded" | "half_open" | "open" | "unknown";
   failures: number;
   checked_at: string;
+}
+
+// MemoryGraphNodeKind 是个人记忆图谱节点类型。
+export type MemoryGraphNodeKind = "session" | "fact" | "vector" | "summary";
+
+// MemoryGraphNode 是个人记忆图谱中的一个节点。
+export interface MemoryGraphNode {
+  id: string;
+  kind: MemoryGraphNodeKind;
+  label: string;
+  preview?: string;
+  session_id?: string;
+  created_at: string;
+  weight: number;
+  metadata?: Record<string, unknown>;
+}
+
+// MemoryGraphEdge 是个人记忆图谱中的一条有向边。
+export interface MemoryGraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  kind: string;
+  label: string;
+  weight: number;
+}
+
+// MemoryGraphStats 是图谱节点与边数量统计。
+export interface MemoryGraphStats {
+  sessions: number;
+  facts: number;
+  vectors: number;
+  summaries: number;
+  edges: number;
+  truncated: boolean;
+}
+
+// MemoryGraph 是个人记忆知识图谱的完整只读视图。
+export interface MemoryGraph {
+  generated_at: string;
+  nodes: MemoryGraphNode[];
+  edges: MemoryGraphEdge[];
+  stats: MemoryGraphStats;
 }
 
 // VectorStatus 描述长期记忆向量能力是否配置并生效。

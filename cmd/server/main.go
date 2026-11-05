@@ -462,6 +462,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	attachmentRepository := data.NewAttachmentRepository(appDB)
+	attachmentService, err := biz.NewAttachmentService(sessionRepository, attachmentRepository)
+	if err != nil {
+		return err
+	}
 	idempotencyService, err := biz.NewIdempotencyService(data.NewIdempotencyRepository(appDB))
 	if err != nil {
 		return err
@@ -508,6 +513,7 @@ func run() error {
 		return err
 	}
 	platformService.WithVectorStatus(vectorStatusService)
+	platformService.WithAttachments(attachmentService)
 	// Plan 服务复用 Run 服务完成取消与恢复入队。
 	planService, err := biz.NewPlanService(data.NewPlanRepository(appDB), runService)
 	if err != nil {
@@ -524,6 +530,12 @@ func run() error {
 		return err
 	}
 	platformService.WithDeletion(deletionService, exportService)
+	// 个人记忆知识图谱复用记忆仓储，按 user_id 聚合只读视图。
+	memoryGraphService, err := biz.NewMemoryGraphService(sessionRepository, summaryRepository, factRepository, memoryRepository, nil)
+	if err != nil {
+		return err
+	}
+	platformService.WithMemoryGraph(memoryGraphService)
 	// Worker 标识在执行 Worker 与飞书 Worker 间共享；为空时启动时生成唯一标识。
 	workerID := cfg.Agent.Worker.WorkerID
 	if workerID == "" {
@@ -746,6 +758,7 @@ func run() error {
 			Summaries: summaryRepository, SummaryTrigger: summaryPlanner,
 			Memory: memoryRetriever, MemoryTrigger: memoryIndexer,
 			Facts: factService, FactTrigger: factIndexer,
+			Attachments:   attachmentRepository,
 			GlobalLimiter: globalLimiter, UserLimiter: userLimiter,
 			Health: routeHealth, Sandbox: sandboxRunner,
 		}, biz.WorkerConfig{

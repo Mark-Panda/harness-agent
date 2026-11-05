@@ -34,6 +34,10 @@ type PlatformService struct {
 	Routing *biz.RoutingHealthService
 	// Vectors 长期记忆向量能力状态查询服务，可为空表示未装配。
 	Vectors *biz.VectorStatusService
+	// Attachments 会话附件上传、查询与下载服务，可为空表示未启用。
+	Attachments *biz.AttachmentService
+	// MemoryGraph 个人记忆知识图谱聚合服务，可为空表示未启用。
+	MemoryGraph *biz.MemoryGraphService
 	// Plans 计划查询、暂停、恢复与人工终止服务，可为空表示未启用。
 	Plans *biz.PlanService
 	// FeishuIngest 飞书事件接入服务；为空表示飞书未启用，回调路由不会注册。
@@ -81,6 +85,18 @@ func (s *PlatformService) WithDeletion(deletions *biz.DeletionService, exports *
 // WithVectorStatus 附加长期记忆向量状态查询能力。
 func (s *PlatformService) WithVectorStatus(vectors *biz.VectorStatusService) *PlatformService {
 	s.Vectors = vectors
+	return s
+}
+
+// WithAttachments 附加会话附件能力。
+func (s *PlatformService) WithAttachments(attachments *biz.AttachmentService) *PlatformService {
+	s.Attachments = attachments
+	return s
+}
+
+// WithMemoryGraph 附加个人记忆知识图谱查询能力。
+func (s *PlatformService) WithMemoryGraph(graph *biz.MemoryGraphService) *PlatformService {
+	s.MemoryGraph = graph
 	return s
 }
 

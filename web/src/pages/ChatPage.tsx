@@ -4,11 +4,11 @@ import { Link, useParams } from "react-router-dom";
 import { SafeMarkdown } from "../components/SafeMarkdown";
 import { useToast } from "../components/Toast";
 import { Badge, Button, Card, EmptyState, ErrorBanner, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
-import { mutate, requestJSON, streamRunEvents } from "../lib/api";
+import { downloadAttachment, mutate, requestJSON, streamRunEvents, uploadAttachment } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/format";
 import { useRemote } from "../lib/hooks";
-import type { Agent, Message, Page, Run, RunEvent, Session, ToolApproval } from "../lib/types";
+import type { Agent, Attachment, Message, Page, Run, RunEvent, Session, ToolApproval } from "../lib/types";
 
 // terminalStatuses 是 Run 的最终状态集合。
 const terminalStatuses = new Set(["completed", "failed", "cancelled", "dead"]);
@@ -82,6 +82,37 @@ interface LiveMessage {
   name?: string;
 }
 
+// PendingAttachment 表示输入区中尚未随消息发送的附件。
+interface PendingAttachment {
+  // key 本地去重标识。
+  key: string;
+  // name 文件名。
+  name: string;
+  // size 文件字节数。
+  size: number;
+  // status 上传状态：uploading/ready/failed。
+  status: "uploading" | "ready" | "failed";
+  // id 上传成功后的附件 ID。
+  id?: string;
+  // error 上传失败原因。
+  error?: string;
+}
+
+// 附件限制与服务端保持一致：单文件 20MB，每条消息最多 5 个。
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 5;
+
+// formatFileSize 把字节数转换为易读大小。
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 interface TimelineEntry {
   key: string;
   label: string;
@@ -115,6 +146,8 @@ export default function ChatPage() {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [liveMessages, setLiveMessages] = useState<LiveMessage[]>([]);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
@@ -382,9 +415,61 @@ export default function ChatPage() {
     };
   }, [activeRun?.id, messagesReload, refreshApprovals]);
 
+  // uploadFiles 逐个上传附件，超限或失败的文件在输入区内提示，不阻塞其它文件。
+  const uploadFiles = async (files: File[]) => {
+    const room = MAX_ATTACHMENTS_PER_MESSAGE - pendingAttachments.length;
+    if (room <= 0) {
+      setSendError(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件。`);
+      return;
+    }
+    const accepted = files.slice(0, room);
+    if (files.length > room) {
+      setSendError(`超出数量上限，只会上传前 ${room} 个文件。`);
+    }
+    for (const file of accepted) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setSendError(`${file.name} 超过 20MB，未上传。`);
+        continue;
+      }
+      if (file.size === 0) {
+        setSendError(`${file.name} 是空文件，未上传。`);
+        continue;
+      }
+      const key = crypto.randomUUID();
+      setPendingAttachments((current) => [...current, { key, name: file.name, size: file.size, status: "uploading" }]);
+      try {
+        const attachment = await uploadAttachment<Attachment>(`/api/v1/sessions/${sessionId}/attachments`, file);
+        setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "ready", id: attachment.id } : item)));
+      } catch (failure) {
+        const message = describeError(failure);
+        setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "failed", error: message } : item)));
+      }
+    }
+  };
+
+  // removePendingAttachment 从输入区移除附件；已上传但未发送的文件保留在服务端并由会话配额回收。
+  const removePendingAttachment = (key: string) => {
+    setPendingAttachments((current) => current.filter((item) => item.key !== key));
+  };
+
+  // downloadMessageAttachment 鉴权下载消息附件，失败时在页面内提示。
+  const downloadMessageAttachment = async (attachment: Attachment) => {
+    setActionError(null);
+    try {
+      await downloadAttachment(attachment.download_url, attachment.file_name);
+    } catch (failure) {
+      setActionError(describeError(failure));
+    }
+  };
+
   const send = async (contentOverride?: string) => {
     const content = (contentOverride ?? draft).trim();
-    if (!content || sending || runActive) {
+    const readyAttachments = pendingAttachments.filter((item) => item.status === "ready" && item.id);
+    if (pendingAttachments.some((item) => item.status === "uploading")) {
+      setSendError("附件仍在上传，请稍候再发送。");
+      return;
+    }
+    if ((!content && readyAttachments.length === 0) || sending || runActive) {
       return;
     }
     if (!canRun) {
@@ -398,11 +483,16 @@ export default function ChatPage() {
     stickToBottomRef.current = true;
     setShowJump(false);
     try {
-      await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", { content }, crypto.randomUUID());
+      await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", {
+        // 仅附件时补一句正文，保证消息可读且执行器有明确任务描述。
+        content: content || "我上传了附件，请结合附件内容回答。",
+        attachment_ids: readyAttachments.map((item) => item.id),
+      }, crypto.randomUUID());
       // 重试上一轮时保留输入框内容，避免用户正在编辑的新内容被清空。
       if (contentOverride === undefined) {
         setDraft("");
       }
+      setPendingAttachments([]);
       messagesReload();
       const run = await mutate<Run>(`/api/v1/sessions/${sessionId}/runs`, "POST", {
         agent_id: agent?.id ?? null,
@@ -591,6 +681,8 @@ export default function ChatPage() {
                   role={message.role}
                   content={message.content}
                   toolCalls={message.tool_calls}
+                  attachments={message.attachments}
+                  onDownloadAttachment={downloadMessageAttachment}
                   createdAt={message.created_at}
                   copied={copiedKey === message.id}
                   onCopy={copyMessage}
@@ -712,6 +804,42 @@ export default function ChatPage() {
         ) : null}
 
         <div className="sticky bottom-3 z-10 mt-4 rounded-[3px] border border-line-strong bg-paper-raised/95 p-3 shadow-[0_-6px_20px_rgb(31_27_21/0.06)] backdrop-blur focus-within:border-accent">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            aria-label="选择附件"
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              event.target.value = "";
+              if (files.length > 0) {
+                void uploadFiles(files);
+              }
+            }}
+          />
+          {pendingAttachments.length > 0 ? (
+            <div className="mb-2 flex flex-col gap-1.5 rounded-[3px] border border-line bg-paper-deep/40 p-2">
+              {pendingAttachments.map((item) => (
+                <div key={item.key} className={cn("flex items-center gap-2 text-xs", item.status === "failed" ? "text-rust" : "text-ink-soft")}>
+                  <span className="shrink-0" aria-hidden>📎</span>
+                  <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                  <span className="shrink-0 text-[11px] text-muted">{formatFileSize(item.size)}</span>
+                  <span className="shrink-0 text-[11px]">
+                    {item.status === "uploading" ? "上传中…" : item.status === "failed" ? item.error ?? "上传失败" : "待发送"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => removePendingAttachment(item.key)}
+                    className="shrink-0 rounded-[2px] px-1 text-muted transition hover:text-rust"
+                    aria-label={`移除附件 ${item.name}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <Textarea
             id="chat-composer"
             value={draft}
@@ -733,13 +861,26 @@ export default function ChatPage() {
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] text-muted">
-              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 内容会自动保存"}
+              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 单个文件 ≤20MB，最多 5 个，文本类内容会自动提供给助手"}
             </p>
             <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!canRun || runActive || sending || pendingAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE}
+              >
+                添加附件
+              </Button>
               {runActive ? (
                 <Button size="sm" variant="secondary" onClick={() => void cancel()}>停止本轮</Button>
               ) : null}
-              <Button size="sm" onClick={() => void send()} loading={sending} disabled={!canRun || runActive || draft.trim() === ""}>
+              <Button
+                size="sm"
+                onClick={() => void send()}
+                loading={sending}
+                disabled={!canRun || runActive || (draft.trim() === "" && pendingAttachments.filter((item) => item.status === "ready").length === 0) || pendingAttachments.some((item) => item.status === "uploading")}
+              >
                 发送
               </Button>
             </div>
@@ -838,6 +979,8 @@ function MessageBubble({
   toolCalls,
   name,
   createdAt,
+  attachments,
+  onDownloadAttachment,
   live = false,
   copied,
   onCopy,
@@ -848,6 +991,8 @@ function MessageBubble({
   toolCalls?: unknown;
   name?: string;
   createdAt?: string;
+  attachments?: Attachment[];
+  onDownloadAttachment?: (attachment: Attachment) => void;
   live?: boolean;
   copied: boolean;
   onCopy: (key: string, content: string) => Promise<void>;
@@ -862,6 +1007,26 @@ function MessageBubble({
       <div className="flex justify-end">
         <div className="max-w-[85%]">
           <div className="whitespace-pre-wrap break-words rounded-[4px] bg-jade px-4 py-3 text-sm leading-6 text-paper-raised">{content}</div>
+          {attachments && attachments.length > 0 ? (
+            <div className="mt-2 flex flex-col gap-1">
+              {attachments.map((attachment) => (
+                <button
+                  key={attachment.id}
+                  type="button"
+                  onClick={() => onDownloadAttachment?.(attachment)}
+                  className="flex items-center gap-2 rounded-[3px] border border-line bg-paper-raised px-2 py-1 text-left text-[11px] text-ink-soft transition hover:border-accent hover:text-accent"
+                  aria-label={`下载附件 ${attachment.file_name}`}
+                >
+                  <span aria-hidden>📎</span>
+                  <span className="min-w-0 flex-1 truncate">{attachment.file_name}</span>
+                  <span className="shrink-0 text-muted">{formatFileSize(attachment.size_bytes)}</span>
+                  <span className="shrink-0 text-muted">
+                    {attachment.text_extracted ? (attachment.text_truncated ? "已读取（截断）" : "已读取内容") : "仅保存"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : null}
           {createdAt ? <p className="mt-1 text-right text-[11px] text-muted">{formatDateTime(createdAt)}</p> : null}
         </div>
       </div>

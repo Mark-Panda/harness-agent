@@ -10,6 +10,7 @@ import AuditPage from "./pages/AuditPage";
 import ChatPage from "./pages/ChatPage";
 import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
+import MemoryGraphPage from "./pages/MemoryGraphPage";
 import RegisterPage from "./pages/RegisterPage";
 import RunPage from "./pages/RunPage";
 import SessionsPage from "./pages/SessionsPage";
@@ -42,6 +43,7 @@ export default function App() {
             <Route path="/agents/new" element={<AgentWizardPage />} />
             <Route path="/agents/:agentId/edit" element={<AgentWizardPage />} />
             <Route path="/sessions" element={<SessionsPage />} />
+            <Route path="/memory" element={<MemoryGraphPage />} />
             <Route path="/sessions/:sessionId" element={<ChatPage />} />
             <Route path="/audit" element={<AuditPage />} />
             <Route path="/runs/:runId" element={<RunPage />} />

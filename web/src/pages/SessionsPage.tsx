@@ -281,6 +281,9 @@ export default function SessionsPage() {
       </Card>
       <Card title="隐私与记忆" description="助手会记住跨对话的偏好与事实。你可以随时导出或清空这些记忆；清空不会删除原始对话。">
         <div className="flex flex-wrap gap-2">
+          <Link to="/memory">
+            <Button variant="secondary">查看记忆图谱</Button>
+          </Link>
           <Button variant="secondary" onClick={() => void exportMemory()}>导出我的记忆</Button>
           <Button variant="danger" onClick={() => setConfirmMemory(true)}>清空长期记忆</Button>
         </div>

@@ -115,6 +115,47 @@ export function mutate<T>(path: string, method: string, body?: unknown, idempote
   });
 }
 
+// uploadAttachment 以 multipart 上传单个文件，鉴权与 CSRF 由 requestJSON 统一处理。
+export function uploadAttachment<T>(path: string, file: File): Promise<T> {
+  const body = new FormData();
+  body.append("file", file);
+  return requestJSON<T>(path, { method: "POST", body });
+}
+
+// downloadAttachment 鉴权下载附件并触发浏览器保存，避免把令牌拼进 URL。
+export async function downloadAttachment(path: string, filename: string): Promise<void> {
+  const attempt = async (retry: boolean): Promise<Response> => {
+    const headers = new Headers({ Accept: "*/*" });
+    const token = bindings.accessToken();
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+    const response = await fetch(path, { headers, credentials: "same-origin" });
+    if (response.status === 401 && retry) {
+      const refreshed = await bindings.refreshSession();
+      if (refreshed) {
+        return attempt(false);
+      }
+      bindings.onUnauthorized();
+      throw new ApiError(401, "unauthorized");
+    }
+    return response;
+  };
+  const response = await attempt(true);
+  if (!response.ok) {
+    throw await parseError(response);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 // downloadJSON 通过鉴权请求下载导出文件，禁止把令牌放入 URL。
 export async function downloadJSON(path: string, filename: string): Promise<void> {
   const attempt = async (retry: boolean): Promise<Response> => {
