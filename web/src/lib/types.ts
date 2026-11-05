@@ -356,6 +356,21 @@ export interface ModelHealth {
   checked_at: string;
 }
 
+// VectorStatus 描述长期记忆向量能力是否配置并生效。
+export interface VectorStatus {
+  vector_enabled: boolean;
+  model_configured: boolean;
+  provider_id?: string;
+  provider_name?: string;
+  model?: string;
+  dimension?: number;
+  index_version?: string;
+  index_status?: string;
+  vector_count: number;
+  healthy: boolean;
+  warning?: string;
+}
+
 export interface ModelAttempt {
   id: string;
   run_id: string;

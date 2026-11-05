@@ -41,6 +41,10 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("GET /api/v1/models/{id}", handler.getModel)
 	handle("PUT /api/v1/models/{id}", handler.updateModel)
 	handle("DELETE /api/v1/models/{id}", handler.deleteModel)
+	// 向量模型状态：登录用户可读，用于提示长期记忆是否需要配置 embedding 模型。
+	if platform.Vectors != nil {
+		handle("GET /api/v1/memory/vector-status", handler.vectorStatus)
+	}
 	handleWrite("POST /api/v1/model-policies", "model_policy", handler.createPolicy)
 	handle("GET /api/v1/model-policies", handler.listPolicies)
 	handle("GET /api/v1/model-policies/{id}", handler.getPolicy)
@@ -658,6 +662,12 @@ func (h *platformHTTPHandler) listModels(w http.ResponseWriter, r *http.Request)
 	}
 	models, err := h.service.Models.List(r.Context(), requestPrincipal(r), providerID)
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(models, modelResponse)}, err)
+}
+
+// vectorStatus 处理 GET /api/v1/memory/vector-status：返回向量模型是否配置并生效。
+func (h *platformHTTPHandler) vectorStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := h.service.Vectors.Status(r.Context())
+	writePlatformResult(w, http.StatusOK, status, err)
 }
 
 // createPolicy 处理 POST /api/v1/model-policies：创建草稿策略。

@@ -527,6 +527,12 @@ func run() error {
 		return err
 	}
 	platformService.WithRoutingHealth(routingHealth)
+	// 向量模型状态只读查询：供前端提示是否已配置并生效的 embedding 模型。
+	vectorStatusService, err := biz.NewVectorStatusService(memoryRepository, memoryRepository, catalogRepository, cfg.Agent.Memory.Vector.Enabled)
+	if err != nil {
+		return err
+	}
+	platformService.WithVectorStatus(vectorStatusService)
 	// Plan 服务复用 Run 服务完成取消与恢复入队。
 	planService, err := biz.NewPlanService(data.NewPlanRepository(appDB), runService)
 	if err != nil {

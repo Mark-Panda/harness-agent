@@ -5,7 +5,7 @@ import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, formatNumber, statusLabel, statusTone } from "../../lib/format";
 import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
-import type { Model, ModelHealth, ModelKind, Page, Provider, RemoteModel } from "../../lib/types";
+import type { Model, ModelHealth, ModelKind, Page, Provider, RemoteModel, VectorStatus } from "../../lib/types";
 
 interface ModelFormState {
   providerId: string;
@@ -280,6 +280,7 @@ export default function ModelsPage() {
     [providerFilter],
   );
   const health = useRemote(() => requestJSON<{ items: ModelHealth[] }>("/api/v1/model-routing/health"), []);
+  const vectorStatus = useRemote(() => requestJSON<VectorStatus>("/api/v1/memory/vector-status"), []);
   const [editing, setEditing] = useState<Model | null | "new">(null);
   useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Model | null>(null);
@@ -360,6 +361,7 @@ export default function ModelsPage() {
 
   const providerNames = new Map(providers.data?.items.map((provider) => [provider.id, provider.name]) ?? []);
   const healthByModel = new Map(health.data?.items.map((item) => [item.model_id, item]) ?? []);
+  const vector = vectorStatus.data;
 
   return (
     <div className="flex flex-col gap-6">
@@ -372,15 +374,67 @@ export default function ModelsPage() {
       {providers.error ? <ErrorBanner message={providers.error} onRetry={providers.reload} /> : null}
       {models.error ? <ErrorBanner message={models.error} onRetry={models.reload} /> : null}
       {health.error ? <ErrorBanner message={`熔断状态不可用：${health.error}`} onRetry={health.reload} /> : null}
+      {vectorStatus.error ? <ErrorBanner message={`向量模型状态不可用：${vectorStatus.error}`} onRetry={vectorStatus.reload} /> : null}
       {batchError ? <ErrorBanner message={batchError} /> : null}
       {editing ? (
         <ModelForm
           initial={editing === "new" ? null : editing}
           providers={providers.data?.items ?? []}
           onCancel={() => setEditing(null)}
-          onSaved={() => { setEditing(null); models.reload(); }}
+          onSaved={() => { setEditing(null); models.reload(); vectorStatus.reload(); }}
         />
       ) : null}
+      <Card
+        title="向量模型状态"
+        description="长期记忆检索依赖已启用的 embedding 模型。模型、启用状态与索引都就绪才算生效。"
+        actions={
+          <>
+            {vector ? <Badge tone={vector.healthy ? "success" : "warning"}>{vector.healthy ? "已生效" : "未生效"}</Badge> : null}
+            <Button size="sm" variant="secondary" loading={vectorStatus.loading} onClick={vectorStatus.reload}>重新检查</Button>
+          </>
+        }
+      >
+        {vectorStatus.loading ? (
+          <p className="text-xs text-muted">正在检查向量模型配置…</p>
+        ) : vector ? (
+          <div className="flex flex-col gap-3">
+            <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+              <div>
+                <dt className="text-[11px] uppercase tracking-wide text-muted">模型服务</dt>
+                <dd className="mt-1 text-ink">{vector.provider_name ?? "—"}</dd>
+              </div>
+              <div>
+                <dt className="text-[11px] uppercase tracking-wide text-muted">向量模型</dt>
+                <dd className={vector.model_configured ? "mt-1 text-ink" : "mt-1 text-rust"}>{vector.model ?? "未配置"}</dd>
+              </div>
+              <div>
+                <dt className="text-[11px] uppercase tracking-wide text-muted">向量维度</dt>
+                <dd className="mt-1 text-ink">{vector.dimension ? `${vector.dimension} 维` : "—"}</dd>
+              </div>
+              <div>
+                <dt className="text-[11px] uppercase tracking-wide text-muted">索引 / 已写入</dt>
+                <dd className="mt-1 text-ink">
+                  {vector.index_version ?? "尚未创建"}
+                  {vector.index_status ? ` · ${vector.index_status}` : ""}
+                  {` · ${formatNumber(vector.vector_count)} 条`}
+                </dd>
+              </div>
+            </dl>
+            {vector.warning ? (
+              <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-[3px] border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
+                <span>{vector.warning}</span>
+                {!vector.model_configured ? (
+                  <Button size="sm" variant="secondary" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>
+                    登记 embedding 模型
+                  </Button>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs leading-5 text-jade">模型与索引均已就绪，新的对话内容会自动写入向量记忆。</p>
+            )}
+          </div>
+        ) : null}
+      </Card>
       <Card
         title="已登记模型"
         description="“当前可用性”来自运行时的熔断状态；未核验或上下文不足的生成模型不会被规则选中。"

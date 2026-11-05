@@ -32,6 +32,8 @@ type PlatformService struct {
 	Exports *biz.ExportService
 	// Routing 模型路由健康与熔断状态查询服务，可为空表示未启用。
 	Routing *biz.RoutingHealthService
+	// Vectors 长期记忆向量能力状态查询服务，可为空表示未装配。
+	Vectors *biz.VectorStatusService
 	// Plans 计划查询、暂停、恢复与人工终止服务，可为空表示未启用。
 	Plans *biz.PlanService
 	// FeishuIngest 飞书事件接入服务；为空表示飞书未启用，回调路由不会注册。
@@ -73,6 +75,12 @@ func (s *PlatformService) WithPlans(plans *biz.PlanService) *PlatformService {
 func (s *PlatformService) WithDeletion(deletions *biz.DeletionService, exports *biz.ExportService) *PlatformService {
 	s.Deletions = deletions
 	s.Exports = exports
+	return s
+}
+
+// WithVectorStatus 附加长期记忆向量状态查询能力。
+func (s *PlatformService) WithVectorStatus(vectors *biz.VectorStatusService) *PlatformService {
+	s.Vectors = vectors
 	return s
 }
 

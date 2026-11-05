@@ -4,7 +4,7 @@ import { useAuth } from "../lib/auth";
 import { requestJSON } from "../lib/api";
 import { formatRelative } from "../lib/format";
 import { useRemote } from "../lib/hooks";
-import type { Agent, Model, ModelPolicy, Page, Provider, Session } from "../lib/types";
+import type { Agent, Model, ModelPolicy, Page, Provider, Session, VectorStatus } from "../lib/types";
 import { Badge, Card, EmptyState, PageHeader, cn } from "../components/ui";
 
 interface SetupStep {
@@ -35,6 +35,10 @@ export default function HomePage() {
   );
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=50"), []);
   const sessions = useRemote(() => requestJSON<Page<Session>>("/api/v1/sessions?limit=10"), []);
+  const vector = useRemote(
+    () => (isAdmin ? requestJSON<VectorStatus>("/api/v1/memory/vector-status") : Promise.resolve(null)),
+    [isAdmin],
+  );
 
   const chatModels = (models.data?.items ?? []).filter((model) => model.kind === "chat" && model.verified_at);
   const publishedPolicies = (policies.data?.items ?? []).filter((policy) => policy.status === "published");
@@ -182,6 +186,12 @@ export default function HomePage() {
         {!isAdmin && !adminReady ? (
           <p className="mt-3 rounded-[3px] border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
             管理员还没有完成模型配置。你仍然可以创建助手草稿，但发布前需要等待选模规则就绪。
+          </p>
+        ) : null}
+        {isAdmin && vector.data && !vector.data.healthy ? (
+          <p className="mt-3 rounded-[3px] border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
+            向量记忆未生效：{vector.data.warning ?? "尚未配置生效的向量模型。"}
+            <Link to="/admin/models" className="ml-2 underline underline-offset-2">去模型目录配置</Link>
           </p>
         ) : null}
       </Card>
