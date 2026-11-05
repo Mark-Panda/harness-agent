@@ -13,6 +13,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
@@ -47,6 +48,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-playground/form/v4 v4.3.0 // indirect
 	github.com/go-sql-driver/mysql v1.8.1 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/goph/emperror v0.17.2 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect

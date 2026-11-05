@@ -451,6 +451,8 @@ type AuditConfig struct {
 type FeishuConfig struct {
 	// Enabled 是否启用飞书事件接入与 Worker。
 	Enabled bool `yaml:"enabled"`
+	// EventMode 事件接收方式：webhook 或 long_connection。
+	EventMode string `yaml:"event_mode"`
 	// AppID 飞书应用 App ID。
 	AppID string `yaml:"app_id"`
 	// AppSecret 飞书应用 App Secret，必须由环境变量注入。
@@ -481,6 +483,23 @@ type FeishuConfig struct {
 	Reply FeishuReplyConfig `yaml:"reply"`
 	// Group 群聊话题与回复策略。
 	Group FeishuGroupConfig `yaml:"group"`
+}
+
+// 飞书事件接收方式。
+const (
+	// FeishuEventModeWebhook 由飞书回调到公网 HTTPS 地址。
+	FeishuEventModeWebhook = "webhook"
+	// FeishuEventModeLongConnection 由服务主动与飞书建立长连接接收事件。
+	FeishuEventModeLongConnection = "long_connection"
+)
+
+// NormalizedEventMode 返回规范化后的事件接收方式；未配置时按 webhook 处理。
+func (c FeishuConfig) NormalizedEventMode() string {
+	mode := strings.TrimSpace(strings.ToLower(c.EventMode))
+	if mode == "" {
+		return FeishuEventModeWebhook
+	}
+	return mode
 }
 
 // FeishuEncryptKey 是飞书事件加密密钥版本。
@@ -840,17 +859,17 @@ func (c Config) Validate() error {
 }
 
 // validateFeishu 校验飞书集成配置；未启用时允许全部留空，避免本地开发强依赖飞书。
-// 关键步骤：启用时必须具备应用凭据、事件校验密钥与默认 Agent，生产环境额外强制签名与时间窗。
+// 关键步骤：webhook 模式必须具备应用凭据、事件校验密钥与默认 Agent；长连接模式改用已登记机器人凭据。
 func (c Config) validateFeishu() error {
 	feishu := c.Feishu
 	if !feishu.Enabled {
 		return nil
 	}
-	if strings.TrimSpace(feishu.AppID) == "" {
-		return fmt.Errorf("feishu.app_id is required when feishu is enabled")
-	}
-	if strings.TrimSpace(feishu.AppSecret) == "" {
-		return fmt.Errorf("feishu.app_secret is required when feishu is enabled")
+	eventMode := feishu.NormalizedEventMode()
+	switch eventMode {
+	case FeishuEventModeWebhook, FeishuEventModeLongConnection:
+	default:
+		return fmt.Errorf("unsupported feishu.event_mode %q", feishu.EventMode)
 	}
 	if raw := strings.TrimSpace(feishu.LoginRedirectURL); raw != "" {
 		parsed, err := url.Parse(raw)
@@ -858,36 +877,55 @@ func (c Config) validateFeishu() error {
 			return fmt.Errorf("feishu.login_redirect_url must be an absolute HTTP(S) URL")
 		}
 	}
-	if strings.TrimSpace(feishu.VerificationToken) == "" {
-		return fmt.Errorf("feishu.verification_token is required when feishu is enabled")
-	}
 	if feishu.EventWindow.Duration <= 0 {
 		return fmt.Errorf("feishu.event_window must be positive when feishu is enabled")
 	}
 	if feishu.MaxBodyBytes <= 0 {
 		return fmt.Errorf("feishu.max_body_bytes must be positive when feishu is enabled")
 	}
-	if len(feishu.EncryptKeys) == 0 {
-		return fmt.Errorf("feishu.encrypt_keys is required when feishu is enabled")
-	}
+	// 配置模板会保留一组空占位；长连接模式允许完全不配置加密密钥。
 	keyIDs := map[string]struct{}{}
+	validKeys := 0
 	for i, key := range feishu.EncryptKeys {
-		if strings.TrimSpace(key.ID) == "" {
+		keyID := strings.TrimSpace(key.ID)
+		secret := strings.TrimSpace(key.Secret)
+		if keyID == "" && secret == "" {
+			continue
+		}
+		if keyID == "" {
 			return fmt.Errorf("feishu.encrypt_keys[%d].id is required", i)
 		}
-		if strings.TrimSpace(key.Secret) == "" {
+		if secret == "" {
 			return fmt.Errorf("feishu.encrypt_keys[%d].secret is required", i)
 		}
-		if _, exists := keyIDs[key.ID]; exists {
-			return fmt.Errorf("feishu encrypt key id %q is not unique", key.ID)
+		if _, exists := keyIDs[keyID]; exists {
+			return fmt.Errorf("feishu encrypt key id %q is not unique", keyID)
 		}
-		keyIDs[key.ID] = struct{}{}
+		keyIDs[keyID] = struct{}{}
+		validKeys++
 	}
-	if strings.TrimSpace(feishu.DefaultAgentID) == "" {
-		return fmt.Errorf("feishu.default_agent_id is required when feishu is enabled")
+	if eventMode == FeishuEventModeWebhook {
+		if strings.TrimSpace(feishu.AppID) == "" {
+			return fmt.Errorf("feishu.app_id is required when feishu.event_mode is webhook")
+		}
+		if strings.TrimSpace(feishu.AppSecret) == "" {
+			return fmt.Errorf("feishu.app_secret is required when feishu.event_mode is webhook")
+		}
+		if strings.TrimSpace(feishu.VerificationToken) == "" {
+			return fmt.Errorf("feishu.verification_token is required when feishu.event_mode is webhook")
+		}
+		if validKeys == 0 {
+			return fmt.Errorf("feishu.encrypt_keys is required when feishu.event_mode is webhook")
+		}
+		if strings.TrimSpace(feishu.DefaultAgentID) == "" {
+			return fmt.Errorf("feishu.default_agent_id is required when feishu.event_mode is webhook")
+		}
+		if feishu.DefaultAgentVersion <= 0 {
+			return fmt.Errorf("feishu.default_agent_version must be positive when feishu.event_mode is webhook")
+		}
 	}
-	if feishu.DefaultAgentVersion <= 0 {
-		return fmt.Errorf("feishu.default_agent_version must be positive when feishu is enabled")
+	if feishu.DefaultAgentVersion < 0 {
+		return fmt.Errorf("feishu.default_agent_version must not be negative")
 	}
 	switch feishu.Mode {
 	case "react", "plan", "super":
@@ -920,8 +958,8 @@ func (c Config) validateFeishu() error {
 	if reply.MaxConcurrentPerChat <= 0 || reply.MaxConcurrentPerUser <= 0 {
 		return fmt.Errorf("feishu.reply concurrency limits must be positive")
 	}
-	// 生产环境必须启用事件签名与时间窗校验，禁止明文回调。
-	if c.Environment == "production" && (len(feishu.EncryptKeys) == 0 || feishu.EventWindow.Duration <= 0) {
+	// Webhook 模式在生产环境必须启用事件签名与时间窗校验，禁止明文回调。
+	if c.Environment == "production" && eventMode == FeishuEventModeWebhook && (validKeys == 0 || feishu.EventWindow.Duration <= 0) {
 		return fmt.Errorf("production feishu callback signature and replay window are required")
 	}
 	return nil

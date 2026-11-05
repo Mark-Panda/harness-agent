@@ -379,6 +379,54 @@ func (s *FeishuIngestService) HandleForBot(ctx context.Context, botID uuid.UUID,
 	return s.handleWithVerifier(ctx, verifier, request)
 }
 
+// AcceptTrusted 接收已由飞书长连接认证的事件载荷；连接本身由应用凭据建立，因此跳过 HTTP 签名与 Token 校验。
+func (s *FeishuIngestService) AcceptTrusted(ctx context.Context, botID uuid.UUID, appID string, payload []byte) (FeishuIngestResult, error) {
+	if botID == uuid.Nil {
+		return FeishuIngestResult{}, invalid("feishu bot id is required")
+	}
+	if len(payload) == 0 {
+		return FeishuIngestResult{}, invalid("feishu event body is empty")
+	}
+	if int64(len(payload)) > s.maxBodyBytes {
+		return FeishuIngestResult{}, invalid("feishu event body exceeds the limit")
+	}
+	envelope, err := feishu.DecodeEnvelope(payload)
+	if err != nil {
+		return FeishuIngestResult{}, err
+	}
+	// 长连接按应用建立，事件头中的 app_id 必须与连接使用的应用一致，防止事件串应用。
+	if expected := strings.TrimSpace(appID); expected != "" && strings.TrimSpace(envelope.Header.AppID) != "" && envelope.Header.AppID != expected {
+		return FeishuIngestResult{}, invalid("feishu event app id mismatch")
+	}
+	return s.persistEnvelope(ctx, envelope, payload)
+}
+
+// persistEnvelope 完成事件格式校验、幂等入库与异步任务入队。
+func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feishu.Envelope, plaintext []byte) (FeishuIngestResult, error) {
+	if envelope.Header.EventID == "" || envelope.Header.EventType == "" {
+		return FeishuIngestResult{}, invalid("feishu event header is incomplete")
+	}
+	record := FeishuEventRecord{
+		EventID: envelope.Header.EventID, EventType: envelope.Header.EventType,
+		TenantKey: envelope.Header.TenantKey, AppID: envelope.Header.AppID,
+		// 原始事件只保存在受数据库权限保护的内部回执中，日志与错误只使用事件 ID。
+		Payload: map[string]any{"body": string(plaintext)},
+		Status:  FeishuEventReceived,
+	}
+	inserted, err := s.events.RecordEvent(ctx, record)
+	if err != nil {
+		return FeishuIngestResult{}, err
+	}
+	// 即便事件已存在也重新入队，修复上次入库成功但入队失败导致的丢任务；
+	// Job 去重键保证同一事件只会有一个消费任务。
+	if err := s.enqueuer.EnqueueFeishuEvent(ctx, envelope.Header.EventID, s.now()); err != nil {
+		_ = s.events.MarkEventStatus(ctx, envelope.Header.EventID, FeishuEventFailed, "enqueue feishu event failed", s.now())
+		return FeishuIngestResult{}, err
+	}
+	_ = inserted
+	return FeishuIngestResult{Accepted: true}, nil
+}
+
 // handle 执行验签、解密、幂等入库与任务入队。
 func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
 	// 入站 Span 只记录事件类型与处理结果，原始事件体、签名头与用户正文禁止进入 Trace。
@@ -425,28 +473,7 @@ func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verif
 	if err := verifier.VerifyToken(envelope.Header.Token); err != nil {
 		return FeishuIngestResult{}, err
 	}
-	if envelope.Header.EventID == "" || envelope.Header.EventType == "" {
-		return FeishuIngestResult{}, invalid("feishu event header is incomplete")
-	}
-	record := FeishuEventRecord{
-		EventID: envelope.Header.EventID, EventType: envelope.Header.EventType,
-		TenantKey: envelope.Header.TenantKey, AppID: envelope.Header.AppID,
-		// 原始事件只保存在受数据库权限保护的内部回执中，日志与错误只使用事件 ID。
-		Payload: map[string]any{"body": string(plaintext)},
-		Status:  FeishuEventReceived,
-	}
-	inserted, err := s.events.RecordEvent(ctx, record)
-	if err != nil {
-		return FeishuIngestResult{}, err
-	}
-	// 即便事件已存在也重新入队，修复上次入库成功但入队失败导致的丢任务；
-	// Job 去重键保证同一事件只会有一个消费任务。
-	if err := s.enqueuer.EnqueueFeishuEvent(ctx, envelope.Header.EventID, s.now()); err != nil {
-		_ = s.events.MarkEventStatus(ctx, envelope.Header.EventID, FeishuEventFailed, "enqueue feishu event failed", s.now())
-		return FeishuIngestResult{}, err
-	}
-	_ = inserted
-	return FeishuIngestResult{Accepted: true}, nil
+	return s.persistEnvelope(ctx, envelope, plaintext)
 }
 
 // feishuErrorCode 返回可安全写入回执与日志的稳定错误分类，不包含事件正文。

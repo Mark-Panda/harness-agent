@@ -379,6 +379,11 @@ func TestLoadValidatesFeishuConfiguration(t *testing.T) {
 			wantErr: "unsupported feishu mode",
 		},
 		{
+			name:    "unsupported event mode",
+			block:   strings.Replace(feishuEnabledBlock, "  mode: react", "  event_mode: unknown\n  mode: react", 1),
+			wantErr: "feishu.event_mode",
+		},
+		{
 			name:    "root fallback with required topic",
 			block:   strings.Replace(feishuEnabledBlock, "    allow_root_reply_fallback: false", "    allow_root_reply_fallback: true", 1),
 			wantErr: "root reply fallback",
@@ -417,5 +422,26 @@ func TestLoadValidatesFeishuConfiguration(t *testing.T) {
 				t.Fatalf("unexpected feishu config %+v", cfg.Feishu)
 			}
 		})
+	}
+}
+
+// TestLoadAllowsFeishuLongConnectionWithoutGlobalCredentials 覆盖只使用已登记机器人的长连接模式。
+func TestLoadAllowsFeishuLongConnectionWithoutGlobalCredentials(t *testing.T) {
+	setCredentialEnvironment(t)
+	block := strings.NewReplacer(
+		"  app_id: app-id\n", "",
+		"  app_secret: app-secret\n", "",
+		"  verification_token: verify-token\n", "",
+		"  encrypt_keys:\n    - id: current\n      secret: encrypt-secret\n", "",
+		"  default_agent_id: 11111111-1111-1111-1111-111111111111\n", "",
+		"  default_agent_version: 1\n", "",
+		"  mode: react\n", "  event_mode: long_connection\n  mode: react\n",
+	).Replace(feishuEnabledBlock)
+	cfg, err := Load(writeConfig(t, strings.Replace(validYAML, feishuGroupTail, block, 1)))
+	if err != nil {
+		t.Fatalf("Load() long connection config error = %v", err)
+	}
+	if !cfg.Feishu.Enabled || cfg.Feishu.NormalizedEventMode() != FeishuEventModeLongConnection {
+		t.Fatalf("unexpected long connection config %+v", cfg.Feishu)
 	}
 }

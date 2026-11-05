@@ -519,17 +519,21 @@ func cardFingerprint(title, text string, maxTextBytes int) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// buildFeishuCard 生成可更新的飞书交互卡片，正文超限时按 UTF-8 边界截断。
+// buildFeishuCard 生成可更新的飞书卡片。
+// 使用卡片 JSON 2.0 的 markdown 组件，支持标题、表格、代码块、分割线等标准 Markdown 语法。
 func buildFeishuCard(title, text string, maxTextBytes int) map[string]any {
 	text = truncateFeishuText(text, maxTextBytes)
 	return map[string]any{
-		"config": map[string]any{"wide_screen_mode": true, "update_multi": true},
+		"schema": "2.0",
+		"config": map[string]any{"update_multi": true, "width_mode": "fill"},
 		"header": map[string]any{
 			"template": "blue",
 			"title":    map[string]any{"tag": "plain_text", "content": title},
 		},
-		"elements": []map[string]any{
-			{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": text}},
+		"body": map[string]any{
+			"elements": []map[string]any{
+				{"tag": "markdown", "content": text},
+			},
 		},
 	}
 }

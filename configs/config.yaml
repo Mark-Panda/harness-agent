@@ -357,6 +357,8 @@ audit:
 feishu:
   # 是否启用飞书事件接入与 Worker。
   enabled: ${FEISHU_ENABLED}
+  # 事件接收方式：webhook 需要公网 HTTPS 回调地址；long_connection 由服务主动连接飞书。
+  event_mode: ${FEISHU_EVENT_MODE}
   # 飞书应用 App ID。
   app_id: ${FEISHU_APP_ID}
   # 飞书应用 App Secret。

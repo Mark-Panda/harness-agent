@@ -509,11 +509,13 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	runs := &feishuRunCreatorStub{run: biz.Run{ID: runID, UserID: userID, SessionID: uuid.New(), Status: biz.RunQueued}}
 	agentID := uuid.New()
 	version := 1
+	hot := &feishuHotStoreStub{}
 	worker, err := biz.NewFeishuEventWorker(biz.FeishuEventWorkerDependencies{
 		Jobs:   &feishuJobsStub{job: biz.Job{ID: uuid.New(), Payload: map[string]any{"event_id": "evt-om_1"}, Attempts: 1, MaxAttempts: 3}, claimed: true},
 		Events: events, Identities: &feishuIdentityStub{userID: userID}, Conversations: conversations,
 		Sessions: &feishuSessionsStub{conversation: conversations}, Messages: messages, Runs: runs, Outbound: &feishuOutboundStub{},
-		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
+		HotMessages: hot,
+		Clock:       func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, biz.FeishuEventWorkerConfig{
 		WorkerID: "worker-1", DefaultAgentID: &agentID, DefaultAgentVersion: &version,
 	})
@@ -534,6 +536,9 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	}
 	if conversations.binding.ThreadID != "p2p" || conversations.binding.SessionID == uuid.Nil {
 		t.Fatalf("binding = %+v", conversations.binding)
+	}
+	if hot.invalidated != 1 {
+		t.Fatalf("hot invalidated=%d, want 1", hot.invalidated)
 	}
 }
 
@@ -912,12 +917,34 @@ func (f *feishuWorkerFixture) buildWithConfig(t *testing.T, config biz.FeishuEve
 		Jobs: f.jobs, Events: f.events, Identities: f.identities, Conversations: f.conversations,
 		Sessions: f.sessions, Messages: f.messages, Runs: f.runs, Outbound: f.outbound,
 		Bots: f.bots, SpeakerFacts: f.facts,
-		Clock:        func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
+		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, config)
 	if err != nil {
 		t.Fatalf("new worker: %v", err)
 	}
 	f.worker = worker
+}
+
+// feishuHotStoreStub 记录会话热缓存的清理次数，用于验证入站消息后不会命中旧上下文。
+type feishuHotStoreStub struct {
+	invalidated int
+}
+
+func (s *feishuHotStoreStub) Append(context.Context, uuid.UUID, uuid.UUID, biz.Message) error {
+	return nil
+}
+
+func (s *feishuHotStoreStub) Invalidate(context.Context, uuid.UUID, uuid.UUID) error {
+	s.invalidated++
+	return nil
+}
+
+func (s *feishuHotStoreStub) Load(context.Context, uuid.UUID, uuid.UUID) ([]biz.Message, bool, error) {
+	return nil, false, nil
+}
+
+func (s *feishuHotStoreStub) Save(context.Context, uuid.UUID, uuid.UUID, []biz.Message) error {
+	return nil
 }
 
 // feishuBotCredentialStub 模拟按机器人 ID 读取加密凭据。
@@ -1790,4 +1817,45 @@ func TestFeishuWorkersStopOnCancelledContext(t *testing.T) {
 	replyFixture := newFeishuReplyFixture(t, biz.FeishuOutbound{ID: uuid.New()}, biz.Run{Status: biz.RunRunning}, biz.FeishuReplyWorkerConfig{})
 	replyFixture.outbound.hasClaim = false
 	replyFixture.worker.Start(ctx)
+}
+
+// TestAcceptTrustedPersistsAndEnqueues 覆盖长连接事件跳过 HTTP 验签后的入库与入队。
+func TestAcceptTrustedPersistsAndEnqueues(t *testing.T) {
+	verifier, err := feishu.NewVerifier(feishu.VerifierConfig{})
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	store := &feishuEventStoreStub{}
+	enqueuer := &feishuEnqueuerStub{}
+	service, err := biz.NewFeishuIngestService(verifier, store, enqueuer, biz.FeishuIngestConfig{MaxBodyBytes: 4096})
+	if err != nil {
+		t.Fatalf("new ingest service: %v", err)
+	}
+	payload := []byte(`{"schema":"2.0","header":{"event_id":"evt-longconn","event_type":"im.message.receive_v1","app_id":"cli_longconn"},"event":{}}`)
+	result, err := service.AcceptTrusted(context.Background(), uuid.New(), "cli_longconn", payload)
+	if err != nil {
+		t.Fatalf("AcceptTrusted() error = %v", err)
+	}
+	if !result.Accepted || store.recorded != 1 {
+		t.Fatalf("unexpected result %+v recorded=%d", result, store.recorded)
+	}
+	if len(enqueuer.enqueued) != 1 || enqueuer.enqueued[0] != "evt-longconn" {
+		t.Fatalf("unexpected enqueued events %v", enqueuer.enqueued)
+	}
+}
+
+// TestAcceptTrustedRejectsAppIDMismatch 覆盖长连接事件不能串到其他应用。
+func TestAcceptTrustedRejectsAppIDMismatch(t *testing.T) {
+	verifier, err := feishu.NewVerifier(feishu.VerifierConfig{})
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	service, err := biz.NewFeishuIngestService(verifier, &feishuEventStoreStub{}, &feishuEnqueuerStub{}, biz.FeishuIngestConfig{MaxBodyBytes: 4096})
+	if err != nil {
+		t.Fatalf("new ingest service: %v", err)
+	}
+	payload := []byte(`{"schema":"2.0","header":{"event_id":"evt-mismatch","event_type":"im.message.receive_v1","app_id":"cli_other"},"event":{}}`)
+	if _, err := service.AcceptTrusted(context.Background(), uuid.New(), "cli_expected", payload); err == nil {
+		t.Fatal("AcceptTrusted() should reject app id mismatch")
+	}
 }

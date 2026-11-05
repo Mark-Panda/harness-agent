@@ -69,3 +69,27 @@ func TestKeyedLimiterEnforcesPerKeyLimit(t *testing.T) {
 	}
 	limiter.release("")
 }
+
+// TestBuildFeishuCardUsesMarkdownV2 验证回复卡片使用 JSON 2.0 markdown 组件，能渲染标题、表格与代码块。
+func TestBuildFeishuCardUsesMarkdownV2(t *testing.T) {
+	text := "# 结论\n\n| 项目 | 结果 |\n| --- | --- |\n| 登录 | 正常 |\n\n```go\nfmt.Println(\"ok\")\n```"
+	card := buildFeishuCard("执行完成", text, 0)
+	if card["schema"] != "2.0" {
+		t.Fatalf("card schema = %v", card["schema"])
+	}
+	config, ok := card["config"].(map[string]any)
+	if !ok || config["width_mode"] != "fill" || config["update_multi"] != true {
+		t.Fatalf("card config = %+v", card["config"])
+	}
+	body, ok := card["body"].(map[string]any)
+	if !ok {
+		t.Fatalf("card body = %+v", card["body"])
+	}
+	elements, ok := body["elements"].([]map[string]any)
+	if !ok || len(elements) != 1 {
+		t.Fatalf("card elements = %+v", body["elements"])
+	}
+	if elements[0]["tag"] != "markdown" || elements[0]["content"] != text {
+		t.Fatalf("markdown element = %+v", elements[0])
+	}
+}

@@ -117,6 +117,72 @@ func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, appID strin
 	return client, nil
 }
 
+// unconfiguredFeishuSender 只使用已登记机器人时作为默认应用占位，调用即返回明确错误。
+type unconfiguredFeishuSender struct{}
+
+// ReplyCard 没有默认应用时不允许发送。
+func (unconfiguredFeishuSender) ReplyCard(context.Context, string, any) (string, error) {
+	return "", fmt.Errorf("feishu default app is not configured")
+}
+
+// ReplyCardInThread 没有默认应用时不允许发送。
+func (unconfiguredFeishuSender) ReplyCardInThread(context.Context, string, any) (biz.FeishuThreadedMessage, error) {
+	return biz.FeishuThreadedMessage{}, fmt.Errorf("feishu default app is not configured")
+}
+
+// UpdateCard 没有默认应用时不允许更新。
+func (unconfiguredFeishuSender) UpdateCard(context.Context, string, any) error {
+	return fmt.Errorf("feishu default app is not configured")
+}
+
+// ReplyText 没有默认应用时不允许发送。
+func (unconfiguredFeishuSender) ReplyText(context.Context, string, string) (string, error) {
+	return "", fmt.Errorf("feishu default app is not configured")
+}
+
+// ReplyTextInThread 没有默认应用时不允许发送。
+func (unconfiguredFeishuSender) ReplyTextInThread(context.Context, string, string) (biz.FeishuThreadedMessage, error) {
+	return biz.FeishuThreadedMessage{}, fmt.Errorf("feishu default app is not configured")
+}
+
+// loadFeishuLongConnectionBots 读取启用机器人的应用凭据，用于建立长连接。
+func loadFeishuLongConnectionBots(ctx context.Context, repo biz.FeishuBotRepository, opener biz.CredentialOpener, logger *slog.Logger) ([]feishu.LongConnectionBot, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	bots, err := repo.ListFeishuBots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]feishu.LongConnectionBot, 0, len(bots))
+	for _, bot := range bots {
+		if bot.Status != biz.FeishuBotEnabled {
+			continue
+		}
+		_, credential, credentialErr := repo.GetFeishuBotCredential(ctx, bot.ID)
+		if credentialErr != nil {
+			logger.Warn("skip feishu long connection bot: read credentials failed", "bot_id", bot.ID, "error", credentialErr)
+			continue
+		}
+		plaintext, openErr := opener.Open(credential.KeyVersion, credential.Encrypted)
+		if openErr != nil {
+			logger.Warn("skip feishu long connection bot: decrypt credentials failed", "bot_id", bot.ID, "error", openErr)
+			continue
+		}
+		var secret biz.FeishuBotSecret
+		if unmarshalErr := json.Unmarshal(plaintext, &secret); unmarshalErr != nil {
+			logger.Warn("skip feishu long connection bot: invalid credentials", "bot_id", bot.ID, "error", unmarshalErr)
+			continue
+		}
+		if strings.TrimSpace(secret.AppSecret) == "" {
+			logger.Warn("skip feishu long connection bot: app secret is empty", "bot_id", bot.ID)
+			continue
+		}
+		result = append(result, feishu.LongConnectionBot{ID: bot.ID.String(), AppID: bot.AppID, AppSecret: secret.AppSecret})
+	}
+	return result, nil
+}
+
 // feishuBotTester 使用应用凭据换取 Tenant Access Token，验证连通性。
 type feishuBotTester struct{}
 
@@ -483,12 +549,18 @@ func run() error {
 		hostname, _ := os.Hostname()
 		workerID = fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), uuid.NewString()[:8])
 	}
-	// 飞书集成：回调只做验签幂等入库，身份映射、话题绑定与回复投递全部异步执行。
+	// 飞书集成：回调或长连接只做验签幂等入库，身份映射、话题绑定与回复投递全部异步执行。
 	var feishuEventWorker *biz.FeishuEventWorker
 	var feishuReplyWorker *biz.FeishuReplyWorker
+	var feishuLongConnection *feishu.LongConnection
 	if cfg.Feishu.Enabled {
+		eventMode := cfg.Feishu.NormalizedEventMode()
 		encryptKeys := make([]feishu.EncryptionKey, 0, len(cfg.Feishu.EncryptKeys))
 		for _, key := range cfg.Feishu.EncryptKeys {
+			// 配置模板保留的空占位不参与验签；长连接模式通常没有加密密钥。
+			if strings.TrimSpace(key.ID) == "" || strings.TrimSpace(key.Secret) == "" {
+				continue
+			}
 			encryptKeys = append(encryptKeys, feishu.EncryptionKey{ID: key.ID, Secret: key.Secret})
 		}
 		verifier, err := feishu.NewVerifier(feishu.VerifierConfig{
@@ -507,16 +579,27 @@ func run() error {
 			return err
 		}
 		ingestService.WithBotVerification(feishuBotRepository, credentialKeys)
-		platformService.WithFeishuIngest(ingestService)
+		// 只有 webhook 模式才注册公网回调路由；长连接由服务主动连飞书。
+		if eventMode == config.FeishuEventModeWebhook {
+			platformService.WithFeishuIngest(ingestService)
+		}
 		// 飞书话题解绑：仅会话所有者可解绑，管理员不跨用户操作他人绑定。
 		feishuBindingService, err := biz.NewFeishuBindingService(data.NewFeishuConversationRepository(appDB), sessionRepository)
 		if err != nil {
 			return err
 		}
 		platformService.WithFeishuBindings(feishuBindingService)
-		feishuClient, err := feishu.NewClient(feishu.ClientConfig{AppID: cfg.Feishu.AppID, AppSecret: cfg.Feishu.AppSecret})
-		if err != nil {
-			return fmt.Errorf("configure feishu client: %w", err)
+		// 默认应用仅在使用全局应用凭据时创建；长连接模式可只依赖已登记机器人。
+		var feishuClient *feishu.Client
+		if strings.TrimSpace(cfg.Feishu.AppID) != "" && strings.TrimSpace(cfg.Feishu.AppSecret) != "" {
+			feishuClient, err = feishu.NewClient(feishu.ClientConfig{AppID: cfg.Feishu.AppID, AppSecret: cfg.Feishu.AppSecret})
+			if err != nil {
+				return fmt.Errorf("configure feishu client: %w", err)
+			}
+		}
+		var defaultFeishuSender biz.FeishuReplySender = unconfiguredFeishuSender{}
+		if feishuClient != nil {
+			defaultFeishuSender = feishuClient
 		}
 		// 默认应用机器人仅在配置了默认助手时启用；只使用注册机器人时可留空。
 		var defaultAgentID *uuid.UUID
@@ -538,6 +621,7 @@ func run() error {
 			Messages:      data.NewFeishuMessageRepository(appDB),
 			Runs:          runService,
 			Outbound:      data.NewFeishuOutboundRepository(appDB),
+			HotMessages:   hotMessages,
 			Bots:          feishuBotRepository,
 			Logger:        slog.Default(),
 		}
@@ -558,11 +642,11 @@ func run() error {
 		feishuReplyWorker, err = biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
 			Outbound: data.NewFeishuOutboundRepository(appDB),
 			Runs:     runRepository,
-			Sender:   feishuClient,
+			Sender:   defaultFeishuSender,
 			// 已登记机器人按 App ID 使用各自的客户端，避免回复串到默认应用。
 			Senders: &feishuBotSenderResolver{
 				router: feishuBotRepository, credentials: feishuBotRepository,
-				opener: credentialKeys, defaultSender: feishuClient, senders: make(map[string]biz.FeishuReplySender),
+				opener: credentialKeys, defaultSender: defaultFeishuSender, senders: make(map[string]biz.FeishuReplySender),
 			},
 			Conversations: data.NewFeishuConversationRepository(appDB),
 			Logger:        slog.Default(),
@@ -577,6 +661,28 @@ func run() error {
 		})
 		if err != nil {
 			return err
+		}
+		if eventMode == config.FeishuEventModeLongConnection {
+			bots, loadErr := loadFeishuLongConnectionBots(context.Background(), feishuBotRepository, credentialKeys, slog.Default())
+			if loadErr != nil {
+				return fmt.Errorf("load feishu long connection bots: %w", loadErr)
+			}
+			feishuLongConnection, err = feishu.NewLongConnection(feishu.LongConnectionConfig{
+				Bots: bots,
+				Handler: func(ctx context.Context, botID, appID string, body []byte) error {
+					botUUID, parseErr := uuid.Parse(botID)
+					if parseErr != nil {
+						return fmt.Errorf("parse feishu bot id: %w", parseErr)
+					}
+					_, ingestErr := ingestService.AcceptTrusted(ctx, botUUID, appID, body)
+					return ingestErr
+				},
+				Logger: slog.Default(),
+			})
+			if err != nil {
+				return fmt.Errorf("configure feishu long connection: %w", err)
+			}
+			slog.Info("feishu long connection configured", "bots", len(bots))
 		}
 	}
 	// API 多维限流：全局、来源 IP 与登录用户三个维度各自独立计数；
@@ -822,6 +928,13 @@ func run() error {
 		go func() {
 			defer workers.Done()
 			feishuReplyWorker.Start(workerContext)
+		}()
+	}
+	if feishuLongConnection != nil {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			feishuLongConnection.Start(workerContext)
 		}()
 	}
 	app := kratos.New(

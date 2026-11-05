@@ -87,6 +87,8 @@ type FeishuEventWorkerDependencies struct {
 	Runs FeishuRunCreator
 	// Outbound 外发回复仓储。
 	Outbound FeishuOutboundStore
+	// HotMessages 会话热消息缓存；入站消息落库后清理，确保下一次 Run 能读到新消息。
+	HotMessages HotMessageStore
 	// Bots 机器人注册与绑定解析端口；为空时退化为配置中的默认机器人。
 	Bots FeishuBotRouter
 	// SpeakerFacts 群聊发言人事实提取触发器；为空表示不提取个人事实。
@@ -107,6 +109,7 @@ type FeishuEventWorker struct {
 	messages      FeishuInboundMessageStore
 	runs          FeishuRunCreator
 	outbound      FeishuOutboundStore
+	hotMessages   HotMessageStore
 	bots          FeishuBotRouter
 	config        FeishuEventWorkerConfig
 	clock         func() time.Time
@@ -136,8 +139,9 @@ func NewFeishuEventWorker(dependencies FeishuEventWorkerDependencies, config Fei
 		jobs: dependencies.Jobs, events: dependencies.Events, identities: dependencies.Identities,
 		conversations: dependencies.Conversations, sessions: dependencies.Sessions,
 		messages: dependencies.Messages, runs: dependencies.Runs, outbound: dependencies.Outbound,
-		bots:   dependencies.Bots,
-		config: config.normalize(), clock: clock, logger: logger, speakerFacts: dependencies.SpeakerFacts,
+		hotMessages: dependencies.HotMessages,
+		bots:        dependencies.Bots,
+		config:      config.normalize(), clock: clock, logger: logger, speakerFacts: dependencies.SpeakerFacts,
 	}, nil
 }
 
@@ -351,17 +355,25 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	// 乱序保护：消息时间取飞书 create_time，而不是任务实际处理时间；
 	// 这样旧事件晚到时仍按发生时间落库，上下文与摘要顺序不会被投递顺序打乱。
 	occurredAt := messageEvent.CreatedAt(w.clock())
-	_, created, err := w.messages.AppendInbound(ctx, Message{
+	inbound := Message{
 		ID: uuid.New(), SessionID: session.ID, UserID: binding.UserID, Role: MessageUser,
 		Content: text, ExternalMessageID: messageEvent.MessageID, SpeakerOpenID: messageEvent.SenderOpenID,
 		CreatedAt: occurredAt,
-	}, mutationEvent(binding.UserID, "message.created", "message", uuid.New()))
+	}
+	_, created, err := w.messages.AppendInbound(ctx, inbound, mutationEvent(binding.UserID, "message.created", "message", uuid.New()))
 	if err != nil {
 		return "", err
 	}
 	if !created {
 		// 飞书重推同一消息时，消息已存在即视为处理成功，不重复创建 Run。
 		return FeishuEventProcessed, nil
+	}
+	// 入站消息只写 PostgreSQL；必须清理 Redis 热窗口，否则下一次 Run 会命中旧缓存而看不到本轮问题。
+	// 冷缓存或 Redis 重启后，清理也能让下一次 Run 从数据库重建完整历史。
+	if w.hotMessages != nil {
+		if err := w.hotMessages.Invalidate(ctx, binding.UserID, session.ID); err != nil {
+			w.logger.Warn("invalidate hot messages after inbound failed", "session_id", session.ID, "error", err)
+		}
 	}
 	// 群聊话题中个人事实只写入发言人私有记忆：消息归属会话所有者，但提取与写入身份切换为发言人本人。
 	// 失败不影响回复链路，仅记录日志等待下一轮重试。
