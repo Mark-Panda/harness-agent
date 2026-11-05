@@ -8,10 +8,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // FeishuEventJobType 是飞书事件异步消费的任务类型。
@@ -429,18 +426,10 @@ func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feis
 
 // handle 执行验签、解密、幂等入库与任务入队。
 func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
-	// 入站 Span 只记录事件类型与处理结果，原始事件体、签名头与用户正文禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "feishu.ingest")
-	defer span.End()
 	if verifier == nil {
-		telemetry.Fail(span, "verifier_missing")
 		return FeishuIngestResult{}, fmt.Errorf("%w: feishu verifier is not configured", ErrInvalidConfig)
 	}
-	result, err := s.handle(ctx, verifier, request)
-	if err != nil {
-		telemetry.Fail(span, "ingest_failed")
-	}
-	return result, err
+	return s.handle(ctx, verifier, request)
 }
 
 // handle 使用指定验签器处理请求。
@@ -459,7 +448,6 @@ func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verif
 	if err != nil {
 		return FeishuIngestResult{}, err
 	}
-	telemetry.Annotate(trace.SpanFromContext(ctx), attribute.String(telemetry.AttrFeishuEventType, envelope.Header.EventType))
 	// URL 验证请求必须在验签后校验 Verification Token，再原样返回 challenge。
 	if envelope.IsURLVerification() {
 		if err := verifier.VerifyToken(envelope.Token); err != nil {

@@ -363,8 +363,7 @@ type ExecutionRecordsConfig struct {
 }
 
 type ObservabilityConfig struct {
-	IncludeExecutionPayloads bool          `yaml:"include_execution_payloads"`
-	Tracing                  TracingConfig `yaml:"tracing"`
+	IncludeExecutionPayloads bool `yaml:"include_execution_payloads"`
 }
 
 // LoggingConfig 配置结构化日志级别与输出格式；保留期由部署侧日志采集与轮转统一管理。
@@ -383,30 +382,6 @@ type RetentionConfig struct {
 	AuditLogs Duration `yaml:"audit_logs"`
 	// FeishuEvents 飞书原始事件回执保留期，用于限制重放载荷中的正文驻留时间。
 	FeishuEvents Duration `yaml:"feishu_events"`
-}
-
-// TracingConfig 配置 OpenTelemetry OTLP HTTP 导出、采样与出口认证。
-// 约束：Headers 只允许承载导出凭证，禁止写入用户或会话标识；
-// ResourceAttributes 为全局低基数资源属性，Trace/日志正文默认不采集 Prompt、Completion 与工具原文。
-type TracingConfig struct {
-	// Enabled 是否启用 Trace 导出。
-	Enabled bool `yaml:"enabled"`
-	// ServiceName 服务名，写入 service.name。
-	ServiceName string `yaml:"service_name"`
-	// Endpoint OTLP HTTP 端点，支持 host:port 或完整 URL。
-	Endpoint string `yaml:"endpoint"`
-	// Insecure host:port 形式下允许明文 HTTP，仅限内网或本地调试。
-	Insecure bool `yaml:"insecure"`
-	// SampleRatio 采样比例，必须位于 (0, 1]。
-	SampleRatio float64 `yaml:"sample_ratio"`
-	// BatchTimeout 批量导出间隔。
-	BatchTimeout Duration `yaml:"batch_timeout"`
-	// ExportTimeout 单次导出超时。
-	ExportTimeout Duration `yaml:"export_timeout"`
-	// Headers 导出请求头，用于网关或 Collector 出口认证。
-	Headers map[string]string `yaml:"headers"`
-	// ResourceAttributes 附加资源属性。
-	ResourceAttributes map[string]string `yaml:"resource_attributes"`
 }
 
 type AuthConfig struct {
@@ -774,24 +749,6 @@ func (c Config) Validate() error {
 	}
 	if c.Observability.IncludeExecutionPayloads {
 		return fmt.Errorf("observability.include_execution_payloads must remain false")
-	}
-	tracing := c.Observability.Tracing
-	if tracing.Enabled {
-		if strings.TrimSpace(tracing.Endpoint) == "" {
-			return fmt.Errorf("observability.tracing.endpoint is required when tracing is enabled")
-		}
-		if strings.Contains(tracing.Endpoint, "://") {
-			parsed, err := url.Parse(tracing.Endpoint)
-			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-				return fmt.Errorf("observability.tracing.endpoint must be a valid http(s) URL")
-			}
-		}
-		if tracing.SampleRatio <= 0 || tracing.SampleRatio > 1 {
-			return fmt.Errorf("observability.tracing.sample_ratio must be within (0, 1]")
-		}
-		if tracing.BatchTimeout.Duration <= 0 || tracing.ExportTimeout.Duration <= 0 {
-			return fmt.Errorf("observability.tracing batch and export timeouts must be positive")
-		}
 	}
 	if c.Retention.ExecutionRecords.Duration <= 0 || c.Retention.AuditLogs.Duration <= 0 {
 		return fmt.Errorf("retention.execution_records and retention.audit_logs must be positive")

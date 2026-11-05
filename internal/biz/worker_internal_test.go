@@ -14,7 +14,6 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/sandbox"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // fakeSandboxRunner 记录高风险工具调用并按预设返回结果。
@@ -203,7 +202,6 @@ func TestAttemptFinishedDropsPartialResponseWhenDisabled(t *testing.T) {
 	observer := &runAttemptObserver{
 		worker: worker, run: Run{ID: uuid.New(), UserID: uuid.New()},
 		callIDs: map[int]uuid.UUID{1: uuid.New()}, stepIDs: map[int]uuid.UUID{1: uuid.New()},
-		attemptSpans: map[int]trace.Span{},
 	}
 	err := observer.AttemptFinished(context.Background(), model.AttemptRecord{
 		AttemptNo: 1, Status: "succeeded", ResponseText: strings.Repeat("长响应", 20),
@@ -268,7 +266,6 @@ func TestAttemptStartedPersistsRebuildableManifest(t *testing.T) {
 	observer := &runAttemptObserver{
 		worker: worker, run: Run{ID: uuid.New(), UserID: uuid.New()}, fence: RunFence{Owner: "worker", Token: 1},
 		callIDs: map[int]uuid.UUID{}, stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
-		attemptSpans: map[int]trace.Span{},
 	}
 	record := model.AttemptRecord{
 		AttemptNo: 1, ProviderID: uuid.NewString(), ModelID: uuid.NewString(), RemoteModelName: "generation",

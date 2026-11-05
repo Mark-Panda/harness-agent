@@ -308,50 +308,6 @@ const feishuEnabledBlock = `feishu:
     allow_root_reply_fallback: false
 `
 
-// TestLoadValidatesTracingConfiguration 覆盖追踪启停、端点格式、采样比例与导出超时校验。
-func TestLoadValidatesTracingConfiguration(t *testing.T) {
-	setCredentialEnvironment(t)
-	tracingEnabled := `observability:
-  include_execution_payloads: false
-  tracing:
-    enabled: true
-    service_name: harness-agent
-    endpoint: http://collector:4318
-    sample_ratio: 0.25
-    batch_timeout: 5s
-    export_timeout: 10s
-    headers:
-      authorization: "Bearer collector-token"
-`
-	base := strings.Replace(validYAML, "observability:\n  include_execution_payloads: false", tracingEnabled, 1)
-	cfg, err := Load(writeConfig(t, base))
-	if err != nil {
-		t.Fatalf("Load() tracing config error = %v", err)
-	}
-	if !cfg.Observability.Tracing.Enabled || cfg.Observability.Tracing.SampleRatio != 0.25 {
-		t.Fatalf("tracing config = %+v", cfg.Observability.Tracing)
-	}
-
-	tests := []struct {
-		name    string
-		content string
-		wantErr string
-	}{
-		{name: "missing endpoint", content: strings.Replace(base, "    endpoint: http://collector:4318\n", "", 1), wantErr: "endpoint is required"},
-		{name: "invalid endpoint scheme", content: strings.Replace(base, "http://collector:4318", "ftp://collector", 1), wantErr: "valid http(s) URL"},
-		{name: "zero sample ratio", content: strings.Replace(base, "sample_ratio: 0.25", "sample_ratio: 0", 1), wantErr: "sample_ratio"},
-		{name: "ratio above one", content: strings.Replace(base, "sample_ratio: 0.25", "sample_ratio: 2", 1), wantErr: "sample_ratio"},
-		{name: "zero export timeout", content: strings.Replace(base, "export_timeout: 10s", "export_timeout: 0s", 1), wantErr: "timeouts must be positive"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := Load(writeConfig(t, tt.content)); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("Load() error = %v, want error containing %q", err, tt.wantErr)
-			}
-		})
-	}
-}
-
 // TestLoadValidatesFeishuConfiguration 覆盖飞书启用时的凭据、密钥与策略校验。
 func TestLoadValidatesFeishuConfiguration(t *testing.T) {
 	tests := []struct {

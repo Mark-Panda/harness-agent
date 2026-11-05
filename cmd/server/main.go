@@ -25,9 +25,7 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
 	"github.com/Mark-Panda/harness-agent/pkg/sandbox"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"github.com/go-kratos/kratos/v3"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -239,26 +237,6 @@ func run() error {
 		return fmt.Errorf("configure logging: %w", err)
 	}
 	slog.SetDefault(logger)
-	// 追踪初始化先于数据库与 Worker：HTTP/gRPC 与后台任务共享同一全局 TracerProvider，
-	// 停机时先停止接流再刷新批量 Span，避免退出丢失尾批数据。
-	tracingConfig := cfg.Observability.Tracing
-	telemetryProvider, err := telemetry.Setup(context.Background(), telemetry.Options{
-		Enabled: tracingConfig.Enabled, ServiceName: tracingConfig.ServiceName,
-		Environment: cfg.Environment, Endpoint: tracingConfig.Endpoint, Insecure: tracingConfig.Insecure,
-		Headers: tracingConfig.Headers, SampleRatio: tracingConfig.SampleRatio,
-		BatchTimeout: tracingConfig.BatchTimeout.Duration, ExportTimeout: tracingConfig.ExportTimeout.Duration,
-		ResourceAttributes: tracingConfig.ResourceAttributes,
-	})
-	if err != nil {
-		return fmt.Errorf("configure telemetry: %w", err)
-	}
-	defer func() {
-		shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancelShutdown()
-		if err := telemetryProvider.Shutdown(shutdownContext); err != nil {
-			slog.Warn("shutdown telemetry failed", "error", err)
-		}
-	}()
 	previousCredentialKeys := make([]platformcrypto.Key, 0, len(cfg.Credentials.PreviousKeys))
 	for _, key := range cfg.Credentials.PreviousKeys {
 		previousCredentialKeys = append(previousCredentialKeys, platformcrypto.Key{ID: key.ID, Secret: []byte(key.Secret)})
@@ -277,7 +255,6 @@ func run() error {
 		return err
 	}
 	defer closeDB(authDB)
-	// 连接池指标从启动即开始采集，用于识别连接耗尽与故障转移后的恢复情况。
 	appSQL, err := appDB.DB()
 	if err != nil {
 		return fmt.Errorf("get app postgres pool: %w", err)
@@ -286,8 +263,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("get auth postgres pool: %w", err)
 	}
-	metrics.RegisterDBPool("app", appSQL)
-	metrics.RegisterDBPool("auth", authSQL)
 	verificationKeys := make([]auth.SigningKey, 0, len(cfg.Auth.JWTVerificationKeys))
 	for _, key := range cfg.Auth.JWTVerificationKeys {
 		verificationKeys = append(verificationKeys, auth.SigningKey{ID: key.ID, Secret: []byte(key.Secret)})
@@ -953,7 +928,7 @@ func run() error {
 			defer deadline.Stop()
 			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
-			for metrics.InflightJobs() > 0 {
+			for biz.InflightJobs() > 0 {
 				select {
 				case <-ctx.Done():
 					stopWorker()

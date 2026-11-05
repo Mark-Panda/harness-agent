@@ -12,10 +12,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/memory"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // 摘要任务错误，用于区分可重试的基础设施失败与不可重试的来源/版本失效。
@@ -493,23 +490,12 @@ func (w *SummaryWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 解析任务载荷并生成摘要；可重试错误退避重试，来源/版本失效直接完成。
 func (w *SummaryWorker) handle(ctx context.Context, job Job) {
-	// 摘要 Span 只记录任务与版本元数据，摘要正文、消息原文禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "job.process",
-		attribute.String(telemetry.AttrJobType, job.Type),
-		attribute.String(telemetry.AttrJobID, job.ID.String()),
-	)
-	defer span.End()
-	jobType := job.Type
-	if jobType == "" {
-		jobType = "summary"
-	}
-	finishJob := metrics.StartJob(jobType)
+	finishJob := beginJob()
 	failureClass := ""
 	defer func() {
 		outcome := "success"
 		if failureClass != "" {
 			outcome = "failure"
-			telemetry.Fail(span, failureClass)
 		}
 		finishJob(outcome)
 	}()
@@ -520,7 +506,6 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
-	telemetry.Annotate(span, attribute.String(telemetry.AttrSessionID, task.SessionID.String()))
 	// 会话归档或删除后不再生成新摘要，避免继续消耗模型额度。
 	session, err := w.sessions.GetSession(ctx, task.UserID, task.SessionID)
 	if err != nil {
@@ -607,10 +592,8 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		}
 		w.failJob(ctx, job, generateErr)
 		failureClass = "retryable_failure"
-		metrics.ObserveMemory("summary", "failure")
 		return
 	}
-	metrics.ObserveMemory("summary", "success")
 	if err := memory.ValidateSummaryText(generation.Text, w.config.MaxSummaryBytes); err != nil {
 		w.logger.Warn("summary text rejected", "job_id", job.ID, "error", err)
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)

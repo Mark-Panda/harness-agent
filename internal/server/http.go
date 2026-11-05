@@ -13,8 +13,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/internal/platform/config"
 	"github.com/Mark-Panda/harness-agent/internal/service"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
+	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	kratoshttp "github.com/go-kratos/kratos/v3/transport/http"
 )
 
@@ -103,14 +102,13 @@ func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimit
 	mux.HandleFunc("GET /health/ready", readinessHandler)
 	mux.HandleFunc("GET /api/v1/health", healthHandler("ok"))
 	mux.HandleFunc("GET /api/v1/sse/probe", sseProbeHandler)
-	mux.HandleFunc("GET /metrics", metrics.Handler().ServeHTTP)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "api_not_found"})
 	})
 	mux.Handle("/", spaHandler(assets))
 	apiHandler := apiRateLimitMiddleware(apiLimits, ipResolver, mux)
-	// 指标中间件位于追踪内层：路由模板由 ServeMux 回填后作为低基数标签；追踪仍为每个请求建立 Span。
-	return securityHeaders(cookies.Secure, telemetry.HTTPMiddleware(metrics.Middleware(apiHandler)))
+	// 请求关联中间件为每个请求建立或复用 request_id，并回写响应头。
+	return securityHeaders(cookies.Secure, logging.RequestIDMiddleware(apiHandler))
 }
 
 // apiRateLimitMiddleware 对 /api/v1 请求执行全局与来源 IP 维度限流；

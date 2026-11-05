@@ -15,14 +15,11 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/Mark-Panda/harness-agent/pkg/memory"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
 	"github.com/Mark-Panda/harness-agent/pkg/sandbox"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // 执行器错误，用于区分业务失败与基础设施失败。
@@ -375,23 +372,12 @@ func (w *ExecutionWorker) deferJob(ctx context.Context, job Job, reason string) 
 
 // handle 执行单个 Run 任务；任何失败都会转换为明确终态或可重试的 Job 失败。
 func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
-	// 任务 Span 仅记录任务类型、ID 与 Run 关联，不记录用户正文或模型输出。
-	ctx, span := telemetry.Start(ctx, "job.process",
-		attribute.String(telemetry.AttrJobType, job.Type),
-		attribute.String(telemetry.AttrJobID, job.ID.String()))
-	defer span.End()
-	jobType := job.Type
-	if jobType == "" {
-		jobType = "agent.run"
-	}
-	finishJob := metrics.StartJob(jobType)
-	runStarted := time.Now()
+	finishJob := beginJob()
 	failureClass := ""
 	defer func() {
 		outcome := "success"
 		if failureClass != "" {
 			outcome = "failure"
-			telemetry.Fail(span, failureClass)
 		}
 		finishJob(outcome)
 	}()
@@ -430,11 +416,7 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 	}
 	run = claimed
 	// 将 Run ID 写入上下文，后续使用 *Context 日志方法时自动附加 run_id 关联字段。
-	ctx = telemetry.WithRunID(ctx, run.ID.String())
-	telemetry.Annotate(span,
-		attribute.String(telemetry.AttrRunID, run.ID.String()),
-		attribute.String(telemetry.AttrAgentMode, string(run.Mode)),
-	)
+	ctx = logging.WithRunID(ctx, run.ID.String())
 
 	// 执行上下文受 Run Deadline 约束；用户取消或租约失效会通过 cancel 中止模型调用。
 	execCtx, cancel := context.WithCancel(ctx)
@@ -559,7 +541,6 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "complete run")
 		return
 	}
-	metrics.ObserveRunFinished(string(run.Mode), string(RunCompleted), time.Since(runStarted))
 	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 	// 记忆写入必须遵循会话策略：群聊话题不写入个人长期记忆与结构化事实，disabled 停止全部记忆写入。
 	policy := w.resolveMemoryPolicy(context.WithoutCancel(ctx), run)
@@ -699,7 +680,6 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	observer := &runAttemptObserver{
 		worker: w, run: run, fence: fence, policyVersion: policyVersion,
 		callIDs: map[int]uuid.UUID{}, stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
-		attemptSpans: map[int]trace.Span{},
 	}
 	routing := model.RouterConfig{
 		MinContextTokens: w.config.Routing.MinContextTokens, MaxAttemptsPerModel: w.config.Routing.MaxAttemptsPerModel,
@@ -849,12 +829,8 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 				// 向量或 embedding 故障只降级为无长期记忆，不得阻断 Run 或扩大检索范围。
 				w.logger.Warn("retrieve long-term memory failed; continuing without it", "run_id", run.ID, "error", err)
 				degradations = append(degradations, "vector_memory")
-				metrics.ObserveMemory("retrieve", "failure")
 			} else if text := formatMemoryContext(matches, historyIDs); text != "" {
 				messages = append(messages, react.Message{Role: react.RoleSystem, Content: text})
-				metrics.ObserveMemory("retrieve", "success")
-			} else {
-				metrics.ObserveMemory("retrieve", "empty")
 			}
 		}
 	}
@@ -1247,7 +1223,6 @@ func (w *ExecutionWorker) failRun(ctx context.Context, run Run, fence RunFence, 
 		w.logger.Error("mark run failed", "run_id", run.ID, "error", err)
 		return
 	}
-	metrics.IncRunStatus(string(run.Mode), string(RunFailed))
 }
 
 // retryJob 把任务退回 pending 并按退避时间延后，保持 Run 处于可恢复状态。
@@ -1362,32 +1337,10 @@ type runAttemptObserver struct {
 	callIDs       map[int]uuid.UUID
 	stepIDs       map[int]uuid.UUID
 	stepSeqs      map[int]int64
-	// attemptSpans 保存每次模型尝试的 Span，结束结算时补齐 Token 与错误分类后关闭。
-	attemptSpans map[int]trace.Span
 }
 
 // AttemptStarted 在调用前落库请求清单；失败时阻止发起模型调用。
 func (o *runAttemptObserver) AttemptStarted(ctx context.Context, record model.AttemptRecord) error {
-	// 模型尝试 Span 包裹真实供应商调用窗口，只记录模型、尝试序号与步骤 ID，
-	// 禁止写入 Prompt、Completion、工具入参或供应商错误原文。
-	ctx, span := telemetry.Start(ctx, "llm.attempt",
-		attribute.String(telemetry.AttrProviderID, record.ProviderID),
-		attribute.String(telemetry.AttrModelID, record.ModelID),
-		attribute.String(telemetry.AttrRemoteModelName, record.RemoteModelName),
-		attribute.Int(telemetry.AttrAttemptNo, record.AttemptNo),
-	)
-	if o.attemptSpans == nil {
-		o.attemptSpans = map[int]trace.Span{}
-	}
-	o.attemptSpans[record.AttemptNo] = span
-	ready := false
-	defer func() {
-		if !ready {
-			telemetry.Fail(span, "attempt_start_failed")
-			span.End()
-			delete(o.attemptSpans, record.AttemptNo)
-		}
-	}()
 	providerID, err := uuid.Parse(record.ProviderID)
 	if err != nil {
 		return err
@@ -1436,7 +1389,6 @@ func (o *runAttemptObserver) AttemptStarted(ctx context.Context, record model.At
 		o.stepIDs[record.AttemptNo] = step.ID
 		o.stepSeqs[record.AttemptNo] = step.StepSeq
 		stepID = &step.ID
-		telemetry.Annotate(span, attribute.String(telemetry.AttrStepID, step.ID.String()))
 		// 请求清单只保存元数据，不落用户正文与凭证；完整上下文由内存中的请求持有。
 		_, payloadErr := o.worker.steps.SavePayload(ctx, ExecutionPayload{
 			RunID: o.run.ID, UserID: o.run.UserID, StepID: &step.ID, Type: PayloadModelRequest,
@@ -1474,28 +1426,11 @@ func (o *runAttemptObserver) AttemptStarted(ctx context.Context, record model.At
 	}); err != nil {
 		return err
 	}
-	ready = true
 	return nil
 }
 
 // AttemptFinished 落库 Token、费用、耗时与错误分类；重复结算由仓储拒绝。
 func (o *runAttemptObserver) AttemptFinished(ctx context.Context, record model.AttemptRecord) error {
-	if span, exists := o.attemptSpans[record.AttemptNo]; exists {
-		// Span 只补充 Token、结束原因与脱敏错误分类；供应商返回正文与错误原文不进入 Trace。
-		telemetry.Annotate(span,
-			attribute.Int64(telemetry.AttrInputTokens, int64(record.InputTokens)),
-			attribute.Int64(telemetry.AttrOutputTokens, int64(record.OutputTokens)),
-			attribute.String(telemetry.AttrFinishReason, record.FinishReason),
-		)
-		if record.Status != "succeeded" {
-			telemetry.Fail(span, record.ErrorClass)
-		}
-		metrics.ObserveLLM(string(o.run.Mode), int64(record.InputTokens), int64(record.OutputTokens), record.EstimatedCost)
-		defer func() {
-			span.End()
-			delete(o.attemptSpans, record.AttemptNo)
-		}()
-	}
 	callID, exists := o.callIDs[record.AttemptNo]
 	if !exists {
 		return nil
@@ -1756,7 +1691,6 @@ func (w *ExecutionWorker) reconcileUnknownApproval(ctx context.Context, run Run,
 		w.logger.Error("mark run reconciliation required failed", "run_id", run.ID, "error", err)
 		return
 	}
-	metrics.IncRunStatus(string(run.Mode), string(RunReconciliationRequired))
 }
 
 // resumeApprovals 在 ReAct 之前处理 Run 的审批事实：

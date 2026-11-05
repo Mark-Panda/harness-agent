@@ -10,10 +10,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // 执行器错误分类，供上层决定是否可重试或终止 Run。
@@ -414,22 +410,12 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 			toolContext, toolCancel := context.WithTimeout(runContext, toolTimeout)
 			// 注入调用元数据，审批包装器据此把审批绑定到具体 tool_call_id。
 			toolContext = WithToolCall(toolContext, call.ID, call.Name)
-			// 工具 Span 只记录名称、风险等级与结果状态，不记录入参、结果或错误原文。
-			toolContext, toolSpan := telemetry.Start(toolContext, "tool.invoke",
-				attribute.String(telemetry.AttrToolName, call.Name),
-				attribute.String(telemetry.AttrToolRiskLevel, tool.RiskLevel()),
-			)
-			toolStarted := time.Now()
 			output, toolErr := tool.Invoke(toolContext, call.Arguments)
-			elapsed := time.Since(toolStarted)
 			toolCancel()
 			if toolErr != nil {
 				// 审批门禁拦截时立即结束本轮，不伪造工具结果；Run 由上层暂停等待决策。
 				var approvalErr *ApprovalRequiredError
 				if errors.As(toolErr, &approvalErr) {
-					telemetry.Annotate(toolSpan, attribute.String(telemetry.AttrToolStatus, "approval_required"))
-					metrics.ObserveTool(call.Name, "approval_required", elapsed)
-					toolSpan.End()
 					emit(sink, "tool.approval.required", map[string]any{
 						"tool": call.Name, "tool_call_id": call.ID,
 						"approval_id": approvalErr.ApprovalID, "risk_level": approvalErr.RiskLevel,
@@ -446,10 +432,6 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 					status = "timeout"
 					toolErr = fmt.Errorf("%w: %s", ErrToolTimeout, call.Name)
 				}
-				telemetry.Annotate(toolSpan, attribute.String(telemetry.AttrToolStatus, status))
-				telemetry.Fail(toolSpan, status)
-				metrics.ObserveTool(call.Name, status, elapsed)
-				toolSpan.End()
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": status, "error": sanitizeError(toolErr)})
 				// 工具错误以不可信数据回填模型，由模型决定下一步，不直接终止 Run。
 				content := fmt.Sprintf(`{"error":%q}`, status)
@@ -461,17 +443,10 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 			}
 			// 工具结果超过上限时拒绝进入上下文，避免挤占 Token 预算或注入超长内容。
 			if len(output) > r.limits.MaxToolResultBytes {
-				telemetry.Annotate(toolSpan, attribute.String(telemetry.AttrToolStatus, "too_large"))
-				telemetry.Fail(toolSpan, "tool_result_too_large")
-				metrics.ObserveTool(call.Name, "too_large", elapsed)
-				toolSpan.End()
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "too_large"})
 				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: `{"error":"tool_result_too_large"}`})
 				continue
 			}
-			telemetry.Annotate(toolSpan, attribute.String(telemetry.AttrToolStatus, "completed"))
-			metrics.ObserveTool(call.Name, "completed", elapsed)
-			toolSpan.End()
 			emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "completed"})
 			appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: string(output)})
 		}

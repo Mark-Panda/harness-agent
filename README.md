@@ -54,7 +54,7 @@ make docker-up
 make smoke
 ```
 
-服务地址：Web `http://localhost:8080`，Jaeger `http://localhost:16686`，Prometheus `http://localhost:9090`。
+服务地址：Web `http://localhost:8080`。
 
 停止环境：
 

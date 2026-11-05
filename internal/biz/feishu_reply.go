@@ -12,9 +12,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // FeishuReplyWorkerConfig 是外发回复 Worker 的轮询、租约与限流配置。
@@ -319,14 +316,7 @@ func (w *FeishuReplyWorker) promoteThread(ctx context.Context, outbound FeishuOu
 
 // handle 根据 Run 状态发送占位卡片、增量更新或最终文本。
 func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound) {
-	// 外发 Span 只记录会话定位与外发类型，卡片正文、用户消息与 Run 输出禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "feishu.reply",
-		attribute.String(telemetry.AttrFeishuChatID, outbound.ChatID),
-		attribute.String(telemetry.AttrFeishuThreadID, outbound.ThreadID),
-		attribute.String("feishu.outbound_kind", outbound.Kind),
-	)
-	defer span.End()
-	finishJob := metrics.StartJob("feishu.reply")
+	finishJob := beginJob()
 	jobOutcome := "success"
 	defer func() { finishJob(jobOutcome) }()
 	run, err := w.runs.GetRun(ctx, outbound.UserID, outbound.RunID)
@@ -341,7 +331,6 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 		return
 	}
 	if err := w.sendFinal(ctx, outbound, title, text); err != nil {
-		telemetry.Fail(span, "reply_failed")
 		jobOutcome = "failure"
 		w.failOutbound(ctx, outbound, err)
 		return

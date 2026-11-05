@@ -3,14 +3,10 @@ package logging
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
-
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // TestSetupRejectsInvalidOptions 验证非法级别与格式被拒绝。
@@ -46,32 +42,21 @@ func TestSetupJSONLevelAndAttributes(t *testing.T) {
 	}
 }
 
-// TestContextHandlerInjectsCorrelationIDs 验证 request_id、trace_id、span_id 与 run_id 自动注入。
+// TestContextHandlerInjectsCorrelationIDs 验证 request_id 与 run_id 自动注入。
 func TestContextHandlerInjectsCorrelationIDs(t *testing.T) {
 	var buffer bytes.Buffer
 	logger, err := Setup(Options{Format: "json", Output: &buffer})
 	if err != nil {
 		t.Fatalf("setup logging: %v", err)
 	}
-	traceBytes, _ := hex.DecodeString("4bf92f3577b34da6a3ce929d0e0e4736")
-	spanBytes, _ := hex.DecodeString("00f067aa0ba902b7")
-	var traceID trace.TraceID
-	copy(traceID[:], traceBytes)
-	var spanID trace.SpanID
-	copy(spanID[:], spanBytes)
-	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
-	})
-	ctx := trace.ContextWithSpanContext(context.Background(), spanContext)
-	ctx = telemetry.WithRequestID(ctx, "req-1")
-	ctx = telemetry.WithRunID(ctx, "run-1")
+	ctx := WithRequestID(context.Background(), "req-1")
+	ctx = WithRunID(ctx, "run-1")
 	logger.InfoContext(ctx, "correlated")
 	var record map[string]any
 	if err := json.Unmarshal(buffer.Bytes(), &record); err != nil {
 		t.Fatalf("decode log: %v", err)
 	}
-	if record["request_id"] != "req-1" || record["run_id"] != "run-1" ||
-		record["trace_id"] != traceID.String() || record["span_id"] != spanID.String() {
+	if record["request_id"] != "req-1" || record["run_id"] != "run-1" {
 		t.Fatalf("correlation ids = %+v", record)
 	}
 	// 日志正文只包含业务消息，不采集 Prompt/Completion 或工具原文。

@@ -7,10 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // Run 是一次 Agent 执行的领域聚合，保存不可变配置快照与状态机。
@@ -261,17 +258,7 @@ type CreateRunInput struct {
 
 // Create 创建排队中的 Run；会话归属与模式在此校验。
 func (s *RunService) Create(ctx context.Context, principal Principal, input CreateRunInput) (Run, error) {
-	// Run 创建 Span 关联入站 request_id 与新生成的 run_id，打通请求到下文的 Trace 链路。
-	ctx, span := telemetry.Start(ctx, "run.create",
-		attribute.String(telemetry.AttrSessionID, input.SessionID.String()),
-		attribute.String(telemetry.AttrAgentMode, string(input.Mode)),
-	)
-	defer span.End()
-	if requestID := telemetry.RequestIDFrom(ctx); requestID != "" {
-		telemetry.Annotate(span, attribute.String(telemetry.AttrRequestID, requestID))
-	}
 	if principal.UserID == uuid.Nil {
-		telemetry.Fail(span, "forbidden")
 		return Run{}, ErrForbidden
 	}
 	// 创建前先校验每日预算，避免已超限用户继续排队产生费用；Provider 维度在 Worker 调用前校验。
@@ -314,12 +301,9 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	// Run 落库后入队；入队使用 Run ID 去重，客户端重试不会产生重复执行。
 	if s.enqueuer != nil && created.Status == RunQueued {
 		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
-			telemetry.Fail(span, "enqueue_failed")
 			return Run{}, err
 		}
 	}
-	telemetry.Annotate(span, attribute.String(telemetry.AttrRunID, created.ID.String()))
-	metrics.IncRunCreated(string(created.Mode))
 	return created, nil
 }
 
@@ -492,7 +476,6 @@ func (s *RunService) Cancel(ctx context.Context, principal Principal, runID uuid
 	if err != nil {
 		return Run{}, err
 	}
-	metrics.IncRunStatus(string(run.Mode), string(RunCancelled))
 	return cancelled, nil
 }
 

@@ -11,10 +11,8 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
-	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 )
 
 // MessagesFromEino 把 Eino 消息转换为执行器内部消息。
@@ -150,22 +148,16 @@ func (t *Tool) Info(context.Context) (*schema.ToolInfo, error) {
 
 // InvokableRun 校验参数 JSON 后调用执行器工具，并返回其 JSON 文本结果。
 func (t *Tool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
-	// Eino 工具 Span 只记录工具名与结果状态，参数与结果原文禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "eino.tool.invoke", attribute.String(telemetry.AttrToolName, t.inner.Spec().Name))
-	defer span.End()
 	if argumentsInJSON == "" {
 		argumentsInJSON = "{}"
 	}
 	if !json.Valid([]byte(argumentsInJSON)) {
-		telemetry.Fail(span, "invalid_arguments")
 		return "", fmt.Errorf("tool arguments for %s are not valid JSON", t.inner.Spec().Name)
 	}
 	output, err := t.inner.Invoke(ctx, json.RawMessage(argumentsInJSON))
 	if err != nil {
-		telemetry.Fail(span, "tool_failed")
 		return "", err
 	}
-	telemetry.Annotate(span, attribute.String(telemetry.AttrToolStatus, "completed"))
 	return string(output), nil
 }
 
@@ -200,15 +192,8 @@ func (m *ChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatMo
 
 // Generate 执行一次非流式模型调用并转换为 Eino 消息。
 func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
-	// Eino 模型 Span 只记录消息数与工具数，Prompt 与 Completion 原文禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "eino.model.generate",
-		attribute.Int("llm.message_count", len(input)),
-		attribute.Int("llm.tool_count", len(m.specs)),
-	)
-	defer span.End()
 	completion, err := m.inner.Complete(ctx, MessagesFromEino(input), append([]react.ToolSpec(nil), m.specs...))
 	if err != nil {
-		telemetry.Fail(span, "model_call_failed")
 		return nil, err
 	}
 	message := &schema.Message{Role: schema.Assistant, Content: completion.Content}

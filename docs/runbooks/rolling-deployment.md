@@ -4,7 +4,7 @@
 
 1. 确认迁移已先行完成，且 `go run ./cmd/migrate version` 为 `dirty=false`。
 2. 确认错误预算剩余 > 10%；否则只允许修复类发布。
-3. 确认 Sandbox Runner、OTLP Collector、PostgreSQL、Redis 健康。
+3. 确认 Sandbox Runner、PostgreSQL、Redis 健康。
 4. 备份当前镜像 digest 与配置版本，准备回滚。
 
 ## 滚动顺序

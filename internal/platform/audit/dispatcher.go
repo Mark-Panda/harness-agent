@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/platform/clock"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -107,13 +106,9 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) (bool, error) {
 	})
 	if err != nil {
 		if event.ID != uuid.Nil {
-			metrics.IncOutbox(event.EventType, "failure")
 			_ = d.recordFailure(context.Background(), event.ID, err)
 		}
 		return false, err
-	}
-	if event.ID != uuid.Nil {
-		metrics.IncOutbox(event.EventType, "success")
 	}
 	return event.ID != uuid.Nil, nil
 }

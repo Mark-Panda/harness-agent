@@ -322,28 +322,6 @@ retention:
 observability:
   # 是否在管理端执行记录中包含完整执行载荷；生产建议保持 false。
   include_execution_payloads: false
-  # OpenTelemetry 链路追踪；默认关闭，启用时由环境变量注入 OTLP 端点。
-  tracing:
-    # 是否启用 Trace 导出。
-    enabled: ${OTEL_TRACING_ENABLED}
-    # 写入 Trace 的 service.name。
-    service_name: harness-agent
-    # OTLP HTTP 端点，支持 host:port 或完整 URL。
-    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
-    # host:port 形式下是否允许明文 HTTP，仅限内网或本地调试。
-    insecure: ${OTEL_EXPORTER_OTLP_INSECURE}
-    # 采样比例，取值 (0,1]。
-    sample_ratio: ${OTEL_TRACING_SAMPLE_RATIO}
-    # 批量导出间隔。
-    batch_timeout: 5s
-    # 单次导出超时。
-    export_timeout: 10s
-    # 导出请求头，仅用于网关或 Collector 出口认证，禁止写入用户标识。
-    headers:
-      authorization: "${OTEL_EXPORTER_OTLP_AUTH_HEADER}"
-    # 附加的低基数资源属性。
-    resource_attributes:
-      deployment.name: "${DEPLOYMENT_NAME}"
 
 audit:
   # 关键写操作是否同步落审计日志，保证审计不丢。

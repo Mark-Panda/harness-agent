@@ -10,7 +10,6 @@ import (
 	harnessv1 "github.com/Mark-Panda/harness-agent/api/harness/v1"
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/service"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -30,8 +29,7 @@ func NewGRPCServer(addr string, auth AuthApplication, platform *service.Platform
 		return nil, errors.New("gRPC address, auth and platform services are required")
 	}
 	platformServer := &platformGRPCServer{platform: platform}
-	// 追踪拦截器位于鉴权外层：鉴权失败也保留 RPC 方法与状态码，但绝不记录请求内容。
-	server := grpc.NewServer(grpc.ChainUnaryInterceptor(telemetry.UnaryServerInterceptor(), authUnaryInterceptor(auth)))
+	server := grpc.NewServer(grpc.ChainUnaryInterceptor(authUnaryInterceptor(auth)))
 	harnessv1.RegisterProviderServiceServer(server, platformServer)
 	harnessv1.RegisterModelCatalogServiceServer(server, platformServer)
 	harnessv1.RegisterModelPolicyServiceServer(server, platformServer)

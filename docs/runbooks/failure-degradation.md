@@ -99,12 +99,10 @@
 
 ```bash
 go test ./internal/server -run TestReadiness
-go test ./pkg/metrics -run TestRegisterDBPool
 go test ./pkg/agent/model -run TestRouterSlowProviderTimesOutAndSwitches
 go test ./internal/biz -run TestPrepareMCPTools
 go test ./pkg/feishu -run TestClientSlowUpstreamFailsFast
 go test ./internal/data -run TestHotMessageStoreRecoversAfterRedisRestart
 go test ./internal/platform/ratelimit -run TestRedisLimiterFailsClosedThenRecovers
 REQUIRE_DATABASE=true go test -tags=integration ./internal/data -run TestConnectionPoolExhaustionTimeoutAndRecovery
-make monitoring-check
 ```

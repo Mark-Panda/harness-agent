@@ -48,12 +48,6 @@ func TestHealthAndSSEProbe(t *testing.T) {
 		t.Fatalf("draining readiness = %d %s", draining.Code, draining.Body.String())
 	}
 	SetReady(true)
-	// /metrics 必须输出 Prometheus 文本格式并包含资源 USE 指标。
-	metricsRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(metricsRecorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if metricsRecorder.Code != http.StatusOK || !strings.Contains(metricsRecorder.Body.String(), "go_goroutines") {
-		t.Fatalf("metrics response = %d %s", metricsRecorder.Code, metricsRecorder.Body.String())
-	}
 }
 
 func TestSPAFallbackAndAssetCaching(t *testing.T) {

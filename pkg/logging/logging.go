@@ -1,5 +1,5 @@
 // Package logging 统一结构化日志级别、输出格式与关联 ID 注入。
-// 默认输出 JSON 到 stdout，自动附加 request_id、trace_id、span_id 与 run_id；
+// 默认输出 JSON 到 stdout，自动附加 request_id 与 run_id；
 // 日志保留期由部署侧采集管道统一管理，进程不写入本地滚动文件，避免多副本写入冲突。
 package logging
 
@@ -10,9 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Options 是日志初始化参数。
@@ -69,19 +66,13 @@ type contextHandler struct {
 	slog.Handler
 }
 
-// Handle 注入 request_id、trace_id、span_id 与 run_id 后写日志。
+// Handle 注入 request_id 与 run_id 后写日志。
 func (h contextHandler) Handle(ctx context.Context, record slog.Record) error {
-	if requestID := telemetry.RequestIDFrom(ctx); requestID != "" {
-		record.AddAttrs(slog.String(telemetry.AttrRequestID, requestID))
+	if requestID := RequestIDFrom(ctx); requestID != "" {
+		record.AddAttrs(slog.String(AttrRequestID, requestID))
 	}
-	if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
-		record.AddAttrs(
-			slog.String("trace_id", spanContext.TraceID().String()),
-			slog.String("span_id", spanContext.SpanID().String()),
-		)
-	}
-	if runID := telemetry.RunIDFrom(ctx); runID != "" {
-		record.AddAttrs(slog.String(telemetry.AttrRunID, runID))
+	if runID := RunIDFrom(ctx); runID != "" {
+		record.AddAttrs(slog.String(AttrRunID, runID))
 	}
 	return h.Handler.Handle(ctx, record)
 }

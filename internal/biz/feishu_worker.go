@@ -8,11 +8,8 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
-	"github.com/Mark-Panda/harness-agent/pkg/telemetry"
+	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // FeishuRunCreator 是事件 Worker 创建 Run 的端口，生产实现为 RunService。
@@ -190,26 +187,18 @@ func (w *FeishuEventWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 解析任务并处理事件；业务忽略直接完成，可重试错误进入退避或死信。
 func (w *FeishuEventWorker) handle(ctx context.Context, job Job) {
-	// 事件处理 Span 只记录任务、事件类型与会话定位信息，事件明文与用户消息正文禁止进入 Trace。
-	ctx, span := telemetry.Start(ctx, "feishu.event.process",
-		attribute.String(telemetry.AttrJobType, job.Type),
-		attribute.String(telemetry.AttrJobID, job.ID.String()),
-	)
-	defer span.End()
-	finishJob := metrics.StartJob(FeishuEventJobType)
+	finishJob := beginJob()
 	jobOutcome := "success"
 	defer func() { finishJob(jobOutcome) }()
 	eventID, err := decodeFeishuEventJob(job)
 	if err != nil {
 		w.logger.Error("invalid feishu event job payload", "job_id", job.ID)
-		telemetry.Fail(span, "invalid_job")
 		jobOutcome = "failure"
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
 	record, err := w.events.GetEvent(ctx, eventID)
 	if err != nil {
-		telemetry.Fail(span, "event_lookup_failed")
 		jobOutcome = "failure"
 		w.failJob(ctx, job, eventID, err)
 		return
@@ -222,7 +211,6 @@ func (w *FeishuEventWorker) handle(ctx context.Context, job Job) {
 
 	outcome, err := w.process(ctx, record)
 	if err != nil {
-		telemetry.Fail(span, "event_failed")
 		jobOutcome = "failure"
 		w.failJob(ctx, job, eventID, err)
 		return
@@ -261,10 +249,6 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if messageEvent.SenderOpenID == "" {
 		return FeishuEventIgnored, nil
 	}
-	telemetry.Annotate(trace.SpanFromContext(ctx),
-		attribute.String(telemetry.AttrFeishuEventType, envelope.Header.EventType),
-		attribute.String(telemetry.AttrFeishuChatID, messageEvent.ChatID),
-	)
 	// 已登记的机器人按应用 App ID 解析；未登记时保持原有默认应用行为。
 	botOpenID := w.config.BotOpenID
 	botName := w.config.BotName
@@ -298,7 +282,6 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if ignored {
 		return FeishuEventIgnored, nil
 	}
-	telemetry.Annotate(trace.SpanFromContext(ctx), attribute.String(telemetry.AttrFeishuThreadID, threadID))
 	identity, err := w.identities.Resolve(ctx, record.TenantKey, messageEvent.SenderOpenID)
 	if err != nil {
 		return "", err
@@ -403,7 +386,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if err != nil {
 		return "", err
 	}
-	ctx = telemetry.WithRunID(ctx, run.ID.String())
+	ctx = logging.WithRunID(ctx, run.ID.String())
 	// 先创建外发记录占位，Run 完成后由回复 Worker 增量更新卡片。
 	err = w.outbound.CreateOutbound(ctx, FeishuOutbound{
 		ID: uuid.New(), UserID: binding.UserID, SessionID: session.ID, RunID: run.ID, AppID: record.AppID,

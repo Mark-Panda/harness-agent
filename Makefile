@@ -43,7 +43,7 @@ test-migration:
 
 # 故障注入测试：覆盖依赖不可用、慢调用、连接池耗尽与恢复路径，不依赖真实外部服务。
 test-chaos:
-	go test -count=1 -run 'TestReadiness|TestRegisterDBPool|TestRouterSlowProviderTimesOutAndSwitches|TestPrepareMCPTools|TestClientSlowUpstreamFailsFast|TestHotMessageStoreRecoversAfterRedisRestart|TestRedisLimiterFailsClosedThenRecovers|TestWritePlatformError' ./internal/server ./pkg/metrics ./pkg/agent/model ./internal/biz ./pkg/feishu ./internal/data ./internal/platform/ratelimit
+	go test -count=1 -run 'TestReadiness|TestRouterSlowProviderTimesOutAndSwitches|TestPrepareMCPTools|TestClientSlowUpstreamFailsFast|TestHotMessageStoreRecoversAfterRedisRestart|TestRedisLimiterFailsClosedThenRecovers|TestWritePlatformError' ./internal/server ./pkg/agent/model ./internal/biz ./pkg/feishu ./internal/data ./internal/platform/ratelimit
 
 backup-check:
 	go test -count=1 ./internal/platform/backup ./deploy/backup
@@ -51,11 +51,6 @@ backup-check:
 # 安全扫描：SAST、依赖/密钥/IaC/镜像扫描、API Fuzz 与模块完整性。
 test-security:
 	./scripts/security_scan.sh
-
-monitoring-check:
-	docker run --rm --entrypoint promtool -v $(CURDIR)/deploy/prometheus:/etc/prometheus prom/prometheus:v3.7.3 check rules /etc/prometheus/alerts.yaml
-	docker run --rm --entrypoint promtool -v $(CURDIR)/deploy/prometheus:/etc/prometheus prom/prometheus:v3.7.3 test rules /etc/prometheus/alerts_test.yaml
-	go test ./deploy/monitoring
 
 test-coverage:
 	mkdir -p coverage

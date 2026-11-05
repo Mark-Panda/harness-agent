@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
-	"github.com/Mark-Panda/harness-agent/pkg/metrics"
 	"github.com/google/uuid"
 )
 
@@ -153,8 +152,6 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-	metrics.AddSSEConnection(1)
-	defer metrics.AddSSEConnection(-1)
 
 	// Kratos 的全局 HTTP Timeout（15s）会给请求 Context 加截止时间；
 	// SSE 需要跨越多分钟执行，因此这里脱离该 Deadline，改用每轮查询超时 + 写失败检测。
@@ -424,7 +421,6 @@ func safeSSEEventType(eventType string) string {
 // 返回 false 表示慢消费者写入超时或连接已断开，调用方必须停止推送并释放槽位。
 func writeSSE(w http.ResponseWriter, seq int64, eventType string, payload map[string]any) bool {
 	eventType = safeSSEEventType(eventType)
-	metrics.IncSSEEvent(eventType)
 	setSSEWriteDeadline(w)
 	if seq > 0 {
 		if _, err := fmt.Fprintf(w, "id: %d\n", seq); err != nil {
