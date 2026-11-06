@@ -11,8 +11,8 @@ import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/
 import { useRemote } from "../lib/hooks";
 import type { Agent, Attachment, Message, Page, Run, RunEvent, Session, ToolApproval } from "../lib/types";
 
-// terminalStatuses 是 Run 的最终状态集合。
-const terminalStatuses = new Set(["completed", "failed", "cancelled", "dead"]);
+// terminalStatuses 是 Run 已停止自动执行的状态集合；人工对账虽非终态也不能继续等待流式输出。
+const terminalStatuses = new Set(["completed", "failed", "cancelled", "dead", "reconciliation_required"]);
 
 // isTerminal 判断 Run 是否已结束。
 function isTerminal(status: string): boolean {
@@ -140,6 +140,16 @@ export default function ChatPage() {
   // 保留已归档助手，仅用于展示会话绑定的助手名称；发送能力仍要求已发布状态。
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100&include_archived=true"), []);
   const messagesReload = messages.reload;
+  // 长会话按游标继续加载更早消息，避免只显示最近 100 条。
+  const [olderMessages, setOlderMessages] = useState<Message[]>([]);
+  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  const [olderEnded, setOlderEnded] = useState(false);
+  const [olderLoading, setOlderLoading] = useState(false);
+  useEffect(() => {
+    setOlderMessages([]);
+    setOlderCursor(null);
+    setOlderEnded(false);
+  }, [sessionId]);
 
   const [runsVersion, setRunsVersion] = useState(0);
   const runs = useRemote(() => requestJSON<Page<Run>>(`/api/v1/sessions/${sessionId}/runs?limit=20`), [sessionId, runsVersion]);
@@ -149,6 +159,8 @@ export default function ChatPage() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // removedAttachmentKeys 记录上传完成前已被用户移除的文件，用于回收服务端对象。
+  const removedAttachmentKeys = useRef<Set<string>>(new Set());
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [liveMessages, setLiveMessages] = useState<LiveMessage[]>([]);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
@@ -165,6 +177,17 @@ export default function ChatPage() {
   const messageListRef = useRef<HTMLDivElement | null>(null);
   // stickToBottomRef 记录用户是否停留在底部，避免新内容把正在翻历史的用户拽回去。
   const stickToBottomRef = useRef(true);
+
+  // 页面刷新或重新进入会话时，从最近 Run 列表恢复仍在执行的 Run，继续订阅 SSE。
+  useEffect(() => {
+    if (activeRun) {
+      return;
+    }
+    const current = runs.data?.items.find((run) => !isTerminal(run.status));
+    if (current) {
+      setActiveRun(current);
+    }
+  }, [activeRun, runs.data]);
 
   const agent = useMemo(() => {
     const target = session.data?.agent_id;
@@ -459,7 +482,17 @@ export default function ChatPage() {
       setPendingAttachments((current) => [...current, { key, name: file.name, size: file.size, status: "uploading" }]);
       try {
         const attachment = await uploadAttachment<Attachment>(`/api/v1/sessions/${sessionId}/attachments`, file);
-        setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "ready", id: attachment.id } : item)));
+        if (removedAttachmentKeys.current.has(key)) {
+          removedAttachmentKeys.current.delete(key);
+          // 上传完成前用户已移除该文件：立即删除服务端对象，避免占用未绑定附件配额。
+          try {
+            await requestJSON<void>(`/api/v1/attachments/${encodeURIComponent(attachment.id)}`, { method: "DELETE" });
+          } catch {
+            // 删除失败由服务端配额回收兜底，不阻塞其它附件。
+          }
+        } else {
+          setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "ready", id: attachment.id } : item)));
+        }
       } catch (failure) {
         const message = describeError(failure);
         setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "failed", error: message } : item)));
@@ -467,9 +500,21 @@ export default function ChatPage() {
     }
   };
 
-  // removePendingAttachment 从输入区移除附件；已上传但未发送的文件保留在服务端并由会话配额回收。
-  const removePendingAttachment = (key: string) => {
+  // removePendingAttachment 从输入区移除附件，并回收已上传但未发送的服务端文件。
+  const removePendingAttachment = async (key: string) => {
+    const target = pendingAttachments.find((item) => item.key === key);
+    if (target?.status === "uploading") {
+      removedAttachmentKeys.current.add(key);
+    }
     setPendingAttachments((current) => current.filter((item) => item.key !== key));
+    if (target?.id) {
+      try {
+        await requestJSON<void>(`/api/v1/attachments/${encodeURIComponent(target.id)}`, { method: "DELETE" });
+      } catch (failure) {
+        // 附件已从输入区移除；服务端删除失败不阻塞继续编辑，错误由页面提示。
+        setSendError(describeError(failure));
+      }
+    }
   };
 
   // downloadMessageAttachment 鉴权下载消息附件，失败时在页面内提示。
@@ -562,8 +607,31 @@ export default function ChatPage() {
     }
   };
 
+  // loadOlderMessages 按当前页游标继续向前加载历史消息。
+  const loadOlderMessages = async () => {
+    const cursor = olderCursor ?? messages.data?.next_cursor ?? null;
+    if (!cursor || olderLoading) {
+      return;
+    }
+    setOlderLoading(true);
+    setActionError(null);
+    try {
+      const page = await requestJSON<Page<Message>>(
+        `/api/v1/sessions/${sessionId}/messages?limit=100&cursor=${encodeURIComponent(cursor)}`,
+      );
+      const ascending = [...page.items].reverse();
+      setOlderMessages((current) => [...ascending, ...current]);
+      setOlderCursor(page.next_cursor ?? null);
+      setOlderEnded(!page.next_cursor);
+    } catch (failure) {
+      setActionError(describeError(failure));
+    } finally {
+      setOlderLoading(false);
+    }
+  };
+
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
-  const persistedMessages = (messages.data?.items ?? []).slice().reverse();
+  const persistedMessages = [...olderMessages, ...(messages.data?.items ?? []).slice().reverse()];
 
   // 最近一条用户消息用于失败后的“重试本轮”和“编辑后重发”。
   const lastUserContent = useMemo(() => {
@@ -735,6 +803,13 @@ export default function ChatPage() {
             </div>
           ) : (
             <>
+              {!olderEnded && (olderCursor || messages.data?.next_cursor) ? (
+                <div className="flex justify-center py-2">
+                  <Button size="sm" variant="secondary" loading={olderLoading} onClick={() => void loadOlderMessages()}>
+                    加载更早消息
+                  </Button>
+                </div>
+              ) : null}
               {persistedMessages.map((message) => (
                 <MessageBubble
                   key={message.id}
@@ -915,7 +990,7 @@ export default function ChatPage() {
                   </span>
                   <button
                     type="button"
-                    onClick={() => removePendingAttachment(item.key)}
+                    onClick={() => void removePendingAttachment(item.key)}
                     className="shrink-0 rounded-[2px] px-1 text-muted transition hover:text-rust"
                     aria-label={`移除附件 ${item.name}`}
                   >

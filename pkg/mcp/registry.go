@@ -272,13 +272,20 @@ func canonicalToolName(server, tool string) string {
 	return name
 }
 
-// sanitizeName 仅保留字母、数字、下划线与短横线，其余字符替换为下划线。
+// sanitizeName 仅保留模型函数名允许的 ASCII 字母、数字、下划线与短横线。
+// 中文等非 ASCII 字符必须替换为下划线，否则 OpenAI-compatible 接口会拒绝工具定义。
 func sanitizeName(value string) string {
 	mapped := strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
 			return unicode.ToLower(r)
+		case r >= '0' && r <= '9', r == '_', r == '-':
+			return r
+		default:
+			return '_'
 		}
-		return '_'
 	}, strings.TrimSpace(value))
 	return strings.Trim(mapped, "_")
 }

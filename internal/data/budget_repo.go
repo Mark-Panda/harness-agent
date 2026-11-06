@@ -63,6 +63,35 @@ func (r *BudgetRepository) GetUsage(ctx context.Context, scope biz.BudgetScope, 
 	}, nil
 }
 
+// RecordUsage 为后台模型调用累加用户与供应商预算计数；零用量不写库。
+func (r *BudgetRepository) RecordUsage(ctx context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID,
+	inputTokens, outputTokens int64, estimatedCost float64, now time.Time,
+) error {
+	if userID == uuid.Nil {
+		return fmt.Errorf("%w: user id is required", biz.ErrInvalidConfig)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	window := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := incrementUsage(tx, biz.BudgetScopeUser, userID, window, inputTokens, outputTokens, estimatedCost, now); err != nil {
+			return err
+		}
+		if providerID != nil && *providerID != uuid.Nil {
+			if err := incrementUsage(tx, biz.BudgetScopeProvider, *providerID, window, inputTokens, outputTokens, estimatedCost, now); err != nil {
+				return err
+			}
+		}
+		if agentID != nil && *agentID != uuid.Nil {
+			if err := incrementUsage(tx, biz.BudgetScopeAgent, *agentID, window, inputTokens, outputTokens, estimatedCost, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // incrementUsage 在结算事务内原子累加预算计数；零用量不写库，避免无意义更新。
 func incrementUsage(tx *gorm.DB, scope biz.BudgetScope, scopeID uuid.UUID, windowStart time.Time, inputTokens, outputTokens int64, cost float64, now time.Time) error {
 	if scopeID == uuid.Nil || (inputTokens == 0 && outputTokens == 0 && cost == 0) {

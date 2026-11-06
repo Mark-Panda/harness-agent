@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -1314,5 +1315,19 @@ func TestBoundHistoryByTrigger(t *testing.T) {
 	unbounded := boundHistoryByTrigger(Run{ID: runID}, history)
 	if len(unbounded) != len(history) {
 		t.Fatalf("unbounded history len = %d, want %d", len(unbounded), len(history))
+	}
+}
+
+// TestTruncateUTF8Bytes 验证按字节截断不会切坏中文或 emoji。
+func TestTruncateUTF8Bytes(t *testing.T) {
+	text := "执行失败：中文错误信息🙂"
+	for limit := 1; limit < len(text); limit++ {
+		got := truncateUTF8Bytes(text, limit)
+		if !utf8.ValidString(got) {
+			t.Fatalf("truncateUTF8Bytes(%d) produced invalid UTF-8: %q", limit, got)
+		}
+	}
+	if got := truncateUTF8Bytes(text, len(text)); got != text {
+		t.Fatalf("full text changed: %q", got)
 	}
 }

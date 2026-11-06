@@ -197,6 +197,12 @@ type PlanStepUpdate struct {
 	FinishedAt *time.Time
 }
 
+// PlanDeadlineExtender 是可选的计划截止时间延长能力，用于暂停期间不消耗执行窗口。
+type PlanDeadlineExtender interface {
+	// ExtendPlanDeadline 延长非终态计划的截止时间并返回最新计划。
+	ExtendPlanDeadline(ctx context.Context, userID, planID uuid.UUID, deadline time.Time, now time.Time) (Plan, error)
+}
+
 // PlanRepository 定义计划持久化契约；所有查询与写入强制携带 user_id。
 type PlanRepository interface {
 	// CreatePlan 在同一事务内创建计划与全部步骤，并写入审计事件。

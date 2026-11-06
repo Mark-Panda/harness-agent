@@ -163,6 +163,33 @@ func (r *PlanRepository) GetPlanByRun(ctx context.Context, userID, runID uuid.UU
 	return toBizPlan(planRecord, steps)
 }
 
+// ExtendPlanDeadline 延长非终态计划的截止时间，不递增 revision，避免恢复路径产生额外冲突。
+func (r *PlanRepository) ExtendPlanDeadline(ctx context.Context, userID, planID uuid.UUID, deadline time.Time, now time.Time) (biz.Plan, error) {
+	if userID == uuid.Nil || planID == uuid.Nil || deadline.IsZero() {
+		return biz.Plan{}, fmt.Errorf("%w: plan identity and deadline are required", biz.ErrInvalidConfig)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		result := tx.Model(&planModel{}).
+			Where("id = ? AND user_id = ? AND status IN ?", planID, userID,
+				[]string{string(biz.PlanPlanning), string(biz.PlanExecuting), string(biz.PlanWaitingApproval), string(biz.PlanPaused)}).
+			Updates(map[string]any{"deadline_at": deadline, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: plan deadline cannot be extended in its current state", biz.ErrResourceConflict)
+		}
+		return nil
+	})
+	if err != nil {
+		return biz.Plan{}, catalogError("extend plan deadline", err)
+	}
+	return r.GetPlan(ctx, userID, planID)
+}
+
 // GetPlan 按 ID 读取计划及步骤。
 func (r *PlanRepository) GetPlan(ctx context.Context, userID, planID uuid.UUID) (biz.Plan, error) {
 	var planRecord planModel

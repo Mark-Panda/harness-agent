@@ -59,3 +59,10 @@ func TransitionRunStatus(current, next RunStatus) error {
 func RunTerminal(status RunStatus) bool {
 	return status == RunCompleted || status == RunFailed || status == RunCancelled
 }
+
+// RunSettled 判断 Run 是否已停止自动执行。
+// 人工对账状态虽不是终态，但同样不会再被 Worker 自动推进，SSE 与前端应按“已停止”
+// 关闭连接并允许用户发起新的对话，避免任务永久占据当前会话。
+func RunSettled(status RunStatus) bool {
+	return RunTerminal(status) || status == RunReconciliationRequired
+}

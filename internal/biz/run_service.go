@@ -99,6 +99,13 @@ type AdminRunFilter struct {
 	Source SessionSource
 }
 
+// RunDeadlineExtender 是可选的 Run 截止时间延长能力。
+// 用于计划暂停/恢复：暂停期间不应消耗执行窗口，恢复时按暂停时长顺延截止时间。
+type RunDeadlineExtender interface {
+	// ExtendRunDeadline 延长非终态 Run 的截止时间并返回最新记录。
+	ExtendRunDeadline(ctx context.Context, userID, runID uuid.UUID, deadline time.Time) (Run, error)
+}
+
 // RunSummary 是管理员全局运行记录的展示条目，附带会话来源与用户名。
 type RunSummary struct {
 	// Run 执行聚合本体。
@@ -637,13 +644,159 @@ func (s *RunService) Enqueue(ctx context.Context, principal Principal, runID uui
 	if err != nil {
 		return err
 	}
-	if RunTerminal(run.Status) {
-		return fmt.Errorf("%w: run is already terminal", ErrResourceConflict)
+	// 人工对账状态必须显式结案，不能通过重新入队绕过副作用确认。
+	if RunSettled(run.Status) {
+		return fmt.Errorf("%w: run is already settled", ErrResourceConflict)
 	}
 	if s.enqueuer == nil {
 		return fmt.Errorf("%w: run queue is not configured", ErrInvalidConfig)
 	}
 	return s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock())
+}
+
+// Replay 重新投递卡在 queued/running 的 Run 任务，支持 failed/dead Job 的人工重放。
+// 终态与人工对账 Run 不允许重放，避免重复执行已确认的副作用。
+func (s *RunService) Replay(ctx context.Context, principal Principal, runID uuid.UUID) error {
+	if principal.UserID == uuid.Nil {
+		return ErrForbidden
+	}
+	run, err := s.repo.GetRun(ctx, principal.UserID, runID)
+	if err != nil {
+		return err
+	}
+	if RunSettled(run.Status) {
+		return fmt.Errorf("%w: settled run cannot be replayed", ErrResourceConflict)
+	}
+	if replayer, ok := s.enqueuer.(RunJobReplayer); ok {
+		if err := replayer.RequeueRun(ctx, runID, s.clock()); err == nil {
+			return nil
+		} else if !errors.Is(err, ErrResourceConflict) {
+			return err
+		}
+	}
+	// 没有失败任务可重放时退化为幂等入队，覆盖“Run 已落库但 Job 从未创建”的场景。
+	return s.Enqueue(ctx, principal, runID)
+}
+
+// ExtendDeadline 按暂停时长顺延非终态 Run 的截止时间。
+// 仓储未实现可选扩展能力时保持原截止时间，便于测试替身继续工作。
+func (s *RunService) ExtendDeadline(ctx context.Context, principal Principal, runID uuid.UUID, extension time.Duration) (Run, error) {
+	if principal.UserID == uuid.Nil {
+		return Run{}, ErrForbidden
+	}
+	run, err := s.repo.GetRun(ctx, principal.UserID, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	if RunSettled(run.Status) {
+		return Run{}, fmt.Errorf("%w: run is already settled", ErrResourceConflict)
+	}
+	if extension <= 0 {
+		return run, nil
+	}
+	base := s.clock()
+	if run.DeadlineAt != nil {
+		base = *run.DeadlineAt
+	}
+	extender, ok := s.repo.(RunDeadlineExtender)
+	if !ok {
+		return run, nil
+	}
+	return extender.ExtendRunDeadline(ctx, principal.UserID, runID, base.Add(extension))
+}
+
+// ResumeAfterPause 把因计划暂停而退回队列的 Run 重新入队。
+// 若 Run 停在等待审批状态，只有不存在待决策审批时才自动恢复；仍有审批时保持等待，
+// 由审批决策路径推进，避免恢复动作绕过人工审批。
+func (s *RunService) ResumeAfterPause(ctx context.Context, principal Principal, runID uuid.UUID) (Run, error) {
+	if principal.UserID == uuid.Nil {
+		return Run{}, ErrForbidden
+	}
+	run, err := s.repo.GetRun(ctx, principal.UserID, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	if RunSettled(run.Status) {
+		return Run{}, fmt.Errorf("%w: run is already settled", ErrResourceConflict)
+	}
+	if run.Status == RunWaitingApproval {
+		if s.approvals == nil {
+			return Run{}, fmt.Errorf("%w: tool approvals are not configured", ErrInvalidConfig)
+		}
+		pending, err := s.approvals.CountPendingApprovals(ctx, principal.UserID, runID)
+		if err != nil {
+			return Run{}, err
+		}
+		if pending > 0 {
+			// 审批仍未决策：Run 保持等待，恢复计划不改变审批门禁。
+			return run, nil
+		}
+		resumed, err := s.repo.ResumeRun(ctx, principal.UserID, runID, s.clock())
+		if err != nil && !errors.Is(err, ErrResourceConflict) {
+			return Run{}, err
+		}
+		if err == nil {
+			run = resumed
+		}
+	}
+	if s.enqueuer == nil {
+		return Run{}, fmt.Errorf("%w: run queue is not configured", ErrInvalidConfig)
+	}
+	if err := s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock()); err != nil {
+		return Run{}, err
+	}
+	return run, nil
+}
+
+// ResolveReconciliation 由 Run 所有者对人工对账状态做出最终结论。
+// 只允许 reconciliation_required -> completed/failed，且必须记录书面理由；
+// 该操作不会重新执行任何工具，只负责把未知副作用状态收敛为可审计的终态。
+func (s *RunService) ResolveReconciliation(
+	ctx context.Context, principal Principal, runID uuid.UUID, rawOutcome, rawReason string,
+) (Run, error) {
+	if principal.UserID == uuid.Nil {
+		return Run{}, ErrForbidden
+	}
+	outcome := RunStatus(strings.ToLower(strings.TrimSpace(rawOutcome)))
+	if outcome != RunCompleted && outcome != RunFailed {
+		return Run{}, invalid("reconciliation outcome must be completed or failed")
+	}
+	reason := strings.TrimSpace(rawReason)
+	if len([]rune(reason)) < 4 || len([]rune(reason)) > 500 {
+		return Run{}, invalid("reconciliation reason must contain 4-500 characters")
+	}
+	run, err := s.repo.GetRun(ctx, principal.UserID, runID)
+	if err != nil {
+		return Run{}, err
+	}
+	if run.Status != RunReconciliationRequired {
+		return Run{}, fmt.Errorf("%w: run is not waiting for reconciliation", ErrResourceConflict)
+	}
+	if err := TransitionRunStatus(run.Status, outcome); err != nil {
+		return Run{}, err
+	}
+	errorCode := "reconciliation_completed"
+	if outcome == RunFailed {
+		errorCode = "reconciliation_failed"
+	}
+	now := s.clock()
+	fields := map[string]any{
+		"error_code": errorCode, "error_message": reason, "finished_at": now,
+	}
+	resolved, err := s.repo.TransitionRun(ctx, principal.UserID, runID, RunReconciliationRequired, outcome, fields)
+	if err != nil {
+		return Run{}, err
+	}
+	// 与审批决策保持一致：审计事件写入失败时向调用方报错，避免出现无审计的结案。
+	if _, err := s.repo.AppendEvent(ctx, RunEvent{
+		RunID: runID, UserID: principal.UserID, EventType: "run.reconciliation.resolved",
+		Payload: map[string]any{
+			"outcome": string(outcome), "reason": reason, "actor_user_id": principal.UserID.String(),
+		},
+	}); err != nil {
+		return Run{}, err
+	}
+	return resolved, nil
 }
 
 // Cancel 取消排队、执行中或等待审批的 Run；终态 Run 返回冲突。

@@ -89,6 +89,31 @@ func (s *PlanService) Pause(ctx context.Context, principal Principal, runID uuid
 	})
 }
 
+// extendForPause 把暂停期间从 Run 与 Plan 的截止时间中扣除。
+// 暂停不应消耗执行窗口，否则长时间暂停后的恢复会立即触发 deadline_exceeded。
+func (s *PlanService) extendForPause(ctx context.Context, principal Principal, plan Plan) (Plan, error) {
+	pausedFor := s.clock().Sub(plan.UpdatedAt)
+	if pausedFor <= 0 {
+		return plan, nil
+	}
+	if plan.DeadlineAt != nil {
+		deadline := plan.DeadlineAt.Add(pausedFor)
+		if extender, ok := s.plans.(PlanDeadlineExtender); ok {
+			updated, err := extender.ExtendPlanDeadline(ctx, principal.UserID, plan.ID, deadline, s.clock())
+			if err != nil {
+				return Plan{}, err
+			}
+			plan = updated
+		} else {
+			plan.DeadlineAt = &deadline
+		}
+	}
+	if _, err := s.runs.ExtendDeadline(ctx, principal, plan.RunID, pausedFor); err != nil {
+		return Plan{}, err
+	}
+	return plan, nil
+}
+
 // Resume 恢复暂停的计划并重新入队 Run。
 func (s *PlanService) Resume(ctx context.Context, principal Principal, runID uuid.UUID) (Plan, error) {
 	plan, err := s.GetByRun(ctx, principal, runID)
@@ -101,14 +126,30 @@ func (s *PlanService) Resume(ctx context.Context, principal Principal, runID uui
 	if err := TransitionPlanStatus(plan.Status, PlanExecuting); err != nil {
 		return Plan{}, err
 	}
+	plan, err = s.extendForPause(ctx, principal, plan)
+	if err != nil {
+		return Plan{}, err
+	}
 	resumed, err := s.plans.UpdatePlan(ctx, principal.UserID, plan.ID, PlanPaused, PlanExecuting, plan.Revision, PlanFence{}, PlanUpdate{
 		ErrorCode: "", ErrorMessage: "",
 	})
 	if err != nil {
 		return Plan{}, err
 	}
-	if err := s.runs.Enqueue(ctx, principal, runID); err != nil && !errors.Is(err, ErrResourceConflict) {
+	run, err := s.runs.ResumeAfterPause(ctx, principal, runID)
+	if err != nil {
+		// 入队或审批状态不满足时回滚计划状态，避免出现“计划执行中但没有 Run”的悬挂状态。
+		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, plan.ID, PlanExecuting, PlanPaused, resumed.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_paused", ErrorMessage: "计划恢复失败，已回到暂停状态",
+		})
 		return Plan{}, err
+	}
+	if run.Status == RunWaitingApproval {
+		// 仍有待决策审批：计划保持暂停，等待审批完成后再由用户恢复。
+		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, plan.ID, PlanExecuting, PlanPaused, resumed.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_paused", ErrorMessage: "仍有工具审批待处理，计划保持暂停",
+		})
+		return Plan{}, fmt.Errorf("%w: plan has pending tool approvals", ErrResourceConflict)
 	}
 	return resumed, nil
 }
@@ -125,6 +166,14 @@ func (s *PlanService) Revise(ctx context.Context, principal Principal, runID uui
 	}
 	if latest.Status != PlanPaused {
 		return Plan{}, fmt.Errorf("%w: only paused plans can be revised", ErrResourceConflict)
+	}
+	// 审批待决策时修订会让旧审批与新版本步骤失配；要求先处理审批再修订。
+	runState, err := s.runs.Get(ctx, principal, runID)
+	if err != nil {
+		return Plan{}, err
+	}
+	if runState.Status == RunWaitingApproval {
+		return Plan{}, fmt.Errorf("%w: resolve pending tool approvals before revising the plan", ErrResourceConflict)
 	}
 	limits := DefaultPlanLimits()
 	draft, err = validatePlanDraft(draft, limits)
@@ -148,6 +197,11 @@ func (s *PlanService) Revise(ctx context.Context, principal Principal, runID uui
 		})
 	}
 	parentID := latest.ID
+	steps = carryCompletedPlanSteps(steps, latest, true)
+	latest, err = s.extendForPause(ctx, principal, latest)
+	if err != nil {
+		return Plan{}, err
+	}
 	created, err := s.plans.CreatePlan(ctx, principal.UserID, Plan{
 		ID: planID, UserID: principal.UserID, RunID: latest.RunID, SessionID: latest.SessionID,
 		Version: latest.Version + 1, ParentPlanID: &parentID, Status: PlanExecuting, Goal: draft.Goal,
@@ -161,8 +215,30 @@ func (s *PlanService) Revise(ctx context.Context, principal Principal, runID uui
 	if err != nil {
 		return Plan{}, err
 	}
-	if err := s.runs.Enqueue(ctx, principal, runID); err != nil && !errors.Is(err, ErrResourceConflict) {
+	// 旧版本必须退出 paused 生命周期，否则后续“继续”可能重新绑定已修订的旧计划。
+	if _, err := s.plans.UpdatePlan(ctx, principal.UserID, latest.ID, PlanPaused, PlanCancelled, latest.Revision, PlanFence{}, PlanUpdate{
+		ErrorCode: "plan_superseded", ErrorMessage: "计划已由人工修订版本替代", FinishedAt: ptrTime(now),
+	}); err != nil {
+		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanFailed, created.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_supersede_failed", ErrorMessage: "旧计划版本无法关闭，已终止新版本", FinishedAt: ptrTime(now),
+		})
 		return Plan{}, err
+	}
+	run, err := s.runs.ResumeAfterPause(ctx, principal, runID)
+	if err != nil {
+		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanFailed, created.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_resume_failed", ErrorMessage: "修订后的计划无法恢复执行", FinishedAt: ptrTime(now),
+		})
+		return Plan{}, err
+	}
+	if run.Status == RunWaitingApproval {
+		paused, pauseErr := s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanPaused, created.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_paused", ErrorMessage: "仍有工具审批待处理，修订计划保持暂停",
+		})
+		if pauseErr != nil {
+			return Plan{}, pauseErr
+		}
+		return paused, nil
 	}
 	return created, nil
 }

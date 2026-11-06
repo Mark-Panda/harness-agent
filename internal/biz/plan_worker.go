@@ -666,6 +666,43 @@ func (r lowRiskToolRegistry) List() []react.ToolSpec {
 	return result
 }
 
+// carryCompletedPlanSteps 把上一版本中已完成步骤的结果复制到新版本。
+// 重规划与人工修订都会创建全新的 PlanStep；若不复制结果，已产生副作用且成功的步骤
+// 会因为状态回到 pending 而再次执行。匹配条件至少包含步骤序号、标题与工具名，
+// 人工修订时还要求描述一致，确保用户修改过的步骤仍会重新执行。
+func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription bool) []PlanStep {
+	if len(steps) == 0 || len(previous.Steps) == 0 {
+		return steps
+	}
+	completed := make(map[int]PlanStep, len(previous.Steps))
+	for _, step := range previous.Steps {
+		if step.Status == PlanStepCompleted {
+			completed[step.StepNo] = step
+		}
+	}
+	for index := range steps {
+		old, exists := completed[steps[index].StepNo]
+		if !exists {
+			continue
+		}
+		if strings.TrimSpace(old.Title) != strings.TrimSpace(steps[index].Title) ||
+			strings.TrimSpace(old.ToolName) != strings.TrimSpace(steps[index].ToolName) {
+			continue
+		}
+		if matchDescription && strings.TrimSpace(old.Description) != strings.TrimSpace(steps[index].Description) {
+			continue
+		}
+		steps[index].Status = PlanStepCompleted
+		steps[index].Result = old.Result
+		steps[index].Attempts = old.Attempts
+		steps[index].StartedAt = old.StartedAt
+		steps[index].FinishedAt = old.FinishedAt
+		// 执行步骤 ID 属于旧 Run 的执行树，新计划重新绑定 Run 后不能复用。
+		steps[index].ExecutionStepID = nil
+	}
+	return steps
+}
+
 // replanPlan 基于失败原因生成新版本计划，保留已完成步骤的成果并替换失败步骤。
 func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunFence, router *model.Router, messages []react.Message, tools react.Registry, plan Plan) (Plan, error) {
 	failureText := "当前计划存在无法完成的步骤或依赖"
@@ -702,6 +739,7 @@ func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunF
 	if snapshot == nil {
 		snapshot = map[string]any{}
 	}
+	steps = carryCompletedPlanSteps(steps, plan, false)
 	parentID := plan.ID
 	newPlan := Plan{
 		ID: planID, UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID,

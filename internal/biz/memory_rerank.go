@@ -25,6 +25,21 @@ type Reranker interface {
 	Rerank(ctx context.Context, query string, documents []string) ([]float64, error)
 }
 
+// RerankUsage 是 rerank 调用的计量信息，用于后台预算累计。
+type RerankUsage struct {
+	// ProviderID 供应商 ID。
+	ProviderID uuid.UUID
+	// Model 模型名。
+	Model string
+	// InputTokens 输入 Token。
+	InputTokens int
+}
+
+// RerankerWithUsage 是可选能力：在返回分数的同时暴露计量信息。
+type RerankerWithUsage interface {
+	RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, RerankUsage, error)
+}
+
 // LLMReranker 使用平台启用的 rerank 模型为候选记忆重新排序。
 type LLMReranker struct {
 	providers ProviderCredentialRepository
@@ -46,27 +61,33 @@ func NewLLMReranker(providers ProviderCredentialRepository, models RerankModelSo
 
 // Rerank 调用启用的 rerank 模型并校验返回下标与文档数量。
 func (r *LLMReranker) Rerank(ctx context.Context, query string, documents []string) ([]float64, error) {
+	scores, _, err := r.RerankWithUsage(ctx, query, documents)
+	return scores, err
+}
+
+// RerankWithUsage 在返回分数时一并暴露供应商、模型与输入 Token，供后台预算累计。
+func (r *LLMReranker) RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, RerankUsage, error) {
 	if len(documents) == 0 {
-		return nil, fmt.Errorf("%w: rerank documents are empty", ErrInvalidConfig)
+		return nil, RerankUsage{}, fmt.Errorf("%w: rerank documents are empty", ErrInvalidConfig)
 	}
 	providerID, modelName, err := r.models.GetEnabledRerankModel(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
+		return nil, RerankUsage{}, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
 	}
 	provider, credential, err := r.providers.GetProviderCredential(ctx, providerID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: read provider credential: %v", ErrRerankModelUnavailable, err)
+		return nil, RerankUsage{}, fmt.Errorf("%w: read provider credential: %v", ErrRerankModelUnavailable, err)
 	}
 	if provider.Status != ProviderEnabled {
-		return nil, fmt.Errorf("%w: provider is disabled", ErrRerankModelUnavailable)
+		return nil, RerankUsage{}, fmt.Errorf("%w: provider is disabled", ErrRerankModelUnavailable)
 	}
 	plaintext, err := r.opener.Open(credential.KeyVersion, credential.Encrypted)
 	if err != nil || len(plaintext) == 0 {
-		return nil, fmt.Errorf("%w: decrypt provider credential", ErrRerankModelUnavailable)
+		return nil, RerankUsage{}, fmt.Errorf("%w: decrypt provider credential", ErrRerankModelUnavailable)
 	}
 	client, err := model.NewClient(provider.BaseURL, string(plaintext), r.timeout)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
+		return nil, RerankUsage{}, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
 	}
 	response, err := client.Rerank(ctx, model.RerankRequest{
 		Model: modelName, Query: query, Documents: documents, TopN: len(documents),
@@ -74,21 +95,21 @@ func (r *LLMReranker) Rerank(ctx context.Context, query string, documents []stri
 	if err != nil {
 		// 认证、参数与能力错误重试无意义，其余错误交给调用方降级。
 		if errors.Is(err, model.ErrAuthentication) || errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrCapability) {
-			return nil, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
+			return nil, RerankUsage{}, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
 		}
-		return nil, err
+		return nil, RerankUsage{}, err
 	}
 	scores := make([]float64, len(documents))
 	scored := 0
 	for _, hit := range response.Results {
 		if hit.Index < 0 || hit.Index >= len(scores) {
-			return nil, fmt.Errorf("%w: rerank index %d is out of range", ErrRerankModelUnavailable, hit.Index)
+			return nil, RerankUsage{}, fmt.Errorf("%w: rerank index %d is out of range", ErrRerankModelUnavailable, hit.Index)
 		}
 		scores[hit.Index] = hit.Score
 		scored++
 	}
 	if scored == 0 {
-		return nil, fmt.Errorf("%w: rerank returned no results", ErrRerankModelUnavailable)
+		return nil, RerankUsage{}, fmt.Errorf("%w: rerank returned no results", ErrRerankModelUnavailable)
 	}
-	return scores, nil
+	return scores, RerankUsage{ProviderID: providerID, Model: modelName, InputTokens: response.InputTokens}, nil
 }

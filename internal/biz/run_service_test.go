@@ -123,6 +123,48 @@ func TestRunServiceCancelAndEvents(t *testing.T) {
 	}
 }
 
+// TestRunServiceResolveReconciliation 验证人工对账只能从对账状态结案，并强制写入审计事件。
+func TestRunServiceResolveReconciliation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	runRepo := mocks.NewMockRunRepository(ctrl)
+	sessionRepo := mocks.NewMockSessionRepository(ctrl)
+	service, _ := biz.NewRunService(runRepo, sessionRepo)
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	runID := uuid.New()
+	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).
+		Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunReconciliationRequired}, nil)
+	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, runID,
+		biz.RunReconciliationRequired, biz.RunCompleted, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, _, to biz.RunStatus, fields map[string]any) (biz.Run, error) {
+			if to != biz.RunCompleted || fields["error_code"] != "reconciliation_completed" {
+				t.Fatalf("unexpected reconciliation fields: %#v", fields)
+			}
+			return biz.Run{ID: runID, Status: biz.RunCompleted}, nil
+		},
+	)
+	runRepo.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, event biz.RunEvent) (biz.RunEvent, error) {
+			if event.EventType != "run.reconciliation.resolved" {
+				t.Fatalf("event type = %q", event.EventType)
+			}
+			return event, nil
+		},
+	)
+	resolved, err := service.ResolveReconciliation(context.Background(), principal, runID, "completed", "已确认下游执行成功")
+	if err != nil || resolved.Status != biz.RunCompleted {
+		t.Fatalf("ResolveReconciliation() = %#v, %v", resolved, err)
+	}
+
+	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).
+		Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunRunning}, nil)
+	if _, err := service.ResolveReconciliation(context.Background(), principal, runID, "completed", "已确认下游执行成功"); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("non-reconciliation error = %v", err)
+	}
+	if _, err := service.ResolveReconciliation(context.Background(), principal, runID, "unknown", "已确认下游执行成功"); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("invalid outcome error = %v", err)
+	}
+}
+
 // TestRunServiceAdoptsPausedPlanOnNewRun 验证同一会话新建 Plan Run 时会续跑暂停中的计划，
 // 而不是丢弃既有进度重新规划。
 func TestRunServiceAdoptsPausedPlanOnNewRun(t *testing.T) {

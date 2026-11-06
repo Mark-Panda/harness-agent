@@ -84,6 +84,7 @@ export function statusTone(status: string | null | undefined): Tone {
     case "pending":
     case "draft":
     case "waiting_approval":
+    case "reconciliation_required":
     case "planning":
     case "executing":
       return "info";
@@ -126,6 +127,7 @@ export function statusLabel(status: string | null | undefined): string {
     succeeded: "成功",
     failed: "失败",
     cancelled: "已取消",
+    reconciliation_required: "待人工对账",
     approved: "已批准",
     denied: "已拒绝",
     rejected: "已拒绝",

@@ -110,6 +110,38 @@ func (h *platformHTTPHandler) cancelRun(w http.ResponseWriter, r *http.Request) 
 	writePlatformResult(w, http.StatusOK, runResponse(run), err)
 }
 
+// replayRun 处理 POST /api/v1/runs/{id}/replay：人工重放 failed/dead 执行任务。
+func (h *platformHTTPHandler) replayRun(w http.ResponseWriter, r *http.Request) {
+	runID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	err := h.service.Runs.Replay(r.Context(), requestPrincipal(r), runID)
+	writePlatformResult(w, http.StatusAccepted, map[string]any{"status": "accepted"}, err)
+}
+
+// reconcileRun 处理 POST /api/v1/runs/{id}/reconciliation：人工结案未知副作用。
+func (h *platformHTTPHandler) reconcileRun(w http.ResponseWriter, r *http.Request) {
+	runID, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request reconcileRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	run, err := h.service.Runs.ResolveReconciliation(r.Context(), requestPrincipal(r), runID, request.Outcome, request.Reason)
+	writePlatformResult(w, http.StatusOK, runResponse(run), err)
+}
+
+// reconcileRequest 是人工对账结案请求体。
+type reconcileRequest struct {
+	// Outcome 结案结论：completed 或 failed。
+	Outcome string `json:"outcome"`
+	// Reason 书面理由，必填并写入审计事件。
+	Reason string `json:"reason"`
+}
+
 // runEvents 处理 GET /api/v1/runs/{id}/events：按 seq 游标回放并持续推送事件。
 // 客户端通过 Last-Event-ID 或 ?after 指定已收到的最新序号，重连不会重复执行 Run。
 func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) {
@@ -203,8 +235,8 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 		if statusErr != nil {
 			return
 		}
-		// 终态且事件已全部输出后关闭连接，客户端无需猜测结束时间。
-		if biz.RunTerminal(current) && len(events) == 0 {
+		// 终态或人工对账状态且事件已全部输出后关闭连接，客户端无需猜测结束时间。
+		if biz.RunSettled(current) && len(events) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {

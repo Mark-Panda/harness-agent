@@ -215,6 +215,7 @@ type MemoryRetriever struct {
 	vectors   MemoryVectorRepository
 	generator EmbeddingGenerator
 	reranker  Reranker
+	usage     UsageRecorder
 	config    MemoryRetrieverConfig
 	logger    *slog.Logger
 }
@@ -232,6 +233,12 @@ func NewMemoryRetriever(indexes EmbeddingIndexRepository, vectors MemoryVectorRe
 		reranker = nil
 	}
 	return &MemoryRetriever{indexes: indexes, vectors: vectors, generator: generator, reranker: reranker, config: config.normalize(), logger: logger}, nil
+}
+
+// WithUsageRecorder 注入长期记忆 rerank 用量记录器。
+func (r *MemoryRetriever) WithUsageRecorder(recorder UsageRecorder) *MemoryRetriever {
+	r.usage = recorder
+	return r
 }
 
 // Retrieve 返回与当前输入语义相关的长期记忆；没有 active 索引或查询为空时返回空结果。
@@ -278,7 +285,20 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 	}
 	if r.reranker != nil && len(filtered) > 1 {
 		// rerank 失败时保留向量分数，确保长期记忆检索仍可用。
-		scores, rerankErr := r.reranker.Rerank(ctx, query, memoryContents(filtered))
+		var scores []float64
+		var rerankErr error
+		if scoped, ok := r.reranker.(RerankerWithUsage); ok {
+			var usage RerankUsage
+			scores, usage, rerankErr = scoped.RerankWithUsage(ctx, query, memoryContents(filtered))
+			if rerankErr == nil && r.usage != nil && usage.InputTokens > 0 {
+				providerID := usage.ProviderID
+				if err := r.usage.RecordUsage(ctx, userID, nil, &providerID, int64(usage.InputTokens), 0, 0, time.Now().UTC()); err != nil {
+					r.logger.Warn("record rerank usage failed", "session_id", sessionID, "error", err)
+				}
+			}
+		} else {
+			scores, rerankErr = r.reranker.Rerank(ctx, query, memoryContents(filtered))
+		}
 		if rerankErr != nil {
 			r.logger.Warn("long-term memory rerank failed", "session_id", sessionID, "error", rerankErr)
 		} else if len(scores) == len(filtered) {

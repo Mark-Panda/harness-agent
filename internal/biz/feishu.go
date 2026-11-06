@@ -95,6 +95,8 @@ type FeishuConversationBinding struct {
 	Provider string
 	// TenantKey 飞书租户。
 	TenantKey string
+	// AppID 事件所属飞书应用，用于隔离同一群聊中的多个机器人。
+	AppID string
 	// ChatID 飞书会话 ID。
 	ChatID string
 	// ThreadID 话题维度键；单聊固定 p2p。
@@ -120,6 +122,22 @@ const (
 	// FeishuBindingUnbound 绑定已解绑，查找时跳过；同一话题的下一条 @ 消息会创建新会话。
 	FeishuBindingUnbound = "unbound"
 )
+
+// SessionAgentBinder 是可选的会话 Agent 绑定能力。
+// 飞书话题首次创建时可能尚未解析出绑定机器人；后续事件解析出 Agent 后补齐，
+// 保证 Web 端打开飞书会话时也能继续对话。
+type SessionAgentBinder interface {
+	// BindSessionAgent 把活跃会话绑定到指定 Agent。
+	BindSessionAgent(ctx context.Context, userID, sessionID, agentID uuid.UUID, now time.Time) error
+}
+
+// FeishuConversationAppScopedRepository 是按飞书应用隔离话题绑定的可选能力。
+// 同一群聊可能同时安装多个机器人，绑定必须按 app_id 区分，避免不同机器人的
+// 会话、上下文与回复互相串台。
+type FeishuConversationAppScopedRepository interface {
+	// FindConversationForApp 按 app/tenant/chat 查找绑定。
+	FindConversationForApp(ctx context.Context, appID, tenantKey, chatID, threadID, rootMessageID string) (FeishuConversationBinding, bool, error)
+}
 
 // FeishuConversationRepository 定义飞书话题绑定契约。
 type FeishuConversationRepository interface {
@@ -474,8 +492,5 @@ func feishuErrorCode(err error) string {
 
 // truncateError 截断错误文本，避免把上游长响应写入数据库。
 func truncateError(text string, limit int) string {
-	if len(text) <= limit {
-		return text
-	}
-	return text[:limit]
+	return truncateUTF8Bytes(text, limit)
 }

@@ -276,7 +276,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		return FeishuEventIgnored, nil
 	}
 	if len(text) > w.config.MaxMessageBytes {
-		text = text[:w.config.MaxMessageBytes]
+		text = truncateUTF8Bytes(text, w.config.MaxMessageBytes)
 	}
 	threadID, rootMessageID, ignored := w.threadKey(messageEvent)
 	if ignored {
@@ -290,9 +290,11 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if err := w.events.BindUser(ctx, record.EventID, identity.UserID); err != nil {
 		return "", err
 	}
-	// 机器人绑定只服务助手所属用户本人；其他飞书用户的消息直接忽略。
+	// 机器人绑定只服务助手所属用户本人；群聊中的其他成员可以作为发言人使用该机器人，
+	// 但会话、预算与 Agent 归属仍保持在机器人绑定所有者名下。
 	var routeAgentID *uuid.UUID
 	var routeAgentVersion *int
+	routeOwnerID := identity.UserID
 	routeMode := w.config.Mode
 	if routedBot != nil {
 		binding, found, err := w.bots.FindFeishuBotBinding(ctx, routedBot.ID)
@@ -302,23 +304,38 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		if !found {
 			return FeishuEventIgnored, nil
 		}
-		if binding.UserID != identity.UserID {
+		if messageEvent.ChatType != feishu.ChatTypeGroup && binding.UserID != identity.UserID {
 			return FeishuEventIgnored, nil
 		}
 		// 助手取消发布或归档后绑定会被解除；此处兜底避免旧绑定继续执行。
 		if binding.AgentStatus != AgentPublished {
 			return FeishuEventIgnored, nil
 		}
+		routeOwnerID = binding.UserID
 		agentID, agentVersion := binding.AgentID, binding.AgentVersion
 		routeAgentID, routeAgentVersion = &agentID, &agentVersion
 		routeMode = binding.AgentMode
+	} else {
+		if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
+			// 未登记机器人且未配置默认助手时直接忽略，避免事件无限重试进入死信。
+			return FeishuEventIgnored, nil
+		}
+		routeAgentID, routeAgentVersion = w.config.DefaultAgentID, w.config.DefaultAgentVersion
 	}
-	binding, found, err := w.conversations.FindConversation(ctx, record.TenantKey, messageEvent.ChatID, threadID, rootMessageID)
+	if routeAgentID == nil || routeAgentVersion == nil {
+		return FeishuEventIgnored, nil
+	}
+	// 未登记机器人使用默认应用，沿用迁移前的空 app_id 绑定，避免历史会话被拆成新话题。
+	conversationAppID := record.AppID
+	if routedBot == nil {
+		conversationAppID = ""
+	}
+	binding, found, err := w.findConversation(ctx, conversationAppID, record.TenantKey, messageEvent.ChatID, threadID, rootMessageID)
 	if err != nil {
 		return "", err
 	}
 	if !found {
-		binding, err = w.createConversation(ctx, identity.UserID, record.TenantKey, messageEvent, threadID, rootMessageID)
+		binding, err = w.createConversation(ctx, routeOwnerID, conversationAppID, record.TenantKey, routeAgentID, messageEvent, threadID, rootMessageID)
 		if err != nil {
 			return "", err
 		}
@@ -334,6 +351,16 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	}
 	if session.Status != SessionActive {
 		return FeishuEventIgnored, nil
+	}
+	// 旧话题可能创建于机器人绑定解析完成前；补齐 Agent 绑定后 Web 端才能继续该会话。
+	if session.AgentID == nil && routeAgentID != nil {
+		if binder, ok := w.sessions.(SessionAgentBinder); ok {
+			if err := binder.BindSessionAgent(ctx, session.UserID, session.ID, *routeAgentID, w.clock()); err != nil {
+				w.logger.Warn("bind feishu session agent failed", "session_id", session.ID, "error", err)
+			} else {
+				session.AgentID = routeAgentID
+			}
+		}
 	}
 	// 乱序保护：消息时间取飞书 create_time，而不是任务实际处理时间；
 	// 这样旧事件晚到时仍按发生时间落库，上下文与摘要顺序不会被投递顺序打乱。
@@ -363,16 +390,6 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		if err := w.speakerFacts.MaybeEnqueueSpeaker(ctx, binding.UserID, session.ID, identity.UserID, messageEvent.SenderOpenID); err != nil {
 			w.logger.Warn("enqueue speaker fact extraction failed", "session_id", session.ID, "speaker_open_id", messageEvent.SenderOpenID, "error", err)
 		}
-	}
-	if routedBot == nil {
-		if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
-			// 未登记机器人且未配置默认助手时直接忽略，避免事件无限重试进入死信。
-			return FeishuEventIgnored, nil
-		}
-		routeAgentID, routeAgentVersion = w.config.DefaultAgentID, w.config.DefaultAgentVersion
-	}
-	if routeAgentID == nil || routeAgentVersion == nil {
-		return FeishuEventIgnored, nil
 	}
 	principal, err := NewPrincipal(binding.UserID, RoleUser)
 	if err != nil {
@@ -421,8 +438,16 @@ func (w *FeishuEventWorker) threadKey(event feishu.MessageEvent) (string, string
 	return event.MessageID, event.MessageID, false
 }
 
+// findConversation 优先使用按应用隔离的检索能力，兼容未实现该能力的历史测试替身。
+func (w *FeishuEventWorker) findConversation(ctx context.Context, appID, tenantKey, chatID, threadID, rootMessageID string) (FeishuConversationBinding, bool, error) {
+	if scoped, ok := w.conversations.(FeishuConversationAppScopedRepository); ok {
+		return scoped.FindConversationForApp(ctx, appID, tenantKey, chatID, threadID, rootMessageID)
+	}
+	return w.conversations.FindConversation(ctx, tenantKey, chatID, threadID, rootMessageID)
+}
+
 // createConversation 在同一事务创建 Session、所有者成员与话题绑定。
-func (w *FeishuEventWorker) createConversation(ctx context.Context, userID uuid.UUID, tenantKey string, event feishu.MessageEvent, threadID, rootMessageID string) (FeishuConversationBinding, error) {
+func (w *FeishuEventWorker) createConversation(ctx context.Context, userID uuid.UUID, appID, tenantKey string, agentID *uuid.UUID, event feishu.MessageEvent, threadID, rootMessageID string) (FeishuConversationBinding, error) {
 	sessionID := uuid.New()
 	// 群聊话题禁止注入个人长期记忆与画像，单聊保持私有记忆策略。
 	memoryPolicy := SessionMemoryPrivate
@@ -430,11 +455,11 @@ func (w *FeishuEventWorker) createConversation(ctx context.Context, userID uuid.
 		memoryPolicy = SessionMemoryGroup
 	}
 	session := Session{
-		ID: sessionID, UserID: userID, Title: feishuTitle(event.ChatID), Source: SessionSourceFeishu,
+		ID: sessionID, UserID: userID, AgentID: agentID, Title: feishuTitle(event.ChatID), Source: SessionSourceFeishu,
 		MemoryPolicy: memoryPolicy, Status: SessionActive, Version: 1,
 	}
 	binding := FeishuConversationBinding{
-		ID: uuid.New(), UserID: userID, Provider: "feishu", TenantKey: tenantKey,
+		ID: uuid.New(), UserID: userID, Provider: "feishu", TenantKey: tenantKey, AppID: appID,
 		ChatID: event.ChatID, ThreadID: threadID, RootMessageID: rootMessageID,
 		SessionID: sessionID, Status: FeishuBindingActive,
 	}

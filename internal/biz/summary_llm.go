@@ -53,6 +53,7 @@ type SummaryLLMGenerator struct {
 	opener    CredentialOpener
 	budgets   BudgetChecker
 	limiter   model.ConcurrencyLimiter
+	usage     UsageRecorder
 	config    SummaryLLMConfig
 }
 
@@ -67,6 +68,12 @@ func NewSummaryLLMGenerator(runs RunRepository, providers ProviderCredentialRepo
 	}, nil
 }
 
+// WithUsageRecorder 注入后台摘要用量记录器；为空时只做预算校验不累加计数。
+func (g *SummaryLLMGenerator) WithUsageRecorder(recorder UsageRecorder) *SummaryLLMGenerator {
+	g.usage = recorder
+	return g
+}
+
 // resolvedSummaryModel 是解密后可用于摘要调用的模型与凭证。
 type resolvedSummaryModel struct {
 	providerID      uuid.UUID
@@ -76,6 +83,8 @@ type resolvedSummaryModel struct {
 	apiKey          string
 	contextWindow   int64
 	maxOutput       int
+	inputPrice      float64
+	outputPrice     float64
 }
 
 // Summarize 解析模型候选、分块生成并归并摘要。
@@ -114,6 +123,7 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 	chunks := memory.SplitSummaryMessages(toSummaryMessages(messages), g.config.MaxInputBytes)
 	partials := make([]string, 0, len(chunks))
 	inputTokens, outputTokens := 0, 0
+	estimatedCost := 0.0
 	carried := previous
 	for _, chunk := range chunks {
 		system, user, err := memory.BuildSummaryPrompt(carried, chunk, g.config.MaxMessageBytes)
@@ -127,6 +137,7 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 		partials = append(partials, response.Content)
 		inputTokens += response.InputTokens
 		outputTokens += response.OutputTokens
+		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
 		// 后续分块携带上一片段摘要，保持跨分块的指代与事实连续。
 		carried = response.Content
 	}
@@ -143,6 +154,14 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 		finalText = response.Content
 		inputTokens += response.InputTokens
 		outputTokens += response.OutputTokens
+		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
+	}
+	if g.usage != nil {
+		providerID := resolved.providerID
+		if err := g.usage.RecordUsage(ctx, userID, nil, &providerID, int64(inputTokens), int64(outputTokens), estimatedCost, time.Now().UTC()); err != nil {
+			// 用量记录失败不阻断摘要落库，但下一条摘要仍会继续尝试记录。
+			_ = err
+		}
 	}
 	providerID := resolved.providerID
 	return SummaryGeneration{
@@ -232,6 +251,7 @@ func resolveSessionModel(ctx context.Context, runs RunRepository, providers Prov
 			providerID: providerID, modelID: candidate.ModelID, remoteModelName: candidate.RemoteModelName,
 			baseURL: baseURL, apiKey: string(plaintext),
 			contextWindow: candidate.ContextWindowTokens, maxOutput: candidate.MaxOutputTokens,
+			inputPrice: candidate.InputPricePerMillion, outputPrice: candidate.OutputPricePerMillion,
 		}, nil
 	}
 	return resolvedSummaryModel{}, fmt.Errorf("%w: no enabled provider with decryptable credential", ErrSummaryModelUnavailable)

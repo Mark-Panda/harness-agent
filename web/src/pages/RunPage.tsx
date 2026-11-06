@@ -84,6 +84,11 @@ export default function RunPage() {
   const [reviseText, setReviseText] = useState("");
   const [reviseError, setReviseError] = useState<string | null>(null);
   const [reviseBusy, setReviseBusy] = useState(false);
+  const [reconcileReason, setReconcileReason] = useState("");
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+  const [reconcileBusy, setReconcileBusy] = useState(false);
+  const [replayBusy, setReplayBusy] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
 
   const orderedSteps = [...(steps.data?.steps ?? [])].sort((left, right) => left.step_seq - right.step_seq);
   const modelNames = useMemo(() => candidateNames(run.data?.model_policy_snapshot), [run.data?.model_policy_snapshot]);
@@ -180,6 +185,44 @@ export default function RunPage() {
     }
   };
 
+  // resolveReconciliation 由所有者对未知副作用做出书面结案，避免 Run 永久停留在对账状态。
+  const resolveReconciliation = async (outcome: "completed" | "failed") => {
+    if (reconcileReason.trim().length < 4) {
+      setReconcileError("请填写至少 4 个字符的对账说明。");
+      return;
+    }
+    setReconcileBusy(true);
+    setReconcileError(null);
+    try {
+      await mutate<Run>(`/api/v1/runs/${runId}/reconciliation`, "POST", {
+        outcome,
+        reason: reconcileReason.trim(),
+      }, crypto.randomUUID());
+      setReconcileReason("");
+      run.reload();
+      steps.reload();
+      attempts.reload();
+    } catch (failure) {
+      setReconcileError(describeError(failure));
+    } finally {
+      setReconcileBusy(false);
+    }
+  };
+
+  // replayRun 人工重新投递卡在队列/执行中的 Run 任务。
+  const replayRun = async () => {
+    setReplayBusy(true);
+    setReplayError(null);
+    try {
+      await mutate(`/api/v1/runs/${runId}/replay`, "POST", undefined, crypto.randomUUID());
+      run.reload();
+    } catch (failure) {
+      setReplayError(describeError(failure));
+    } finally {
+      setReplayBusy(false);
+    }
+  };
+
   if (run.loading) {
     return <LoadingState label="正在加载处理记录" />;
   }
@@ -198,6 +241,9 @@ export default function RunPage() {
             <Link to={`/sessions/${run.data.session_id}`} className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
               返回对话
             </Link>
+            {(run.data.status === "queued" || run.data.status === "running") ? (
+              <Button variant="secondary" loading={replayBusy} onClick={() => void replayRun()}>重新投递</Button>
+            ) : null}
             <Button variant="secondary" onClick={exportAudit}>导出详情 JSON</Button>
           </>
         }
@@ -222,8 +268,30 @@ export default function RunPage() {
       {run.data.error_message ? (
         <ErrorBanner message={`${run.data.error_code ?? "error"}：${run.data.error_message}`} />
       ) : null}
+      {replayError ? <ErrorBanner message={`重新投递失败：${replayError}`} /> : null}
       {planError ? <ErrorBanner message={planError} /> : null}
       {plan.error ? <ErrorBanner message={`计划读取失败：${plan.error}`} onRetry={plan.reload} /> : null}
+
+      {run.data.status === "reconciliation_required" ? (
+        <Card
+          title="需要人工对账"
+          description="工具副作用结果未知，系统不会自动重试。请核对下游结果后填写说明并结案。"
+        >
+          <Field label="对账说明" hint="至少 4 个字符，会写入审计事件。">
+            <Textarea
+              rows={3}
+              value={reconcileReason}
+              onChange={(event) => setReconcileReason(event.target.value)}
+              placeholder="例如：已在邮件系统中确认邮件实际发送成功。"
+            />
+          </Field>
+          {reconcileError ? <p className="mt-2 text-xs text-rust">{reconcileError}</p> : null}
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button loading={reconcileBusy} onClick={() => void resolveReconciliation("completed")}>确认为已完成</Button>
+            <Button variant="danger" loading={reconcileBusy} onClick={() => void resolveReconciliation("failed")}>确认为失败</Button>
+          </div>
+        </Card>
+      ) : null}
 
       {plan.data ? (
         <Card

@@ -338,7 +338,7 @@ func encodeMessageContent(content any) (string, error) {
 func safeMessage(message string) string {
 	message = strings.TrimSpace(message)
 	if len(message) > 256 {
-		message = message[:256]
+		message = strings.ToValidUTF8(message[:256], "")
 	}
 	return message
 }

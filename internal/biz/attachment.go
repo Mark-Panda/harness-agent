@@ -100,6 +100,12 @@ type AttachmentSessionReader interface {
 	GetSession(ctx context.Context, userID, sessionID uuid.UUID) (Session, error)
 }
 
+// AttachmentDeleter 是可选的未绑定附件删除能力，用于回收用户移除但未发送的上传文件。
+type AttachmentDeleter interface {
+	// DeleteUnbound 删除尚未绑定消息的附件；已绑定附件必须保留。
+	DeleteUnbound(ctx context.Context, userID, attachmentID uuid.UUID) error
+}
+
 // AttachmentService 处理附件上传、查询与消息绑定。
 type AttachmentService struct {
 	repo     AttachmentRepository
@@ -201,6 +207,25 @@ func (s *AttachmentService) ValidateForMessage(ctx context.Context, principal Pr
 	return s.repo.Validate(ctx, principal.UserID, sessionID, unique)
 }
 
+// DeleteUnbound 删除用户移除且尚未发送的附件，避免未绑定文件长期占用会话配额。
+func (s *AttachmentService) DeleteUnbound(ctx context.Context, principal Principal, attachmentID uuid.UUID) error {
+	if principal.UserID == uuid.Nil {
+		return ErrForbidden
+	}
+	attachment, err := s.repo.Get(ctx, principal.UserID, attachmentID)
+	if err != nil {
+		return err
+	}
+	if attachment.MessageID != nil {
+		return fmt.Errorf("%w: bound attachments cannot be deleted", ErrResourceConflict)
+	}
+	deleter, ok := s.repo.(AttachmentDeleter)
+	if !ok {
+		return fmt.Errorf("%w: attachment deletion is unavailable", ErrInvalidConfig)
+	}
+	return deleter.DeleteUnbound(ctx, principal.UserID, attachmentID)
+}
+
 // AttachToMessage 绑定附件与消息；数量与归属校验在此重复执行，防止并发重复绑定。
 func (s *AttachmentService) AttachToMessage(ctx context.Context, principal Principal, sessionID, messageID uuid.UUID, attachmentIDs []uuid.UUID) error {
 	if principal.UserID == uuid.Nil {
@@ -280,8 +305,8 @@ func sanitizeFileName(raw string) string {
 		builder.WriteRune(r)
 	}
 	name := strings.TrimSpace(builder.String())
-	for len(name) > 255 {
-		name = name[:len(name)-1]
+	if len(name) > 255 {
+		name = truncateUTF8Bytes(name, 255)
 	}
 	return name
 }

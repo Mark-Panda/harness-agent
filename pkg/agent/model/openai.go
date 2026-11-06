@@ -603,7 +603,7 @@ func (c *Client) redactedError(body io.Reader) string {
 	}
 	message := strings.TrimSpace(string(raw))
 	if len(message) > 512 {
-		message = message[:512]
+		message = strings.ToValidUTF8(message[:512], "")
 	}
 	message = strings.ReplaceAll(message, c.apiKey, "[REDACTED]")
 	return message

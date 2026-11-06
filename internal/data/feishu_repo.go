@@ -276,6 +276,8 @@ type externalBindingModel struct {
 	Provider string
 	// TenantKey 飞书租户。
 	TenantKey string
+	// AppID 事件所属飞书应用。
+	AppID string
 	// ChatID 飞书会话。
 	ChatID string
 	// ThreadID 话题键。
@@ -308,10 +310,15 @@ func NewFeishuConversationRepository(db *gorm.DB) *FeishuConversationRepositoryI
 // FindConversation 以系统作用域按 tenant/chat 查找绑定：优先匹配话题键，未命中时按根消息别名回退。
 // 已解绑（unbound）记录不参与匹配，保证解绑后同一话题的下一轮 @ 能创建全新会话。
 func (r *FeishuConversationRepositoryImpl) FindConversation(ctx context.Context, tenantKey, chatID, threadID, rootMessageID string) (biz.FeishuConversationBinding, bool, error) {
+	return r.FindConversationForApp(ctx, "", tenantKey, chatID, threadID, rootMessageID)
+}
+
+// FindConversationForApp 按飞书应用隔离查找绑定；空 appID 兼容单应用部署的既有数据。
+func (r *FeishuConversationRepositoryImpl) FindConversationForApp(ctx context.Context, appID, tenantKey, chatID, threadID, rootMessageID string) (biz.FeishuConversationBinding, bool, error) {
 	var record externalBindingModel
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		result := tx.Where("provider = ? AND tenant_key = ? AND chat_id = ? AND thread_id = ? AND status <> ?",
-			"feishu", tenantKey, chatID, threadID, biz.FeishuBindingUnbound).
+		result := tx.Where("provider = ? AND tenant_key = ? AND app_id = ? AND chat_id = ? AND thread_id = ? AND status <> ?",
+			"feishu", tenantKey, appID, chatID, threadID, biz.FeishuBindingUnbound).
 			First(&record)
 		if result.Error == nil {
 			return nil
@@ -325,8 +332,8 @@ func (r *FeishuConversationRepositoryImpl) FindConversation(ctx context.Context,
 			return nil
 		}
 		alias := externalBindingModel{}
-		aliasResult := tx.Where("provider = ? AND tenant_key = ? AND chat_id = ? AND root_message_id = ? AND status <> ?",
-			"feishu", tenantKey, chatID, rootMessageID, biz.FeishuBindingUnbound).
+		aliasResult := tx.Where("provider = ? AND tenant_key = ? AND app_id = ? AND chat_id = ? AND root_message_id = ? AND status <> ?",
+			"feishu", tenantKey, appID, chatID, rootMessageID, biz.FeishuBindingUnbound).
 			First(&alias)
 		if aliasResult.Error == nil {
 			record = alias
@@ -353,7 +360,7 @@ func (r *FeishuConversationRepositoryImpl) EnsureConversation(ctx context.Contex
 	rootMessageID := binding.RootMessageID
 	record := externalBindingModel{
 		ID: binding.ID, UserID: binding.UserID, Provider: binding.Provider, TenantKey: binding.TenantKey,
-		ChatID: binding.ChatID, ThreadID: &threadID, SessionID: binding.SessionID, Status: biz.FeishuBindingActive,
+		AppID: binding.AppID, ChatID: binding.ChatID, ThreadID: &threadID, SessionID: binding.SessionID, Status: biz.FeishuBindingActive,
 	}
 	if rootMessageID != "" {
 		record.RootMessageID = &rootMessageID
@@ -383,7 +390,7 @@ func (r *FeishuConversationRepositoryImpl) EnsureConversation(ctx context.Contex
 	if !errors.Is(err, gorm.ErrDuplicatedKey) {
 		return biz.FeishuConversationBinding{}, biz.Session{}, catalogError("ensure feishu conversation", err)
 	}
-	existing, found, findErr := r.FindConversation(ctx, binding.TenantKey, binding.ChatID, binding.ThreadID, rootMessageID)
+	existing, found, findErr := r.FindConversationForApp(ctx, binding.AppID, binding.TenantKey, binding.ChatID, binding.ThreadID, rootMessageID)
 	if findErr != nil {
 		return biz.FeishuConversationBinding{}, biz.Session{}, findErr
 	}
@@ -514,7 +521,7 @@ func toFeishuConversationBinding(record externalBindingModel) biz.FeishuConversa
 	}
 	return biz.FeishuConversationBinding{
 		ID: record.ID, UserID: record.UserID, Provider: record.Provider, TenantKey: record.TenantKey,
-		ChatID: record.ChatID, ThreadID: threadID, RootMessageID: rootMessageID,
+		AppID: record.AppID, ChatID: record.ChatID, ThreadID: threadID, RootMessageID: rootMessageID,
 		SessionID: record.SessionID, Status: record.Status, CreatedAt: record.CreatedAt,
 	}
 }

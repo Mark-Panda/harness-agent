@@ -277,6 +277,8 @@ type MemoryEmbedWorkerDependencies struct {
 	Vectors MemoryVectorRepository
 	// Generator embedding 生成器。
 	Generator EmbeddingGenerator
+	// Usage 后台向量化用量记录器，可为空。
+	Usage UsageRecorder
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -290,6 +292,7 @@ type MemoryEmbedWorker struct {
 	indexes   EmbeddingIndexRepository
 	vectors   MemoryVectorRepository
 	generator EmbeddingGenerator
+	usage     UsageRecorder
 	config    MemoryEmbedWorkerConfig
 	clock     func() time.Time
 	logger    *slog.Logger
@@ -314,7 +317,7 @@ func NewMemoryEmbedWorker(dependencies MemoryEmbedWorkerDependencies, config Mem
 	}
 	return &MemoryEmbedWorker{
 		jobs: dependencies.Jobs, messages: dependencies.Messages, indexes: dependencies.Indexes,
-		vectors: dependencies.Vectors, generator: dependencies.Generator,
+		vectors: dependencies.Vectors, generator: dependencies.Generator, usage: dependencies.Usage,
 		config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -451,6 +454,12 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 		result, err := w.generator.Embed(ctx, index, inputs)
 		if err != nil {
 			return err
+		}
+		if w.usage != nil && result.InputTokens > 0 {
+			providerID := index.ProviderID
+			if err := w.usage.RecordUsage(ctx, userID, nil, &providerID, int64(result.InputTokens), 0, 0, now); err != nil {
+				w.logger.Warn("record embedding usage failed", "session_id", sessionID, "error", err)
+			}
 		}
 		if len(result.Vectors) != len(batch) {
 			return fmt.Errorf("%w: embedding count mismatch", ErrInvalidConfig)

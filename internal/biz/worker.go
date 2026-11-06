@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -481,7 +482,7 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		return
 	}
 	// 终态与人工对账状态都不得继续自动执行；对账 Run 由人工处理后另行推进。
-	if RunTerminal(run.Status) || run.Status == RunReconciliationRequired {
+	if RunSettled(run.Status) {
 		_ = w.jobs.Complete(ctx, job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
@@ -1926,9 +1927,7 @@ func payloadToolCalls(value any) []map[string]any {
 
 // failRun 在栅栏有效时把 Run 推进到失败终态，并追加 run.failed 事件。
 func (w *ExecutionWorker) failRun(ctx context.Context, run Run, fence RunFence, code, message string) {
-	if len(message) > 512 {
-		message = message[:512]
-	}
+	message = truncateUTF8Bytes(message, 512)
 	// 失败事件与失败终态同事务提交，避免出现只有事件或只有状态的半成品。
 	if _, err := w.runs.FinishRunWithEvent(ctx, run.UserID, run.ID, RunRunning, RunFailed, map[string]any{
 		"error_code": code, "error_message": message,
@@ -1979,10 +1978,7 @@ func isBusinessFailure(err error) bool {
 
 // failureDetails 把执行错误映射为稳定业务码与脱敏消息，供前端与告警使用。
 func failureDetails(err error) (string, string) {
-	message := err.Error()
-	if len(message) > 512 {
-		message = message[:512]
-	}
+	message := truncateUTF8Bytes(err.Error(), 512)
 	switch {
 	case errors.Is(err, ErrNoUserMessage):
 		return "no_user_message", "会话中没有可执行的用户消息"
@@ -2238,6 +2234,19 @@ func (o *runAttemptObserver) AttemptFinished(ctx context.Context, record model.A
 	})
 }
 
+// truncateUTF8Bytes 按字节上限截断文本并保证结果是合法 UTF-8。
+// 直接切片可能把中文或 emoji 切成半个字符，写入 PostgreSQL text 时会触发编码错误。
+func truncateUTF8Bytes(text string, maximum int) string {
+	if maximum <= 0 || len(text) <= maximum {
+		return text
+	}
+	limit := maximum
+	for limit > 0 && !utf8.RuneStart(text[limit]) {
+		limit--
+	}
+	return strings.ToValidUTF8(text[:limit], "")
+}
+
 // truncatePayloadText 按字节上限截断响应文本，并保证结果仍是合法 UTF-8。
 func truncatePayloadText(text string, maximum int64) (string, bool) {
 	if maximum <= 0 {
@@ -2280,20 +2289,25 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 		if entry.Status != "enabled" {
 			continue
 		}
-		riskLevel := entry.RiskLevel
-		if riskLevel == "" {
-			riskLevel = "high"
-		}
-		if riskLevel != "low" && w.approvals == nil {
-			w.logger.Info("skip MCP server: approval repository unavailable", "mcp", entry.Name, "risk", riskLevel)
-			continue
-		}
 		mcpID, err := uuid.Parse(entry.ID)
 		if err != nil {
 			continue
 		}
 		live, credential, err := w.mcps.GetMCPCredential(ctx, mcpID)
 		if err != nil || live.Status != "enabled" {
+			continue
+		}
+		// 风险等级属于平台安全控制，必须取实时目录值而不是发布快照；
+		// 否则管理员在发布后上调风险等级也无法重新触发人工审批。
+		riskLevel := live.RiskLevel
+		if riskLevel == "" {
+			riskLevel = entry.RiskLevel
+		}
+		if riskLevel == "" {
+			riskLevel = "high"
+		}
+		if riskLevel != "low" && w.approvals == nil {
+			w.logger.Info("skip MCP server: approval repository unavailable", "mcp", entry.Name, "risk", riskLevel)
 			continue
 		}
 		endpoint := entry.Endpoint
@@ -2991,9 +3005,5 @@ func (t approvalTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 
 // sanitizeExecutionError 截断工具错误文本，避免超长内容进入载荷。
 func sanitizeExecutionError(err error) string {
-	message := err.Error()
-	if len(message) > 256 {
-		message = message[:256]
-	}
-	return message
+	return truncateUTF8Bytes(err.Error(), 256)
 }

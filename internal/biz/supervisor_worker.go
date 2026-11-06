@@ -576,6 +576,9 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	}
 	writeContext := context.WithoutCancel(ctx)
 	for index, message := range result.Messages {
+		if message.Ephemeral {
+			continue
+		}
 		if message.Role != react.RoleAssistant && message.Role != react.RoleTool {
 			continue
 		}

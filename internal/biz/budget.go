@@ -109,6 +109,19 @@ type BudgetChecker interface {
 	Check(ctx context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID) ([]BudgetAlert, error)
 }
 
+// UsageRecorder 记录后台模型调用（摘要、事实、embedding、rerank）产生的用量。
+// 这些调用没有 Run Attempt 记录，必须显式累加预算计数，否则每日预算会被低估。
+type UsageRecorder interface {
+	// RecordUsage 按用户、可选 Agent 与供应商累加 Token 与费用。
+	RecordUsage(ctx context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID,
+		inputTokens, outputTokens int64, estimatedCost float64, now time.Time) error
+}
+
+// estimateBackgroundCost 按模型单价估算后台调用费用。
+func estimateBackgroundCost(inputPrice, outputPrice float64, inputTokens, outputTokens int) float64 {
+	return float64(inputTokens)*inputPrice/1_000_000 + float64(outputTokens)*outputPrice/1_000_000
+}
+
 // BudgetService 实现每日预算校验，读取失败由调用方决定降级策略。
 type BudgetService struct {
 	repo   BudgetRepository

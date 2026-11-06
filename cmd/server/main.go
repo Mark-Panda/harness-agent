@@ -488,7 +488,8 @@ func run() error {
 	mcpClientCache := mcp.NewClientCache(0)
 	stepRepository := data.NewExecutionStepRepository(appDB)
 	approvalRepository := data.NewToolApprovalRepository(appDB)
-	budgetService, err := biz.NewBudgetService(data.NewBudgetRepository(appDB), biz.BudgetPolicy{
+	budgetRepository := data.NewBudgetRepository(appDB)
+	budgetService, err := biz.NewBudgetService(budgetRepository, biz.BudgetPolicy{
 		UserDailyTokens: cfg.Agent.Budgets.UserDailyTokens, UserDailyCost: cfg.Agent.Budgets.UserDailyCost,
 		AgentDailyTokens: cfg.Agent.Budgets.AgentDailyTokens, AgentDailyCost: cfg.Agent.Budgets.AgentDailyCost,
 		ProviderDailyTokens: cfg.Agent.Budgets.ProviderDailyTokens, ProviderDailyCost: cfg.Agent.Budgets.ProviderDailyCost,
@@ -496,6 +497,9 @@ func run() error {
 	}, nil)
 	if err != nil {
 		return err
+	}
+	if memoryRetriever != nil {
+		memoryRetriever.WithUsageRecorder(budgetRepository)
 	}
 	runService, err := biz.NewRunService(runRepository, sessionRepository,
 		biz.WithRunSnapshots(data.NewRunSnapshotRepository(agentRepository, catalogRepository)),
@@ -834,6 +838,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		generator.WithUsageRecorder(budgetRepository)
 		summaryWorker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
 			Jobs: jobRepository, Sessions: sessionRepository, Messages: sessionRepository,
 			Summaries: summaryRepository, Generator: generator, Logger: slog.Default(),
@@ -854,7 +859,7 @@ func run() error {
 	if cfg.Agent.Memory.Vector.Enabled {
 		memoryEmbedWorker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
 			Jobs: jobRepository, Messages: sessionRepository, Indexes: memoryRepository,
-			Vectors: memoryRepository, Generator: embeddingGenerator, Logger: slog.Default(),
+			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Logger: slog.Default(),
 		}, biz.MemoryEmbedWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Vector.Concurrency,
 			PollInterval: cfg.Agent.Memory.Vector.PollInterval.Duration, Lease: cfg.Agent.Memory.Vector.Lease.Duration,
@@ -894,6 +899,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		factExtractor.WithUsageRecorder(budgetRepository)
 		factWorker, err := biz.NewFactExtractionWorker(biz.FactExtractionWorkerDependencies{
 			Jobs: jobRepository, Messages: sessionRepository, Facts: factService, Extractor: factExtractor,
 			Logger: slog.Default(),

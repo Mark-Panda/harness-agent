@@ -119,6 +119,31 @@ func (r *AttachmentRepository) Open(ctx context.Context, userID, attachmentID uu
 	return toBizAttachment(record), content.Data, nil
 }
 
+// DeleteUnbound 删除尚未绑定消息的附件及二进制内容；已绑定附件返回冲突。
+func (r *AttachmentRepository) DeleteUnbound(ctx context.Context, userID, attachmentID uuid.UUID) error {
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var record attachmentModel
+		if err := tx.Where("id = ? AND user_id = ?", attachmentID, userID).First(&record).Error; err != nil {
+			return err
+		}
+		if record.MessageID != nil {
+			return fmt.Errorf("%w: bound attachments cannot be deleted", biz.ErrResourceConflict)
+		}
+		if err := tx.Where("attachment_id = ?", attachmentID).Delete(&attachmentContentModel{}).Error; err != nil {
+			return err
+		}
+		result := tx.Where("id = ? AND user_id = ? AND message_id IS NULL", attachmentID, userID).Delete(&attachmentModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: attachment deletion conflicted", biz.ErrResourceConflict)
+		}
+		return nil
+	})
+	return catalogError("delete unbound attachment", err)
+}
+
 // ListBySession 列出会话附件元数据。
 func (r *AttachmentRepository) ListBySession(ctx context.Context, userID, sessionID uuid.UUID) ([]biz.Attachment, error) {
 	var records []attachmentModel

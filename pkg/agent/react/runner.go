@@ -119,6 +119,8 @@ type Message struct {
 	Name string `json:"name,omitempty"`
 	// ToolCalls 助手消息携带的工具调用，供下一轮协议回放。
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// Ephemeral 标记仅用于本次模型续写、不得落库的中间片段。
+	Ephemeral bool `json:"-"`
 }
 
 // ToolSpec 是暴露给模型的工具定义。
@@ -429,6 +431,13 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 		emit(sink, "message.created", messageEventPayload(messageIndex, message))
 		messageIndex++
 	}
+	// appendEphemeral 只把续写片段留在内存中供下一次模型调用，不产生落库事件；
+	// 否则半截答案会被持久化，最终答案再落库后会话里会出现重复内容。
+	appendEphemeral := func(message Message) {
+		message.Ephemeral = true
+		messages = append(messages, message)
+		messageIndex++
+	}
 
 	for step := 1; step <= r.limits.MaxSteps; step++ {
 		if err := runContext.Err(); err != nil {
@@ -517,7 +526,7 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 				// 输出被长度截断时先请求模型续写一次，避免把半截答案直接返回用户。
 				if step < r.limits.MaxSteps && !continuationRequested {
 					if partial != "" {
-						appendMessage(Message{Role: RoleAssistant, Content: partial})
+						appendEphemeral(Message{Role: RoleAssistant, Content: partial})
 					}
 					emit(sink, "message.truncated", map[string]any{"step": step, "has_partial": partial != ""})
 					continuationRequested = true
@@ -1072,7 +1081,7 @@ func sanitizeError(err error) string {
 	}
 	message := err.Error()
 	if len(message) > 512 {
-		return message[:512]
+		return strings.ToValidUTF8(message[:512], "")
 	}
 	return message
 }

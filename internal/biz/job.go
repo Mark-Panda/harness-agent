@@ -47,6 +47,12 @@ type JobQueue interface {
 	Fail(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, retryAt time.Time, reason string, now time.Time) error
 }
 
+// RunJobReplayer 是可选的任务重放能力：把同一 Run 的 failed/dead 任务重置为 pending。
+type RunJobReplayer interface {
+	// RequeueRun 重置 Run 执行任务并清空租约与失败计数。
+	RequeueRun(ctx context.Context, runID uuid.UUID, now time.Time) error
+}
+
 // RunEnqueuer 是 Run 创建后的入队端口，供 RunService 解耦具体队列实现。
 type RunEnqueuer interface {
 	// EnqueueRun 幂等入队 Run 执行任务。

@@ -92,6 +92,33 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 	return catalogError("enqueue run job", err)
 }
 
+// RequeueRun 把同一 Run 的失败或死信任务重置为 pending，供人工重放。
+func (r *JobRepository) RequeueRun(ctx context.Context, runID uuid.UUID, now time.Time) error {
+	if runID == uuid.Nil {
+		return fmt.Errorf("%w: run id is required", biz.ErrInvalidConfig)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	dedupe := "run:" + runID.String()
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		result := tx.Model(&jobModel{}).
+			Where("dedupe_key = ? AND status IN ?", dedupe, []string{"failed", "dead"}).
+			Updates(map[string]any{
+				"status": "pending", "attempts": 0, "available_at": now, "updated_at": now,
+				"lease_owner": "", "lease_expires_at": nil, "last_error": "",
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("%w: no failed run job to replay", biz.ErrResourceConflict)
+		}
+		return nil
+	})
+	return catalogError("requeue run job", err)
+}
+
 // EnqueueSummary 幂等写入异步摘要任务；去重键绑定会话与来源指纹，同一来源范围只执行一次。
 func (r *JobRepository) EnqueueSummary(ctx context.Context, task biz.SummaryTask, availableAt time.Time) error {
 	if task.UserID == uuid.Nil || task.SessionID == uuid.Nil || task.EndMessageID == uuid.Nil {

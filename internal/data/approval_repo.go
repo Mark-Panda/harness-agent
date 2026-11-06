@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -255,7 +256,7 @@ func (r *ToolApprovalRepository) FinishApprovalExecution(ctx context.Context, us
 			return err
 		}
 		if len(errorMessage) > 512 {
-			errorMessage = errorMessage[:512]
+			errorMessage = strings.ToValidUTF8(errorMessage[:512], "")
 		}
 		updates := map[string]any{
 			"status": string(status), "error_code": errorCode, "error_message": errorMessage, "updated_at": now,

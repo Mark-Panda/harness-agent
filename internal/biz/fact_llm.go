@@ -43,6 +43,7 @@ type FactLLMExtractor struct {
 	runs      RunRepository
 	providers ProviderCredentialRepository
 	opener    CredentialOpener
+	usage     UsageRecorder
 	config    FactLLMConfig
 }
 
@@ -52,6 +53,12 @@ func NewFactLLMExtractor(runs RunRepository, providers ProviderCredentialReposit
 		return nil, invalid("fact extractor requires runs, providers and credential opener")
 	}
 	return &FactLLMExtractor{runs: runs, providers: providers, opener: opener, config: config.normalize()}, nil
+}
+
+// WithUsageRecorder 注入后台事实提取用量记录器。
+func (e *FactLLMExtractor) WithUsageRecorder(recorder UsageRecorder) *FactLLMExtractor {
+	e.usage = recorder
+	return e
 }
 
 // Extract 调用模型提取事实并解析为候选；空输出表示本轮没有可提取事实。
@@ -102,6 +109,14 @@ func (e *FactLLMExtractor) Extract(ctx context.Context, userID, sessionID uuid.U
 	}
 	if len(response.ToolCalls) > 0 {
 		return nil, fmt.Errorf("%w: provider returned tool calls for fact extraction", ErrFactPermanent)
+	}
+	if e.usage != nil {
+		providerID := resolved.providerID
+		cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
+		if err := e.usage.RecordUsage(ctx, userID, nil, &providerID, int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); err != nil {
+			// 用量记录失败不阻断事实提取结果。
+			_ = err
+		}
 	}
 	candidates, err := ParseFactModelOutput(response.Content, messages)
 	if err != nil {

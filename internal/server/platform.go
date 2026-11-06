@@ -94,6 +94,7 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		handle("GET /api/v1/sessions/{id}/attachments", handler.listAttachments)
 		handle("GET /api/v1/attachments/{id}", handler.getAttachment)
 		handle("GET /api/v1/attachments/{id}/download", handler.downloadAttachment)
+		handleWrite("DELETE /api/v1/attachments/{id}", "attachment", handler.deleteAttachment)
 	}
 	// 飞书话题生命周期：仅装配飞书能力时注册，仅会话所有者可操作。
 	if platform.FeishuBindings != nil {
@@ -107,6 +108,10 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("GET /api/v1/sessions/{id}/runs", handler.listRuns)
 	handle("GET /api/v1/runs/{id}", handler.getRun)
 	handleWrite("POST /api/v1/runs/{id}/cancel", "run", handler.cancelRun)
+	// 人工重放：恢复 Job 入队失败或死信且尚未终结的 Run。
+	handleWrite("POST /api/v1/runs/{id}/replay", "run", handler.replayRun)
+	// 人工对账：未知副作用的 Run 必须由所有者书面结案，禁止自动重试。
+	handleWrite("POST /api/v1/runs/{id}/reconciliation", "run", handler.reconcileRun)
 	handle("GET /api/v1/runs/{id}/events", handler.runEvents)
 	// 执行树接口：返回步骤事实，按需附带脱敏载荷。
 	handle("GET /api/v1/runs/{id}/steps", handler.runSteps)
@@ -1129,6 +1134,20 @@ func (h *platformHTTPHandler) getAttachment(w http.ResponseWriter, r *http.Reque
 	}
 	attachment, err := h.service.Attachments.Get(r.Context(), requestPrincipal(r), id)
 	writePlatformResult(w, http.StatusOK, attachmentResponse(attachment), err)
+}
+
+// deleteAttachment 处理 DELETE /api/v1/attachments/{id}：删除尚未发送的附件并回收配额。
+func (h *platformHTTPHandler) deleteAttachment(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	if h.service.Attachments == nil {
+		writeErrorCode(w, http.StatusBadRequest, "attachments_unavailable")
+		return
+	}
+	err := h.service.Attachments.DeleteUnbound(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusNoContent, nil, err)
 }
 
 // downloadAttachment 处理 GET /api/v1/attachments/{id}/download：鉴权后流式返回文件内容。

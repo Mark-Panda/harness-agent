@@ -335,6 +335,19 @@ func TestRegistryBusinessErrorAndSpec(t *testing.T) {
 	}
 }
 
+// TestCanonicalNameASCIIOnly 验证中文 MCP/工具名不会生成非法函数名。
+func TestCanonicalNameASCIIOnly(t *testing.T) {
+	name := canonicalToolName("客户系统", "发送消息")
+	for _, r := range name {
+		if r > 127 || !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			t.Fatalf("canonical name contains invalid character %q: %q", r, name)
+		}
+	}
+	if name == "" || name == "mcp__" {
+		t.Fatalf("canonical name is empty: %q", name)
+	}
+}
+
 // TestCanonicalNameTruncation 验证超长工具名被稳定截断并保持唯一后缀。
 func TestCanonicalNameTruncation(t *testing.T) {
 	longServer := strings.Repeat("server", 20)

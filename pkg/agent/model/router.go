@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -707,7 +708,7 @@ func sanitizedMessage(err error) string {
 	}
 	message := err.Error()
 	if len(message) > 512 {
-		message = message[:512]
+		message = strings.ToValidUTF8(message[:512], "")
 	}
 	return message
 }

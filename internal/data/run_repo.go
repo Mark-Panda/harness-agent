@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -336,6 +337,31 @@ func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UU
 	return toBizRun(record)
 }
 
+// ExtendRunDeadline 延长非终态 Run 的截止时间，用于计划暂停后恢复时补偿暂停时长。
+func (r *RunRepository) ExtendRunDeadline(ctx context.Context, userID, runID uuid.UUID, deadline time.Time) (biz.Run, error) {
+	if userID == uuid.Nil || runID == uuid.Nil || deadline.IsZero() {
+		return biz.Run{}, fmt.Errorf("%w: run identity and deadline are required", biz.ErrInvalidConfig)
+	}
+	var record runModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		result := tx.Model(&runModel{}).
+			Where("id = ? AND user_id = ? AND status IN ?", runID, userID,
+				[]string{string(biz.RunQueued), string(biz.RunRunning), string(biz.RunWaitingApproval)}).
+			Updates(map[string]any{"deadline_at": deadline, "updated_at": time.Now().UTC()})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: run deadline cannot be extended in its current state", biz.ErrResourceConflict)
+		}
+		return tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error
+	})
+	if err != nil {
+		return biz.Run{}, catalogError("extend run deadline", err)
+	}
+	return toBizRun(record)
+}
+
 // ClaimRun 认领排队中或租约已过期的 Run，并在同一事务内递增 fencing token。
 // 认领规则：queued 可直接执行；running 仅在租约缺失或过期时允许恢复，避免抢占健康 Worker。
 // 同一会话的 Run 串行执行：会话级 advisory lock 内检查是否已有运行中或等待审批的 Run，
@@ -516,7 +542,7 @@ func (r *RunRepository) MarkRunReconciliationRequired(ctx context.Context, userI
 		return biz.Run{}, fmt.Errorf("%w: valid fence is required to reconcile a run", biz.ErrInvalidConfig)
 	}
 	if len(message) > 512 {
-		message = message[:512]
+		message = strings.ToValidUTF8(message[:512], "")
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {

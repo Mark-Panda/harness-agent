@@ -150,7 +150,7 @@ func (r *SessionRepository) ListSessions(ctx context.Context, userID uuid.UUID, 
 	limit = NormalizeLimit(limit)
 	var records []sessionModel
 	err = WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		query := tx.Where("user_id = ?", userID)
+		query := tx.Where("user_id = ? AND parent_session_id IS NULL", userID)
 		if decoded.ID != uuid.Nil {
 			query = query.Where("(created_at < ? OR (created_at = ? AND id < ?))", decoded.CreatedAt, decoded.CreatedAt, decoded.ID)
 		}
@@ -227,6 +227,29 @@ func (r *SessionRepository) UpdateSessionMemoryPolicy(ctx context.Context, sessi
 // GetAgent 读取绑定 Agent，用于校验会话引用的 Agent 是否已发布。
 func (r *SessionRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUID) (biz.Agent, error) {
 	return r.agents.GetAgent(ctx, userID, agentID)
+}
+
+// BindSessionAgent 为活跃会话补齐 Agent 绑定，供飞书会话在 Web 端继续使用。
+func (r *SessionRepository) BindSessionAgent(ctx context.Context, userID, sessionID, agentID uuid.UUID, now time.Time) error {
+	if userID == uuid.Nil || sessionID == uuid.Nil || agentID == uuid.Nil {
+		return fmt.Errorf("%w: session and agent ids are required", biz.ErrInvalidConfig)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		result := tx.Model(&sessionModel{}).
+			Where("id = ? AND user_id = ? AND status = ?", sessionID, userID, biz.SessionActive).
+			Updates(map[string]any{"agent_id": agentID, "updated_at": now, "version": gorm.Expr("version + 1")})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: session is missing or inactive", biz.ErrResourceConflict)
+		}
+		return nil
+	})
+	return catalogError("bind session agent", err)
 }
 
 // AppendMessage 在同一事务内写入消息、推进会话最近消息时间与版本，并追加审计事件。
@@ -363,7 +386,9 @@ func (r *SessionRepository) ListMessages(ctx context.Context, userID, sessionID 
 func (r *SessionRepository) CountSessions(ctx context.Context, userID uuid.UUID) (int64, error) {
 	var count int64
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.Model(&sessionModel{}).Where("user_id = ? AND status <> ?", userID, biz.SessionDeleted).Count(&count).Error
+		return tx.Model(&sessionModel{}).
+			Where("user_id = ? AND parent_session_id IS NULL AND status <> ?", userID, biz.SessionDeleted).
+			Count(&count).Error
 	})
 	if err != nil {
 		return 0, catalogError("count sessions", err)
