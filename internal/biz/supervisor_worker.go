@@ -109,47 +109,60 @@ func (w *ExecutionWorker) supervisorUsageFromEvents(ctx context.Context, run Run
 }
 
 // executeSupervisor 执行 Supervisor 模式：生成委派、并发运行 Worker、汇总结果。
+// engine=eino 时由 Eino Graph 编排加载、Worker 与汇总节点，custom 路径保持原有流程。
 func (w *ExecutionWorker) executeSupervisor(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, messages []react.Message, tools react.Registry) (react.Result, error) {
 	if w.supervisor == nil {
 		return react.Result{}, fmt.Errorf("%w: supervisor task repository is not configured", ErrSupervisorInvalid)
 	}
+	if w.config.Engine == "eino" {
+		return w.executeSupervisorEino(ctx, run, fence, candidates, policyVersion, messages, tools)
+	}
 	var attempts atomic.Int64
 	attempts.Store(int64(run.AttemptNo))
-	tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
+	tasks, usage, err := w.prepareSupervisorTasks(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools)
 	if err != nil {
 		return react.Result{}, err
 	}
-	usage := supervisorUsage{}
+	return w.runSupervisorTasks(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools, usage, tasks)
+}
+
+// prepareSupervisorTasks 读取或生成委派任务，并恢复既往用量与中断任务。
+func (w *ExecutionWorker) prepareSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry) ([]SupervisorTask, supervisorUsage, error) {
+	tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
+	if err != nil {
+		return nil, supervisorUsage{}, err
+	}
 	if len(tasks) == 0 {
-		draft, draftUsage, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools)
+		draft, draftUsage, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, attempts, messages, tools)
 		if err != nil {
-			return react.Result{}, err
+			return nil, supervisorUsage{}, err
 		}
-		usage = supervisorUsage{
+		usage := supervisorUsage{
 			input: int64(draftUsage.Usage.InputTokens), output: int64(draftUsage.Usage.OutputTokens), cost: draftUsage.EstimatedCost,
 		}
 		if w.supervisorBudgetExceeded(usage.input, usage.output, usage.cost) {
-			return react.Result{}, ErrSupervisorBudget
+			return nil, usage, ErrSupervisorBudget
 		}
 		tasks, err = w.persistSupervisorTasks(ctx, run, fence, tools, draft)
 		if err != nil {
 			w.logger.Error("persist supervisor tasks failed", "run_id", run.ID, "error", err)
-			return react.Result{}, err
+			return nil, supervisorUsage{}, err
 		}
-	} else {
-		recoveredUsage, hasUsage, usageErr := w.supervisorUsageFromEvents(ctx, run)
-		if usageErr != nil {
-			return react.Result{}, usageErr
-		}
-		if hasUsage {
-			usage = recoveredUsage
-		}
-		tasks, err = w.recoverSupervisorTasks(ctx, run, tasks)
-		if err != nil {
-			return react.Result{}, err
-		}
+		return tasks, usage, nil
 	}
-	return w.runSupervisorTasks(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools, usage, tasks)
+	usage := supervisorUsage{}
+	recoveredUsage, hasUsage, usageErr := w.supervisorUsageFromEvents(ctx, run)
+	if usageErr != nil {
+		return nil, supervisorUsage{}, usageErr
+	}
+	if hasUsage {
+		usage = recoveredUsage
+	}
+	tasks, err = w.recoverSupervisorTasks(ctx, run, tasks)
+	if err != nil {
+		return nil, supervisorUsage{}, err
+	}
+	return tasks, usage, nil
 }
 
 // generateSupervision 调用 Supervisor 模型生成 Worker 委派。
@@ -378,150 +391,187 @@ func (w *ExecutionWorker) recoverSupervisorTasks(ctx context.Context, run Run, t
 
 // runSupervisorTasks 并发执行待处理 Worker 任务并汇总结果。
 func (w *ExecutionWorker) runSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, usage supervisorUsage, tasks []SupervisorTask) (react.Result, error) {
+	pending := pendingSupervisorTasks(tasks)
+	if len(pending) > 0 {
+		outcome, err := w.runPendingSupervisorTasks(ctx, run, fence, candidates, policyVersion, attempts, messages, tools, usage, pending)
+		if err != nil {
+			return react.Result{}, err
+		}
+		// 子任务触发人工审批时保留审批记录并暂停主 Run，不能降级为普通失败后继续汇总。
+		if outcome.ApprovalError != nil {
+			return react.Result{}, outcome.ApprovalError
+		}
+		tasks = outcome.Tasks
+		if err := w.ensureSupervisorPartialAllowed(run, tasks, outcome.BudgetExceeded); err != nil {
+			return react.Result{}, err
+		}
+	}
+	return w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, usage, tasks)
+}
+
+// supervisorRunOutcome 是并发执行 Worker 后的状态快照。
+type supervisorRunOutcome struct {
+	Tasks          []SupervisorTask
+	BudgetExceeded bool
+	ApprovalError  error
+}
+
+// pendingSupervisorTasks 返回仍待执行的子任务。
+func pendingSupervisorTasks(tasks []SupervisorTask) []SupervisorTask {
 	pending := make([]SupervisorTask, 0, len(tasks))
 	for _, task := range tasks {
 		if task.Status == SupervisorTaskPending {
 			pending = append(pending, task)
 		}
 	}
-	if len(pending) > 0 {
-		taskCtx, cancelTasks := context.WithCancel(ctx)
-		defer cancelTasks()
-		semaphore := make(chan struct{}, w.config.SupervisorMaxWorkers)
-		var wait sync.WaitGroup
-		var sharedInput, sharedOutput atomic.Int64
-		sharedInput.Store(usage.input)
-		sharedOutput.Store(usage.output)
-		var costMu sync.Mutex
-		sharedCost := usage.cost
-		addCost := func(value float64) {
-			costMu.Lock()
-			sharedCost += value
-			costMu.Unlock()
-		}
-		currentCost := func() float64 {
-			costMu.Lock()
-			defer costMu.Unlock()
-			return sharedCost
-		}
-		var budgetExceeded atomic.Bool
-		// 子任务触发人工审批时必须暂停主 Run，禁止把审批信号降级为普通失败后继续汇总。
-		var approvalMu sync.Mutex
-		var approvalError error
-		for _, task := range pending {
-			task := task
-			wait.Add(1)
-			semaphore <- struct{}{}
-			go func() {
-				defer wait.Done()
-				defer func() { <-semaphore }()
-				// 子任务 panic 不得终止进程：标记任务失败由主 Run 汇总，其余任务继续执行。
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						w.logger.Error("supervisor worker panicked", "run_id", run.ID, "task_id", task.ID,
-							"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
-						_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskFailed, nil,
-							"worker_panic", "子任务执行异常", w.clock())
-					}
-				}()
-				started, err := w.supervisor.StartTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, w.clock())
-				if err != nil {
-					// 已被其他 Worker 领取或已终态：跳过，避免重复执行。
-					return
-				}
-				w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.started", map[string]any{
-					"task_id": started.ID.String(), "worker": started.WorkerName, "index": started.WorkerIndex,
-				})
-				result, inputTokens, outputTokens, cost, err := w.executeWorkerTask(taskCtx, run, fence, candidates, policyVersion, attempts, messages, tools, started)
-				usageResult := map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "estimated_cost": cost}
-				// 成功与失败 Worker 都必须计入共享预算；失败前的模型调用同样真实消耗了 Token。
-				sharedInput.Add(inputTokens)
-				sharedOutput.Add(outputTokens)
-				addCost(cost)
-				if w.supervisorBudgetExceeded(sharedInput.Load(), sharedOutput.Load(), currentCost()) {
-					budgetExceeded.Store(true)
-					cancelTasks()
-					_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(taskCtx), run.UserID, run.ID, "共享预算耗尽", w.clock())
-					w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.budget_exceeded", map[string]any{
-						"input_tokens": sharedInput.Load(), "output_tokens": sharedOutput.Load(), "estimated_cost": currentCost(),
-					})
-				}
-				if err != nil {
-					// 审批门禁拦截不是任务失败：保留审批记录，取消其余子任务后把错误冒泡给主 Run，
-					// 由 Worker 统一推进 waiting_approval，避免 Run 完成而审批永久悬挂。
-					if errors.Is(err, react.ErrApprovalRequired) {
-						approvalMu.Lock()
-						if approvalError == nil {
-							approvalError = err
-						}
-						approvalMu.Unlock()
-						cancelTasks()
-						_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(taskCtx), run.UserID, run.ID, "等待人工审批", w.clock())
-						_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskFailed, usageResult,
-							"approval_required", "子任务触发人工审批，需主 Run 暂停", w.clock())
-						w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.approval_required", map[string]any{
-							"task_id": task.ID.String(), "worker": task.WorkerName, "code": "approval_required",
-						})
-						return
-					}
-					status := SupervisorTaskFailed
-					code, message := failureDetails(err)
-					w.logger.Warn("supervisor worker failed", "task_id", task.ID, "worker", task.WorkerName, "error", err)
-					if taskCtx.Err() != nil {
-						status = SupervisorTaskCancelled
-						code, message = "task_cancelled", "任务已取消"
-					} else if budgetExceeded.Load() {
-						status = SupervisorTaskCancelled
-						code, message = "budget_exceeded", "共享预算耗尽"
-					}
-					_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, status, usageResult, code, message, w.clock())
-					w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.failed", map[string]any{
-						"task_id": task.ID.String(), "worker": task.WorkerName, "status": string(status), "code": code, "message": message,
-					})
-					return
-				}
-				usageResult["content"] = result.Content
-				_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskCompleted, usageResult,
-					"", "", w.clock())
-				w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.completed", map[string]any{
-					"task_id": task.ID.String(), "worker": task.WorkerName, "index": task.WorkerIndex,
-				})
-				// 子会话完成后再触发记忆任务，所有写入保持原始 user_id。
-				if w.summary != nil {
-					_ = w.summary.MaybeEnqueue(context.WithoutCancel(taskCtx), run.UserID, started.ChildSessionID)
-				}
-				// 子会话只服务于单次委派，其中的中间推理与工具结果不是用户的长期事实；
-				// 只有会话摘要会写入，长期记忆与结构化事实仍由主会话独占，避免污染用户画像。
-			}()
-		}
-		wait.Wait()
-		approvalMu.Lock()
-		pendingApproval := approvalError
-		approvalMu.Unlock()
-		if pendingApproval != nil {
-			// 交给 Worker 的审批分支暂停 Run；审批完成后 resumeApprovals 会执行已批准工具。
-			return react.Result{}, pendingApproval
-		}
-		tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
-		if err != nil {
-			return react.Result{}, err
-		}
-		if budgetExceeded.Load() {
-			// 预算耗尽属于部分失败：已有 Worker 产出时降级为部分结果汇总，只有全部无产出才整体失败。
-			completed := 0
-			for _, task := range tasks {
-				if task.Status == SupervisorTaskCompleted {
-					completed++
-				}
-			}
-			if completed == 0 {
-				return react.Result{}, ErrSupervisorBudget
-			}
-			w.logger.Warn("supervisor budget exceeded; aggregating partial results", "run_id", run.ID, "completed", completed)
-		}
-		return w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, usage, tasks)
+	return pending
+}
+
+// runPendingSupervisorTasks 并发执行待处理 Worker 任务，返回最新任务快照与预算、审批状态。
+func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, usage supervisorUsage, pending []SupervisorTask) (supervisorRunOutcome, error) {
+	if len(pending) == 0 {
+		return supervisorRunOutcome{}, nil
 	}
-	return w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, usage, tasks)
+	taskCtx, cancelTasks := context.WithCancel(ctx)
+	defer cancelTasks()
+	semaphore := make(chan struct{}, w.config.SupervisorMaxWorkers)
+	var wait sync.WaitGroup
+	var sharedInput, sharedOutput atomic.Int64
+	sharedInput.Store(usage.input)
+	sharedOutput.Store(usage.output)
+	var costMu sync.Mutex
+	sharedCost := usage.cost
+	addCost := func(value float64) {
+		costMu.Lock()
+		sharedCost += value
+		costMu.Unlock()
+	}
+	currentCost := func() float64 {
+		costMu.Lock()
+		defer costMu.Unlock()
+		return sharedCost
+	}
+	var budgetExceeded atomic.Bool
+	// 子任务触发人工审批时必须暂停主 Run，禁止把审批信号降级为普通失败后继续汇总。
+	var approvalMu sync.Mutex
+	var approvalError error
+	for _, task := range pending {
+		task := task
+		wait.Add(1)
+		semaphore <- struct{}{}
+		go func() {
+			defer wait.Done()
+			defer func() { <-semaphore }()
+			// 子任务 panic 不得终止进程：标记任务失败由主 Run 汇总，其余任务继续执行。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("supervisor worker panicked", "run_id", run.ID, "task_id", task.ID,
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+					_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskFailed, nil,
+						"worker_panic", "子任务执行异常", w.clock())
+				}
+			}()
+			started, err := w.supervisor.StartTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, w.clock())
+			if err != nil {
+				// 已被其他 Worker 领取或已终态：跳过，避免重复执行。
+				return
+			}
+			w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.started", map[string]any{
+				"task_id": started.ID.String(), "worker": started.WorkerName, "index": started.WorkerIndex,
+			})
+			result, inputTokens, outputTokens, cost, err := w.executeWorkerTask(taskCtx, run, fence, candidates, policyVersion, attempts, messages, tools, started)
+			usageResult := map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "estimated_cost": cost}
+			// 成功与失败 Worker 都必须计入共享预算；失败前的模型调用同样真实消耗了 Token。
+			sharedInput.Add(inputTokens)
+			sharedOutput.Add(outputTokens)
+			addCost(cost)
+			if w.supervisorBudgetExceeded(sharedInput.Load(), sharedOutput.Load(), currentCost()) {
+				budgetExceeded.Store(true)
+				cancelTasks()
+				_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(taskCtx), run.UserID, run.ID, "共享预算耗尽", w.clock())
+				w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.budget_exceeded", map[string]any{
+					"input_tokens": sharedInput.Load(), "output_tokens": sharedOutput.Load(), "estimated_cost": currentCost(),
+				})
+			}
+			if err != nil {
+				// 审批门禁拦截不是任务失败：保留审批记录，取消其余子任务后把错误冒泡给主 Run，
+				// 由 Worker 统一推进 waiting_approval，避免 Run 完成而审批永久悬挂。
+				if errors.Is(err, react.ErrApprovalRequired) {
+					approvalMu.Lock()
+					if approvalError == nil {
+						approvalError = err
+					}
+					approvalMu.Unlock()
+					cancelTasks()
+					_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(taskCtx), run.UserID, run.ID, "等待人工审批", w.clock())
+					_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskFailed, usageResult,
+						"approval_required", "子任务触发人工审批，需主 Run 暂停", w.clock())
+					w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.approval_required", map[string]any{
+						"task_id": task.ID.String(), "worker": task.WorkerName, "code": "approval_required",
+					})
+					return
+				}
+				status := SupervisorTaskFailed
+				code, message := failureDetails(err)
+				w.logger.Warn("supervisor worker failed", "task_id", task.ID, "worker", task.WorkerName, "error", err)
+				if taskCtx.Err() != nil {
+					status = SupervisorTaskCancelled
+					code, message = "task_cancelled", "任务已取消"
+				} else if budgetExceeded.Load() {
+					status = SupervisorTaskCancelled
+					code, message = "budget_exceeded", "共享预算耗尽"
+				}
+				_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, status, usageResult, code, message, w.clock())
+				w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.failed", map[string]any{
+					"task_id": task.ID.String(), "worker": task.WorkerName, "status": string(status), "code": code, "message": message,
+				})
+				return
+			}
+			usageResult["content"] = result.Content
+			_, _ = w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, SupervisorTaskCompleted, usageResult,
+				"", "", w.clock())
+			w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.completed", map[string]any{
+				"task_id": task.ID.String(), "worker": task.WorkerName, "index": task.WorkerIndex,
+			})
+			// 子会话完成后再触发记忆任务，所有写入保持原始 user_id。
+			if w.summary != nil {
+				_ = w.summary.MaybeEnqueue(context.WithoutCancel(taskCtx), run.UserID, started.ChildSessionID)
+			}
+			// 子会话只服务于单次委派，其中的中间推理与工具结果不是用户的长期事实；
+			// 只有会话摘要会写入，长期记忆与结构化事实仍由主会话独占，避免污染用户画像。
+		}()
+	}
+	wait.Wait()
+	approvalMu.Lock()
+	pendingApproval := approvalError
+	approvalMu.Unlock()
+	if pendingApproval != nil {
+		return supervisorRunOutcome{ApprovalError: pendingApproval}, nil
+	}
+	tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
+	if err != nil {
+		return supervisorRunOutcome{}, err
+	}
+	return supervisorRunOutcome{Tasks: tasks, BudgetExceeded: budgetExceeded.Load()}, nil
+}
+
+// ensureSupervisorPartialAllowed 在共享预算耗尽且没有任何成功 Worker 时终止运行；
+// 已有成功结果时降级为部分结果汇总。
+func (w *ExecutionWorker) ensureSupervisorPartialAllowed(run Run, tasks []SupervisorTask, budgetExceeded bool) error {
+	if !budgetExceeded {
+		return nil
+	}
+	completed := 0
+	for _, task := range tasks {
+		if task.Status == SupervisorTaskCompleted {
+			completed++
+		}
+	}
+	if completed == 0 {
+		return ErrSupervisorBudget
+	}
+	w.logger.Warn("supervisor budget exceeded; aggregating partial results", "run_id", run.ID, "completed", completed)
+	return nil
 }
 
 // executeWorkerTask 在独立子会话中运行 Worker，返回结果与用量。
