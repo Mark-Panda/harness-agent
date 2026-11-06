@@ -26,6 +26,8 @@ var (
 	ErrRPC = errors.New("MCP JSON-RPC error")
 	// ErrTransport 网络或响应解析失败。
 	ErrTransport = errors.New("MCP transport error")
+	// ErrSessionExpired 服务端已回收会话（HTTP 404），需要重新初始化。
+	ErrSessionExpired = errors.New("MCP session expired")
 )
 
 // maxResponseBytes 限制单次 MCP 响应大小，避免恶意服务耗尽内存。
@@ -365,6 +367,20 @@ func (c *Client) CallToolWithMeta(ctx context.Context, name string, arguments js
 	if err := c.Initialize(ctx); err != nil {
 		return CallResult{}, err
 	}
+	result, err := c.callTool(ctx, name, arguments, meta)
+	if !errors.Is(err, ErrSessionExpired) {
+		return result, err
+	}
+	// 缓存复用的客户端可能持有已被服务端回收的会话；重置后重新握手并重试一次。
+	c.resetSession()
+	if initErr := c.Initialize(ctx); initErr != nil {
+		return CallResult{}, initErr
+	}
+	return c.callTool(ctx, name, arguments, meta)
+}
+
+// callTool 执行一次 tools/call，供会话重置后的重试复用。
+func (c *Client) callTool(ctx context.Context, name string, arguments json.RawMessage, meta map[string]any) (CallResult, error) {
 	params := map[string]any{"name": name, "arguments": json.RawMessage(`{}`)}
 	if len(arguments) > 0 {
 		params["arguments"] = arguments
@@ -381,6 +397,14 @@ func (c *Client) CallToolWithMeta(ctx context.Context, name string, arguments js
 		return CallResult{}, fmt.Errorf("%w: decode tools/call result", ErrTransport)
 	}
 	return result, nil
+}
+
+// resetSession 清空会话状态，使下一次 Initialize 重新执行完整握手。
+func (c *Client) resetSession() {
+	c.mu.Lock()
+	c.sessionID = ""
+	c.initialized = false
+	c.mu.Unlock()
 }
 
 // notify 发送无编号 JSON-RPC 通知。
@@ -415,61 +439,89 @@ func (c *Client) notifyLocked(ctx context.Context, method string, params any) er
 }
 
 // call 执行一次 JSON-RPC 请求并解析 JSON 或 SSE 响应；requireSession 为真时记录会话 ID。
+// 仅在生成请求编号与读写会话 ID 时持锁，网络往返期间不阻塞其他并发工具调用。
 func (c *Client) call(ctx context.Context, method string, params any, requireSession bool) (rpcResponse, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.callLocked(ctx, method, params, requireSession)
-}
-
-// callLocked 在已持有锁时执行 JSON-RPC 请求。
-func (c *Client) callLocked(ctx context.Context, method string, params any, requireSession bool) (rpcResponse, error) {
 	c.nextID++
 	id := c.nextID
-	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	sessionID := c.sessionID
+	c.mu.Unlock()
+	response, session, err := c.roundTrip(ctx, id, sessionID, method, params, requireSession)
 	if err != nil {
 		return rpcResponse{}, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if session != "" && len(session) <= 256 {
+		c.mu.Lock()
+		c.sessionID = session
+		c.mu.Unlock()
+	}
+	return response, nil
+}
+
+// callLocked 在已持有锁时执行 JSON-RPC 请求，仅用于初始化握手等必须串行的阶段。
+func (c *Client) callLocked(ctx context.Context, method string, params any, requireSession bool) (rpcResponse, error) {
+	c.nextID++
+	id := c.nextID
+	response, session, err := c.roundTrip(ctx, id, c.sessionID, method, params, requireSession)
 	if err != nil {
 		return rpcResponse{}, err
+	}
+	if session != "" && len(session) <= 256 {
+		c.sessionID = session
+	}
+	return response, nil
+}
+
+// roundTrip 发送单次请求并解码响应；返回服务端会话 ID 供调用方按需回写。
+func (c *Client) roundTrip(ctx context.Context, id int64, sessionID, method string, params any, requireSession bool) (rpcResponse, string, error) {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	if err != nil {
+		return rpcResponse{}, "", err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return rpcResponse{}, "", err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	c.applyAuth(request)
-	if c.sessionID != "" {
-		request.Header.Set("Mcp-Session-Id", c.sessionID)
+	if sessionID != "" {
+		request.Header.Set("Mcp-Session-Id", sessionID)
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
-		return rpcResponse{}, fmt.Errorf("%w: transport failure", ErrTransport)
+		return rpcResponse{}, "", fmt.Errorf("%w: transport failure", ErrTransport)
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusAccepted && method == "notifications/initialized" {
-		return rpcResponse{}, nil
+		return rpcResponse{}, "", nil
 	}
 	if response.StatusCode != http.StatusOK {
-		return rpcResponse{}, fmt.Errorf("%w: status %d", ErrTransport, response.StatusCode)
-	}
-	if requireSession {
-		if session := response.Header.Get("Mcp-Session-Id"); session != "" && len(session) <= 256 {
-			c.sessionID = session
+		// 已持有会话却收到 404，说明服务端回收了会话；交由上层重新初始化后重试。
+		if response.StatusCode == http.StatusNotFound && sessionID != "" {
+			return rpcResponse{}, "", fmt.Errorf("%w: status %d", ErrSessionExpired, response.StatusCode)
 		}
+		return rpcResponse{}, "", fmt.Errorf("%w: status %d", ErrTransport, response.StatusCode)
+	}
+	session := ""
+	if requireSession {
+		session = response.Header.Get("Mcp-Session-Id")
 	}
 	payload, err := readPayload(response)
 	if err != nil {
-		return rpcResponse{}, err
+		return rpcResponse{}, "", err
 	}
 	var decoded rpcResponse
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return rpcResponse{}, fmt.Errorf("%w: decode response", ErrTransport)
+		return rpcResponse{}, "", fmt.Errorf("%w: decode response", ErrTransport)
 	}
 	if decoded.Error != nil {
-		return rpcResponse{}, fmt.Errorf("%w: code %d: %s", ErrRPC, decoded.Error.Code, truncate(decoded.Error.Message, 256))
+		return rpcResponse{}, "", fmt.Errorf("%w: code %d: %s", ErrRPC, decoded.Error.Code, truncate(decoded.Error.Message, 256))
 	}
 	if len(decoded.Result) == 0 {
-		return rpcResponse{}, fmt.Errorf("%w: empty result", ErrTransport)
+		return rpcResponse{}, "", fmt.Errorf("%w: empty result", ErrTransport)
 	}
-	return decoded, nil
+	return decoded, session, nil
 }
 
 // applyAuth 设置鉴权头；头名称与值均来自内存中的已解密凭证。

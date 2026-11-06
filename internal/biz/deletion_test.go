@@ -14,17 +14,19 @@ import (
 
 // fakeDeletionRepository 是删除请求仓储的内存实现。
 type fakeDeletionRepository struct {
-	request     biz.DeletionRequest
-	claimed     bool
-	created     []biz.DeletionRequest
-	completed   int
-	failed      int
-	renewed     int
-	getErr      error
-	claimErr    error
-	completeErr error
-	active      biz.DeletionRequest
-	dedupe      bool
+	request      biz.DeletionRequest
+	claimed      bool
+	created      []biz.DeletionRequest
+	completed    int
+	failed       int
+	renewed      int
+	getErr       error
+	claimErr     error
+	completeErr  error
+	active       biz.DeletionRequest
+	dedupe       bool
+	renewBlocks  bool
+	renewStarted chan struct{}
 }
 
 // Create 记录创建或返回既有请求。
@@ -58,9 +60,16 @@ func (f *fakeDeletionRepository) Claim(context.Context, string, time.Duration, t
 	return f.request, true, nil
 }
 
-// Renew 记录续约。
-func (f *fakeDeletionRepository) Renew(context.Context, uuid.UUID, string, int64, time.Duration, time.Time) error {
+// Renew 记录续约；renewBlocks 为真时模拟在途续约，直到上下文取消才返回。
+func (f *fakeDeletionRepository) Renew(ctx context.Context, _ uuid.UUID, _ string, _ int64, _ time.Duration, _ time.Time) error {
 	f.renewed++
+	if f.renewBlocks {
+		if f.renewStarted != nil {
+			close(f.renewStarted)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -84,12 +93,15 @@ type fakeDeletionExecutor struct {
 	err          error
 	userID       uuid.UUID
 	sessionID    uuid.UUID
+	started      chan struct{}
+	release      chan struct{}
 }
 
 // DeleteSession 记录会话删除。
 func (f *fakeDeletionExecutor) DeleteSession(_ context.Context, userID, sessionID uuid.UUID) error {
 	f.sessionCalls++
 	f.userID, f.sessionID = userID, sessionID
+	f.hold()
 	return f.err
 }
 
@@ -97,7 +109,18 @@ func (f *fakeDeletionExecutor) DeleteSession(_ context.Context, userID, sessionI
 func (f *fakeDeletionExecutor) DeleteMemory(_ context.Context, userID uuid.UUID) error {
 	f.memoryCalls++
 	f.userID = userID
+	f.hold()
 	return f.err
+}
+
+// hold 在测试需要时阻塞执行，用于模拟删除与心跳续约重叠。
+func (f *fakeDeletionExecutor) hold() {
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.release != nil {
+		<-f.release
+	}
 }
 
 // DeleteAccount 记录账号删除。
@@ -224,6 +247,45 @@ func TestDeletionWorkerExecutes(t *testing.T) {
 	}
 	if executor.accountCalls != 1 || repo.completed != 2 {
 		t.Fatalf("accountCalls=%d completed=%d", executor.accountCalls, repo.completed)
+	}
+}
+
+// TestDeletionWorkerIgnoresCanceledRenewAfterExecution 验证主流程结束时的主动取消不会被误判为丢租约。
+func TestDeletionWorkerIgnoresCanceledRenewAfterExecution(t *testing.T) {
+	request := biz.DeletionRequest{
+		ID: uuid.New(), UserID: uuid.New(), ResourceType: biz.DeletionResourceMemory,
+		ResourceID: uuid.New().String(), Status: biz.DeletionRunning, Attempts: 1, FencingToken: 1,
+	}
+	executorStarted, executorRelease, renewStarted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	repo := &fakeDeletionRepository{request: request, renewBlocks: true, renewStarted: renewStarted}
+	executor := &fakeDeletionExecutor{started: executorStarted, release: executorRelease}
+	worker, err := biz.NewDeletionWorker(biz.DeletionWorkerDependencies{Requests: repo, Executor: executor},
+		biz.DeletionWorkerConfig{WorkerID: "deletion-lease-test", Heartbeat: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := worker.ProcessOne(context.Background()); err != nil {
+			t.Errorf("process deletion: %v", err)
+		}
+	}()
+	waitSignal := func(signal chan struct{}, name string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not start", name)
+		}
+	}
+	waitSignal(executorStarted, "deletion execution")
+	// 等待心跳进入在途续约，再让删除返回并触发主流程 cancel。
+	waitSignal(renewStarted, "lease renewal")
+	close(executorRelease)
+	waitSignal(done, "deletion worker")
+	if repo.completed != 1 || repo.failed != 0 {
+		t.Fatalf("completed=%d failed=%d", repo.completed, repo.failed)
 	}
 }
 

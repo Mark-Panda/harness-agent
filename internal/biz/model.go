@@ -9,7 +9,8 @@ import (
 )
 
 // MinGenerationContextTokens 是生成类模型的上下文硬准入下限（1M Token）。
-// 该限制不适用于 Embedding/Rerank 模型。
+// 该限制不适用于 Embedding/Rerank 模型；模型是否可用于某次 Run 仍由策略的
+// min_context_tokens 与 Prompt 预算共同决定。
 const MinGenerationContextTokens int64 = 1_000_000
 
 // ModelKind 模型用途分类，决定上下文窗口准入规则。

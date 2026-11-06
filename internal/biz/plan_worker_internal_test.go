@@ -71,7 +71,7 @@ func TestPlanStepMessages(t *testing.T) {
 		{StepNo: 1, Title: "收集", Status: PlanStepCompleted, Result: map[string]any{"content": "销售数据"}},
 		{StepNo: 2, Title: "总结", Description: "输出摘要", Status: PlanStepPending, DependsOn: []int{1}},
 	}}
-	messages := planStepMessages(plan, plan.Steps[1])
+	messages := planStepMessages(plan, plan.Steps[1], nil)
 	if len(messages) != 2 {
 		t.Fatalf("message count = %d", len(messages))
 	}

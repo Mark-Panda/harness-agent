@@ -90,10 +90,17 @@ func TestRunServiceBuildsImmutableSnapshots(t *testing.T) {
 	sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).Return(
 		biz.Session{ID: sessionID, UserID: principal.UserID, Status: biz.SessionActive}, nil,
 	)
+	triggerMessageID := uuid.New()
+	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").Return(
+		biz.Page[biz.Message]{Items: []biz.Message{{ID: triggerMessageID, Role: biz.MessageUser}}}, nil,
+	)
 	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, run biz.Run) (biz.Run, error) {
 			if run.ConfigSnapshot == nil || run.ModelPolicySnapshot == nil {
 				t.Fatalf("run snapshots were not frozen: %#v", run)
+			}
+			if run.TriggerMessageID == nil || *run.TriggerMessageID != triggerMessageID {
+				t.Fatalf("trigger message boundary was not frozen: %#v", run)
 			}
 			candidates, _ := run.ModelPolicySnapshot["candidates"].([]map[string]any)
 			if len(candidates) != 1 || candidates[0]["model_id"] == "" {
@@ -245,6 +252,9 @@ func TestRunServiceRejectsUnroutableSnapshots(t *testing.T) {
 			sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).Return(
 				biz.Session{ID: sessionID, UserID: principal.UserID, Status: biz.SessionActive}, nil,
 			)
+			sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").Return(
+				biz.Page[biz.Message]{}, nil,
+			)
 			input := test.input()
 			input.SessionID = sessionID
 			_, err = service.Create(context.Background(), principal, input)
@@ -309,6 +319,9 @@ func TestRunServiceEnqueueFailureIsReturned(t *testing.T) {
 	sessionID := uuid.New()
 	sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).Return(
 		biz.Session{ID: sessionID, UserID: principal.UserID, Status: biz.SessionActive}, nil,
+	)
+	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").Return(
+		biz.Page[biz.Message]{}, nil,
 	)
 	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, run biz.Run) (biz.Run, error) { return run, nil })
 	queue.EXPECT().EnqueueRun(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("queue unavailable"))

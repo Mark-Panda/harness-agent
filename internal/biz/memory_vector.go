@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -134,9 +136,9 @@ type EmbeddingIndexRepository interface {
 	SetDualWrite(ctx context.Context, version string, enabled bool) error
 	// CountVectors 统计指定版本的向量总数，维护任务使用系统作用域。
 	CountVectors(ctx context.Context, version string) (int64, error)
-	// CountEligibleMessages 统计可向量化的消息总数（user/assistant 且未删除）。
+	// CountEligibleMessages 统计可向量化的消息总数（仅 user 且未删除）。
 	CountEligibleMessages(ctx context.Context) (int64, error)
-	// ListUnembeddedMessages 读取尚未写入指定版本的候选消息，按时间正序。
+	// ListUnembeddedMessages 读取尚未写入指定版本的候选用户消息，按时间正序。
 	ListUnembeddedMessages(ctx context.Context, version string, limit int) ([]Message, error)
 }
 
@@ -183,6 +185,8 @@ type MemoryRetrieverConfig struct {
 	Lambda float64
 	// MinSimilarity 最低余弦相似度，默认 0。
 	MinSimilarity float64
+	// RerankEnabled 是否在向量召回后使用 rerank 模型重新排序。
+	RerankEnabled bool
 }
 
 // normalize 补齐检索配置安全默认值。
@@ -205,25 +209,29 @@ func (c MemoryRetrieverConfig) normalize() MemoryRetrieverConfig {
 	return c
 }
 
-// MemoryRetriever 负责查询向量化、Top-K 检索与 MMR 多样性选择。
+// MemoryRetriever 负责查询向量化、Top-K 检索、可选 rerank 与 MMR 多样性选择。
 type MemoryRetriever struct {
 	indexes   EmbeddingIndexRepository
 	vectors   MemoryVectorRepository
 	generator EmbeddingGenerator
+	reranker  Reranker
 	config    MemoryRetrieverConfig
 	logger    *slog.Logger
 }
 
-// NewMemoryRetriever 构造长期记忆检索器；缺失关键依赖时返回错误。
+// NewMemoryRetriever 构造长期记忆检索器；reranker 为空表示不使用 rerank。
 func NewMemoryRetriever(indexes EmbeddingIndexRepository, vectors MemoryVectorRepository, generator EmbeddingGenerator,
-	config MemoryRetrieverConfig, logger *slog.Logger) (*MemoryRetriever, error) {
+	reranker Reranker, config MemoryRetrieverConfig, logger *slog.Logger) (*MemoryRetriever, error) {
 	if indexes == nil || vectors == nil || generator == nil {
 		return nil, invalid("memory retriever requires index, vector and embedding dependencies")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &MemoryRetriever{indexes: indexes, vectors: vectors, generator: generator, config: config.normalize(), logger: logger}, nil
+	if !config.RerankEnabled {
+		reranker = nil
+	}
+	return &MemoryRetriever{indexes: indexes, vectors: vectors, generator: generator, reranker: reranker, config: config.normalize(), logger: logger}, nil
 }
 
 // Retrieve 返回与当前输入语义相关的长期记忆；没有 active 索引或查询为空时返回空结果。
@@ -268,11 +276,28 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 	if len(filtered) == 0 {
 		return nil, nil
 	}
+	if r.reranker != nil && len(filtered) > 1 {
+		// rerank 失败时保留向量分数，确保长期记忆检索仍可用。
+		scores, rerankErr := r.reranker.Rerank(ctx, query, memoryContents(filtered))
+		if rerankErr != nil {
+			r.logger.Warn("long-term memory rerank failed", "session_id", sessionID, "error", rerankErr)
+		} else if len(scores) == len(filtered) {
+			for index := range filtered {
+				filtered[index].Score = scores[index]
+			}
+			sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Score > filtered[j].Score })
+		}
+	}
 	candidates := make([]memory.VectorCandidate, 0, len(filtered))
 	byID := make(map[string]MemoryMatch, len(filtered))
+	now := time.Now().UTC()
 	for _, match := range filtered {
 		id := match.VectorID.String()
-		candidates = append(candidates, memory.VectorCandidate{ID: id, Relevance: match.Score, Vector: match.Vector})
+		// 旧记忆同样语义相关时优先选择较新的内容；按 30 天半衰期衰减，
+		// 但保留至少 70% 的基础相关性，避免完全压掉长期稳定的用户偏好。
+		candidates = append(candidates, memory.VectorCandidate{
+			ID: id, Relevance: match.Score * recencyWeight(match.Metadata, now), Vector: match.Vector,
+		})
 		byID[id] = match
 	}
 	selected := memory.SelectMMR(candidates, r.config.MMRTop, r.config.Lambda)
@@ -284,6 +309,38 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 	}
 	r.logger.Info("long-term memory retrieved", "session_id", sessionID, "candidates", len(filtered), "selected", len(resultMatches))
 	return resultMatches, nil
+}
+
+// memoryContents 提取候选记忆文本用于 rerank。
+func memoryContents(matches []MemoryMatch) []string {
+	contents := make([]string, len(matches))
+	for index := range matches {
+		contents[index] = matches[index].Content
+	}
+	return contents
+}
+
+// recencyWeight 按 30 天半衰期对记忆相关性做时间衰减，最低保留 0.7 权重。
+func recencyWeight(metadata map[string]any, now time.Time) float64 {
+	raw, exists := metadata["created_at"]
+	if !exists {
+		return 1
+	}
+	text, ok := raw.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return 1
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		return 1
+	}
+	age := now.Sub(createdAt)
+	if age <= 0 {
+		return 1
+	}
+	const halfLife = 30 * 24 * time.Hour
+	decay := math.Pow(0.5, age.Hours()/halfLife.Hours())
+	return 0.7 + 0.3*decay
 }
 
 // validateVectorDimension 校验向量维度与索引声明一致。

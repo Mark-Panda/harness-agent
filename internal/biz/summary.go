@@ -567,8 +567,12 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 			case <-ticker.C:
 			}
 			if err := w.jobs.Renew(runCtx, job.ID, w.config.WorkerID, job.FencingToken, w.config.Lease, w.clock()); err != nil {
-				close(leaseLost)
-				cancel()
+				// 主流程结束时主动 cancel 会让在途续约返回 context.Canceled；
+				// 只有上下文仍有效时的续约失败才代表租约真的丢失。
+				if runCtx.Err() == nil {
+					close(leaseLost)
+					cancel()
+				}
 				return
 			}
 		}
@@ -576,14 +580,15 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 
 	generation, generateErr := w.generator.Summarize(runCtx, task.UserID, task.SessionID, previous, source)
 	cancel()
+	// 先等待心跳协程退出再判定租约：心跳可能在 cancel 之后才写入 leaseLost，
+	// 提前判定会把正常结束误判为丢租约并跳过摘要落库。
+	<-done
 	select {
 	case <-leaseLost:
 		w.logger.Warn("summary job lease lost", "job_id", job.ID)
-		<-done
 		return
 	default:
 	}
-	<-done
 	if generateErr != nil {
 		if errors.Is(generateErr, ErrSummaryModelUnavailable) || errors.Is(generateErr, ErrSummaryPermanent) {
 			w.logger.Warn("summary generation is not retryable; completing job", "job_id", job.ID, "error", generateErr)

@@ -22,6 +22,8 @@ type runRequest struct {
 	AgentVersion *int `json:"agent_version"`
 	// Mode 编排模式：react/plan/super。
 	Mode biz.AgentMode `json:"mode"`
+	// TriggerMessageID 可选的触发消息 ID；缺省时取会话内最近一条用户消息。
+	TriggerMessageID *uuid.UUID `json:"trigger_message_id"`
 }
 
 // createRun 处理 POST /api/v1/sessions/{id}/runs：创建排队中的 Run。
@@ -38,6 +40,7 @@ func (h *platformHTTPHandler) createRun(w http.ResponseWriter, r *http.Request) 
 	run, err := h.service.Runs.Create(r.Context(), requestPrincipal(r), biz.CreateRunInput{
 		SessionID: sessionID, AgentID: request.AgentID, AgentVersion: request.AgentVersion,
 		Mode: request.Mode, IdempotencyKey: strings.TrimSpace(r.Header.Get(idempotencyKeyHeader)),
+		TriggerMessageID: request.TriggerMessageID,
 	})
 	writePlatformResult(w, http.StatusCreated, runResponse(run), err)
 }
@@ -156,11 +159,22 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	// Kratos 的全局 HTTP Timeout（15s）会给请求 Context 加截止时间；
 	// SSE 需要跨越多分钟执行，因此这里脱离该 Deadline，改用每轮查询超时 + 写失败检测。
 	streamCtx := context.WithoutCancel(r.Context())
-	deadline := time.Now().Add(5 * time.Minute)
+	// 长任务的 Plan/Supervisor 执行可能远超 5 分钟；连接上限应覆盖 Run 的最长执行窗口，
+	// 而不是在任务仍活跃时直接截断事件流。终态检测仍会立即关闭连接。
+	deadline := time.Now().Add(30 * time.Minute)
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-	poll := time.NewTicker(250 * time.Millisecond)
-	defer poll.Stop()
+	// 事件写入会经 Redis 通知立即唤醒；3 秒兜底轮询覆盖 Redis 故障与漏通知。
+	failover := time.NewTicker(3 * time.Second)
+	defer failover.Stop()
+
+	// 进入循环前订阅，避免首轮查询与订阅之间的事件通知丢失（漏通知仍由兜底轮询覆盖）。
+	var notify <-chan struct{}
+	if stream := currentRunEventStream(); stream != nil {
+		channel, unsubscribe := stream.Subscribe(runID)
+		defer unsubscribe()
+		notify = channel
+	}
 
 	for {
 		// 每轮数据库查询使用独立短超时，避免全局请求超时或慢查询无限占用连接。
@@ -182,14 +196,15 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 		if len(events) > 0 {
 			flusher.Flush()
 		}
+		// 兜底轮询只读状态列，避免每轮反序列化完整 Run 快照。
 		statusCtx, cancelStatus := context.WithTimeout(streamCtx, 10*time.Second)
-		current, getErr := h.service.Runs.Get(statusCtx, requestPrincipal(r), runID)
+		current, statusErr := h.service.Runs.Status(statusCtx, requestPrincipal(r), runID)
 		cancelStatus()
-		if getErr != nil {
+		if statusErr != nil {
 			return
 		}
 		// 终态且事件已全部输出后关闭连接，客户端无需猜测结束时间。
-		if biz.RunTerminal(current.Status) && len(events) == 0 {
+		if biz.RunTerminal(current) && len(events) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -202,7 +217,9 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			flusher.Flush()
-		case <-poll.C:
+		case <-notify:
+			// 新事件通知：立即回到查询，跨实例通知经 Redis 扇出到达。
+		case <-failover.C:
 		}
 	}
 }

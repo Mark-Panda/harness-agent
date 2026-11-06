@@ -149,6 +149,21 @@ func (mr *MockRunRepositoryMockRecorder) GetRun(ctx, userID, runID any) *gomock.
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRun", reflect.TypeOf((*MockRunRepository)(nil).GetRun), ctx, userID, runID)
 }
 
+// GetRunStatus mocks base method.
+func (m *MockRunRepository) GetRunStatus(ctx context.Context, userID, runID uuid.UUID) (biz.RunStatus, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetRunStatus", ctx, userID, runID)
+	ret0, _ := ret[0].(biz.RunStatus)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetRunStatus indicates an expected call of GetRunStatus.
+func (mr *MockRunRepositoryMockRecorder) GetRunStatus(ctx, userID, runID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRunStatus", reflect.TypeOf((*MockRunRepository)(nil).GetRunStatus), ctx, userID, runID)
+}
+
 // ListAllRuns mocks base method.
 func (m *MockRunRepository) ListAllRuns(ctx context.Context, filter biz.AdminRunFilter, limit int, cursor string) (biz.Page[biz.RunSummary], error) {
 	m.ctrl.T.Helper()

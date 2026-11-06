@@ -762,7 +762,7 @@ func TestFeishuLatestAssistantMessageIsolation(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	latest, err := NewFeishuOutboundRepository(appDB).LatestAssistantMessage(ctx, userID, sessionID)
+	latest, err := NewFeishuOutboundRepository(appDB).LatestAssistantMessage(ctx, userID, sessionID, nil)
 	if err != nil {
 		t.Fatalf("latest assistant message: %v", err)
 	}
@@ -770,7 +770,7 @@ func TestFeishuLatestAssistantMessageIsolation(t *testing.T) {
 		t.Fatalf("latest assistant message = %#v", latest)
 	}
 	// 其他用户读取同一会话必须返回不存在，禁止跨用户召回回复内容。
-	if _, err := NewFeishuOutboundRepository(appDB).LatestAssistantMessage(ctx, uuid.New(), sessionID); !errors.Is(err, biz.ErrResourceNotFound) {
+	if _, err := NewFeishuOutboundRepository(appDB).LatestAssistantMessage(ctx, uuid.New(), sessionID, nil); !errors.Is(err, biz.ErrResourceNotFound) {
 		t.Fatalf("cross-user latest message error = %v", err)
 	}
 }

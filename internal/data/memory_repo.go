@@ -228,7 +228,7 @@ func (r *MemoryRepository) CountEligibleMessages(ctx context.Context) (int64, er
 	var count int64
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
 		return tx.Model(&messageModel{}).
-			Where("deleted_at IS NULL AND role IN ?", []string{string(biz.MessageUser), string(biz.MessageAssistant)}).
+			Where("deleted_at IS NULL AND role = ?", string(biz.MessageUser)).
 			Count(&count).Error
 	})
 	if err != nil {
@@ -248,7 +248,7 @@ func (r *MemoryRepository) ListUnembeddedMessages(ctx context.Context, version s
 	var records []messageModel
 	query := `
 SELECT m.* FROM messages m
-WHERE m.deleted_at IS NULL AND m.role IN ('user', 'assistant')
+WHERE m.deleted_at IS NULL AND m.role = 'user'
 AND NOT EXISTS (
   SELECT 1 FROM memory_vectors v
   WHERE v.user_id = m.user_id AND v.source_type = 'message' AND v.source_id = m.id
@@ -450,6 +450,28 @@ LIMIT 1`).Scan(&record).Error
 		return uuid.Nil, "", 0, fmt.Errorf("%w: no enabled embedding model", biz.ErrResourceNotFound)
 	}
 	return record.ProviderID, record.RemoteModelName, biz.EmbeddingDimension, nil
+}
+
+// GetEnabledRerankModel 返回第一个启用供应商下的 rerank 模型。
+func (r *MemoryRepository) GetEnabledRerankModel(ctx context.Context) (uuid.UUID, string, error) {
+	var record struct {
+		ProviderID      uuid.UUID
+		RemoteModelName string
+	}
+	err := r.db.WithContext(ctx).Raw(`
+SELECT m.provider_id, m.remote_model_name
+FROM llm_models m
+JOIN llm_providers p ON p.id = m.provider_id
+WHERE m.model_kind = 'rerank' AND m.status = 'enabled' AND p.status = 'enabled'
+ORDER BY m.created_at ASC, m.id ASC
+LIMIT 1`).Scan(&record).Error
+	if err != nil {
+		return uuid.Nil, "", catalogError("get rerank model", err)
+	}
+	if record.ProviderID == uuid.Nil || record.RemoteModelName == "" {
+		return uuid.Nil, "", fmt.Errorf("%w: no enabled rerank model", biz.ErrResourceNotFound)
+	}
+	return record.ProviderID, record.RemoteModelName, nil
 }
 
 // toBizIndex 把索引行转换为领域对象。

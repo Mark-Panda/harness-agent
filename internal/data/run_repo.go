@@ -39,6 +39,10 @@ type runModel struct {
 	AttemptNo int
 	// IdempotencyKey 创建幂等键。
 	IdempotencyKey *string
+	// TriggerMessageID 触发本次 Run 的用户消息 ID，作为上下文历史右边界。
+	TriggerMessageID *uuid.UUID `gorm:"type:uuid"`
+	// TriggerMessageAt 触发消息写入时间，热窗口丢失触发消息时用于裁剪。
+	TriggerMessageAt *time.Time
 	// ErrorCode 失败业务码。
 	ErrorCode string
 	// ErrorMessage 脱敏失败原因。
@@ -89,14 +93,36 @@ type runEventModel struct {
 // TableName 指定事件表名。
 func (runEventModel) TableName() string { return "run_events" }
 
+// RunEventNotifier 在事件写入成功后广播「Run 有新事件」信号，供 SSE 立即拉取。
+type RunEventNotifier interface {
+	// Publish 通知指定 Run 有新事件；实现必须容忍失败，通知只是加速手段。
+	Publish(ctx context.Context, runID uuid.UUID)
+}
+
+// RunRepositoryOption 用于注入 Run 仓库的可选能力。
+type RunRepositoryOption func(*RunRepository)
+
+// WithRunEventNotifier 注入事件通知器；未注入时 SSE 只能依赖兜底轮询。
+func WithRunEventNotifier(notifier RunEventNotifier) RunRepositoryOption {
+	return func(r *RunRepository) {
+		r.notifier = notifier
+	}
+}
+
 // RunRepository 是 Run 与事件的 GORM 实现，所有查询强制携带 user_id。
 type RunRepository struct {
 	db *gorm.DB
+	// notifier 事件写入后的通知端口。
+	notifier RunEventNotifier
 }
 
 // NewRunRepository 构造 Run 仓库。
-func NewRunRepository(db *gorm.DB) *RunRepository {
-	return &RunRepository{db: db}
+func NewRunRepository(db *gorm.DB, options ...RunRepositoryOption) *RunRepository {
+	repository := &RunRepository{db: db}
+	for _, option := range options {
+		option(repository)
+	}
+	return repository
 }
 
 // CreateRun 在用户作用域内创建 Run；幂等键冲突时返回既有 Run。
@@ -106,6 +132,8 @@ func (r *RunRepository) CreateRun(ctx context.Context, run biz.Run) (biz.Run, er
 		return biz.Run{}, err
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: run.UserID}, func(tx *gorm.DB) error {
+		// 创建始终允许排队：同一会话的 Run 由 ClaimRun 串行执行，
+		// 避免用户并发提交时直接收到 409，也避免多条 Run 争抢同一轮消息顺序。
 		return tx.Create(&record).Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) && run.IdempotencyKey != "" {
@@ -140,6 +168,18 @@ func (r *RunRepository) GetRun(ctx context.Context, userID, runID uuid.UUID) (bi
 		return biz.Run{}, catalogError("get run", err)
 	}
 	return toBizRun(record)
+}
+
+// GetRunStatus 只读取状态列，供 SSE 兜底轮询低成本判断终态。
+func (r *RunRepository) GetRunStatus(ctx context.Context, userID, runID uuid.UUID) (biz.RunStatus, error) {
+	var record runModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Select("status").First(&record, "id = ? AND user_id = ?", runID, userID).Error
+	})
+	if err != nil {
+		return "", catalogError("get run status", err)
+	}
+	return biz.RunStatus(record.Status), nil
 }
 
 // ListRuns 按创建时间与 ID 降序游标分页。
@@ -298,6 +338,8 @@ func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UU
 
 // ClaimRun 认领排队中或租约已过期的 Run，并在同一事务内递增 fencing token。
 // 认领规则：queued 可直接执行；running 仅在租约缺失或过期时允许恢复，避免抢占健康 Worker。
+// 同一会话的 Run 串行执行：会话级 advisory lock 内检查是否已有运行中或等待审批的 Run，
+// 有则返回 ErrSessionRunActive，让 Worker 把任务退回队列等待前序 Run 结束。
 func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, owner string, lease time.Duration, now time.Time) (biz.Run, biz.RunFence, error) {
 	if owner == "" || lease <= 0 {
 		return biz.Run{}, biz.RunFence{}, fmt.Errorf("%w: worker owner and positive lease are required", biz.ErrInvalidConfig)
@@ -305,14 +347,44 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 	var record runModel
 	leaseUntil := now.Add(lease)
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+			return err
+		}
+		claimable := biz.RunStatus(record.Status) == biz.RunQueued ||
+			(biz.RunStatus(record.Status) == biz.RunRunning &&
+				(record.LeaseExpiresAt == nil || record.LeaseExpiresAt.Before(now)))
+		if !claimable {
+			return fmt.Errorf("%w: run is not claimable", biz.ErrResourceConflict)
+		}
+		// 以 session_id 作为 advisory lock，串行化同会话 Run 的“检查+认领”过程。
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-session:"+record.SessionID.String()).Error; err != nil {
+			return err
+		}
+		var active int64
+		if err := tx.Model(&runModel{}).
+			Where("user_id = ? AND session_id = ? AND id <> ? AND status IN ?", userID, record.SessionID, runID,
+				[]string{string(biz.RunRunning), string(biz.RunWaitingApproval)}).
+			Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return fmt.Errorf("%w: session already has an executing run", biz.ErrSessionRunActive)
+		}
+		updates := map[string]any{
+			"status": string(biz.RunRunning), "lease_owner": owner, "lease_expires_at": leaseUntil,
+			"fencing_token": gorm.Expr("fencing_token + 1"),
+			"started_at":    gorm.Expr("COALESCE(started_at, ?)", now), "updated_at": now,
+		}
+		if biz.RunStatus(record.Status) == biz.RunQueued && record.DeadlineAt != nil {
+			// 排队等待不计入执行窗口：首次认领时把排队时长补回截止时间，
+			// 避免前序 Run 长时间执行导致后续 Run 一被认领就判定超时。
+			extended := record.DeadlineAt.Add(now.Sub(record.CreatedAt))
+			updates["deadline_at"] = extended
+		}
 		result := tx.Model(&runModel{}).
 			Where("id = ? AND user_id = ? AND (status = ? OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at < ?)))",
 				runID, userID, string(biz.RunQueued), string(biz.RunRunning), now).
-			Updates(map[string]any{
-				"status": string(biz.RunRunning), "lease_owner": owner, "lease_expires_at": leaseUntil,
-				"fencing_token": gorm.Expr("fencing_token + 1"),
-				"started_at":    gorm.Expr("COALESCE(started_at, ?)", now), "updated_at": now,
-			})
+			Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -390,6 +462,7 @@ func (r *RunRepository) PauseRun(ctx context.Context, userID, runID uuid.UUID, f
 	if err != nil {
 		return biz.Run{}, catalogError("pause run", err)
 	}
+	r.notifyEvent(ctx, runID)
 	return toBizRun(record)
 }
 
@@ -429,6 +502,7 @@ func (r *RunRepository) ResumeRun(ctx context.Context, userID, runID uuid.UUID, 
 	if err != nil {
 		return biz.Run{}, catalogError("resume run", err)
 	}
+	r.notifyEvent(ctx, runID)
 	return toBizRun(record)
 }
 
@@ -473,6 +547,7 @@ func (r *RunRepository) MarkRunReconciliationRequired(ctx context.Context, userI
 	if err != nil {
 		return biz.Run{}, catalogError("mark run reconciliation required", err)
 	}
+	r.notifyEvent(ctx, runID)
 	return toBizRun(record)
 }
 
@@ -520,6 +595,8 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 	if err != nil {
 		return biz.Run{}, catalogError("finish run", err)
 	}
+	// 终态已提交，通知 SSE 立即拉取最后一批事件并关闭连接（无事件时也能立即感知终态）。
+	r.notifyEvent(ctx, runID)
 	return toBizRun(record)
 }
 
@@ -555,6 +632,7 @@ func (r *RunRepository) AppendEvent(ctx context.Context, event biz.RunEvent) (bi
 	if err != nil {
 		return biz.RunEvent{}, catalogError("append run event", err)
 	}
+	r.notifyEvent(ctx, event.RunID)
 	return toBizRunEvent(record)
 }
 
@@ -579,7 +657,16 @@ func (r *RunRepository) AppendEventFenced(ctx context.Context, event biz.RunEven
 	if err != nil {
 		return biz.RunEvent{}, catalogError("append fenced run event", err)
 	}
+	r.notifyEvent(ctx, event.RunID)
 	return toBizRunEvent(record)
+}
+
+// notifyEvent 在事件提交后广播通知；未配置通知器时静默跳过。
+func (r *RunRepository) notifyEvent(ctx context.Context, runID uuid.UUID) {
+	if r.notifier == nil || runID == uuid.Nil {
+		return
+	}
+	r.notifier.Publish(ctx, runID)
 }
 
 // appendRunEvent 在事务内分配单调 seq 并插入事件行，供普通与栅栏写入复用。
@@ -655,6 +742,7 @@ func fromBizRun(run biz.Run) (runModel, error) {
 		Mode: string(run.Mode), Status: string(run.Status), ConfigSnapshot: datatypes.JSON(config), ModelPolicySnapshot: datatypes.JSON(policy),
 		CurrentStepSeq: run.CurrentStepSeq, AttemptNo: run.AttemptNo, ErrorCode: run.ErrorCode, ErrorMessage: run.ErrorMessage,
 		DeadlineAt: run.DeadlineAt, StartedAt: run.StartedAt, FinishedAt: run.FinishedAt,
+		TriggerMessageID: run.TriggerMessageID, TriggerMessageAt: run.TriggerMessageAt,
 	}
 	if run.IdempotencyKey != "" {
 		key := run.IdempotencyKey
@@ -679,6 +767,7 @@ func toBizRun(record runModel) (biz.Run, error) {
 		CurrentStepSeq: record.CurrentStepSeq, AttemptNo: record.AttemptNo, ErrorCode: record.ErrorCode, ErrorMessage: record.ErrorMessage,
 		DeadlineAt: record.DeadlineAt, StartedAt: record.StartedAt, FinishedAt: record.FinishedAt,
 		LeaseOwner: record.LeaseOwner, LeaseExpiresAt: record.LeaseExpiresAt, FencingToken: record.FencingToken,
+		TriggerMessageID: record.TriggerMessageID, TriggerMessageAt: record.TriggerMessageAt,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 	if record.IdempotencyKey != nil {

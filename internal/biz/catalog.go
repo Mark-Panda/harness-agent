@@ -17,6 +17,8 @@ var (
 	ErrResourceConflict = errors.New("resource conflict")
 	// ErrInvalidConfig 入参或配置未通过领域校验。
 	ErrInvalidConfig = errors.New("invalid configuration")
+	// ErrSessionRunActive 同一会话已有 Run 正在执行或等待审批，本次执行需继续排队。
+	ErrSessionRunActive = errors.New("session has an active run")
 )
 
 // RequireAdmin 要求调用者为已认证管理员，平台级配置仅管理员可写。

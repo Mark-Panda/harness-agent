@@ -2,8 +2,11 @@ package server
 
 import (
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // 默认 SSE 容量与写入超时；单个慢消费者不得无限占用连接与 goroutine。
@@ -36,6 +39,33 @@ func SetSSELimits(maxConnections int, writeTimeout time.Duration) {
 	}
 	sseMax.Store(int64(maxConnections))
 	sseWriteTimeout.Store(int64(writeTimeout))
+}
+
+// RunEventStream 是 Run 事件的本地通知源；未注入时 SSE 仅依赖兜底轮询。
+type RunEventStream interface {
+	// Subscribe 订阅指定 Run 的新事件通知；返回信号通道与退订函数。
+	Subscribe(runID uuid.UUID) (<-chan struct{}, func())
+}
+
+var runEventStreamRegistry struct {
+	// mu 保护 stream，注入与读取可能发生在启动阶段与请求并发时。
+	mu sync.RWMutex
+	// stream 当前通知源，可为空。
+	stream RunEventStream
+}
+
+// SetRunEventStream 注入 SSE 事件通知源；传入 nil 表示退回固定间隔轮询。
+func SetRunEventStream(stream RunEventStream) {
+	runEventStreamRegistry.mu.Lock()
+	runEventStreamRegistry.stream = stream
+	runEventStreamRegistry.mu.Unlock()
+}
+
+// currentRunEventStream 读取当前通知源；未注入时返回 nil。
+func currentRunEventStream() RunEventStream {
+	runEventStreamRegistry.mu.RLock()
+	defer runEventStreamRegistry.mu.RUnlock()
+	return runEventStreamRegistry.stream
 }
 
 // acquireSSEConnection 占用一个 SSE 槽位；超过上限时返回 false。

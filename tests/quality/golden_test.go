@@ -75,6 +75,8 @@ func (m *scriptedModel) Complete(_ context.Context, messages []react.Message, _ 
 // goldenTool 返回场景预设输出。
 type goldenTool struct {
 	scenario goldenScenario
+	// calls 记录真实执行次数，用于验证重复工具调用被拦截。
+	calls int
 }
 
 // Spec 返回工具定义。
@@ -84,6 +86,7 @@ func (t *goldenTool) Spec() react.ToolSpec {
 
 // Invoke 返回场景输出；oversize 场景生成超过上限的结果。
 func (t *goldenTool) Invoke(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	t.calls++
 	if t.scenario.Kind == "oversize_result" {
 		return json.RawMessage(`{"content":"` + strings.Repeat("x", 131072) + `"}`), nil
 	}
@@ -180,8 +183,19 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 					t.Fatalf("tool messages = %d", toolMessages)
 				}
 			case "tool_loop":
-				if !errors.Is(err, react.ErrToolLoop) {
+				// 重复工具调用不再直接失败，而是回传可观测的 repeated_tool_call 错误且不重复执行工具；
+				// 模型始终不收敛时由步数上限兜底。
+				if !errors.Is(err, react.ErrStepLimit) {
 					t.Fatalf("tool loop error = %v", err)
+				}
+				if registry.tool == nil {
+					t.Fatal("tool loop scenario registered no tool")
+				}
+				if want := config.Thresholds.DuplicateToolThreshold - 1; registry.tool.calls != want {
+					t.Fatalf("repeated tool call was executed %d times, want %d", registry.tool.calls, want)
+				}
+				if content := lastToolContent(result.Messages); !strings.Contains(content, `"error":"repeated_tool_call"`) {
+					t.Fatalf("repeated tool content = %q", content)
 				}
 			case "unknown_tool":
 				// 未知工具必须转成可恢复的工具错误，不得中断 Run 或执行任意工具。

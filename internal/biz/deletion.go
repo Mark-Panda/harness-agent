@@ -344,8 +344,12 @@ func (w *DeletionWorker) handle(ctx context.Context, request DeletionRequest) {
 			case <-ticker.C:
 			}
 			if err := w.requests.Renew(runCtx, request.ID, w.config.WorkerID, request.FencingToken, w.config.Lease, w.clock()); err != nil {
-				close(leaseLost)
-				cancel()
+				// 主流程结束时主动 cancel 会让在途续约返回 context.Canceled；
+				// 只有上下文仍有效时的续约失败才代表租约真的丢失。
+				if runCtx.Err() == nil {
+					close(leaseLost)
+					cancel()
+				}
 				return
 			}
 		}
@@ -368,14 +372,15 @@ func (w *DeletionWorker) handle(ctx context.Context, request DeletionRequest) {
 		err = fmt.Errorf("%w: %s", ErrDeletionUnsupported, request.ResourceType)
 	}
 	cancel()
+	// 先等待心跳协程退出再判定租约：心跳可能在 cancel 之后才写入 leaseLost，
+	// 提前判定会把正常结束误判为丢租约并跳过完成写入。
+	<-done
 	select {
 	case <-leaseLost:
 		w.logger.Warn("deletion request lease lost", "request_id", request.ID)
-		<-done
 		return
 	default:
 	}
-	<-done
 
 	if err != nil {
 		if errors.Is(err, ErrDeletionUnsupported) {

@@ -59,14 +59,12 @@ test-coverage:
 	go test -coverprofile=coverage/auth.out ./internal/platform/auth
 	go test -coverprofile=coverage/agent.out ./pkg/agent/...
 	go test -coverprofile=coverage/mcp.out ./pkg/mcp
-	go test -coverprofile=coverage/einoext.out ./pkg/einoext
 	go test -coverprofile=coverage/memory.out ./pkg/memory
 	python3 scripts/check_coverage.py coverage/biz.out 80
 	python3 scripts/check_coverage.py coverage/service.out 90
 	python3 scripts/check_coverage.py coverage/auth.out 90
 	python3 scripts/check_coverage.py coverage/agent.out 80
 	python3 scripts/check_coverage.py coverage/mcp.out 80
-	python3 scripts/check_coverage.py coverage/einoext.out 80
 	python3 scripts/check_coverage.py coverage/memory.out 80
 
 test-quality:

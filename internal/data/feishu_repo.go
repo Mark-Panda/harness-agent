@@ -824,12 +824,16 @@ func (r *FeishuOutboundRepository) FailOutbound(ctx context.Context, id uuid.UUI
 	return catalogError("fail feishu outbound", err)
 }
 
-// LatestAssistantMessage 读取会话最近一条助手消息。
-func (r *FeishuOutboundRepository) LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID) (biz.Message, error) {
+// LatestAssistantMessage 读取指定 Run 产生的助手消息；runID 为空时退回会话最近一条助手消息。
+// 按 run_id 过滤可避免并发 Run 的回复互相串台。
+func (r *FeishuOutboundRepository) LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID, runID *uuid.UUID) (biz.Message, error) {
 	var record messageModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.Where("user_id = ? AND session_id = ? AND role = ? AND deleted_at IS NULL", userID, sessionID, biz.MessageAssistant).
-			Order("created_at DESC, id DESC").First(&record).Error
+		query := tx.Where("user_id = ? AND session_id = ? AND role = ? AND deleted_at IS NULL", userID, sessionID, biz.MessageAssistant)
+		if runID != nil && *runID != uuid.Nil {
+			query = query.Where("run_id = ?", *runID)
+		}
+		return query.Order("created_at DESC, id DESC").First(&record).Error
 	})
 	if err != nil {
 		return biz.Message{}, catalogError("latest feishu assistant message", err)

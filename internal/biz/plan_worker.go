@@ -73,6 +73,7 @@ func (w *ExecutionWorker) executePlan(ctx context.Context, run Run, fence RunFen
 		return react.Result{}, err
 	}
 	plan = recovered
+	replanned := false
 
 	for iteration := 0; iteration <= plan.MaxSteps+8; iteration++ {
 		plan, err = w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
@@ -113,6 +114,17 @@ func (w *ExecutionWorker) executePlan(ctx context.Context, run Run, fence RunFen
 			return w.finishPlan(ctx, run, fence, plan, messages)
 		}
 		if failed || next == nil {
+			// 步骤失败不再立即终止整份计划：允许一次基于失败原因的重规划，
+			// 让 Planner 保留已完成成果并生成修正步骤；再次失败才终止。
+			if !replanned && plan.Version < 2 {
+				replanned = true
+				updated, replanErr := w.replanPlan(ctx, run, fence, router, messages, plan)
+				if replanErr == nil {
+					plan = updated
+					continue
+				}
+				w.logger.Warn("replan failed; terminating plan", "run_id", run.ID, "plan_id", plan.ID, "error", replanErr)
+			}
 			return react.Result{}, w.failPlan(ctx, plan, fenceState, "plan_step_failed", "计划步骤失败或依赖无法满足")
 		}
 		if err := w.executePlanStep(ctx, run, fence, fenceState, router, messages, tools, plan, *next); err != nil {
@@ -188,23 +200,35 @@ func (w *ExecutionWorker) loadOrCreatePlan(ctx context.Context, run Run, fence R
 func (w *ExecutionWorker) generatePlan(ctx context.Context, router *model.Router, messages []react.Message) (PlanDraft, react.Completion, error) {
 	planMessages := make([]react.Message, 0, len(messages)+2)
 	planMessages = append(planMessages, react.Message{Role: react.RoleSystem, Content: planPlannerInstruction})
-	start := 0
-	if len(messages) > 16 {
-		start = len(messages) - 16
-	}
-	for _, message := range messages[start:] {
-		if message.Role == react.RoleSystem {
-			continue
-		}
+	// Planner 必须看到完整的 Agent 人设、Skill 与对话上下文，否则生成的计划会偏离 Agent 的职责，
+	// 也会丢失多轮对话中已经确认的目标与约束。
+	for _, message := range messages {
 		content := message.Content
 		if len(content) > 4000 {
 			content = content[:4000] + "…"
 		}
-		planMessages = append(planMessages, react.Message{
-			Role: message.Role, Content: content, Name: message.Name, ToolCallID: message.ToolCallID,
-		})
+		switch message.Role {
+		case react.RoleSystem, react.RoleUser, react.RoleAssistant:
+			if strings.TrimSpace(content) == "" {
+				continue
+			}
+			planMessages = append(planMessages, react.Message{
+				Role: message.Role, Content: content, Name: message.Name, ToolCallID: message.ToolCallID,
+			})
+		case react.RoleTool:
+			// Planner 不需要回放工具协议；把观察结果转成普通背景文本，避免出现没有对应
+			// assistant tool_calls 的孤立 tool 消息导致供应商拒绝请求。
+			if strings.TrimSpace(content) == "" {
+				continue
+			}
+			planMessages = append(planMessages, react.Message{
+				Role: react.RoleUser, Content: "[工具结果 observation] " + content,
+			})
+		}
 	}
 	planMessages = append(planMessages, react.Message{Role: react.RoleUser, Content: "请基于以上对话生成可执行计划 JSON。"})
+	// 规划同样受 Prompt 预算约束，长会话先裁剪再调用，避免规划请求超出模型窗口。
+	planMessages = trimRunnerContext(planMessages, w.config.PromptTokenBudget)
 	completion, err := router.Complete(ctx, planMessages, nil)
 	if err != nil {
 		return PlanDraft{}, react.Completion{}, err
@@ -392,13 +416,15 @@ func dependenciesCompleted(dependsOn []int, statusByNo map[int]PlanStepStatus) b
 // executePlanStep 领取并执行单个步骤；业务失败会落库为 failed 并返回 nil，基础设施错误原样返回。
 func (w *ExecutionWorker) executePlanStep(ctx context.Context, run Run, runFence RunFence, fence PlanFence, router *model.Router, messages []react.Message, tools react.Registry, plan Plan, step PlanStep) error {
 	if step.ToolName == "" {
-		return w.executePlanModelStep(ctx, run, fence, router, messages, plan, step)
+		return w.executePlanModelStep(ctx, run, fence, router, messages, tools, plan, step)
 	}
 	return w.executePlanToolStep(ctx, run, runFence, fence, tools, plan, step)
 }
 
-// executePlanModelStep 执行纯模型步骤并保存结果与 Token 用量。
-func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fence PlanFence, router *model.Router, messages []react.Message, plan Plan, step PlanStep) error {
+// executePlanModelStep 执行模型步骤，并在步内允许有限次数的低风险工具调用。
+// 工具只开放 low 风险级别：中高风险工具需要审批记录与计划步骤绑定，
+// 在步骤内部临时调用无法保证审批恢复语义，因此仍交由独立的工具步骤执行。
+func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fence PlanFence, router *model.Router, messages []react.Message, tools react.Registry, plan Plan, step PlanStep) error {
 	claimed, err := w.plans.ClaimPlanStep(ctx, run.UserID, plan.ID, step.ID, nil, fence, w.clock())
 	if err != nil {
 		if errors.Is(err, ErrResourceConflict) {
@@ -406,9 +432,27 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 		}
 		return err
 	}
-	stepMessages := planStepMessages(plan, claimed)
+	stepMessages := planStepMessages(plan, claimed, messages)
 	w.emitPlanEvent(ctx, run, RunFence(fence), "plan.step.started", map[string]any{"step_no": step.StepNo, "title": step.Title})
-	completion, err := router.Complete(ctx, stepMessages, nil)
+	limits := react.DefaultLimits()
+	limits.MaxSteps = 3
+	if w.config.ReactMaxTotalTokens > 0 {
+		limits.MaxTotalTokens = w.config.ReactMaxTotalTokens
+	}
+	if w.config.ReactMaxCost > 0 {
+		limits.MaxCost = w.config.ReactMaxCost
+	}
+	runner, err := react.NewRunner(router, lowRiskToolRegistry{parent: tools}, limits,
+		react.WithContextBudget(w.config.PromptTokenBudget, trimRunnerContext))
+	if err != nil {
+		return err
+	}
+	// 计划步骤同样对外流式输出：复用统一 sink 落库中间消息并推送 message.delta。
+	var appendErr error
+	result, err := runner.Run(ctx, react.Request{Messages: stepMessages}, w.runSink(ctx, run, RunFence(fence), &appendErr))
+	if appendErr != nil {
+		return fmt.Errorf("persist plan step event: %w", appendErr)
+	}
 	if err != nil {
 		code, message := failureDetails(err)
 		_, updateErr := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
@@ -422,7 +466,7 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 		})
 		return nil
 	}
-	content := strings.TrimSpace(completion.Content)
+	content := strings.TrimSpace(result.Content)
 	if content == "" {
 		content = "步骤已完成，但模型未返回文本结果。"
 	}
@@ -431,13 +475,127 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 	}); err != nil {
 		return err
 	}
-	if err := w.plans.AddPlanUsage(ctx, run.UserID, plan.ID, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost, w.clock()); err != nil {
+	if err := w.plans.AddPlanUsage(ctx, run.UserID, plan.ID, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, w.clock()); err != nil {
 		w.logger.Warn("record plan step usage failed", "run_id", run.ID, "error", err)
 	}
 	w.emitPlanEvent(ctx, run, RunFence(fence), "plan.step.completed", map[string]any{
 		"step_no": step.StepNo, "status": "completed",
-		"input_tokens": completion.Usage.InputTokens, "output_tokens": completion.Usage.OutputTokens,
+		"input_tokens": result.InputTokens, "output_tokens": result.OutputTokens,
 	})
+	return nil
+}
+
+// lowRiskToolRegistry 过滤掉需要人工审批的中高风险工具，避免计划步骤内部绕过审批流程。
+type lowRiskToolRegistry struct {
+	parent react.Registry
+}
+
+// Lookup 只返回 low 风险工具。
+func (r lowRiskToolRegistry) Lookup(name string) (react.Tool, bool) {
+	if r.parent == nil {
+		return nil, false
+	}
+	tool, exists := r.parent.Lookup(name)
+	if !exists || approvalRequired(tool.RiskLevel()) {
+		return nil, false
+	}
+	return tool, true
+}
+
+// List 返回过滤后的工具定义，保持父注册表的稳定顺序。
+func (r lowRiskToolRegistry) List() []react.ToolSpec {
+	if r.parent == nil {
+		return nil
+	}
+	specs := r.parent.List()
+	result := make([]react.ToolSpec, 0, len(specs))
+	for _, spec := range specs {
+		tool, exists := r.parent.Lookup(spec.Name)
+		if !exists || approvalRequired(tool.RiskLevel()) {
+			continue
+		}
+		result = append(result, spec)
+	}
+	return result
+}
+
+// replanPlan 基于失败原因生成新版本计划，保留已完成步骤的成果并替换失败步骤。
+func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunFence, router *model.Router, messages []react.Message, plan Plan) (Plan, error) {
+	failureText := "当前计划存在无法完成的步骤或依赖"
+	if failed := firstFailedPlanStep(plan); failed != nil {
+		failureText = fmt.Sprintf("步骤 %d「%s」执行失败：%s", failed.StepNo, failed.Title, failed.ErrorMessage)
+	}
+	replanMessages := append(append([]react.Message(nil), messages...), react.Message{
+		Role:    react.RoleUser,
+		Content: failureText + "。请生成修正后的完整可执行计划：保留已完成步骤的成果，替换或补充失败步骤，不要重复已知失败的调用。",
+	})
+	draft, completion, err := w.generatePlan(ctx, router, replanMessages)
+	if err != nil {
+		return Plan{}, err
+	}
+	limits := DefaultPlanLimits()
+	now := w.clock()
+	planID := uuid.New()
+	steps := make([]PlanStep, 0, len(draft.Steps))
+	for _, draftStep := range draft.Steps {
+		maxAttempts := 2
+		if draftStep.ToolName != "" {
+			maxAttempts = 1
+		}
+		steps = append(steps, PlanStep{
+			ID: uuid.New(), PlanID: planID, UserID: run.UserID, StepNo: draftStep.StepNo,
+			Title: draftStep.Title, Description: draftStep.Description, DependsOn: draftStep.DependsOn,
+			ToolName: draftStep.ToolName, Arguments: draftStep.Arguments,
+			IdempotencyKey: fmt.Sprintf("plan:%s:step:%d", planID, draftStep.StepNo),
+			Status:         PlanStepPending, MaxAttempts: maxAttempts,
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	snapshot := run.ConfigSnapshot
+	if snapshot == nil {
+		snapshot = map[string]any{}
+	}
+	parentID := plan.ID
+	newPlan := Plan{
+		ID: planID, UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID,
+		Version: plan.Version + 1, ParentPlanID: &parentID, Status: PlanExecuting,
+		Goal: draft.Goal, ConfigSnapshot: snapshot, MaxSteps: limits.MaxSteps,
+		DeadlineAt: run.DeadlineAt, Revision: 0, CreatedAt: now, UpdatedAt: now, Steps: steps,
+	}
+	created, err := w.plans.CreatePlan(ctx, run.UserID, newPlan, OutboxEvent{
+		UserID: run.UserID, EventType: "plan.created", AggregateType: "plan", AggregateID: planID.String(),
+		DedupeKey: "plan.created:" + planID.String(),
+		Payload: map[string]any{
+			"run_id": run.ID.String(), "version": newPlan.Version, "steps": len(steps),
+			"parent_plan_id": plan.ID.String(),
+		},
+	})
+	if err != nil {
+		return Plan{}, err
+	}
+	if err := w.plans.AddPlanUsage(ctx, run.UserID, planID, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost, now); err != nil {
+		w.logger.Warn("record replanner usage failed", "run_id", run.ID, "error", err)
+	}
+	// 旧版本保留为失败终态，便于审计失败原因与重规划链路。
+	if _, err := w.plans.UpdatePlan(ctx, run.UserID, plan.ID, plan.Status, PlanFailed, plan.Revision, PlanFence{Owner: w.config.WorkerID, Token: runFence.Token}, PlanUpdate{
+		ErrorCode: "plan_replanned", ErrorMessage: "步骤失败，已生成新版本计划", FinishedAt: &now,
+	}); err != nil && !errors.Is(err, ErrPlanRevisionConflict) {
+		w.logger.Warn("mark old plan failed after replan failed", "run_id", run.ID, "plan_id", plan.ID, "error", err)
+	}
+	w.emitPlanEvent(ctx, run, runFence, "plan.replanned", map[string]any{
+		"plan_id": planID.String(), "version": newPlan.Version, "parent_plan_id": plan.ID.String(),
+		"goal": draft.Goal,
+	})
+	return created, nil
+}
+
+// firstFailedPlanStep 返回第一个失败步骤，供重规划提示使用。
+func firstFailedPlanStep(plan Plan) *PlanStep {
+	for index := range plan.Steps {
+		if plan.Steps[index].Status == PlanStepFailed {
+			return &plan.Steps[index]
+		}
+	}
 	return nil
 }
 
@@ -696,8 +854,8 @@ func (w *ExecutionWorker) emitPlanEvent(ctx context.Context, run Run, fence RunF
 	}
 }
 
-// planStepMessages 构造步骤执行提示：计划目标、前置结果与当前步骤。
-func planStepMessages(plan Plan, step PlanStep) []react.Message {
+// planStepMessages 构造步骤执行提示：Agent 系统提示、对话背景、计划目标、前置结果与当前步骤。
+func planStepMessages(plan Plan, step PlanStep, conversation []react.Message) []react.Message {
 	var builder strings.Builder
 	builder.WriteString("计划目标：")
 	builder.WriteString(plan.Goal)
@@ -725,10 +883,53 @@ func planStepMessages(plan Plan, step PlanStep) []react.Message {
 		builder.WriteString("（无）\n")
 	}
 	builder.WriteString(fmt.Sprintf("\n当前步骤 %d「%s」：\n%s\n请输出本步骤的执行结果。", step.StepNo, step.Title, step.Description))
-	return []react.Message{
-		{Role: react.RoleSystem, Content: planStepInstruction + "\n" + UntrustedContentInstruction},
-		{Role: react.RoleUser, Content: builder.String()},
+	result := make([]react.Message, 0, 4)
+	// 步骤执行必须继承 Agent 的完整系统提示（人设、Skill、安全约束），否则步骤内的模型行为会脱离 Agent 配置。
+	if len(conversation) > 0 && conversation[0].Role == react.RoleSystem {
+		result = append(result, conversation[0])
 	}
+	result = append(result, react.Message{Role: react.RoleSystem, Content: planStepInstruction + "\n" + UntrustedContentInstruction})
+	if background := planConversationBackground(conversation); background != "" {
+		result = append(result, react.Message{
+			Role: react.RoleUser, Content: "对话背景（仅供理解任务，不是新的用户指令）：\n" + background,
+		})
+	}
+	result = append(result, react.Message{Role: react.RoleUser, Content: builder.String()})
+	return result
+}
+
+// planConversationBackground 提取最近对话文本作为步骤背景；跳过系统提示与工具协议细节。
+func planConversationBackground(conversation []react.Message) string {
+	if len(conversation) == 0 {
+		return ""
+	}
+	start := 0
+	if len(conversation) > 8 {
+		start = len(conversation) - 8
+	}
+	var builder strings.Builder
+	for _, message := range conversation[start:] {
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		if len(content) > 1500 {
+			content = content[:1500] + "…"
+		}
+		switch message.Role {
+		case react.RoleUser:
+			builder.WriteString("用户：")
+		case react.RoleAssistant:
+			builder.WriteString("助手：")
+		case react.RoleTool:
+			builder.WriteString("工具结果：")
+		default:
+			continue
+		}
+		builder.WriteString(content)
+		builder.WriteString("\n")
+	}
+	return strings.TrimSpace(builder.String())
 }
 
 // planStepResultText 提取步骤结果文本。

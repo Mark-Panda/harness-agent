@@ -5,7 +5,31 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+// immediateRunEventStream 在订阅时立即发出一次通知，用于验证通知驱动路径。
+type immediateRunEventStream struct{}
+
+// Subscribe 返回已就绪的通知通道。
+func (immediateRunEventStream) Subscribe(uuid.UUID) (<-chan struct{}, func()) {
+	channel := make(chan struct{}, 1)
+	channel <- struct{}{}
+	return channel, func() {}
+}
+
+// TestRunEventStreamRegistry 验证通知源的注入与清除。
+func TestRunEventStreamRegistry(t *testing.T) {
+	SetRunEventStream(immediateRunEventStream{})
+	if currentRunEventStream() == nil {
+		t.Fatal("event stream was not installed")
+	}
+	SetRunEventStream(nil)
+	if currentRunEventStream() != nil {
+		t.Fatal("event stream was not cleared")
+	}
+}
 
 // failingWriter 模拟慢消费者/断开连接后的写入失败。
 type failingWriter struct{ header http.Header }

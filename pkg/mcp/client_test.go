@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -358,6 +359,44 @@ func TestClientRejectsUnsafeEndpoint(t *testing.T) {
 	}
 	if _, err := NewClient("https://example.com/mcp#fragment", "", "", time.Second); !errors.Is(err, ErrInvalidEndpoint) {
 		t.Fatalf("fragment endpoint error = %v", err)
+	}
+}
+
+// TestCallToolRetriesAfterSessionExpired 验证缓存客户端会话被服务端回收后自动重新握手并重试一次。
+func TestCallToolRetriesAfterSessionExpired(t *testing.T) {
+	var initializes int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch body.Method {
+		case "initialize":
+			count := atomic.AddInt32(&initializes, 1)
+			w.Header().Set("Mcp-Session-Id", fmt.Sprintf("session-%d", count))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}`))
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusNoContent)
+		case "tools/call":
+			// 第一个会话已被服务端回收，返回 404；重新握手后的会话正常返回结果。
+			if r.Header.Get("Mcp-Session-Id") == "session-1" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server, "none", "")
+	if _, err := client.CallTool(context.Background(), "tool", nil); err != nil {
+		t.Fatalf("call tool after session expiry = %v", err)
+	}
+	if got := atomic.LoadInt32(&initializes); got != 2 {
+		t.Fatalf("initialize calls = %d, want 2", got)
 	}
 }
 

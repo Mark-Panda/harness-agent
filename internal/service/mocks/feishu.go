@@ -416,18 +416,18 @@ func (mr *MockFeishuOutboundStoreMockRecorder) FailOutbound(ctx, id, reason, ret
 }
 
 // LatestAssistantMessage mocks base method.
-func (m *MockFeishuOutboundStore) LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID) (biz.Message, error) {
+func (m *MockFeishuOutboundStore) LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID, runID *uuid.UUID) (biz.Message, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "LatestAssistantMessage", ctx, userID, sessionID)
+	ret := m.ctrl.Call(m, "LatestAssistantMessage", ctx, userID, sessionID, runID)
 	ret0, _ := ret[0].(biz.Message)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // LatestAssistantMessage indicates an expected call of LatestAssistantMessage.
-func (mr *MockFeishuOutboundStoreMockRecorder) LatestAssistantMessage(ctx, userID, sessionID any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) LatestAssistantMessage(ctx, userID, sessionID, runID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LatestAssistantMessage", reflect.TypeOf((*MockFeishuOutboundStore)(nil).LatestAssistantMessage), ctx, userID, sessionID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LatestAssistantMessage", reflect.TypeOf((*MockFeishuOutboundStore)(nil).LatestAssistantMessage), ctx, userID, sessionID, runID)
 }
 
 // MarkOutboundCardUpdated mocks base method.

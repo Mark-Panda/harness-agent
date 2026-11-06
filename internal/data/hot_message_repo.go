@@ -32,16 +32,24 @@ type hotMessage struct {
 	ToolName string `json:"tool_name,omitempty"`
 	// TokenCount Token 估算。
 	TokenCount int `json:"token_count,omitempty"`
+	// SpeakerOpenID 飞书群聊发言人 open_id，单聊为空。
+	SpeakerOpenID string `json:"speaker_open_id,omitempty"`
+	// RunID 产生该消息的 Run ID；用户消息为空。
+	RunID *uuid.UUID `json:"run_id,omitempty"`
 	// CreatedAt 创建时间。
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// appendHotMessageScript 幂等追加消息：已存在相同载荷时跳过，随后裁剪长度并刷新 TTL。
+// appendHotMessageScript 幂等追加消息：缓存不存在时直接跳过，避免用单条消息伪造完整窗口；
+// 已存在相同载荷时跳过，随后裁剪长度并刷新 TTL。
 var appendHotMessageScript = redis.NewScript(`
 local key = KEYS[1]
 local payload = ARGV[1]
 local max = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
+if redis.call('EXISTS', key) == 0 then
+  return -1
+end
 if redis.call('LPOS', key, payload) then
   return 0
 end
@@ -101,10 +109,27 @@ func (r *HotMessageRepository) Load(ctx context.Context, userID, sessionID uuid.
 		messages = append(messages, biz.Message{
 			ID: record.ID, SessionID: sessionID, UserID: userID, Role: record.Role, Content: record.Content,
 			ToolCalls: record.ToolCalls, ToolCallID: record.ToolCallID, ToolName: record.ToolName,
-			TokenCount: record.TokenCount, CreatedAt: record.CreatedAt,
+			TokenCount: record.TokenCount, SpeakerOpenID: record.SpeakerOpenID, RunID: record.RunID,
+			CreatedAt: record.CreatedAt,
 		})
 	}
+	// 不含任何用户消息的窗口无法作为完整上下文：通常是缓存缺失后被单条追加伪造的残窗，
+	// 视为未命中并清理，强制调用方回表重建。
+	if !hasUserMessage(messages) {
+		_ = r.Invalidate(ctx, userID, sessionID)
+		return nil, false, nil
+	}
 	return messages, true, nil
+}
+
+// hasUserMessage 判断窗口内是否存在用户输入。
+func hasUserMessage(messages []biz.Message) bool {
+	for _, message := range messages {
+		if message.Role == biz.MessageUser {
+			return true
+		}
+	}
+	return false
 }
 
 // Save 用完整消息列表重建缓存；空列表直接清理缓存，禁止缓存空值。
@@ -169,7 +194,7 @@ func messageToHot(message biz.Message, sessionID, userID uuid.UUID) hotMessage {
 	return hotMessage{
 		ID: message.ID, Role: message.Role, Content: message.Content, ToolCalls: message.ToolCalls,
 		ToolCallID: message.ToolCallID, ToolName: message.ToolName, TokenCount: message.TokenCount,
-		CreatedAt: message.CreatedAt,
+		SpeakerOpenID: message.SpeakerOpenID, RunID: message.RunID, CreatedAt: message.CreatedAt,
 	}
 }
 

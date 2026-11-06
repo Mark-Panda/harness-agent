@@ -79,6 +79,12 @@ type skillModel struct {
 	ID uuid.UUID `gorm:"type:uuid;primaryKey"`
 	// Name Skill 名称。
 	Name string
+	// Description Skill 用途说明。
+	Description string
+	// PromptTemplate Skill 提示词模板。
+	PromptTemplate string
+	// ParametersJSON Skill 参数定义 JSON Schema，发布快照需要冻结。
+	ParametersJSON datatypes.JSON
 	// Status Skill 状态，发布 Agent 只能绑定 published。
 	Status string
 }
@@ -395,7 +401,15 @@ func (r *AgentRepository) ListSkillsByIDs(ctx context.Context, skillIDs []uuid.U
 	}
 	result := make([]biz.Skill, 0, len(records))
 	for _, record := range records {
-		result = append(result, biz.Skill{ID: record.ID, Name: record.Name, Status: record.Status})
+		// 参数定义随发布快照冻结，运行时不回查平台配置。
+		var parameters map[string]any
+		if len(record.ParametersJSON) > 0 {
+			_ = json.Unmarshal(record.ParametersJSON, &parameters)
+		}
+		result = append(result, biz.Skill{
+			ID: record.ID, Name: record.Name, Description: record.Description,
+			PromptTemplate: record.PromptTemplate, Parameters: parameters, Status: record.Status,
+		})
 	}
 	return result, nil
 }

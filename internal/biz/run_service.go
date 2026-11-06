@@ -36,6 +36,11 @@ type Run struct {
 	AttemptNo int
 	// IdempotencyKey 创建幂等键，同用户内唯一。
 	IdempotencyKey string
+	// TriggerMessageID 触发本次 Run 的用户消息 ID，用于限定上下文历史右边界；
+	// 为空时由服务端取会话内最近一条用户消息，避免排队 Run 误读后续输入。
+	TriggerMessageID *uuid.UUID
+	// TriggerMessageAt 触发消息的写入时间；触发消息已滑出热窗口时用时间裁剪上下文。
+	TriggerMessageAt *time.Time
 	// ErrorCode 失败业务码。
 	ErrorCode string
 	// ErrorMessage 脱敏后的失败原因。
@@ -112,6 +117,8 @@ type RunRepository interface {
 	CreateRun(ctx context.Context, run Run) (Run, error)
 	// GetRun 按用户与 Run ID 读取。
 	GetRun(ctx context.Context, userID, runID uuid.UUID) (Run, error)
+	// GetRunStatus 只读取状态，供 SSE 低成本判断终态。
+	GetRunStatus(ctx context.Context, userID, runID uuid.UUID) (RunStatus, error)
 	// ListRuns 按会话游标分页列出 Run。
 	ListRuns(ctx context.Context, userID, sessionID uuid.UUID, limit int, cursor string) (Page[Run], error)
 	// ListAllRuns 按用户与来源筛选全局 Run，供管理员审计。
@@ -254,6 +261,8 @@ type CreateRunInput struct {
 	Mode AgentMode
 	// IdempotencyKey 可选的创建幂等键。
 	IdempotencyKey string
+	// TriggerMessageID 可选的触发消息 ID；缺省时取会话内最近一条用户消息。
+	TriggerMessageID *uuid.UUID
 }
 
 // Create 创建排队中的 Run；会话归属与模式在此校验。
@@ -283,6 +292,10 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	if len(input.IdempotencyKey) > 128 {
 		return Run{}, invalid("run idempotency key is too long")
 	}
+	triggerMessageID, triggerMessageAt, err := s.resolveTriggerMessage(ctx, principal.UserID, input.SessionID, input.TriggerMessageID)
+	if err != nil {
+		return Run{}, err
+	}
 	configSnapshot, policySnapshot, err := s.buildSnapshots(ctx, principal, input)
 	if err != nil {
 		return Run{}, err
@@ -292,6 +305,7 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 		ID: uuid.New(), SessionID: input.SessionID, UserID: principal.UserID,
 		AgentID: input.AgentID, AgentVersion: input.AgentVersion, Mode: input.Mode,
 		Status: RunQueued, IdempotencyKey: input.IdempotencyKey, DeadlineAt: &deadline,
+		TriggerMessageID: triggerMessageID, TriggerMessageAt: triggerMessageAt,
 		ConfigSnapshot: configSnapshot, ModelPolicySnapshot: policySnapshot,
 	}
 	created, err := s.repo.CreateRun(ctx, run)
@@ -305,6 +319,40 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 		}
 	}
 	return created, nil
+}
+
+// triggerMessageLookback 解析触发消息时最多回看的消息条数。
+const triggerMessageLookback = 20
+
+// resolveTriggerMessage 确定本次 Run 的输入边界。
+// 显式传入时必须是当前会话内的用户消息；缺省时取最近一条用户消息，
+// 保证排队 Run 不会把创建之后写入的用户消息当成自己的输入。
+func (s *RunService) resolveTriggerMessage(ctx context.Context, userID, sessionID uuid.UUID, provided *uuid.UUID) (*uuid.UUID, *time.Time, error) {
+	page, err := s.sessions.ListMessages(ctx, userID, sessionID, triggerMessageLookback, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, message := range page.Items {
+		if provided != nil {
+			if message.ID != *provided {
+				continue
+			}
+			if message.Role != MessageUser {
+				return nil, nil, invalid("trigger message must be a user message")
+			}
+			trigger, triggerAt := message.ID, message.CreatedAt
+			return &trigger, &triggerAt, nil
+		}
+		if message.Role == MessageUser {
+			trigger, triggerAt := message.ID, message.CreatedAt
+			return &trigger, &triggerAt, nil
+		}
+	}
+	if provided != nil {
+		return nil, nil, invalid("trigger message does not belong to the session")
+	}
+	// 会话内还没有用户消息时保留空边界，由 Worker 报告 ErrNoUserMessage。
+	return nil, nil, nil
 }
 
 // buildSnapshots 固化 Agent 配置、策略候选与模型元数据；未配置快照来源时返回空快照。
@@ -417,6 +465,14 @@ func (s *RunService) Get(ctx context.Context, principal Principal, runID uuid.UU
 		return Run{}, ErrForbidden
 	}
 	return s.repo.GetRun(ctx, principal.UserID, runID)
+}
+
+// Status 只读取当前用户 Run 的状态，供 SSE 兜底轮询低成本判断终态。
+func (s *RunService) Status(ctx context.Context, principal Principal, runID uuid.UUID) (RunStatus, error) {
+	if principal.UserID == uuid.Nil {
+		return "", ErrForbidden
+	}
+	return s.repo.GetRunStatus(ctx, principal.UserID, runID)
 }
 
 // List 按会话游标分页列出 Run。

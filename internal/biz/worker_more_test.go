@@ -85,7 +85,7 @@ func TestWorkerSkipsTerminalAndInvalidJobs(t *testing.T) {
 	}
 }
 
-// TestWorkerDefersWaitingApprovalAndLeaseConflict 验证审批等待与租约冲突都会退避重试。
+// TestWorkerDefersWaitingApprovalAndLeaseConflict 验证审批等待与租约冲突都会退回队列等待，不消耗重试预算。
 func TestWorkerDefersWaitingApprovalAndLeaseConflict(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	userID, runID := uuid.New(), uuid.New()
@@ -104,9 +104,25 @@ func TestWorkerDefersWaitingApprovalAndLeaseConflict(t *testing.T) {
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(conflict, true, nil)
 	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunQueued}, nil)
 	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(biz.Run{}, biz.RunFence{}, biz.ErrResourceConflict)
-	jobs.EXPECT().Fail(gomock.Any(), conflict.ID, "worker-1", conflict.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+	jobs.EXPECT().Release(gomock.Any(), conflict.ID, "worker-1", conflict.FencingToken, gomock.Any(), gomock.Any()).Return(nil)
 	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
 		t.Fatalf("conflict ProcessOne() = %t, %v", processed, err)
+	}
+}
+
+// TestWorkerRequeuesRunsBlockedBySessionSerialization 验证同会话前序 Run 执行时后续任务退回队列而不是记失败。
+func TestWorkerRequeuesRunsBlockedBySessionSerialization(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID := uuid.New(), uuid.New()
+	worker, jobs, runs, _, _ := newWorker(t, ctrl, time.Hour, uuid.NewString(), "https://models.example.com")
+
+	job := jobFixture(userID, runID)
+	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunQueued}, nil)
+	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(biz.Run{}, biz.RunFence{}, biz.ErrSessionRunActive)
+	jobs.EXPECT().Release(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any()).Return(nil)
+	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
+		t.Fatalf("session serialization ProcessOne() = %t, %v", processed, err)
 	}
 }
 

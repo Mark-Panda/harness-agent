@@ -210,16 +210,33 @@ export default function ChatPage() {
     const handleEvent = (event: RunEvent) => {
       const payload = event.data ?? {};
       switch (event.event) {
+        case "message.delta": {
+          const delta = asString(payload.delta);
+          if (!delta) {
+            break;
+          }
+          const key = `delta:${asString(payload.worker) ?? ""}:${String(payload.step ?? "?")}`;
+          setLiveMessages((previous) => {
+            const existing = previous.find((item) => item.key === key);
+            if (existing) {
+              return previous.map((item) => (item.key === key ? { ...item, content: item.content + delta } : item));
+            }
+            return [...previous, { key, role: "assistant", content: delta }];
+          });
+          break;
+        }
         case "message.created": {
           const role = asString(payload.role);
           const content = asString(payload.content) ?? "";
           if (role === "assistant" || role === "tool" || role === "system") {
             setLiveMessages((previous) => {
+              // 完整消息落库后替换同一轮的流式草稿，避免气泡重复。
+              const withoutDrafts = previous.filter((item) => !item.key.startsWith("delta:"));
               const key = `${event.seq}:${event.event}`;
-              if (previous.some((item) => item.key === key)) {
-                return previous;
+              if (withoutDrafts.some((item) => item.key === key)) {
+                return withoutDrafts;
               }
-              return [...previous, {
+              return [...withoutDrafts, {
                 key,
                 role,
                 content,
@@ -483,7 +500,7 @@ export default function ChatPage() {
     stickToBottomRef.current = true;
     setShowJump(false);
     try {
-      await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", {
+      const message = await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", {
         // 仅附件时补一句正文，保证消息可读且执行器有明确任务描述。
         content: content || "我上传了附件，请结合附件内容回答。",
         attachment_ids: readyAttachments.map((item) => item.id),
@@ -498,6 +515,7 @@ export default function ChatPage() {
         agent_id: agent?.id ?? null,
         agent_version: agent?.version ?? null,
         mode: agent?.mode ?? "react",
+        trigger_message_id: message.id,
       }, crypto.randomUUID());
       setActiveRun(run);
     } catch (failure) {

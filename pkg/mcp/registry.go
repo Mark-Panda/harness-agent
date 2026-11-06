@@ -36,6 +36,10 @@ type Server struct {
 	RiskLevel string
 	// Client 已构造的 MCP 客户端。
 	Client *Client
+	// Tools 预发现的工具清单；ToolsKnown 为真时直接使用，跳过远端 tools/list。
+	Tools []Tool
+	// ToolsKnown 是否已由缓存提供工具清单，避免重复发现。
+	ToolsKnown bool
 	// ToolTimeouts 原始工具名或前缀到单次超时的映射；未配置时使用 ReAct 默认超时。
 	ToolTimeouts map[string]time.Duration
 }
@@ -108,9 +112,16 @@ func (r *Registry) Prepare(ctx context.Context) error {
 	}
 	seen := map[string]struct{}{}
 	for _, server := range r.servers {
-		tools, err := server.Client.ListTools(ctx)
-		if err != nil {
-			continue
+		var tools []Tool
+		if server.ToolsKnown {
+			// 缓存已提供工具清单时直接复用，避免每个 Run 重复握手与 tools/list。
+			tools = server.Tools
+		} else {
+			discovered, err := server.Client.ListTools(ctx)
+			if err != nil {
+				continue
+			}
+			tools = discovered
 		}
 		r.preparedServers++
 		for _, tool := range tools {

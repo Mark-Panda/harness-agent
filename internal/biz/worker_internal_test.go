@@ -997,6 +997,24 @@ func TestAppendHotMessageInvalidatesOnFailure(t *testing.T) {
 	}
 }
 
+// TestBuildSystemPromptInjectsSkillParameters 验证 Skill 参数定义随发布快照注入系统提示。
+func TestBuildSystemPromptInjectsSkillParameters(t *testing.T) {
+	worker := &ExecutionWorker{clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }}
+	run := Run{ConfigSnapshot: map[string]any{"published_snapshot": map[string]any{
+		"skills": []any{map[string]any{
+			"name": "审查", "description": "按清单审查", "prompt_template": "检查 {{level}}",
+			"parameters": map[string]any{
+				"type": "object", "required": []any{"level"},
+				"properties": map[string]any{"level": map[string]any{"type": "string", "default": "strict"}},
+			},
+		}},
+	}}}
+	prompt := worker.buildSystemPrompt(run, "")
+	if !strings.Contains(prompt, "参数定义（JSON Schema）") || !strings.Contains(prompt, `"level"`) || !strings.Contains(prompt, "不得臆造") {
+		t.Fatalf("skill parameters were not injected: %s", prompt)
+	}
+}
+
 // TestTruncatePayloadText 验证按字节截断并保持 UTF-8 合法。
 func TestTruncatePayloadText(t *testing.T) {
 	if text, truncated := truncatePayloadText("short", 10); truncated || text != "short" {
@@ -1008,5 +1026,52 @@ func TestTruncatePayloadText(t *testing.T) {
 	}
 	if _, err := json.Marshal(text); err != nil {
 		t.Fatalf("truncated text is not valid UTF-8: %v", err)
+	}
+}
+
+// TestBoundHistoryByTrigger 验证排队 Run 只看到触发消息及其之前的历史，并保留本 Run 自己的产物。
+func TestBoundHistoryByTrigger(t *testing.T) {
+	runID := uuid.New()
+	triggerID := uuid.New()
+	triggerAt := time.Unix(100, 0)
+	history := []Message{
+		{ID: uuid.New(), Role: MessageUser, Content: "上一轮问题", CreatedAt: triggerAt.Add(-time.Minute)},
+		{ID: uuid.New(), Role: MessageAssistant, Content: "上一轮回答", CreatedAt: triggerAt.Add(-30 * time.Second)},
+		{ID: triggerID, Role: MessageUser, Content: "本次输入", CreatedAt: triggerAt},
+		{ID: uuid.New(), Role: MessageUser, Content: "排队期间的新输入", CreatedAt: triggerAt.Add(time.Second)},
+		{ID: uuid.New(), Role: MessageAssistant, Content: "其他 Run 的回复", CreatedAt: triggerAt.Add(2 * time.Second)},
+		{ID: uuid.New(), Role: MessageAssistant, Content: "本 Run 的工具前回复", RunID: &runID, CreatedAt: triggerAt.Add(3 * time.Second)},
+		{ID: uuid.New(), Role: MessageTool, Content: "本 Run 的工具结果", RunID: &runID, CreatedAt: triggerAt.Add(4 * time.Second)},
+	}
+	run := Run{ID: runID, TriggerMessageID: &triggerID, TriggerMessageAt: &triggerAt}
+	bounded := boundHistoryByTrigger(run, history)
+	if len(bounded) != 5 {
+		t.Fatalf("bounded history len = %d, want 5", len(bounded))
+	}
+	for _, message := range bounded {
+		if message.ID == history[3].ID || message.ID == history[4].ID {
+			t.Fatalf("later run message leaked into history: %q", message.Content)
+		}
+	}
+	if bounded[2].ID != triggerID {
+		t.Fatalf("trigger message is not the last input: %#v", bounded[2])
+	}
+
+	// 触发消息滑出窗口时按时间裁剪，仍保留本 Run 的产物。
+	run.TriggerMessageID = nil
+	bounded = boundHistoryByTrigger(run, history)
+	if !hasUserMessage(bounded) {
+		t.Fatalf("time-bounded history lost user input: %#v", bounded)
+	}
+	for _, message := range bounded {
+		if message.ID == history[3].ID || message.ID == history[4].ID {
+			t.Fatalf("later run message leaked into time-bounded history: %q", message.Content)
+		}
+	}
+
+	// 没有触发边界的历史保持原样，兼容历史 Run。
+	unbounded := boundHistoryByTrigger(Run{ID: runID}, history)
+	if len(unbounded) != len(history) {
+		t.Fatalf("unbounded history len = %d, want %d", len(unbounded), len(history))
 	}
 }

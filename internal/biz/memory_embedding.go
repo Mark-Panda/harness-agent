@@ -158,8 +158,10 @@ func writeVersions(ctx context.Context, indexes EmbeddingIndexRepository) ([]str
 }
 
 // embeddableRole 判断消息是否值得进入长期记忆。
+// 只索引用户输入：助手回复由模型生成，缺少新的用户意图与事实，
+// 入库后会在语义检索中大量召回同质内容，反而稀释真正有价值的用户记忆。
 func embeddableRole(role MessageRole) bool {
-	return role == MessageUser || role == MessageAssistant
+	return role == MessageUser
 }
 
 // LLMEmbeddingGenerator 使用索引声明的供应商与模型生成向量。

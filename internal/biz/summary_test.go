@@ -105,6 +105,8 @@ type fakeSummaryGenerator struct {
 	previous   string
 	messages   []biz.Message
 	calls      int
+	started    chan struct{}
+	release    chan struct{}
 }
 
 // Summarize 记录调用参数并返回预置结果。
@@ -112,18 +114,26 @@ func (f *fakeSummaryGenerator) Summarize(_ context.Context, _, _ uuid.UUID, prev
 	f.calls++
 	f.previous = previous
 	f.messages = messages
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.release != nil {
+		<-f.release
+	}
 	return f.generation, f.err
 }
 
 // fakeSummaryJobs 是摘要 Worker 使用的任务队列内存实现。
 type fakeSummaryJobs struct {
-	job       biz.Job
-	claimed   bool
-	completed int
-	failed    int
-	renewed   int
-	released  int
-	claimErr  error
+	job          biz.Job
+	claimed      bool
+	completed    int
+	failed       int
+	renewed      int
+	released     int
+	claimErr     error
+	renewBlocks  bool
+	renewStarted chan struct{}
 }
 
 // EnqueueRun 未被摘要 Worker 使用。
@@ -143,9 +153,16 @@ func (f *fakeSummaryJobs) Claim(context.Context, string, string, time.Duration, 
 	return f.job, true, nil
 }
 
-// Renew 记录续约。
-func (f *fakeSummaryJobs) Renew(context.Context, uuid.UUID, string, int64, time.Duration, time.Time) error {
+// Renew 记录续约；renewBlocks 为真时模拟在途续约，直到上下文取消才返回。
+func (f *fakeSummaryJobs) Renew(ctx context.Context, _ uuid.UUID, _ string, _ int64, _ time.Duration, _ time.Time) error {
 	f.renewed++
+	if f.renewBlocks {
+		if f.renewStarted != nil {
+			close(f.renewStarted)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -352,6 +369,56 @@ func TestSummaryWorkerCreatesVersion(t *testing.T) {
 	saved := repository.saved[0]
 	if saved.Version != 1 || saved.SourceEndMessageID == nil || *saved.SourceEndMessageID != message.ID {
 		t.Fatalf("saved summary = %#v", saved)
+	}
+}
+
+// TestSummaryWorkerIgnoresCanceledRenewAfterGeneration 验证主流程结束时的主动取消不会被误判为丢租约。
+func TestSummaryWorkerIgnoresCanceledRenewAfterGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	message := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Now().UTC()}
+	task := biz.SummaryTask{
+		UserID: uuid.New(), SessionID: uuid.New(),
+		SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+		EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
+	}
+	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+	renewStarted, generatorStarted, generatorRelease := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	jobs := &fakeSummaryJobs{job: job, renewBlocks: true, renewStarted: renewStarted}
+	repository := &fakeSummaryRepository{latest: 0, applied: true}
+	reader := &fakeSummaryReader{byIDs: []biz.Message{message}}
+	generator := &fakeSummaryGenerator{
+		generation: biz.SummaryGeneration{Text: "摘要正文"}, started: generatorStarted, release: generatorRelease,
+	}
+	sessions := mocks.NewMockSessionRepository(ctrl)
+	sessions.EXPECT().GetSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Session{Status: biz.SessionActive}, nil).AnyTimes()
+	worker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
+		Jobs: jobs, Sessions: sessions, Messages: reader, Summaries: repository, Generator: generator,
+	}, biz.SummaryWorkerConfig{WorkerID: "summary-lease-test", Heartbeat: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := worker.ProcessOne(context.Background()); err != nil {
+			t.Errorf("process summary: %v", err)
+		}
+	}()
+	waitSignal := func(signal chan struct{}, name string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not start", name)
+		}
+	}
+	waitSignal(generatorStarted, "summary generation")
+	// 等待心跳进入在途续约，再让生成返回并触发主流程 cancel。
+	waitSignal(renewStarted, "lease renewal")
+	close(generatorRelease)
+	waitSignal(done, "summary worker")
+	if jobs.completed != 1 || len(repository.saved) != 1 {
+		t.Fatalf("completed=%d saved=%d", jobs.completed, len(repository.saved))
 	}
 }
 

@@ -423,9 +423,17 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		memoryRetriever, err = biz.NewMemoryRetriever(memoryRepository, memoryRepository, embeddingGenerator, biz.MemoryRetrieverConfig{
+		var reranker biz.Reranker
+		if cfg.Agent.Memory.Vector.RerankEnabled {
+			reranker, err = biz.NewLLMReranker(catalogRepository, memoryRepository, credentialKeys, cfg.Agent.Memory.Vector.EmbeddingTimeout.Duration)
+			if err != nil {
+				return err
+			}
+		}
+		memoryRetriever, err = biz.NewMemoryRetriever(memoryRepository, memoryRepository, embeddingGenerator, reranker, biz.MemoryRetrieverConfig{
 			TopK: cfg.Agent.Memory.Vector.RetrieverTopK, MMRTop: cfg.Agent.Memory.Vector.MMRTop,
 			Lambda: cfg.Agent.Memory.Vector.MMRLambda, MinSimilarity: cfg.Agent.Memory.Vector.MinSimilarity,
+			RerankEnabled: cfg.Agent.Memory.Vector.RerankEnabled,
 		}, slog.Default())
 		if err != nil {
 			return err
@@ -471,7 +479,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	runRepository := data.NewRunRepository(appDB)
+	// Run 事件通知总线：事件写入后即时唤醒 SSE；Redis 异常时由 SSE 兜底轮询覆盖。
+	runEventBus := data.NewRunEventBus(redisClient)
+	defer runEventBus.Close()
+	server.SetRunEventStream(runEventBus)
+	runRepository := data.NewRunRepository(appDB, data.WithRunEventNotifier(runEventBus))
+	// MCP 客户端与工具清单缓存：跨 Run 复用连接与发现结果，避免每次执行重复握手。
+	mcpClientCache := mcp.NewClientCache(0)
 	stepRepository := data.NewExecutionStepRepository(appDB)
 	approvalRepository := data.NewToolApprovalRepository(appDB)
 	budgetService, err := biz.NewBudgetService(data.NewBudgetRepository(appDB), biz.BudgetPolicy{
@@ -755,6 +769,7 @@ func run() error {
 			Providers:       catalogRepository, Opener: credentialKeys,
 			Attempts: data.NewModelCallRepository(appDB), Steps: stepRepository,
 			Approvals: approvalRepository, Plans: data.NewPlanRepository(appDB), SupervisorTasks: data.NewSupervisorTaskRepository(appDB), Budgets: budgetService, HotMessages: hotMessages, MCPs: catalogRepository,
+			MCPCache:  mcpClientCache,
 			Summaries: summaryRepository, SummaryTrigger: summaryPlanner,
 			Memory: memoryRetriever, MemoryTrigger: memoryIndexer,
 			Facts: factService, FactTrigger: factIndexer,
@@ -773,10 +788,14 @@ func run() error {
 			ReactMaxTotalTokens:       cfg.Agent.Worker.ReactMaxTotalTokens,
 			ReactMaxCost:              cfg.Agent.Worker.ReactMaxCost,
 			SupervisorMaxTokens:       cfg.Agent.Worker.SupervisorMaxTokens,
+			SupervisorMaxCost:         cfg.Agent.Worker.SupervisorMaxCost,
 			MCPTimeout:                cfg.Agent.Worker.MCPTimeout.Duration,
 			MCPAllowPrivateNetwork:    cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 			ApprovalPoll:              cfg.Agent.Worker.ApprovalPoll.Duration,
 			PromptTokenBudget:         int(cfg.Agent.ModelRouting.MaxPromptTokens),
+			ReserveOutputTokens:       int(cfg.Agent.ModelRouting.ReserveOutputTokens),
+			SafetyMarginTokens:        int(cfg.Agent.ModelRouting.SafetyMarginTokens),
+			HistoryLimit:              cfg.Agent.Memory.HotWindowMessages,
 			Routing: model.RouterConfig{
 				MinContextTokens:    cfg.Agent.ModelRouting.MinContextTokens,
 				MaxAttemptsPerModel: cfg.Agent.ModelRouting.MaxAttemptsPerModel,

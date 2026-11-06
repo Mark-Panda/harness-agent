@@ -104,6 +104,8 @@ type Message struct {
 	ExternalMessageID string
 	// SpeakerOpenID 飞书群聊发言人 open_id，单聊为空。
 	SpeakerOpenID string
+	// RunID 产生该消息的 Run ID；用户消息为空。
+	RunID *uuid.UUID
 	// CreatedAt 创建时间（UTC）。
 	CreatedAt time.Time
 }

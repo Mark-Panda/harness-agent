@@ -343,24 +343,23 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		Content: text, ExternalMessageID: messageEvent.MessageID, SpeakerOpenID: messageEvent.SenderOpenID,
 		CreatedAt: occurredAt,
 	}
-	_, created, err := w.messages.AppendInbound(ctx, inbound, mutationEvent(binding.UserID, "message.created", "message", uuid.New()))
+	stored, created, err := w.messages.AppendInbound(ctx, inbound, mutationEvent(binding.UserID, "message.created", "message", uuid.New()))
 	if err != nil {
 		return "", err
 	}
-	if !created {
-		// 飞书重推同一消息时，消息已存在即视为处理成功，不重复创建 Run。
-		return FeishuEventProcessed, nil
-	}
+	// 飞书重推同一消息时消息已存在，但首次处理可能在上一步之后失败；此处不能提前返回，
+	// 否则消息落库成功而 Run 创建失败的事件会被永久丢弃。Run 与外发记录都按幂等键去重。
 	// 入站消息只写 PostgreSQL；必须清理 Redis 热窗口，否则下一次 Run 会命中旧缓存而看不到本轮问题。
 	// 冷缓存或 Redis 重启后，清理也能让下一次 Run 从数据库重建完整历史。
+	// 重推事件同样需要清理：上次处理可能停在清理之前，缓存里仍是旧窗口。
 	if w.hotMessages != nil {
 		if err := w.hotMessages.Invalidate(ctx, binding.UserID, session.ID); err != nil {
 			w.logger.Warn("invalidate hot messages after inbound failed", "session_id", session.ID, "error", err)
 		}
 	}
-	// 群聊话题中个人事实只写入发言人私有记忆：消息归属会话所有者，但提取与写入身份切换为发言人本人。
-	// 失败不影响回复链路，仅记录日志等待下一轮重试。
-	if messageEvent.ChatType == feishu.ChatTypeGroup && w.speakerFacts != nil {
+	if created && messageEvent.ChatType == feishu.ChatTypeGroup && w.speakerFacts != nil {
+		// 群聊话题中个人事实只写入发言人私有记忆：消息归属会话所有者，但提取与写入身份切换为发言人本人。
+		// 失败不影响回复链路，仅记录日志等待下一轮重试。
 		if err := w.speakerFacts.MaybeEnqueueSpeaker(ctx, binding.UserID, session.ID, identity.UserID, messageEvent.SenderOpenID); err != nil {
 			w.logger.Warn("enqueue speaker fact extraction failed", "session_id", session.ID, "speaker_open_id", messageEvent.SenderOpenID, "error", err)
 		}
@@ -382,6 +381,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	run, err := w.runs.Create(ctx, principal, CreateRunInput{
 		SessionID: session.ID, AgentID: routeAgentID, AgentVersion: routeAgentVersion,
 		Mode: routeMode, IdempotencyKey: "feishu:" + messageEvent.MessageID,
+		TriggerMessageID: &stored.ID,
 	})
 	if err != nil {
 		return "", err

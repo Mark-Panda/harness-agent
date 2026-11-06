@@ -289,9 +289,14 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 	})
 	worker.config.SupervisorMaxTokens = 1
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
-	if _, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
-		[]react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{}); !errors.Is(err, ErrSupervisorBudget) {
-		t.Fatalf("budget error = %v", err)
+	result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{})
+	// 预算耗尽但已有 Worker 产出时降级为部分结果，而不是整体失败。
+	if err != nil {
+		t.Fatalf("budget degradation error = %v", err)
+	}
+	if !strings.Contains(result.Content, "结果") {
+		t.Fatalf("partial result content = %q", result.Content)
 	}
 }
 

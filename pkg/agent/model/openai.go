@@ -2,6 +2,7 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,7 +68,7 @@ type ModelRef struct {
 	ModelID string
 	// RemoteModelName 供应商侧模型名。
 	RemoteModelName string
-	// ContextWindowTokens 上下文窗口，生成类必须大于等于 1M。
+	// ContextWindowTokens 上下文窗口；零表示策略未声明，此时不做事前硬性拒绝。
 	ContextWindowTokens int64
 	// MaxOutputTokens 最大输出 Token 数。
 	MaxOutputTokens int
@@ -245,32 +247,63 @@ func (c *Client) Models(ctx context.Context) ([]RemoteModel, error) {
 	return models, nil
 }
 
-// EstimateTokens 使用字符数的保守估算（约 4 字节/Tokens），用于调用前上下文预算。
+// EstimateTextTokens 以保守口径估算文本 Token：ASCII 字符约 4 字符/Token，
+// 非 ASCII（如中文）按 1 字符/Token 计算，避免按字节估算时低估中文输入。
+func EstimateTextTokens(text string) int64 {
+	var ascii, nonASCII int64
+	for _, r := range text {
+		if r < 128 {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	return (ascii+3)/4 + nonASCII
+}
+
+// EstimateTokens 估算消息 Token（不含工具定义）；usage 缺失时的回退口径。
 func EstimateTokens(messages []ChatMessage) int64 {
-	total := 0
+	return EstimateRequestTokens(messages, nil)
+}
+
+// EstimateRequestTokens 估算完整请求的输入 Token，包含消息、工具调用参数与工具定义，
+// 用于调用前的上下文窗口校验与候选模型筛选。
+func EstimateRequestTokens(messages []ChatMessage, tools []ToolDefinition) int64 {
+	total := int64(len(messages) * 4)
 	for _, message := range messages {
-		total += len(message.Content) + len(message.ToolCallID) + len(message.Role)
+		total += EstimateTextTokens(message.Content) + EstimateTextTokens(message.ToolCallID) + EstimateTextTokens(message.Role)
+		for _, call := range message.ToolCalls {
+			total += EstimateTextTokens(call.Function.Name) + EstimateTextTokens(call.Function.Arguments)
+		}
 	}
-	if total == 0 {
-		return 0
+	for _, tool := range tools {
+		parameters := string(tool.Parameters)
+		total += 4 + EstimateTextTokens(tool.Name) + EstimateTextTokens(tool.Description) + EstimateTextTokens(parameters)
 	}
-	return int64((total+3)/4 + len(messages)*4)
+	return total
 }
 
 // Chat 执行一次非流式调用；调用前校验上下文与能力，错误按可重试性分类且不泄露凭证。
 func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, error) {
-	if request.Model.ContextWindowTokens < 1_000_000 {
-		return ChatResponse{}, fmt.Errorf("%w: context window below 1M", ErrContextExceeded)
+	return c.doChat(ctx, request, nil)
+}
+
+// ChatStream 执行一次 SSE 流式调用，并在每个文本增量到达时回调 onDelta。
+// 回调为空时退化为非流式调用。
+func (c *Client) ChatStream(ctx context.Context, request ChatRequest, onDelta func(string)) (ChatResponse, error) {
+	if onDelta == nil {
+		return c.doChat(ctx, request, nil)
 	}
-	if request.Model.Stream {
-		// 流式输出由 SSE 执行层负责；此适配器只提供非流式调用，避免静默降级。
-		return ChatResponse{}, fmt.Errorf("%w: streaming requires the SSE executor", ErrCapability)
-	}
+	return c.doChat(ctx, request, onDelta)
+}
+
+// doChat 是流式与非流式调用的共享实现；onDelta 非空时启用 SSE。
+func (c *Client) doChat(ctx context.Context, request ChatRequest, onDelta func(string)) (ChatResponse, error) {
 	if len(request.Tools) > 0 && !request.Model.Tools {
 		// 工具调用能力是硬准入条件，缺少能力时必须在路由阶段切换到其他候选。
 		return ChatResponse{}, fmt.Errorf("%w: model does not support tool calls", ErrCapability)
 	}
-	inputTokens := EstimateTokens(request.Messages)
+	inputTokens := EstimateRequestTokens(request.Messages, request.Tools)
 	outputBudget := request.MaxOutputTokens
 	if outputBudget <= 0 {
 		outputBudget = request.Model.MaxOutputTokens
@@ -278,8 +311,9 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 	if outputBudget > request.Model.MaxOutputTokens {
 		outputBudget = request.Model.MaxOutputTokens
 	}
-	if inputTokens+int64(outputBudget) > request.Model.ContextWindowTokens {
-		return ChatResponse{}, fmt.Errorf("%w: estimated %d input + %d output exceeds %d", ErrContextExceeded, inputTokens, outputBudget, request.Model.ContextWindowTokens)
+	// 上下文窗口为零表示策略未声明窗口，此时不做硬性拒绝；非零时仍按保守估算校验。
+	if window := request.Model.ContextWindowTokens; window > 0 && inputTokens+int64(outputBudget) > window {
+		return ChatResponse{}, fmt.Errorf("%w: estimated %d input + %d output exceeds %d", ErrContextExceeded, inputTokens, outputBudget, window)
 	}
 
 	body := map[string]any{
@@ -303,6 +337,10 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 		body["tools"] = tools
 		body["tool_choice"] = "auto"
 	}
+	if onDelta != nil {
+		body["stream"] = true
+		body["stream_options"] = map[string]any{"include_usage": true}
+	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("%w: encode request: %v", ErrPermanent, err)
@@ -313,6 +351,9 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if onDelta != nil {
+		httpRequest.Header.Set("Accept", "text/event-stream")
+	}
 
 	response, err := c.http.Do(httpRequest)
 	if err != nil {
@@ -323,9 +364,29 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 		return ChatResponse{}, fmt.Errorf("%w: transport error: %w", ErrRetryable, err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return ChatResponse{}, c.statusError(response)
+	}
+	if onDelta != nil {
+		// 供应商可能忽略 stream 参数并直接返回 JSON；此时回退为非流式解析，
+		// 仍把完整文本作为一次增量回调，避免静默丢失回答。
+		if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+			return c.decodeStream(response, onDelta, EstimateRequestTokens(request.Messages, request.Tools))
+		}
+		result, err := c.decodeResponse(response)
+		if err == nil && result.Content != "" {
+			onDelta(result.Content)
+		}
+		return result, err
+	}
+	return c.decodeResponse(response)
+}
+
+// statusError 把供应商非 2xx 响应转换为可路由的结构化错误。
+func (c *Client) statusError(response *http.Response) error {
 	if response.StatusCode == http.StatusTooManyRequests {
 		// 保留 Retry-After 供路由层判断等待是否在可接受预算内。
-		return ChatResponse{}, &ResponseError{
+		return &ResponseError{
 			StatusCode: response.StatusCode,
 			RetryAfter: RetryAfter(response.Header.Get("Retry-After"), 0),
 			Class:      ErrRateLimited,
@@ -333,20 +394,21 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 		}
 	}
 	if response.StatusCode >= 500 {
-		return ChatResponse{}, &ResponseError{StatusCode: response.StatusCode, Class: ErrRetryable, Message: "provider server error"}
+		return &ResponseError{StatusCode: response.StatusCode, Class: ErrRetryable, Message: "provider server error"}
 	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		// 鉴权失败表示当前 Endpoint 凭证不可用，路由层应熔断该 Endpoint 并切换其他合规供应商。
-		return ChatResponse{}, &ResponseError{
+		return &ResponseError{
 			StatusCode: response.StatusCode, Class: ErrAuthentication, Message: c.redactedError(response.Body),
 		}
 	}
-	if response.StatusCode != http.StatusOK {
-		return ChatResponse{}, &ResponseError{
-			StatusCode: response.StatusCode, Class: ErrPermanent, Message: c.redactedError(response.Body),
-		}
+	return &ResponseError{
+		StatusCode: response.StatusCode, Class: ErrPermanent, Message: c.redactedError(response.Body),
 	}
+}
 
+// decodeResponse 解析非流式响应体。
+func (c *Client) decodeResponse(response *http.Response) (ChatResponse, error) {
 	var payload struct {
 		ID      string `json:"id"`
 		Choices []struct {
@@ -383,6 +445,121 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest) (ChatResponse, e
 		result.ToolCalls = append(result.ToolCalls, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
 	}
 	return result, nil
+}
+
+// streamToolCall 累积流式响应中逐步下发的工具调用片段。
+type streamToolCall struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
+}
+
+// decodeStream 解析 OpenAI SSE 流，累计文本、工具调用与用量。
+// 读取中断时返回已收到的部分结果与错误，调用方据此避免把半截回答当作成功。
+func (c *Client) decodeStream(response *http.Response, onDelta func(string), fallbackInputTokens int64) (ChatResponse, error) {
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	var content strings.Builder
+	calls := map[int]*streamToolCall{}
+	result := ChatResponse{}
+	var readErr error
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			ID      string `json:"id"`
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// 单条损坏事件不应终止整个流；保留已解析内容继续读取。
+			continue
+		}
+		if chunk.ID != "" {
+			result.ProviderRequestID = chunk.ID
+		}
+		if chunk.Usage != nil {
+			result.InputTokens = chunk.Usage.PromptTokens
+			result.OutputTokens = chunk.Usage.CompletionTokens
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		if choice.Delta.Content != "" {
+			content.WriteString(choice.Delta.Content)
+			onDelta(choice.Delta.Content)
+		}
+		for _, call := range choice.Delta.ToolCalls {
+			item, exists := calls[call.Index]
+			if !exists {
+				item = &streamToolCall{}
+				calls[call.Index] = item
+			}
+			if call.ID != "" {
+				item.ID = call.ID
+			}
+			if call.Function.Name != "" {
+				item.Name = call.Function.Name
+			}
+			if call.Function.Arguments != "" {
+				item.Arguments.WriteString(call.Function.Arguments)
+			}
+		}
+		if choice.FinishReason != "" {
+			result.FinishReason = choice.FinishReason
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		readErr = fmt.Errorf("%w: stream read failed: %v", ErrRetryable, err)
+	}
+	result.Content = content.String()
+	if result.OutputTokens == 0 && result.Content != "" {
+		// 供应商未返回 usage 时使用保守估算，保证预算统计不会因流式而失真。
+		result.OutputTokens = int(EstimateTokens([]ChatMessage{{Role: "assistant", Content: result.Content}}))
+	}
+	if result.InputTokens == 0 && fallbackInputTokens > 0 {
+		// 流式响应常省略 usage：用请求侧估算回填输入 Token，避免预算与成本统计恒为零。
+		result.InputTokens = int(fallbackInputTokens)
+	}
+	if len(calls) > 0 {
+		indexes := make([]int, 0, len(calls))
+		for index := range calls {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		result.ToolCalls = make([]ToolCall, 0, len(calls))
+		for _, index := range indexes {
+			item := calls[index]
+			result.ToolCalls = append(result.ToolCalls, ToolCall{ID: item.ID, Name: item.Name, Arguments: item.Arguments.String()})
+		}
+	}
+	return result, readErr
 }
 
 // redactedError 读取并截断供应商错误体，防止超长内容或回显敏感信息进入日志。

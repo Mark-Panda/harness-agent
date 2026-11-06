@@ -342,7 +342,8 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 func (w *FeishuReplyWorker) render(ctx context.Context, run Run) (bool, string, string) {
 	switch run.Status {
 	case RunCompleted:
-		message, err := w.outbound.LatestAssistantMessage(ctx, run.UserID, run.SessionID)
+		runID := run.ID
+		message, err := w.outbound.LatestAssistantMessage(ctx, run.UserID, run.SessionID, &runID)
 		if err != nil || strings.TrimSpace(message.Content) == "" {
 			return true, "执行完成", "任务已执行完成，但没有生成可展示的回复。"
 		}
@@ -362,7 +363,9 @@ func (w *FeishuReplyWorker) render(ctx context.Context, run Run) (bool, string, 
 
 // waitRun 在 Run 未结束时发送或增量更新占位卡片，并延后再次检查。
 func (w *FeishuReplyWorker) waitRun(ctx context.Context, outbound FeishuOutbound, run Run, title, text string) {
-	if w.clock().Sub(outbound.CreatedAt) > w.config.RunWaitTimeout {
+	// 等待人工审批是外部输入决定的暂停，不适用于执行超时：
+	// 若按 RunWaitTimeout 结束外发，审批通过后的最终答案将无法再推送。
+	if run.Status != RunWaitingApproval && w.clock().Sub(outbound.CreatedAt) > w.config.RunWaitTimeout {
 		final := "任务执行超时，请稍后在 Web 端查看结果。"
 		if err := w.sendOrUpdate(ctx, outbound, "执行超时", final); err != nil {
 			w.failOutbound(ctx, outbound, err)

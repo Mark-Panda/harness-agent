@@ -85,6 +85,8 @@ type messageModel struct {
 	ExternalMessageID string
 	// SpeakerOpenID 飞书群聊发言人 open_id。
 	SpeakerOpenID string
+	// RunID 产生该消息的 Run ID；用户消息为空。
+	RunID *uuid.UUID `gorm:"type:uuid"`
 	// CreatedAt 创建时间。
 	CreatedAt time.Time
 }
@@ -240,7 +242,7 @@ func (r *SessionRepository) AppendMessage(ctx context.Context, message biz.Messa
 		ID: message.ID, SessionID: message.SessionID, UserID: message.UserID, Role: string(message.Role), Content: message.Content,
 		ToolCalls: datatypes.JSON(toolCalls), ToolCallID: message.ToolCallID, ToolName: message.ToolName,
 		TokenCount: message.TokenCount, ExternalMessageID: message.ExternalMessageID,
-		SpeakerOpenID: message.SpeakerOpenID, CreatedAt: now,
+		SpeakerOpenID: message.SpeakerOpenID, RunID: message.RunID, CreatedAt: now,
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: message.UserID}, func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
@@ -282,7 +284,7 @@ func (r *SessionRepository) AppendMessageIdempotent(ctx context.Context, message
 		ID: message.ID, SessionID: message.SessionID, UserID: message.UserID, Role: string(message.Role),
 		Content: message.Content, ToolCalls: datatypes.JSON(toolCalls), ToolCallID: message.ToolCallID,
 		ToolName: message.ToolName, TokenCount: message.TokenCount,
-		ExternalMessageID: message.ExternalMessageID, SpeakerOpenID: message.SpeakerOpenID, CreatedAt: now,
+		ExternalMessageID: message.ExternalMessageID, SpeakerOpenID: message.SpeakerOpenID, RunID: message.RunID, CreatedAt: now,
 	}
 	var existing messageModel
 	err = WithScope(ctx, r.db, Scope{UserID: message.UserID}, func(tx *gorm.DB) error {
@@ -399,7 +401,7 @@ func toBizMessage(record messageModel) (biz.Message, error) {
 		ID: record.ID, SessionID: record.SessionID, UserID: record.UserID, Role: biz.MessageRole(record.Role), Content: record.Content,
 		ToolCalls: toolCalls, ToolCallID: record.ToolCallID, ToolName: record.ToolName,
 		TokenCount: record.TokenCount, ExternalMessageID: record.ExternalMessageID,
-		SpeakerOpenID: record.SpeakerOpenID, CreatedAt: record.CreatedAt,
+		SpeakerOpenID: record.SpeakerOpenID, RunID: record.RunID, CreatedAt: record.CreatedAt,
 	}, nil
 }
 

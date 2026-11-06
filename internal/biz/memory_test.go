@@ -189,7 +189,7 @@ func TestMemoryRetrieverMMRSemantics(t *testing.T) {
 		{VectorID: uuid.New(), Content: "低相关", Score: 0.1, Vector: []float32{0, 1}},
 	}}
 	generator := &fakeEmbeddingGenerator{}
-	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, biz.MemoryRetrieverConfig{
+	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, nil, biz.MemoryRetrieverConfig{
 		TopK: 30, MMRTop: 2, Lambda: 0.5, MinSimilarity: 0.2,
 	}, nil)
 	if err != nil {
@@ -207,12 +207,85 @@ func TestMemoryRetrieverMMRSemantics(t *testing.T) {
 	}
 }
 
+// fakeReranker 是 rerank 的测试替身，记录查询与候选文本。
+type fakeReranker struct {
+	scores    []float64
+	err       error
+	calls     int
+	query     string
+	documents []string
+}
+
+// Rerank 返回预置分数或错误。
+func (f *fakeReranker) Rerank(_ context.Context, query string, documents []string) ([]float64, error) {
+	f.calls++
+	f.query = query
+	f.documents = append([]string(nil), documents...)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.scores, nil
+}
+
+// TestMemoryRetrieverReranksBeforeMMR 验证 rerank 分数在多路召回后、MMR 之前生效。
+func TestMemoryRetrieverReranksBeforeMMR(t *testing.T) {
+	index := activeMemoryIndex()
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{index}}
+	vectors := &fakeMemoryVectors{matches: []biz.MemoryMatch{
+		{VectorID: uuid.New(), Content: "向量最高", Score: 0.95, Vector: []float32{1, 0}},
+		{VectorID: uuid.New(), Content: "重排最高", Score: 0.6, Vector: []float32{0, 1}},
+	}}
+	generator := &fakeEmbeddingGenerator{vectors: [][]float32{makeEmbedding(biz.EmbeddingDimension, 0.1)}}
+	reranker := &fakeReranker{scores: []float64{0.3, 0.9}}
+	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, reranker, biz.MemoryRetrieverConfig{
+		TopK: 30, MMRTop: 1, Lambda: 1, MinSimilarity: 0.2, RerankEnabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := retriever.Retrieve(context.Background(), uuid.New(), uuid.New(), "查询")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Content != "重排最高" {
+		t.Fatalf("rerank did not reorder matches: %#v", matches)
+	}
+	if reranker.calls != 1 || reranker.query != "查询" || len(reranker.documents) != 2 || reranker.documents[1] != "重排最高" {
+		t.Fatalf("rerank inputs = %#v", reranker)
+	}
+}
+
+// TestMemoryRetrieverFallsBackWhenRerankFails 验证 rerank 失败时保留向量分数继续检索。
+func TestMemoryRetrieverFallsBackWhenRerankFails(t *testing.T) {
+	index := activeMemoryIndex()
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{index}}
+	vectors := &fakeMemoryVectors{matches: []biz.MemoryMatch{
+		{VectorID: uuid.New(), Content: "向量最高", Score: 0.95, Vector: []float32{1, 0}},
+		{VectorID: uuid.New(), Content: "向量较低", Score: 0.6, Vector: []float32{0, 1}},
+	}}
+	generator := &fakeEmbeddingGenerator{vectors: [][]float32{makeEmbedding(biz.EmbeddingDimension, 0.1)}}
+	reranker := &fakeReranker{err: biz.ErrRerankModelUnavailable}
+	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, reranker, biz.MemoryRetrieverConfig{
+		TopK: 30, MMRTop: 1, Lambda: 1, MinSimilarity: 0.2, RerankEnabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := retriever.Retrieve(context.Background(), uuid.New(), uuid.New(), "查询")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Content != "向量最高" {
+		t.Fatalf("rerank fallback failed: %#v", matches)
+	}
+}
+
 // TestMemoryRetrieverSkipsWithoutActiveIndex 验证无 active 索引或空查询时不调用模型。
 func TestMemoryRetrieverSkipsWithoutActiveIndex(t *testing.T) {
 	generator := &fakeEmbeddingGenerator{}
 	retriever, err := biz.NewMemoryRetriever(&fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{{
 		Version: "staging", Status: biz.EmbeddingIndexStaging, Dimension: biz.EmbeddingDimension,
-	}}}, &fakeMemoryVectors{}, generator, biz.MemoryRetrieverConfig{}, nil)
+	}}}, &fakeMemoryVectors{}, generator, nil, biz.MemoryRetrieverConfig{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +296,7 @@ func TestMemoryRetrieverSkipsWithoutActiveIndex(t *testing.T) {
 	if _, err := retriever.Retrieve(context.Background(), uuid.Nil, uuid.New(), "查询"); err != nil {
 		t.Fatalf("nil user error = %v", err)
 	}
-	if _, err := biz.NewMemoryRetriever(nil, nil, nil, biz.MemoryRetrieverConfig{}, nil); !errors.Is(err, biz.ErrInvalidConfig) {
+	if _, err := biz.NewMemoryRetriever(nil, nil, nil, nil, biz.MemoryRetrieverConfig{}, nil); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("constructor error = %v", err)
 	}
 }
@@ -236,6 +309,7 @@ func TestMemoryIndexerUsesDualWriteVersions(t *testing.T) {
 		{ID: uuid.New(), Version: "v2", Status: biz.EmbeddingIndexStaging, DualWrite: true, Dimension: biz.EmbeddingDimension},
 		{ID: uuid.New(), Version: "v3", Status: biz.EmbeddingIndexStaging, DualWrite: false, Dimension: biz.EmbeddingDimension},
 	}}
+	// 只索引用户输入：助手回复与工具输出不进入长期记忆。
 	reader := &fakeSummaryReader{recent: []biz.Message{
 		{ID: uuid.New(), Role: biz.MessageUser, Content: "问题"},
 		{ID: uuid.New(), Role: biz.MessageTool, Content: "工具输出"},
@@ -253,7 +327,7 @@ func TestMemoryIndexerUsesDualWriteVersions(t *testing.T) {
 		t.Fatalf("tasks = %#v", queue.tasks)
 	}
 	task := queue.tasks[0]
-	if len(task.MessageIDs) != 2 || len(task.Versions) != 2 {
+	if len(task.MessageIDs) != 1 || len(task.Versions) != 2 {
 		t.Fatalf("task = %#v", task)
 	}
 	if task.Versions[0] != "v1" || task.Versions[1] != "v2" {

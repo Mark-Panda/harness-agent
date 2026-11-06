@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/service/mocks"
@@ -22,11 +23,19 @@ func TestRunServiceCreateAndValidation(t *testing.T) {
 	}
 	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
 	sessionID := uuid.New()
+	triggerMessageID := uuid.New()
+	triggerAt := time.Now().UTC()
 	sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).Return(biz.Session{ID: sessionID, UserID: principal.UserID, Status: biz.SessionActive}, nil)
+	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").Return(
+		biz.Page[biz.Message]{Items: []biz.Message{{ID: triggerMessageID, Role: biz.MessageUser, CreatedAt: triggerAt}}}, nil,
+	)
 	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, run biz.Run) (biz.Run, error) {
 			if run.Status != biz.RunQueued || run.Mode != biz.AgentModeReact || run.DeadlineAt == nil {
 				t.Fatalf("invalid run defaults: %#v", run)
+			}
+			if run.TriggerMessageID == nil || *run.TriggerMessageID != triggerMessageID || run.TriggerMessageAt == nil {
+				t.Fatalf("trigger message boundary was not frozen: %#v", run)
 			}
 			return run, nil
 		},
@@ -174,5 +183,26 @@ func TestRunServiceListModelCalls(t *testing.T) {
 	empty, err := noCalls.ListModelCalls(context.Background(), principal, runID)
 	if err != nil || len(empty) != 0 {
 		t.Fatalf("empty ListModelCalls() = %#v, %v", empty, err)
+	}
+}
+
+// TestRunServiceStatus 验证轻量状态查询的匿名拒绝与用户隔离。
+func TestRunServiceStatus(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	runRepo := mocks.NewMockRunRepository(ctrl)
+	sessionRepo := mocks.NewMockSessionRepository(ctrl)
+	service, err := biz.NewRunService(runRepo, sessionRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID := uuid.New()
+	if _, err := service.Status(context.Background(), biz.Principal{}, runID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("anonymous status error = %v", err)
+	}
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	runRepo.EXPECT().GetRunStatus(gomock.Any(), principal.UserID, runID).Return(biz.RunCompleted, nil)
+	status, err := service.Status(context.Background(), principal, runID)
+	if err != nil || status != biz.RunCompleted {
+		t.Fatalf("Status() = %q, %v", status, err)
 	}
 }

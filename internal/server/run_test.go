@@ -39,17 +39,25 @@ func TestRunAPIAuthenticationAndCancellation(t *testing.T) {
 	}
 
 	sessionID := uuid.New()
+	triggerMessageID := uuid.New()
 	sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).Return(biz.Session{ID: sessionID, Status: biz.SessionActive}, nil)
+	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").Return(
+		biz.Page[biz.Message]{Items: []biz.Message{{ID: triggerMessageID, Role: biz.MessageUser, CreatedAt: time.Now().UTC()}}}, nil,
+	)
 	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, run biz.Run) (biz.Run, error) {
 			if run.UserID != principal.UserID || run.Status != biz.RunQueued || run.SessionID != sessionID {
 				t.Fatalf("invalid run created from API: %#v", run)
 			}
+			if run.TriggerMessageID == nil || *run.TriggerMessageID != triggerMessageID {
+				t.Fatalf("trigger message was not bound from API: %#v", run)
+			}
 			return run, nil
 		},
 	)
 	recorder = httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+sessionID.String()+"/runs", strings.NewReader(`{"mode":"react"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+sessionID.String()+"/runs",
+		strings.NewReader(`{"mode":"react","trigger_message_id":"`+triggerMessageID.String()+`"}`))
 	request.Header.Set("Authorization", "Bearer access")
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusCreated || !strings.Contains(recorder.Body.String(), "queued") {
@@ -86,8 +94,12 @@ func TestRunEventStreamReplayAndTerminalClose(t *testing.T) {
 	handler := NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, auth, nil, platform)
 	runID := uuid.New()
 
-	// GetRun 同时用于归属校验与终态轮询；返回终态但仅当事件为空时关闭流。
+	// GetRun 供建立流前的归属校验与 ListEvents 内部归属校验使用；循环内状态判断使用轻量查询。
 	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, Status: biz.RunCompleted}, nil).AnyTimes()
+	runRepo.EXPECT().GetRunStatus(gomock.Any(), principal.UserID, runID).Return(biz.RunCompleted, nil).AnyTimes()
+	// 注入即时通知源，验证通知驱动路径无需等待兜底轮询。
+	SetRunEventStream(immediateRunEventStream{})
+	t.Cleanup(func() { SetRunEventStream(nil) })
 	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(2), 200).Return([]biz.RunEvent{
 		{RunID: runID, Seq: 3, EventType: "message.delta", Payload: map[string]any{"text": "hi"}},
 	}, nil)

@@ -260,8 +260,8 @@ type FeishuOutboundStore interface {
 	CompleteOutbound(ctx context.Context, id uuid.UUID, now time.Time) error
 	// FailOutbound 记录失败并在预算内重试，超出预算进入死信。
 	FailOutbound(ctx context.Context, id uuid.UUID, reason string, retryAt, now time.Time) error
-	// LatestAssistantMessage 读取会话最近一条助手消息，用于生成最终回复。
-	LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID) (Message, error)
+	// LatestAssistantMessage 读取指定 Run 产生的助手消息，用于生成最终回复；runID 为空时退回会话最近一条。
+	LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID, runID *uuid.UUID) (Message, error)
 }
 
 // FeishuThreadedMessage 复用飞书客户端的话题回复结果，避免在 Biz 层重复定义结构。

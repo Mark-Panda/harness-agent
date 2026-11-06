@@ -60,19 +60,13 @@ func TestChatSuccessAndToolCalls(t *testing.T) {
 	}
 }
 
-// TestChatRejectsContextAndStreaming 验证 1M+ 硬准入与流式请求不被静默降级。
-func TestChatRejectsContextAndStreaming(t *testing.T) {
+// TestChatContextBudgetOverflow 验证窗口内预算溢出会被拒绝，避免供应商侧 400。
+func TestChatContextBudgetOverflow(t *testing.T) {
 	client, err := NewClient("https://models.example.com", "secret-key", time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Chat(context.Background(), ChatRequest{Model: ModelRef{ContextWindowTokens: 128_000}}); !errors.Is(err, ErrContextExceeded) {
-		t.Fatalf("low context error = %v", err)
-	}
-	if _, err := client.Chat(context.Background(), ChatRequest{Model: ModelRef{ContextWindowTokens: 1_000_000, Stream: true}}); !errors.Is(err, ErrCapability) {
-		t.Fatalf("streaming error = %v", err)
-	}
-	// 估算输入加上输出预算超过窗口时必须拒绝，避免供应商侧 400。
+	// 估算输入加上输出预算超过窗口时必须拒绝。
 	longMessages := []ChatMessage{{Role: "user", Content: strings.Repeat("x", 4_000_000)}}
 	_, err = client.Chat(context.Background(), ChatRequest{
 		Model:    ModelRef{ContextWindowTokens: 1_000_000, MaxOutputTokens: 100},
@@ -80,6 +74,70 @@ func TestChatRejectsContextAndStreaming(t *testing.T) {
 	})
 	if !errors.Is(err, ErrContextExceeded) {
 		t.Fatalf("budget overflow error = %v", err)
+	}
+}
+
+// TestChatStreamParsesSSE 验证流式请求携带 stream 参数，并正确累计文本、工具调用与用量。
+func TestChatStreamParsesSSE(t *testing.T) {
+	var sawStream bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		sawStream = payload["stream"] == true
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"req-s\",\"choices\":[{\"delta\":{\"content\":\"你\"},\"finish_reason\":\"\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret-key", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []string
+	response, err := client.ChatStream(context.Background(), ChatRequest{
+		Model: ModelRef{ContextWindowTokens: 1_000_000, MaxOutputTokens: 100, Stream: true},
+	}, func(delta string) { deltas = append(deltas, delta) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawStream {
+		t.Fatalf("stream flag was not sent")
+	}
+	if response.Content != "你好" || len(deltas) != 2 || deltas[0] != "你" || deltas[1] != "好" {
+		t.Fatalf("stream content = %q deltas = %#v", response.Content, deltas)
+	}
+	if response.InputTokens != 5 || response.OutputTokens != 2 || response.FinishReason != "stop" {
+		t.Fatalf("stream usage = %#v", response)
+	}
+}
+
+// TestChatStreamEstimatesUsageWhenMissing 验证流式响应省略 usage 时按请求内容回填输入 Token，
+// 避免预算与成本统计因供应商不返回用量而恒为零。
+func TestChatStreamEstimatesUsageWhenMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret-key", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.ChatStream(context.Background(), ChatRequest{
+		Model:    ModelRef{ContextWindowTokens: 1_000_000, MaxOutputTokens: 100, Stream: true},
+		Messages: []ChatMessage{{Role: "system", Content: "you are helpful"}, {Role: "user", Content: "explain vector search"}},
+	}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.InputTokens <= 0 {
+		t.Fatalf("estimated input tokens = %d", response.InputTokens)
+	}
+	if response.OutputTokens <= 0 {
+		t.Fatalf("estimated output tokens = %d", response.OutputTokens)
 	}
 }
 

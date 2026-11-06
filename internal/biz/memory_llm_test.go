@@ -103,6 +103,78 @@ func TestLLMEmbeddingGeneratorGuards(t *testing.T) {
 	}
 }
 
+// fakeRerankModelSource 返回固定 rerank 模型或错误。
+type fakeRerankModelSource struct {
+	providerID uuid.UUID
+	model      string
+	err        error
+}
+
+// GetEnabledRerankModel 返回预置 rerank 模型。
+func (f fakeRerankModelSource) GetEnabledRerankModel(context.Context) (uuid.UUID, string, error) {
+	return f.providerID, f.model, f.err
+}
+
+// newReranker 构造带 Mock 凭证依赖的 LLM rerank 生成器。
+func newReranker(t *testing.T, ctrl *gomock.Controller, baseURL string, providerID uuid.UUID,
+	status biz.ProviderStatus, models biz.RerankModelSource) *biz.LLMReranker {
+	t.Helper()
+	providers := mocks.NewMockProviderCredentialRepository(ctrl)
+	opener := mocks.NewMockCredentialOpener(ctrl)
+	providers.EXPECT().GetProviderCredential(gomock.Any(), providerID).
+		Return(biz.Provider{ID: providerID, Status: status, BaseURL: baseURL},
+			biz.ProviderCredential{KeyVersion: "v1", Encrypted: []byte("cipher")}, nil).AnyTimes()
+	opener.EXPECT().Open("v1", []byte("cipher")).Return([]byte("secret-key"), nil).AnyTimes()
+	reranker, err := biz.NewLLMReranker(providers, models, opener, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reranker
+}
+
+// TestLLMRerankerSuccess 验证 rerank 结果按下标映射到候选分数。
+func TestLLMRerankerSuccess(t *testing.T) {
+	providerID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rerank" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.2}]}`)
+	}))
+	defer server.Close()
+	reranker := newReranker(t, gomock.NewController(t), server.URL, providerID, biz.ProviderEnabled,
+		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
+	scores, err := reranker.Rerank(context.Background(), "查询", []string{"a", "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scores) != 2 || scores[0] != 0.2 || scores[1] != 0.9 {
+		t.Fatalf("scores = %#v", scores)
+	}
+}
+
+// TestLLMRerankerGuards 验证模型缺失、供应商停用与非法输入。
+func TestLLMRerankerGuards(t *testing.T) {
+	providerID := uuid.New()
+	reranker := newReranker(t, gomock.NewController(t), "https://example.com", providerID, biz.ProviderEnabled,
+		fakeRerankModelSource{err: errors.New("no model")})
+	if _, err := reranker.Rerank(context.Background(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
+		t.Fatalf("missing model error = %v", err)
+	}
+	reranker = newReranker(t, gomock.NewController(t), "https://example.com", providerID, biz.ProviderDisabled,
+		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
+	if _, err := reranker.Rerank(context.Background(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
+		t.Fatalf("disabled provider error = %v", err)
+	}
+	if _, err := reranker.Rerank(context.Background(), "查询", nil); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("empty documents error = %v", err)
+	}
+	if _, err := biz.NewLLMReranker(nil, nil, nil, 0); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("constructor error = %v", err)
+	}
+}
+
 // TestLLMEmbeddingGeneratorRetryable 验证供应商 5xx 保留可重试分类。
 func TestLLMEmbeddingGeneratorRetryable(t *testing.T) {
 	providerID := uuid.New()

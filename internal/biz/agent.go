@@ -65,11 +65,18 @@ type Agent struct {
 }
 
 // Skill 是平台级 Skill 的只读摘要，用于发布时校验绑定有效性。
+// 发布时会把描述与提示词模板一并冻结进 Agent 快照，运行时按快照注入系统提示。
 type Skill struct {
 	// ID Skill 唯一标识。
 	ID uuid.UUID `json:"id"`
 	// Name Skill 名称。
 	Name string `json:"name"`
+	// Description Skill 用途说明，用于运行时提示模型何时使用该 Skill。
+	Description string `json:"description,omitempty"`
+	// PromptTemplate Skill 提示词模板，发布后固化，运行中不随平台配置变化。
+	PromptTemplate string `json:"prompt_template,omitempty"`
+	// Parameters Skill 参数定义 JSON Schema，发布时一并冻结并注入运行时提示。
+	Parameters map[string]any `json:"parameters,omitempty"`
 	// Status Skill 状态，发布 Agent 只能绑定 published。
 	Status string `json:"status"`
 }

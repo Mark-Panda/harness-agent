@@ -243,9 +243,23 @@ func NewRouter(candidates []Candidate, health HealthStore, config RouterConfig, 
 
 // Complete 实现 react.Model：执行一次带重试与受控切换的模型调用。
 func (r *Router) Complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec) (react.Completion, error) {
+	return r.complete(ctx, messages, tools, nil)
+}
+
+// CompleteStream 实现 react.StreamingModel：以 SSE 流式执行并在增量到达时回调 onDelta。
+// 一旦已经向调用方输出过增量，失败后不再重试或切换候选，避免重复文本与工具调用。
+func (r *Router) CompleteStream(ctx context.Context, messages []react.Message, tools []react.ToolSpec, onDelta func(string)) (react.Completion, error) {
+	if onDelta == nil {
+		return r.complete(ctx, messages, tools, nil)
+	}
+	return r.complete(ctx, messages, tools, onDelta)
+}
+
+// complete 是流式与非流式调用的共享路由实现。
+func (r *Router) complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec, onDelta func(string)) (react.Completion, error) {
 	chatMessages := toChatMessages(messages)
 	definitions := toToolDefinitions(tools)
-	inputTokens := EstimateTokens(chatMessages)
+	inputTokens := EstimateRequestTokens(chatMessages, definitions)
 	requiresTools := len(definitions) > 0
 	requestHash := hashRequest(chatMessages, definitions)
 	var lastErr error
@@ -297,10 +311,24 @@ func (r *Router) Complete(ctx context.Context, messages []react.Message, tools [
 				release = acquired
 			}
 		}
-		response, callErr := client.Chat(ctx, ChatRequest{
+		chatRequest := ChatRequest{
 			Model: candidate.Ref, Messages: chatMessages, Tools: definitions,
 			Temperature: r.config.Temperature, MaxOutputTokens: outputBudget,
-		})
+		}
+		streamed := false
+		var response ChatResponse
+		var callErr error
+		if onDelta != nil {
+			response, callErr = client.ChatStream(ctx, chatRequest, func(delta string) {
+				if delta == "" {
+					return
+				}
+				streamed = true
+				onDelta(delta)
+			})
+		} else {
+			response, callErr = client.Chat(ctx, chatRequest)
+		}
 		release()
 		record.Duration = time.Since(started)
 		r.total++
@@ -341,6 +369,14 @@ func (r *Router) Complete(ctx context.Context, messages []react.Message, tools [
 		record.Status = "failed"
 		record.ErrorClass = ClassifyError(callErr)
 		record.ErrorMessage = sanitizedMessage(callErr)
+		// 已经向用户输出过增量后不能再重试或切换：重放会产生重复文本，
+		// 工具调用增量也可能已被上游消费。此处直接失败，由 Run 终态明确告知用户。
+		if streamed {
+			if err := r.finished(ctx, record); err != nil {
+				return react.Completion{}, err
+			}
+			return react.Completion{}, callErr
+		}
 		// 仅健康类故障计入熔断；400、内容审核与上下文超限属于请求问题，不能污染模型健康状态。
 		if record.ErrorClass == "retryable_failure" || record.ErrorClass == "rate_limited" ||
 			record.ErrorClass == "authentication_failed" || record.ErrorClass == "timeout" || record.ErrorClass == "unknown" {

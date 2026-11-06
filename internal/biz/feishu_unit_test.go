@@ -296,6 +296,7 @@ type feishuOutboundStub struct {
 	claimed           biz.FeishuOutbound
 	hasClaim          bool
 	assistant         biz.Message
+	lastRunID         *uuid.UUID
 	updateIDs         []string
 	cardFingerprints  []string
 	lastCardUpdatedAt time.Time
@@ -346,7 +347,8 @@ func (s *feishuOutboundStub) FailOutbound(_ context.Context, _ uuid.UUID, reason
 	return nil
 }
 
-func (s *feishuOutboundStub) LatestAssistantMessage(_ context.Context, _, _ uuid.UUID) (biz.Message, error) {
+func (s *feishuOutboundStub) LatestAssistantMessage(_ context.Context, _, _ uuid.UUID, runID *uuid.UUID) (biz.Message, error) {
+	s.lastRunID = runID
 	return s.assistant, nil
 }
 
@@ -578,9 +580,9 @@ func TestFeishuEventWorkerGroupPolicies(t *testing.T) {
 	if _, err := worker.ProcessOne(context.Background()); err != nil || runs.calls != 0 || events.statuses["evt-group"] != biz.FeishuEventIgnored {
 		t.Fatalf("untopiced group calls=%d status=%q err=%v", runs.calls, events.statuses["evt-group"], err)
 	}
-	// 重复消息已存在时视为处理成功，不重复创建 Run。
+	// 重复消息已存在时仍继续触发 Run：创建按幂等键去重，避免首次处理中途失败的消息被永久丢弃。
 	worker, events, _, runs = build(feishuMessageBody(t, feishu.ChatTypeP2P, "oc_1", "om_3", "", nil), false)
-	if _, err := worker.ProcessOne(context.Background()); err != nil || runs.calls != 0 || events.statuses["evt-group"] != biz.FeishuEventProcessed {
+	if _, err := worker.ProcessOne(context.Background()); err != nil || runs.calls != 1 || events.statuses["evt-group"] != biz.FeishuEventProcessed {
 		t.Fatalf("duplicate message calls=%d status=%q err=%v", runs.calls, events.statuses["evt-group"], err)
 	}
 }
@@ -642,13 +644,14 @@ func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 // TestFeishuReplyWorkerFinalCardAndFallback 覆盖终态卡片更新、未完成延后与文本降级。
 func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
+	runID := uuid.New()
 	outbound := &feishuOutboundStub{
-		claimed:  biz.FeishuOutbound{ID: uuid.New(), UserID: uuid.New(), RunID: uuid.New(), ChatID: "oc_1", ReplyToMessageID: "om_1", Kind: "card", Status: "sending", Attempts: 1, CreatedAt: now},
+		claimed:  biz.FeishuOutbound{ID: uuid.New(), UserID: uuid.New(), RunID: runID, ChatID: "oc_1", ReplyToMessageID: "om_1", Kind: "card", Status: "sending", Attempts: 1, CreatedAt: now},
 		hasClaim: true, assistant: biz.Message{Content: "最终答案"},
 	}
 	sender := &feishuSenderStub{cardMessageID: "om_card"}
 	worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
-		Outbound: outbound, Runs: &feishuRunsStub{run: biz.Run{Status: biz.RunCompleted, SessionID: uuid.New(), UserID: uuid.New()}}, Sender: sender,
+		Outbound: outbound, Runs: &feishuRunsStub{run: biz.Run{ID: runID, Status: biz.RunCompleted, SessionID: uuid.New(), UserID: uuid.New()}}, Sender: sender,
 		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-1"})
 	if err != nil {
@@ -656,6 +659,10 @@ func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	}
 	if claimed, err := worker.ProcessOne(context.Background()); err != nil || !claimed {
 		t.Fatalf("process one claimed=%v err=%v", claimed, err)
+	}
+	// 回复必须读取本 Run 产生的助手消息，避免并发 Run 的答案串台。
+	if outbound.lastRunID == nil || *outbound.lastRunID != runID {
+		t.Fatalf("reply read run = %v, want %s", outbound.lastRunID, runID)
 	}
 	if sender.cardCalls != 1 || outbound.completed != 1 || len(outbound.updateIDs) != 1 {
 		t.Fatalf("card calls=%d completed=%d updates=%v", sender.cardCalls, outbound.completed, outbound.updateIDs)
@@ -1480,6 +1487,19 @@ func TestFeishuReplyWorkerWaitTimeoutAndApproval(t *testing.T) {
 	}
 	if approval.sender.updateCalls != 1 || approval.outbound.deferred != 1 || approval.outbound.completed != 0 {
 		t.Fatalf("approval updates=%d deferred=%d completed=%d", approval.sender.updateCalls, approval.outbound.deferred, approval.outbound.completed)
+	}
+	// 等待审批超过 RunWaitTimeout 不得按执行超时结束外发，否则审批通过后的最终回复会丢失。
+	approvalTimeoutOutbound := biz.FeishuOutbound{
+		ID: uuid.New(), UserID: uuid.New(), RunID: uuid.New(), MessageID: "om_card",
+		ReplyToMessageID: "om_1", Status: "sending", Attempts: 1, CreatedAt: now.Add(-11 * time.Minute),
+	}
+	approvalTimeout := newFeishuReplyFixture(t, approvalTimeoutOutbound, biz.Run{Status: biz.RunWaitingApproval},
+		biz.FeishuReplyWorkerConfig{RunWaitTimeout: 10 * time.Minute})
+	if _, err := approvalTimeout.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("approval timeout process: %v", err)
+	}
+	if approvalTimeout.outbound.completed != 0 || approvalTimeout.outbound.deferred != 1 {
+		t.Fatalf("approval timeout deferred=%d completed=%d", approvalTimeout.outbound.deferred, approvalTimeout.outbound.completed)
 	}
 	// 占位卡片发送失败不消耗失败预算，仅延后重试。
 	pendingOutbound := biz.FeishuOutbound{

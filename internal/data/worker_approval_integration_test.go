@@ -143,8 +143,8 @@ func TestExecutionWorkerApprovalRoundTrip(t *testing.T) {
 		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{}, Opener: integrationOpener{},
 		Attempts: calls, Steps: steps, Approvals: approvals,
 		MCPs: fakeApprovalMCPCredentials{endpoint: mcpServer.URL},
-		MCPClientFactory: func(endpoint, header, value string, timeout time.Duration) (*mcp.Client, error) {
-			return mcp.NewClient(endpoint, header, value, timeout, mcp.WithHTTPClient(mcpServer.Client()))
+		MCPClientFactory: func(endpoint string, authHeaders http.Header, timeout time.Duration, _ bool) (*mcp.Client, error) {
+			return mcp.NewClientWithHeaders(endpoint, authHeaders, timeout, mcp.WithHTTPClient(mcpServer.Client()))
 		},
 	}, biz.WorkerConfig{
 		WorkerID: "approval-worker", JobType: "agent.run.approval", Concurrency: 1, PollInterval: time.Millisecond,
