@@ -137,6 +137,7 @@ func (r *AttachmentRepository) ListBySession(ctx context.Context, userID, sessio
 }
 
 // ListTextContexts 读取已绑定消息的附件抽取文本，供执行器注入上下文。
+// 结果按创建时间倒序返回：调用方的注入预算有限，最新附件应优先获得预算。
 func (r *AttachmentRepository) ListTextContexts(ctx context.Context, userID, sessionID uuid.UUID) ([]biz.AttachmentText, error) {
 	type row struct {
 		MessageID   uuid.UUID
@@ -150,7 +151,9 @@ func (r *AttachmentRepository) ListTextContexts(ctx context.Context, userID, ses
 			Joins("JOIN attachment_contents ON attachment_contents.attachment_id = attachments.id").
 			Where("attachments.user_id = ? AND attachments.session_id = ? AND attachments.message_id IS NOT NULL", userID, sessionID).
 			Where("attachment_contents.text_content <> ''").
-			Order("attachments.created_at ASC, attachments.id ASC").
+			// 注入预算有限，按最新优先排序，保证当前轮次的附件先拿到预算，
+			// 不会因为历史大附件把用户刚上传的文件挤掉。
+			Order("attachments.created_at DESC, attachments.id DESC").
 			Scan(&rows).Error
 	})
 	if err != nil {

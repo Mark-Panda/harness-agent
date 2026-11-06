@@ -351,7 +351,7 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 				return react.Completion{}, err
 			}
 			return react.Completion{
-				Content: response.Content, FinishReason: response.FinishReason,
+				Content: response.Content, ReasoningContent: response.ReasoningContent, FinishReason: response.FinishReason,
 				Usage:         react.Usage{InputTokens: response.InputTokens, OutputTokens: response.OutputTokens},
 				EstimatedCost: record.EstimatedCost,
 				ToolCalls:     toReactToolCalls(response.ToolCalls),

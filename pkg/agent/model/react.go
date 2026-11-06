@@ -52,7 +52,7 @@ func (m *ReActModel) Complete(ctx context.Context, messages []react.Message, too
 		return react.Completion{}, err
 	}
 	completion := react.Completion{
-		Content: response.Content, FinishReason: response.FinishReason,
+		Content: response.Content, ReasoningContent: response.ReasoningContent, FinishReason: response.FinishReason,
 		Usage:     react.Usage{InputTokens: response.InputTokens, OutputTokens: response.OutputTokens},
 		ToolCalls: make([]react.ToolCall, 0, len(response.ToolCalls)),
 	}

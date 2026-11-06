@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -31,6 +34,31 @@ func TestCompileToolSchemaValidatesArguments(t *testing.T) {
 		if invalid.Detail == "" {
 			t.Fatalf("arguments %s missing validation detail", arguments)
 		}
+	}
+}
+
+// TestBindingInvokeKeepsLargeOutput 验证 MCP 大结果会交给执行层截断，而不是在适配层直接失败。
+func TestBindingInvokeKeepsLargeOutput(t *testing.T) {
+	server := mockRPCServer(t, func(method string, _ json.RawMessage, _ *http.Request, _ http.ResponseWriter) (any, bool) {
+		switch method {
+		case "initialize":
+			return map[string]any{"protocolVersion": "2025-06-18"}, true
+		case "notifications/initialized":
+			return nil, false
+		case "tools/call":
+			return map[string]any{"content": []map[string]any{{"type": "text", "text": strings.Repeat("x", 70*1024)}}, "isError": false}, true
+		default:
+			t.Fatalf("unexpected method %s", method)
+			return nil, false
+		}
+	})
+	bound := binding{server: Server{Name: "docs", RiskLevel: "low", Client: newTestClient(t, server, "none", "")}, tool: Tool{Name: "search"}}
+	output, err := bound.Invoke(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output) <= 64*1024 {
+		t.Fatalf("large output was unexpectedly discarded: %d bytes", len(output))
 	}
 }
 

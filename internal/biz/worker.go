@@ -27,6 +27,8 @@ import (
 var (
 	// ErrNoUserMessage 会话中没有可执行的用户输入。
 	ErrNoUserMessage = errors.New("session has no user message")
+	// ErrTriggerMessageMissing 当前 Run 的触发消息无法从持久化历史恢复，禁止改用其他用户输入执行。
+	ErrTriggerMessageMissing = errors.New("session trigger message is unavailable")
 	// ErrInvalidRunSnapshot Run 快照缺失或结构非法，无法构建模型调用。
 	ErrInvalidRunSnapshot = errors.New("run snapshot is invalid")
 	// ErrSandboxRequired 高风险工具缺少可用 Sandbox Runner，禁止本地执行。
@@ -34,8 +36,50 @@ var (
 )
 
 // trimRunnerContext 按提示 Token 预算裁剪送入模型的消息；完整消息序列仍由 Runner 返回并持久化。
+// 超预算时先压缩较早的工具结果再按轮次裁剪，避免长任务把早期观测整体丢掉后只能重复调用工具。
 func trimRunnerContext(messages []react.Message, budget int) []react.Message {
-	return memory.Trim(messages, budget).Messages
+	if budget <= 0 || memory.EstimateMessagesTokens(messages) <= budget {
+		return memory.Trim(messages, budget).Messages
+	}
+	return memory.Trim(compactToolResults(messages, compactKeepRecentMessages), budget).Messages
+}
+
+// 历史工具结果压缩参数：较早的结果保留首尾片段，最近若干条保持原文。
+const (
+	compactToolResultMaxRunes  = 1600
+	compactToolResultHeadRunes = 1200
+	compactKeepRecentMessages  = 8
+	// attachmentInjectUserTurns 只回注最近几轮用户消息的附件文本，避免历史附件反复占满上下文。
+	attachmentInjectUserTurns = 3
+)
+
+// compactToolResults 压缩较早且过长的工具结果，保留首尾关键片段。
+// 只作用于最近若干条之前的历史，确保当前步骤的完整观测不被削弱。
+func compactToolResults(messages []react.Message, keepRecent int) []react.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	if keepRecent < 0 {
+		keepRecent = 0
+	}
+	compacted := append([]react.Message(nil), messages...)
+	end := len(compacted) - keepRecent
+	for index := 0; index < end; index++ {
+		message := compacted[index]
+		if message.Role != react.RoleTool {
+			continue
+		}
+		runes := []rune(message.Content)
+		if len(runes) <= compactToolResultMaxRunes {
+			continue
+		}
+		tailStart := len(runes) - (compactToolResultMaxRunes - compactToolResultHeadRunes)
+		message.Content = string(runes[:compactToolResultHeadRunes]) +
+			fmt.Sprintf("\n[... earlier tool result compacted: original %d chars ...]\n", len(runes)) +
+			string(runes[tailStart:])
+		compacted[index] = message
+	}
+	return compacted
 }
 
 // UntrustedContentInstruction 是系统提示中的安全约束：工具返回与外部内容只能作为数据，
@@ -541,8 +585,9 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 	}
 
 	if executionErr != nil {
-		// 计划暂停：释放任务等待人工恢复，不写失败终态。
+		// 计划暂停：把 Run 退回队列并释放任务等待人工恢复，不写失败终态。
 		if errors.Is(executionErr, ErrPlanPaused) {
+			w.requeuePausedRun(ctx, run)
 			w.releaseJob(ctx, job, w.config.ApprovalPoll, "plan is paused")
 			return
 		}
@@ -576,7 +621,7 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		}
 		code, message := failureDetails(executionErr)
 		failureClass = code
-		if errors.Is(executionErr, ErrNoUserMessage) || errors.Is(executionErr, ErrInvalidRunSnapshot) || isBusinessFailure(executionErr) {
+		if errors.Is(executionErr, ErrNoUserMessage) || errors.Is(executionErr, ErrTriggerMessageMissing) || errors.Is(executionErr, ErrInvalidRunSnapshot) || isBusinessFailure(executionErr) {
 			w.failRun(context.WithoutCancel(ctx), run, fence, code, message)
 			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			return
@@ -597,7 +642,9 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		"steps": result.Steps, "total_tokens": result.TotalTokens, "estimated_cost": result.EstimatedCost,
 		"content": result.Content,
 	}
-	if len(result.Messages) > 0 {
+	if result.FinalMessageID != "" {
+		payload["message_id"] = result.FinalMessageID
+	} else if len(result.Messages) > 0 {
 		index := len(result.Messages) - 1
 		payload["message_id"] = deterministicMessageID(run.ID, index).String()
 	}
@@ -979,6 +1026,100 @@ func truncateRunes(text string, maximum int) string {
 	return string(runes[:maximum]) + "…"
 }
 
+// listAllRunEvents 分页读取 Run 的全部事件，供完成恢复与用量恢复使用。
+func (w *ExecutionWorker) listAllRunEvents(ctx context.Context, run Run) ([]RunEvent, error) {
+	items := make([]RunEvent, 0, 256)
+	after := int64(0)
+	for {
+		batch, err := w.runs.ListEvents(ctx, run.UserID, run.ID, after, 200)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, batch...)
+		if len(batch) < 200 {
+			return items, nil
+		}
+		after = batch[len(batch)-1].Seq
+	}
+}
+
+// eventNumber 兼容事件载荷中的 int、int64 与 JSON float64 数字。
+func eventNumber(value any) float64 {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	case float64:
+		return typed
+	default:
+		return 0
+	}
+}
+
+// recoverReactResult 在本 Run 的最终消息已落库、但完成状态尚未提交时直接恢复结果。
+// 只有消息归属、最终步 finish_reason 与截断次数都匹配时才恢复，避免误把历史回复或续写中间态当成完成。
+func (w *ExecutionWorker) recoverReactResult(ctx context.Context, run Run, messages []react.Message) (react.Result, bool, error) {
+	if len(messages) == 0 {
+		return react.Result{}, false, nil
+	}
+	last := messages[len(messages)-1]
+	if last.Role != react.RoleAssistant || len(last.ToolCalls) > 0 || last.ID == "" || last.RunID != run.ID.String() || strings.TrimSpace(last.Content) == "" {
+		return react.Result{}, false, nil
+	}
+	events, err := w.listAllRunEvents(ctx, run)
+	if err != nil {
+		return react.Result{}, false, err
+	}
+	lastStep := 0
+	lastFinish := ""
+	truncations := 0
+	var inputTokens, outputTokens int64
+	estimatedCost := 0.0
+	for _, event := range events {
+		switch event.EventType {
+		case "step.completed":
+			lastStep = int(eventNumber(event.Payload["step"]))
+			lastFinish, _ = event.Payload["finish_reason"].(string)
+		case "message.truncated":
+			truncations++
+		case "model.attempt.completed":
+			inputTokens += int64(eventNumber(event.Payload["input_tokens"]))
+			outputTokens += int64(eventNumber(event.Payload["output_tokens"]))
+			estimatedCost += eventNumber(event.Payload["estimated_cost"])
+		}
+	}
+	// 第一次 length 且仍有续写预算时，最后一条 assistant 只是中间片段，必须继续执行而不是恢复完成。
+	if strings.EqualFold(strings.TrimSpace(lastFinish), "length") && lastStep < w.config.ReactMaxSteps && truncations < 2 {
+		return react.Result{}, false, nil
+	}
+	// 连续的当前 Run assistant 片段属于同一次截断续写；完整结果需要重新拼接。
+	parts := make([]string, 0, 2)
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		if message.Role != react.RoleAssistant || len(message.ToolCalls) > 0 || message.RunID != run.ID.String() {
+			break
+		}
+		parts = append(parts, message.Content)
+	}
+	for left, right := 0, len(parts)-1; left < right; left, right = left+1, right-1 {
+		parts[left], parts[right] = parts[right], parts[left]
+	}
+	content := strings.Join(parts, "")
+	if len(parts) > 1 {
+		prefix := strings.Join(parts[:len(parts)-1], "")
+		// 最后一条若已经包含此前全部片段，说明它是合并后的最终消息，不能再重复拼接。
+		if strings.HasPrefix(last.Content, prefix) {
+			content = last.Content
+		}
+	}
+	return react.Result{
+		Content: content, Steps: lastStep,
+		TotalTokens: int(inputTokens + outputTokens), InputTokens: int(inputTokens), OutputTokens: int(outputTokens),
+		EstimatedCost: estimatedCost, Messages: messages, FinalMessageID: last.ID,
+	}, true, nil
+}
+
 // execute 构建上下文与路由模型并运行 ReAct 循环，事件通过栅栏写入 run_events。
 func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) (react.Result, error) {
 	// 先加载 MCP 工具：恢复审批结果时需要执行已批准的工具。
@@ -990,6 +1131,15 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	messages, err := w.buildMessages(ctx, run, fence)
 	if err != nil {
 		return react.Result{}, err
+	}
+	if run.Mode == AgentModeReact {
+		recovered, ok, recoverErr := w.recoverReactResult(ctx, run, messages)
+		if recoverErr != nil {
+			return react.Result{}, recoverErr
+		}
+		if ok {
+			return recovered, nil
+		}
 	}
 	candidates, policyVersion, err := w.buildCandidates(ctx, run)
 	if err != nil {
@@ -1162,6 +1312,39 @@ func hasUserMessage(history []Message) bool {
 	return false
 }
 
+// recentAttachmentTexts 只保留最近 turns 轮用户消息的附件文本，其余历史附件不再回注。
+func recentAttachmentTexts(items []AttachmentText, history []Message, turns int) []AttachmentText {
+	if turns <= 0 || len(items) == 0 {
+		return nil
+	}
+	recent := make(map[uuid.UUID]struct{}, turns)
+	for index := len(history) - 1; index >= 0 && len(recent) < turns; index-- {
+		if history[index].Role == MessageUser {
+			recent[history[index].ID] = struct{}{}
+		}
+	}
+	filtered := make([]AttachmentText, 0, len(items))
+	for _, item := range items {
+		if _, ok := recent[item.MessageID]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+// persistedMessageIdentity 提取恢复所需的消息归属，不进入模型请求协议。
+func persistedMessageIdentity(message Message) (string, string) {
+	id := ""
+	if message.ID != uuid.Nil {
+		id = message.ID.String()
+	}
+	runID := ""
+	if message.RunID != nil && *message.RunID != uuid.Nil {
+		runID = message.RunID.String()
+	}
+	return id, runID
+}
+
 // buildMessages 组装系统提示与全部会话消息。
 // 审批恢复会产生当前用户输入之后的 assistant/tool 消息，因此不能只截断到最后一个用户输入；
 // 这里按 Run 的触发消息边界裁剪，只回放本 Run 的产物，避免排队 Run 读到后续用户消息。
@@ -1176,22 +1359,29 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 	if cacheDegraded {
 		degradations = append(degradations, "redis_hot_window")
 	}
-	fullHistory := history
 	history = boundHistoryByTrigger(run, history)
-	if !hasUserMessage(history) && hasUserMessage(fullHistory) {
-		// 触发消息已滑出热窗口（例如前序 Run 执行期间用户大量补发消息）时退回完整窗口，
-		// 宁可多带上下文，也不能让 Run 因缺少输入直接失败。
-		w.logger.Warn("trigger message is outside history window; falling back to full history", "run_id", run.ID)
-		history = fullHistory
-	}
 	if !hasUserMessage(history) {
 		return nil, ErrNoUserMessage
 	}
-	// 先索引已有工具结果，避免为同一 tool_call_id 同时补造与回放结果。
-	existingResults := make(map[string]struct{}, len(history))
-	for _, message := range history {
-		if message.Role == MessageTool && message.ToolCallID != "" {
-			existingResults[message.ToolCallID] = struct{}{}
+	// 工具结果按“所属 assistant 消息 + tool_call_id”关联，不能只按 call ID 全局索引：
+	// OpenAI-compatible 供应商可能在不同轮次复用 call_0/call_1，后一轮结果不能覆盖前一轮。
+	toolResults := make(map[string]Message, len(history))
+	lastAssistantByRun := make(map[uuid.UUID]string)
+	for historyIndex, message := range history {
+		runID := uuid.Nil
+		if message.RunID != nil {
+			runID = *message.RunID
+		}
+		switch message.Role {
+		case MessageAssistant:
+			lastAssistantByRun[runID] = fmt.Sprintf("%d:%s", historyIndex, message.ID.String())
+		case MessageTool:
+			if message.ToolCallID == "" {
+				continue
+			}
+			if owner, ok := lastAssistantByRun[runID]; ok {
+				toolResults[owner+"\x00"+message.ToolCallID] = message
+			}
 		}
 	}
 	query, historyIDs := lastUserQuery(history)
@@ -1209,6 +1399,7 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 		}
 	}
 	// 附件抽取文本按消息注入到对应轮次，与记忆策略无关；读取失败只降级为无附件内容。
+	// 只注入最近几轮用户消息的附件：历史附件每轮全量重发会持续挤占上下文预算。
 	attachmentText := map[uuid.UUID]string{}
 	if w.attachments != nil {
 		items, err := w.attachments.ListTextContexts(ctx, run.UserID, run.SessionID)
@@ -1216,7 +1407,7 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 			w.logger.Warn("load attachment texts failed; continuing without them", "run_id", run.ID, "error", err)
 			degradations = append(degradations, "attachments")
 		} else {
-			attachmentText = formatAttachmentContext(items)
+			attachmentText = formatAttachmentContext(recentAttachmentTexts(items, history, attachmentInjectUserTurns))
 		}
 	}
 	systemPrompt := w.buildSystemPrompt(run, factsText)
@@ -1253,7 +1444,8 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 			}
 		}
 	}
-	for _, message := range history {
+	for historyIndex, message := range history {
+		messageID, messageRunID := persistedMessageIdentity(message)
 		switch message.Role {
 		case MessageUser:
 			content := message.Content
@@ -1265,30 +1457,32 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 			if text := attachmentText[message.ID]; text != "" {
 				content += "\n\n" + text
 			}
-			messages = append(messages, react.Message{Role: react.RoleUser, Content: content})
+			messages = append(messages, react.Message{ID: messageID, RunID: messageRunID, Role: react.RoleUser, Content: content})
 		case MessageAssistant:
-			converted := react.Message{Role: react.RoleAssistant, Content: message.Content}
+			converted := react.Message{ID: messageID, RunID: messageRunID, Role: react.RoleAssistant, Content: message.Content}
 			converted.ToolCalls = messageToolCalls(message.ToolCalls)
 			messages = append(messages, converted)
-			// 崩溃或审批暂停可能留下没有结果的工具调用，立即补齐错误保证协议合法。
+			// 按 tool_calls 原始顺序挂载工具结果；崩溃或审批暂停留下的缺失结果补一条
+			// 明确错误，保证协议合法且不会被模型误当作成功。
+			owner := fmt.Sprintf("%d:%s", historyIndex, message.ID.String())
 			for _, call := range converted.ToolCalls {
-				if _, exists := existingResults[call.ID]; exists {
+				if result, exists := toolResults[owner+"\x00"+call.ID]; exists {
+					resultID, resultRunID := persistedMessageIdentity(result)
+					messages = append(messages, react.Message{
+						ID: resultID, RunID: resultRunID,
+						Role: react.RoleTool, Content: result.Content,
+						ToolCallID: call.ID, Name: result.ToolName,
+					})
 					continue
 				}
 				messages = append(messages, react.Message{
-					Role: react.RoleTool, ToolCallID: call.ID, Name: call.Name,
+					RunID: messageRunID, Role: react.RoleTool, ToolCallID: call.ID, Name: call.Name,
 					Content: `{"error":"tool_result_missing"}`,
 				})
 			}
 		case MessageTool:
-			// 工具消息缺少原调用 ID 时无法合法回放，跳过以避免协议错误。
-			if message.ToolCallID == "" {
-				continue
-			}
-			messages = append(messages, react.Message{
-				Role: react.RoleTool, Content: message.Content,
-				ToolCallID: message.ToolCallID, Name: message.ToolName,
-			})
+			// 已在所属 assistant 消息处按顺序回放，跳过原始位置避免重复与乱序。
+			continue
 		}
 	}
 	// 按 Token 预算裁剪历史：保留系统提示与当前轮次，从最旧轮次开始丢弃并记录裁剪原因。
@@ -1360,7 +1554,12 @@ func (w *ExecutionWorker) loadHistory(ctx context.Context, run Run) ([]Message, 
 			w.logger.Warn("load hot messages failed; falling back to postgres", "run_id", run.ID, "error", err)
 			degraded = true
 		} else if hit {
-			return cached, degraded, nil
+			if run.TriggerMessageID == nil || historyContainsMessage(cached, *run.TriggerMessageID) {
+				return cached, degraded, nil
+			}
+			// 热缓存缺少本次触发消息时不能拿旧用户输入冒充当前输入；废弃残窗并回源数据库。
+			_ = w.hotMessages.Invalidate(ctx, run.UserID, run.SessionID)
+			degraded = true
 		}
 	}
 	page, err := w.sessions.ListMessages(ctx, run.UserID, run.SessionID, w.config.HistoryLimit, "")
@@ -1378,7 +1577,71 @@ func (w *ExecutionWorker) loadHistory(ctx context.Context, run Run) ([]Message, 
 			degraded = true
 		}
 	}
+	if run.TriggerMessageID != nil && !historyContainsMessage(history, *run.TriggerMessageID) {
+		recovered, recoverErr := w.loadHistoryAtTrigger(ctx, run, history, page.NextCursor)
+		return recovered, degraded, recoverErr
+	}
 	return history, degraded, nil
+}
+
+// historyContainsMessage 判断指定消息是否位于当前历史窗口。
+func historyContainsMessage(history []Message, messageID uuid.UUID) bool {
+	for _, message := range history {
+		if message.ID == messageID {
+			return true
+		}
+	}
+	return false
+}
+
+// loadHistoryAtTrigger 向前分页找回已滑出最新窗口的触发消息。
+// 返回内容只包含触发前的上下文与本 Run 已产生的消息，绝不混入后续 Run 的用户输入。
+func (w *ExecutionWorker) loadHistoryAtTrigger(ctx context.Context, run Run, latest []Message, cursor string) ([]Message, error) {
+	if run.TriggerMessageID == nil {
+		return latest, nil
+	}
+	runMessages := currentRunMessages(latest, run.ID)
+	for cursor != "" {
+		page, err := w.sessions.ListMessages(ctx, run.UserID, run.SessionID, w.config.HistoryLimit, cursor)
+		if err != nil {
+			return nil, err
+		}
+		runMessages = append(runMessages, currentRunMessages(page.Items, run.ID)...)
+		triggerIndex := -1
+		for index, message := range page.Items {
+			if message.ID == *run.TriggerMessageID {
+				triggerIndex = index
+				break
+			}
+		}
+		if triggerIndex >= 0 {
+			// 当前页为倒序；从页尾到触发位置反转，得到触发前的正序上下文。
+			older := make([]Message, 0, len(page.Items)-triggerIndex)
+			for index := len(page.Items) - 1; index >= triggerIndex; index-- {
+				older = append(older, page.Items[index])
+			}
+			sort.SliceStable(runMessages, func(i, j int) bool {
+				if runMessages[i].CreatedAt.Equal(runMessages[j].CreatedAt) {
+					return runMessages[i].ID.String() < runMessages[j].ID.String()
+				}
+				return runMessages[i].CreatedAt.Before(runMessages[j].CreatedAt)
+			})
+			return append(older, runMessages...), nil
+		}
+		cursor = page.NextCursor
+	}
+	return nil, fmt.Errorf("%w: %s", ErrTriggerMessageMissing, run.TriggerMessageID.String())
+}
+
+// currentRunMessages 过滤当前 Run 已持久化的 assistant/tool 消息。
+func currentRunMessages(messages []Message, runID uuid.UUID) []Message {
+	items := make([]Message, 0)
+	for _, message := range messages {
+		if message.RunID != nil && *message.RunID == runID {
+			items = append(items, message)
+		}
+	}
+	return items
 }
 
 // messageToolCalls 把持久化的工具调用元数据还原为执行器协议结构，参数非法时回退为空对象。
@@ -1535,11 +1798,41 @@ func (w *ExecutionWorker) buildCandidates(ctx context.Context, run Run) ([]model
 }
 
 // persistRunnerMessage 把 ReAct 中间消息或最终回答幂等写入会话。
-// 消息 ID 由 Run 与消息序号确定性生成，Worker 重试不会产生重复消息。
+// 消息 ID 默认由 Run 与消息序号确定性生成，Worker 重试不会产生重复消息。
 func (w *ExecutionWorker) persistRunnerMessage(ctx context.Context, run Run, payload map[string]any) error {
+	stored, err := w.persistRunnerMessageRecord(ctx, run, payload)
+	if err != nil {
+		return err
+	}
+	// 幂等冲突时数据库保留首次内容，后续 Run 事件也必须使用这份权威记录，
+	// 否则 SSE 与重新加载会话会看到不同文本。
+	payload["message_id"] = stored.ID.String()
+	payload["role"] = string(stored.Role)
+	payload["content"] = stored.Content
+	if stored.ToolCallID != "" {
+		payload["tool_call_id"] = stored.ToolCallID
+	} else {
+		delete(payload, "tool_call_id")
+	}
+	if stored.ToolName != "" {
+		payload["name"] = stored.ToolName
+	} else {
+		delete(payload, "name")
+	}
+	if len(stored.ToolCalls) > 0 {
+		payload["tool_calls"] = stored.ToolCalls
+	} else {
+		delete(payload, "tool_calls")
+	}
+	return nil
+}
+
+// persistRunnerMessageRecord 持久化消息并返回数据库中的权威记录。
+// 编排器可通过 message_id 指定独立命名空间，避免多个局部 Runner 的序号互相碰撞。
+func (w *ExecutionWorker) persistRunnerMessageRecord(ctx context.Context, run Run, payload map[string]any) (Message, error) {
 	index, ok := payloadIndex(payload["index"])
 	if !ok {
-		return fmt.Errorf("message event is missing a valid index")
+		return Message{}, fmt.Errorf("message event is missing a valid index")
 	}
 	role := MessageAssistant
 	switch payloadRole, _ := payload["role"].(string); payloadRole {
@@ -1548,14 +1841,22 @@ func (w *ExecutionWorker) persistRunnerMessage(ctx context.Context, run Run, pay
 	case string(MessageTool):
 		role = MessageTool
 	default:
-		return fmt.Errorf("unsupported message role")
+		return Message{}, fmt.Errorf("unsupported message role")
 	}
 	content, _ := payload["content"].(string)
 	toolCallID, _ := payload["tool_call_id"].(string)
 	name, _ := payload["name"].(string)
 	toolCalls := payloadToolCalls(payload["tool_calls"])
+	messageID := deterministicMessageID(run.ID, index)
+	if rawID, _ := payload["message_id"].(string); rawID != "" {
+		parsed, err := uuid.Parse(rawID)
+		if err != nil {
+			return Message{}, fmt.Errorf("message event has an invalid message_id: %w", err)
+		}
+		messageID = parsed
+	}
 	message := Message{
-		ID: deterministicMessageID(run.ID, index), SessionID: run.SessionID, UserID: run.UserID,
+		ID: messageID, SessionID: run.SessionID, UserID: run.UserID,
 		Role: role, Content: content, ToolCallID: toolCallID, ToolName: name, ToolCalls: toolCalls,
 		RunID: &run.ID,
 	}
@@ -1566,11 +1867,11 @@ func (w *ExecutionWorker) persistRunnerMessage(ctx context.Context, run Run, pay
 	// 使用不受取消影响的上下文，确保取消发生在工具返回后仍能保存已完成事实。
 	stored, err := w.sessions.AppendMessageIdempotent(context.WithoutCancel(ctx), message, event)
 	if err != nil {
-		return err
+		return Message{}, err
 	}
 	// 使用数据库落盘后的消息回放缓存，避免零值 CreatedAt 破坏触发边界的时间裁剪。
 	w.appendHotMessage(context.WithoutCancel(ctx), run, stored)
-	return nil
+	return stored, nil
 }
 
 // appendHotMessage 幂等追加消息到热缓存；失败时清理缓存，下次读取回退 PostgreSQL。
@@ -1665,6 +1966,7 @@ func jobIdentity(job Job) (uuid.UUID, uuid.UUID, bool) {
 // isBusinessFailure 判断错误是否属于明确的业务失败，需要立即终止 Run 而不是重试。
 func isBusinessFailure(err error) bool {
 	return errors.Is(err, react.ErrStepLimit) || errors.Is(err, react.ErrToolLoop) ||
+		errors.Is(err, react.ErrIncompleteToolCall) || errors.Is(err, react.ErrContentFiltered) ||
 		errors.Is(err, react.ErrBudgetExceeded) || errors.Is(err, ErrBudgetExceeded) ||
 		errors.Is(err, react.ErrUnknownTool) || errors.Is(err, ErrPlanFailed) || errors.Is(err, ErrPlanInvalid) || errors.Is(err, ErrPlanCancelled) ||
 		errors.Is(err, ErrSupervisorInvalid) || errors.Is(err, ErrSupervisorAllFailed) || errors.Is(err, ErrSupervisorBudget) ||
@@ -1698,6 +2000,10 @@ func failureDetails(err error) (string, string) {
 		return "supervisor_budget_exceeded", "Supervisor 共享预算耗尽"
 	case errors.Is(err, ErrInvalidRunSnapshot):
 		return "invalid_run_snapshot", "Run 模型配置快照不可用"
+	case errors.Is(err, react.ErrIncompleteToolCall):
+		return "incomplete_tool_call", "模型返回的工具调用被截断，无法安全执行"
+	case errors.Is(err, react.ErrContentFiltered):
+		return "content_filtered", "模型输出被内容审核拦截"
 	case errors.Is(err, react.ErrStepLimit):
 		return "step_limit_exceeded", message
 	case errors.Is(err, react.ErrToolLoop):
@@ -2075,6 +2381,23 @@ func (w *ExecutionWorker) runnerRegistry(base react.Registry, run Run) react.Reg
 		registry = approvalRegistry{inner: registry, worker: w, run: run}
 	}
 	return registry
+}
+
+// requeuePausedRun 把因计划暂停而停下的 Run 退回 queued 并清空租约。
+// 同一会话的 Run 串行执行，若不退回队列，暂停中的 Run 会一直占用会话，
+// 导致用户后续消息永远无法被认领。
+func (w *ExecutionWorker) requeuePausedRun(ctx context.Context, run Run) {
+	now := w.clock()
+	fields := map[string]any{"lease_owner": "", "lease_expires_at": nil, "updated_at": now}
+	// 暂停期间不计入执行窗口：把本轮排队耗时补回截止时间，否则暂停超过 RunDeadline
+	// 后用户恢复计划会被直接判定 run_deadline_exceeded。
+	if run.DeadlineAt != nil && !run.UpdatedAt.IsZero() {
+		fields["deadline_at"] = run.DeadlineAt.Add(now.Sub(run.UpdatedAt))
+	}
+	writeContext := context.WithoutCancel(ctx)
+	if _, err := w.runs.TransitionRun(writeContext, run.UserID, run.ID, RunRunning, RunQueued, fields); err != nil && !errors.Is(err, ErrResourceConflict) {
+		w.logger.Warn("requeue paused run failed", "run_id", run.ID, "error", err)
+	}
 }
 
 // releaseJob 把任务退回 pending 并按指定间隔延后，不消耗失败重试预算。
@@ -2570,14 +2893,24 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 	}
 	output, invokeErr := t.inner.Invoke(ctx, arguments)
 	if invokeErr != nil {
-		_, _ = t.worker.steps.SavePayload(writeContext, ExecutionPayload{
+		errorPayload := ExecutionPayload{
 			RunID: t.run.ID, UserID: t.run.UserID, StepID: &step.ID, Type: PayloadToolError,
 			CaptureMode: CaptureMetadataOnly, ContentJSON: map[string]any{"error": sanitizeExecutionError(invokeErr)},
-		})
+		}
+		if len(output) > 0 {
+			text, truncated := truncatePayloadText(string(output), t.worker.config.MaxPayloadBytes)
+			errorPayload.ContentJSON = nil
+			errorPayload.ContentText = text
+			errorPayload.CaptureMode = CaptureRedacted
+			errorPayload.OriginalSizeBytes = int64(len(output))
+			errorPayload.Truncated = truncated
+		}
+		_, _ = t.worker.steps.SavePayload(writeContext, errorPayload)
 		_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 			Status: StepFailed, ErrorCode: "tool_failed", FinishedAt: t.worker.clock(),
 		})
-		return nil, invokeErr
+		// 业务错误可能同时携带可纠正的服务端响应，必须原样交给 Runner 回填模型。
+		return output, invokeErr
 	}
 	outputText, outputTruncated := truncatePayloadText(string(output), t.worker.config.MaxPayloadBytes)
 	if _, err := t.worker.steps.SavePayload(writeContext, ExecutionPayload{

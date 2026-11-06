@@ -505,6 +505,7 @@ func run() error {
 		biz.WithBudgets(budgetService),
 		biz.WithModelCalls(data.NewModelCallRepository(appDB)),
 		biz.WithSupervisorTasks(data.NewSupervisorTaskRepository(appDB)),
+		biz.WithPlanResume(data.NewPlanRepository(appDB)),
 		biz.WithRunDeadline(cfg.Agent.Worker.RunDeadline.Duration),
 	)
 	if err != nil {

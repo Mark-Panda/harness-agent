@@ -28,7 +28,9 @@ var runTransitions = map[RunStatus]map[RunStatus]struct{}{
 		RunRunning: {}, RunFailed: {}, RunCancelled: {},
 	},
 	RunRunning: {
-		RunWaitingApproval: {}, RunCompleted: {}, RunFailed: {}, RunCancelled: {}, RunReconciliationRequired: {},
+		// RunQueued 用于计划暂停等“主动让出会话”的场景：停止续租后退回队列，
+		// 避免同会话新消息被一个长期暂停的 Run 永久阻塞。
+		RunQueued: {}, RunWaitingApproval: {}, RunCompleted: {}, RunFailed: {}, RunCancelled: {}, RunReconciliationRequired: {},
 	},
 	RunWaitingApproval: {
 		RunRunning: {}, RunFailed: {}, RunCancelled: {},

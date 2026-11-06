@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -33,6 +34,11 @@ func (stubRunRepository) SetRunAttempt(_ context.Context, _ uuid.UUID, _ uuid.UU
 	return nil
 }
 
+// ListEvents 默认没有历史事件；需要事件的场景由 eventRunRepository 覆盖。
+func (stubRunRepository) ListEvents(_ context.Context, _, _ uuid.UUID, _ int64, _ int) ([]RunEvent, error) {
+	return nil, nil
+}
+
 // stubSessionRepository 只实现最终消息幂等落库。
 type stubSessionRepository struct {
 	SessionRepository
@@ -40,6 +46,24 @@ type stubSessionRepository struct {
 
 // AppendMessageIdempotent 返回输入消息。
 func (stubSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+	return message, nil
+}
+
+// statefulSessionRepository 模拟数据库按消息 ID 幂等返回原记录，用于完成恢复测试。
+type statefulSessionRepository struct {
+	stubSessionRepository
+	messages map[uuid.UUID]Message
+}
+
+// AppendMessageIdempotent 已存在时返回首次保存的内容，模拟 ON CONFLICT DO NOTHING。
+func (r *statefulSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+	if r.messages == nil {
+		r.messages = map[uuid.UUID]Message{}
+	}
+	if existing, ok := r.messages[message.ID]; ok {
+		return existing, nil
+	}
+	r.messages[message.ID] = message
 	return message, nil
 }
 
@@ -250,6 +274,103 @@ func (r *memoryPlanRepo) ResolvePlanStep(_ context.Context, _ uuid.UUID, planID,
 	return PlanStep{}, ErrResourceConflict
 }
 
+// FindPausedPlanBySession 返回会话中最近一个暂停中的计划。
+func (r *memoryPlanRepo) FindPausedPlanBySession(_ context.Context, userID, sessionID uuid.UUID) (Plan, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var latest Plan
+	found := false
+	for _, plan := range r.plans {
+		if plan.UserID != userID || plan.SessionID != sessionID || plan.Status != PlanPaused {
+			continue
+		}
+		if !found || plan.CreatedAt.After(latest.CreatedAt) {
+			latest = plan
+			found = true
+		}
+	}
+	if !found {
+		return Plan{}, ErrResourceNotFound
+	}
+	return clonePlan(latest), nil
+}
+
+// RebindPlanRun 把暂停中的计划迁移到新的 Run。
+func (r *memoryPlanRepo) RebindPlanRun(_ context.Context, _ uuid.UUID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, _ time.Time) (Plan, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	plan, ok := r.plans[planID]
+	if !ok || plan.Status != PlanPaused || plan.Revision != expectedRevision {
+		return Plan{}, ErrPlanRevisionConflict
+	}
+	plan.RunID = runID
+	plan.Status = PlanExecuting
+	plan.DeadlineAt = deadlineAt
+	plan.Revision++
+	r.plans[planID] = plan
+	return clonePlan(plan), nil
+}
+
+// planRiskTool 是测试用工具，只提供名称与风险等级。
+type planRiskTool struct {
+	name string
+	risk string
+}
+
+func (t planRiskTool) Spec() react.ToolSpec { return react.ToolSpec{Name: t.name, Description: t.name} }
+func (t planRiskTool) Invoke(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+func (t planRiskTool) RiskLevel() string { return t.risk }
+
+// planRiskRegistry 是测试用工具注册表。
+type planRiskRegistry struct {
+	tools []planRiskTool
+}
+
+func (r planRiskRegistry) Lookup(name string) (react.Tool, bool) {
+	for _, tool := range r.tools {
+		if tool.name == name {
+			return tool, true
+		}
+	}
+	return nil, false
+}
+
+func (r planRiskRegistry) List() []react.ToolSpec {
+	specs := make([]react.ToolSpec, 0, len(r.tools))
+	for _, tool := range r.tools {
+		specs = append(specs, tool.Spec())
+	}
+	return specs
+}
+
+// TestValidatePlanDraftTools 验证规划引用的工具必须存在且为低风险。
+func TestValidatePlanDraftTools(t *testing.T) {
+	registry := planRiskRegistry{tools: []planRiskTool{
+		{name: "search_docs", risk: "low"},
+		{name: "delete_all", risk: "high"},
+	}}
+	valid := PlanDraft{Steps: []PlanDraftStep{{StepNo: 1, ToolName: "search_docs"}, {StepNo: 2}}}
+	if err := validatePlanDraftTools(valid, registry); err != nil {
+		t.Fatalf("valid draft rejected: %v", err)
+	}
+	invalid := PlanDraft{Steps: []PlanDraftStep{
+		{StepNo: 1, ToolName: "search"},
+		{StepNo: 2, ToolName: "delete_all"},
+	}}
+	err := validatePlanDraftTools(invalid, registry)
+	if err == nil {
+		t.Fatal("invalid draft was accepted")
+	}
+	if !strings.Contains(err.Error(), `"search"`) || !strings.Contains(err.Error(), "delete_all") {
+		t.Fatalf("validation error missing details: %v", err)
+	}
+	if !strings.Contains(err.Error(), "search_docs") {
+		t.Fatalf("validation error should suggest the real tool name: %v", err)
+	}
+}
+
 // clonePlan 深拷贝计划，避免测试断言受后续写入影响。
 func clonePlan(plan Plan) Plan {
 	steps := make([]PlanStep, len(plan.Steps))
@@ -332,6 +453,10 @@ func TestExecutePlanSuccess(t *testing.T) {
 		if strings.Contains(body, "生成可执行计划") {
 			content = planner
 		}
+		// 计划完成后会额外调用一次汇总模型，返回面向用户的最终答案。
+		if strings.Contains(body, "最终汇总器") {
+			content = "最终汇总"
+		}
 		writeCompletion(t, w, content, http.StatusOK)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
@@ -342,7 +467,7 @@ func TestExecutePlanSuccess(t *testing.T) {
 		t.Logf("plan after failure: %#v", plan)
 		t.Fatal(err)
 	}
-	if !strings.Contains(result.Content, "计划执行完成") || !strings.Contains(result.Content, "步骤结果") {
+	if !strings.Contains(result.Content, "最终汇总") {
 		t.Fatalf("final content = %q", result.Content)
 	}
 	plan, _ := plans.GetPlanByRun(context.Background(), run.UserID, run.ID)
@@ -607,8 +732,8 @@ func TestRecoverPlanSteps(t *testing.T) {
 }
 
 func TestFinishPlanAndFinalResult(t *testing.T) {
-	worker, plans, _, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
-		writeCompletion(t, w, "unused", http.StatusOK)
+	worker, plans, router, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
+		writeCompletion(t, w, "汇总答案", http.StatusOK)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
 	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
@@ -618,8 +743,8 @@ func TestFinishPlanAndFinalResult(t *testing.T) {
 	plan.Steps[0].PlanID = plan.ID
 	plans.seedPlan(plan)
 	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
-	result, err := worker.finishPlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, plan, messages)
-	if err != nil || !strings.Contains(result.Content, "计划执行完成") || len(result.Messages) != 2 {
+	result, err := worker.finishPlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, plan, messages)
+	if err != nil || result.Content != "汇总答案" || len(result.Messages) != 2 {
 		t.Fatalf("finishPlan() = %#v, %v", result, err)
 	}
 	stored, _ := plans.GetPlanByRun(context.Background(), run.UserID, run.ID)
@@ -629,6 +754,35 @@ func TestFinishPlanAndFinalResult(t *testing.T) {
 	final, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, stored, messages)
 	if err != nil || !strings.Contains(final.Content, "结果") {
 		t.Fatalf("planFinalResult() = %#v, %v", final, err)
+	}
+}
+
+func TestPlanFinalResultRecoveryKeepsStoredSummary(t *testing.T) {
+	worker, plans, router, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
+		writeCompletion(t, w, "模型汇总", http.StatusOK)
+	})
+	sessions := &statefulSessionRepository{}
+	worker.sessions = sessions
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
+	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
+		Status: PlanExecuting, Goal: "g", MaxSteps: 50,
+		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "步骤结果"}}}}
+	plans.seedPlan(plan)
+	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
+	result, err := worker.finishPlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, plan, messages)
+	if err != nil || result.Content != "模型汇总" {
+		t.Fatalf("finishPlan() = %#v, %v", result, err)
+	}
+	if result.TotalTokens != 8 {
+		t.Fatalf("aggregator usage was not recorded: %d", result.TotalTokens)
+	}
+	stored, _ := plans.GetPlan(context.Background(), run.UserID, plan.ID)
+	recovered, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, stored, result.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Content != "模型汇总" || len(recovered.Messages) != len(result.Messages) || len(sessions.messages) != 1 {
+		t.Fatalf("recovery duplicated or replaced final answer: %#v, stored=%d", recovered, len(sessions.messages))
 	}
 }
 
@@ -679,6 +833,33 @@ func TestResolvePlanApprovalsMissingAndExecuting(t *testing.T) {
 	approvals.items = []ToolApproval{{ID: uuid.New(), RunID: run.ID, StepID: &execStepID, UserID: run.UserID, Status: ApprovalExecuting}}
 	if _, _, err := worker.resolvePlanApprovals(context.Background(), run, plan, PlanFence{Owner: "plan-worker", Token: 1}); !errors.Is(err, ErrApprovalExecutionUnknown) {
 		t.Fatalf("executing approval error = %v", err)
+	}
+}
+
+func TestPlanTextTruncationKeepsUTF8(t *testing.T) {
+	background := planConversationBackground([]react.Message{{Role: react.RoleUser, Content: strings.Repeat("中文", 1000)}})
+	if !utf8.ValidString(background) {
+		t.Fatal("plan background contains invalid UTF-8")
+	}
+	payload, _ := truncatePayloadText(strings.Repeat("中文", 1000), 7)
+	if !utf8.ValidString(payload) {
+		t.Fatal("payload truncation contains invalid UTF-8")
+	}
+}
+
+func TestPlanStepMessageIDsUseStepNamespace(t *testing.T) {
+	firstStep, secondStep := uuid.New(), uuid.New()
+	ids := make([]string, 0, 2)
+	for _, stepID := range []uuid.UUID{firstStep, secondStep} {
+		scopePlanStepMessageEvents(stepID, func(event react.StepEvent) {
+			ids = append(ids, event.Payload["message_id"].(string))
+		})(react.StepEvent{Type: "message.created", Payload: map[string]any{"index": 4, "role": "assistant", "content": "结果"}})
+	}
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("plan step message IDs collide: %#v", ids)
+	}
+	if ids[0] != deterministicMessageID(firstStep, 4).String() || ids[1] != deterministicMessageID(secondStep, 4).String() {
+		t.Fatalf("unexpected scoped IDs: %#v", ids)
 	}
 }
 

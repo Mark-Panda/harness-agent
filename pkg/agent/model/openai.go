@@ -148,6 +148,8 @@ type ToolCall struct {
 type ChatResponse struct {
 	// Content 最终文本。
 	Content string
+	// ReasoningContent 供应商返回的推理内容，仅用于判断空回答，不写入上下文也不持久化。
+	ReasoningContent string
 	// ToolCalls 工具调用列表。
 	ToolCalls []ToolCall
 	// FinishReason 结束原因。
@@ -373,13 +375,13 @@ func (c *Client) doChat(ctx context.Context, request ChatRequest, onDelta func(s
 		if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 			return c.decodeStream(response, onDelta, EstimateRequestTokens(request.Messages, request.Tools))
 		}
-		result, err := c.decodeResponse(response)
+		result, err := c.decodeResponse(response, request)
 		if err == nil && result.Content != "" {
 			onDelta(result.Content)
 		}
 		return result, err
 	}
-	return c.decodeResponse(response)
+	return c.decodeResponse(response, request)
 }
 
 // statusError 把供应商非 2xx 响应转换为可路由的结构化错误。
@@ -408,13 +410,14 @@ func (c *Client) statusError(response *http.Response) error {
 }
 
 // decodeResponse 解析非流式响应体。
-func (c *Client) decodeResponse(response *http.Response) (ChatResponse, error) {
+func (c *Client) decodeResponse(response *http.Response, request ChatRequest) (ChatResponse, error) {
 	var payload struct {
 		ID      string `json:"id"`
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Function struct {
 						Name      string `json:"name"`
@@ -437,14 +440,36 @@ func (c *Client) decodeResponse(response *http.Response) (ChatResponse, error) {
 	}
 	choice := payload.Choices[0]
 	result := ChatResponse{
-		Content: choice.Message.Content, FinishReason: choice.FinishReason,
-		InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens,
+		Content: choice.Message.Content, ReasoningContent: choice.Message.ReasoningContent,
+		FinishReason: choice.FinishReason,
+		InputTokens:  payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens,
 		ProviderRequestID: payload.ID, ToolCalls: make([]ToolCall, 0, len(choice.Message.ToolCalls)),
 	}
 	for _, call := range choice.Message.ToolCalls {
 		result.ToolCalls = append(result.ToolCalls, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
 	}
+	if result.InputTokens == 0 {
+		// 非流式供应商也可能省略 usage，不能因此让预算与成本统计恒为零。
+		result.InputTokens = int(EstimateRequestTokens(request.Messages, request.Tools))
+	}
+	if result.OutputTokens == 0 {
+		result.OutputTokens = estimateChatResponseOutput(result)
+	}
 	return result, nil
+}
+
+// estimateChatResponseOutput 在供应商未返回 usage 时估算输出，包含正文与工具调用参数。
+func estimateChatResponseOutput(response ChatResponse) int {
+	if response.Content == "" && len(response.ToolCalls) == 0 {
+		return 0
+	}
+	message := ChatMessage{Role: "assistant", Content: response.Content}
+	for _, call := range response.ToolCalls {
+		message.ToolCalls = append(message.ToolCalls, ChatToolCall{
+			ID: call.ID, Type: "function", Function: ChatFunction{Name: call.Name, Arguments: call.Arguments},
+		})
+	}
+	return int(EstimateTokens([]ChatMessage{message}))
 }
 
 // streamToolCall 累积流式响应中逐步下发的工具调用片段。
@@ -460,6 +485,7 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	var content strings.Builder
+	var reasoning strings.Builder
 	calls := map[int]*streamToolCall{}
 	result := ChatResponse{}
 	var readErr error
@@ -479,8 +505,9 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 			ID      string `json:"id"`
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Function struct {
@@ -497,8 +524,9 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// 单条损坏事件不应终止整个流；保留已解析内容继续读取。
-			continue
+			// 损坏帧可能已经丢失正文或工具参数片段，必须显式失败；
+			// 静默继续会把不完整回答或工具调用当作成功结果执行。
+			return ChatResponse{}, fmt.Errorf("%w: decode stream event: %v", ErrRetryable, err)
 		}
 		if chunk.ID != "" {
 			result.ProviderRequestID = chunk.ID
@@ -511,6 +539,10 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 			continue
 		}
 		choice := chunk.Choices[0]
+		if choice.Delta.ReasoningContent != "" {
+			// 推理内容只用于判断“只有推理没有回答”，不回调给前端，也不进入上下文。
+			reasoning.WriteString(choice.Delta.ReasoningContent)
+		}
 		if choice.Delta.Content != "" {
 			content.WriteString(choice.Delta.Content)
 			onDelta(choice.Delta.Content)
@@ -539,9 +571,10 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 		readErr = fmt.Errorf("%w: stream read failed: %v", ErrRetryable, err)
 	}
 	result.Content = content.String()
-	if result.OutputTokens == 0 && result.Content != "" {
-		// 供应商未返回 usage 时使用保守估算，保证预算统计不会因流式而失真。
-		result.OutputTokens = int(EstimateTokens([]ChatMessage{{Role: "assistant", Content: result.Content}}))
+	result.ReasoningContent = reasoning.String()
+	if result.OutputTokens == 0 {
+		// 供应商未返回 usage 时使用保守估算，正文与工具调用参数都计入输出。
+		result.OutputTokens = estimateChatResponseOutput(result)
 	}
 	if result.InputTokens == 0 && fallbackInputTokens > 0 {
 		// 流式响应常省略 usage：用请求侧估算回填输入 Token，避免预算与成本统计恒为零。

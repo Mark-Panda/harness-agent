@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // 执行器错误分类，供上层决定是否可重试或终止 Run。
@@ -21,6 +23,12 @@ var (
 	ErrToolLoop = errors.New("react tool loop detected")
 	// ErrContentFiltered 供应商内容审核拦截了模型输出，无法继续生成。
 	ErrContentFiltered = errors.New("react output blocked by content filter")
+	// ErrReasoningOnly 模型只返回了推理内容而没有最终回答，不能当作空答案成功返回。
+	ErrReasoningOnly = errors.New("react model returned reasoning without final answer")
+	// ErrEmptyResponse 模型既没有正文也没有推理内容，空答案成功的 Run 对用户没有意义。
+	ErrEmptyResponse = errors.New("react model returned an empty response")
+	// ErrIncompleteToolCall 模型输出被截断，工具调用的完整性无法保证。
+	ErrIncompleteToolCall = errors.New("react model returned incomplete tool calls")
 	// ErrBudgetExceeded Token 或费用预算耗尽。
 	ErrBudgetExceeded = errors.New("react budget exceeded")
 	// ErrUnknownTool 模型调用了未注册工具。
@@ -97,6 +105,10 @@ const (
 
 // Message 是执行器内部的规范消息。
 type Message struct {
+	// ID 是持久化消息标识，仅用于恢复，不进入模型协议。
+	ID string `json:"-"`
+	// RunID 是产生该消息的执行轮次，仅用于恢复，不进入模型协议。
+	RunID string `json:"-"`
 	// Role 消息角色。
 	Role Role `json:"role"`
 	// Content 文本内容。
@@ -141,6 +153,8 @@ type Usage struct {
 type Completion struct {
 	// Content 最终文本。
 	Content string
+	// ReasoningContent 供应商返回的推理内容，仅用于判断空回答，不进入上下文也不持久化。
+	ReasoningContent string
 	// ToolCalls 工具调用列表。
 	ToolCalls []ToolCall
 	// FinishReason 结束原因。
@@ -195,7 +209,7 @@ type Limits struct {
 	MaxCost float64
 	// DuplicateToolThreshold 连续相同工具调用阈值，默认 3。
 	DuplicateToolThreshold int
-	// MaxToolResultBytes 单个工具结果进入上下文的字节上限，默认 64KB。
+	// MaxToolResultBytes 单个工具结果进入上下文的字节上限，默认 64KB；超限时保留首尾裁剪后回填。
 	MaxToolResultBytes int
 }
 
@@ -272,6 +286,8 @@ type Result struct {
 	EstimatedCost float64
 	// Messages 完整消息序列，用于会话持久化。
 	Messages []Message
+	// FinalMessageID 是最终答复的持久化消息 ID；编排模式使用自定义幂等键时由上层填写。
+	FinalMessageID string
 }
 
 // InvalidArgumentsError 表示工具参数未通过本地 Schema 校验。
@@ -303,6 +319,26 @@ func WithContextBudget(budget int, trim func([]Message, int) []Message) RunnerOp
 	}
 }
 
+// WithMaxToolsPerCall 覆盖单次模型调用下发的工具定义上限；
+// 默认上限足够覆盖常见注册表规模，只有工具数量极端多时才按相关性裁剪。
+func WithMaxToolsPerCall(limit int) RunnerOption {
+	return func(r *Runner) {
+		if limit > 0 {
+			r.maxTools = limit
+		}
+	}
+}
+
+// defaultMaxToolsPerCall 是单次模型调用下发工具定义的默认上限。
+// 取值高于常见 MCP + 内置工具注册规模，避免大量工具因截断而对模型不可见。
+const defaultMaxToolsPerCall = 128
+
+// maxParallelTools 是单步内并行执行工具调用的并发上限，避免瞬时打爆下游连接池。
+const maxParallelTools = 4
+
+// omittedToolsNoteLimit 是提示中最多列出的未下发工具名数量。
+const omittedToolsNoteLimit = 300
+
 // Runner 是 ReAct 执行器，并发安全依赖无共享可变状态。
 type Runner struct {
 	model         Model
@@ -310,6 +346,7 @@ type Runner struct {
 	limits        Limits
 	contextBudget int
 	trimContext   func([]Message, int) []Message
+	maxTools      int
 }
 
 // NewRunner 构造执行器；模型与注册表必填。
@@ -317,7 +354,7 @@ func NewRunner(model Model, registry Registry, limits Limits, options ...RunnerO
 	if model == nil || registry == nil {
 		return nil, errors.New("react model and tool registry are required")
 	}
-	runner := &Runner{model: model, registry: registry, limits: limits.Normalize()}
+	runner := &Runner{model: model, registry: registry, limits: limits.Normalize(), maxTools: defaultMaxToolsPerCall}
 	for _, option := range options {
 		option(runner)
 	}
@@ -379,11 +416,13 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 	result := Result{Messages: messages}
 	var totalTokens int
 	var cost float64
-	// 重复检测针对当前 Run 内的全部步骤：同一工具与完全相同参数累计达到阈值即视为循环，
-	// 即使两次调用之间穿插了其他工具（A-B-A）也能识别；历史消息不作为种子，
-	// 否则重启后的第一次正常调用会被误判为重复。
-	callCounts := map[string]int{}
+	// 重复检测只统计「连续相同」的调用：紧邻的前一次调用与本次工具与参数完全一致时累计，
+	// 出现不同的调用就重置。这样既能识别原地循环，也不会把合法轮询在第 3 次误拦截。
+	// 历史消息不作为种子，否则重启后的第一次正常调用会被误判为重复。
+	var lastCallHash string
+	consecutiveCalls := 0
 	continuationRequested := false
+	continuationParts := make([]string, 0, 2)
 	messageIndex := len(messages)
 	appendMessage := func(message Message) {
 		messages = append(messages, message)
@@ -399,15 +438,19 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 		// 步骤级事件只描述 ReAct 步，模型身份与 Attempt 事实由路由观察者写入。
 		emit(sink, "step.started", map[string]any{"step": step})
 		// 工具数量超过阈值时按与当前输入的词法相关性筛选，避免每步都下发全部工具定义挤占上下文。
-		toolSpecs, omitted := r.toolsForModel(messages)
-		if omitted > 0 {
-			emit(sink, "tools.selected", map[string]any{"step": step, "omitted": omitted})
+		toolSpecs, omittedTools := r.toolsForModel(messages)
+		if len(omittedTools) > 0 {
+			emit(sink, "tools.selected", map[string]any{"step": step, "omitted": len(omittedTools)})
 		}
 		// 长任务会把历史工具结果持续带入上下文；每轮调用前按预算裁剪，避免超出模型窗口。
 		// 工具定义也计入预算，先确定本轮工具集再裁剪消息。
 		modelMessages := r.messagesForModel(messages, toolSpecs)
-		if len(modelMessages) < len(messages) {
-			emit(sink, "context.trimmed", map[string]any{"step": step, "dropped_messages": len(messages) - len(modelMessages)})
+		trimmed := len(modelMessages) < len(messages)
+		if note := omittedToolsNote(omittedTools); note != "" {
+			modelMessages = append([]Message{{Role: RoleSystem, Content: note}}, modelMessages...)
+		}
+		if trimmed {
+			emit(sink, "context.trimmed", map[string]any{"step": step, "dropped_messages": len(messages) - len(modelMessages) + 1})
 		}
 		var completion Completion
 		var err error
@@ -443,6 +486,20 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 			"input_tokens": completion.Usage.InputTokens, "output_tokens": completion.Usage.OutputTokens,
 		})
 
+		// 工具调用被截断或内容审核拦截时不得执行：即使参数片段碰巧是合法 JSON，
+		// 也无法证明调用语义完整，继续执行可能产生非预期副作用。
+		if len(completion.ToolCalls) > 0 {
+			switch strings.ToLower(strings.TrimSpace(completion.FinishReason)) {
+			case "content_filter":
+				emit(sink, "run.failed", map[string]any{"reason": "content_filter", "step": step})
+				result.Messages = messages
+				return result, fmt.Errorf("%w: step=%d", ErrContentFiltered, step)
+			case "length":
+				emit(sink, "run.failed", map[string]any{"reason": "tool_calls_truncated", "step": step})
+				result.Messages = messages
+				return result, fmt.Errorf("%w: step=%d", ErrIncompleteToolCall, step)
+			}
+		}
 		// 无工具调用即得到最终回答；但必须先处理截断与内容审核两种结束原因。
 		if len(completion.ToolCalls) == 0 {
 			switch strings.ToLower(strings.TrimSpace(completion.FinishReason)) {
@@ -453,12 +510,16 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 			case "length":
 				partial := strings.TrimSpace(completion.Content)
 				if partial != "" {
-					appendMessage(Message{Role: RoleAssistant, Content: partial})
+					continuationParts = append(continuationParts, partial)
 				}
-				result.Content = partial
-				emit(sink, "message.truncated", map[string]any{"step": step, "has_partial": partial != ""})
+				// Run 结果必须包含所有续写片段，不能只返回最后一次模型调用的末段。
+				result.Content = strings.Join(continuationParts, "")
 				// 输出被长度截断时先请求模型续写一次，避免把半截答案直接返回用户。
 				if step < r.limits.MaxSteps && !continuationRequested {
+					if partial != "" {
+						appendMessage(Message{Role: RoleAssistant, Content: partial})
+					}
+					emit(sink, "message.truncated", map[string]any{"step": step, "has_partial": partial != ""})
 					continuationRequested = true
 					messages = append(messages, Message{
 						Role:    RoleUser,
@@ -472,42 +533,86 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 					emit(sink, "run.failed", map[string]any{"reason": "output_truncated", "step": step})
 					return result, fmt.Errorf("%w: output truncated at step %d", ErrStepLimit, step)
 				}
+				// 收尾时只追加合并后的完整答案，message_id 因而始终指向完整结果而不是末段。
+				appendMessage(Message{Role: RoleAssistant, Content: result.Content})
+				emit(sink, "message.truncated", map[string]any{"step": step, "has_partial": true})
 				result.Messages = messages
 				emit(sink, "run.completed", map[string]any{"steps": step, "total_tokens": totalTokens, "truncated": true})
 				return result, nil
 			}
+			if strings.TrimSpace(completion.Content) == "" {
+				// 推理模型把答案留在 reasoning 字段时会表现为空回答；
+				// 两者都为空同样必须显式失败，而不是静默返回一个空答案。
+				if completion.ReasoningContent != "" {
+					emit(sink, "run.failed", map[string]any{"reason": "reasoning_only", "step": step})
+					return result, fmt.Errorf("%w: step %d", ErrReasoningOnly, step)
+				}
+				emit(sink, "run.failed", map[string]any{"reason": "empty_response", "step": step})
+				return result, fmt.Errorf("%w: step %d", ErrEmptyResponse, step)
+			}
 			result.Content = completion.Content
-			appendMessage(Message{Role: RoleAssistant, Content: completion.Content})
+			if len(continuationParts) > 0 {
+				result.Content = strings.Join(append(continuationParts, completion.Content), "")
+			}
+			appendMessage(Message{Role: RoleAssistant, Content: result.Content})
 			result.Messages = messages
 			emit(sink, "run.completed", map[string]any{"steps": step, "total_tokens": totalTokens})
 			return result, nil
 		}
 		appendMessage(Message{Role: RoleAssistant, Content: completion.Content, ToolCalls: completion.ToolCalls})
-		stepHashes := make(map[string]int, len(completion.ToolCalls))
-		for _, call := range completion.ToolCalls {
+		// 第一遍串行完成循环检测、工具查找与 started 事件，保证事件顺序稳定；
+		// 结果先写入与 tool_calls 等长的槽位，最后统一按原顺序追加，
+		// 避免“被拦截的调用”和“真正执行的调用”交错导致 tool 消息乱序。
+		stepSeen := make(map[string]bool, len(completion.ToolCalls))
+		toolImpls := make([]Tool, len(completion.ToolCalls))
+		outcomes := make([]toolOutcome, len(completion.ToolCalls))
+		slots := make([]Message, len(completion.ToolCalls))
+		slotSet := make([]bool, len(completion.ToolCalls))
+		runnable := make([]int, 0, len(completion.ToolCalls))
+		// 同批包含需要审批的工具时串行执行：既避免低风险工具在高风险工具获批前先产生副作用，
+		// 也避免模型把有依赖的调用放进同一批时被并发打乱。
+		serial := false
+		for index, call := range completion.ToolCalls {
 			hash := toolCallHash(call)
-			// 同一条 assistant 消息内的重复调用只计一次，避免把并行/等价参数误判为跨步循环。
-			if _, seen := stepHashes[hash]; !seen {
-				callCounts[hash]++
-				stepHashes[hash] = callCounts[hash]
+			if hash == lastCallHash {
+				consecutiveCalls++
+			} else {
+				lastCallHash = hash
+				consecutiveCalls = 1
 			}
-			// 达到阈值后不再执行工具副作用，而是把重复事实作为观察结果回传模型，
-			// 由模型改写策略；持续循环最终由步数上限兜底。
-			if callCounts[hash] >= r.limits.DuplicateToolThreshold {
+			// 同一 assistant 消息内的重复调用只执行一次，避免并行重复产生双份副作用。
+			if stepSeen[hash] || consecutiveCalls >= r.limits.DuplicateToolThreshold {
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "repeated"})
-				appendMessage(Message{
+				slots[index] = Message{
 					Role: RoleTool, ToolCallID: call.ID, Name: call.Name,
-					Content: `{"error":"repeated_tool_call","hint":"与之前某次调用的工具与参数完全相同，工具未重复执行；请总结已有结果、补充缺失信息或改用其他参数或工具。"}`,
-				})
+					Content: `{"error":"repeated_tool_call","hint":"与紧邻的上一次调用参数完全相同，工具未重复执行；请总结已有结果、补充缺失信息或改用其他参数或工具。"}`,
+				}
+				slotSet[index] = true
 				continue
 			}
+			stepSeen[hash] = true
 			tool, exists := r.registry.Lookup(call.Name)
 			if !exists {
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "status": "unknown_tool"})
-				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: `{"error":"unknown_tool"}`})
+				slots[index] = Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: `{"error":"unknown_tool"}`}
+				slotSet[index] = true
 				continue
 			}
-			emit(sink, "tool.started", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "risk_level": tool.RiskLevel()})
+			toolImpls[index] = tool
+			runnable = append(runnable, index)
+			if tool.RiskLevel() != "low" {
+				serial = true
+			}
+		}
+		invoke := func(index int) {
+			call := completion.ToolCalls[index]
+			tool := toolImpls[index]
+			// 工具实现来自内部注册表与 MCP 适配层，仍隔离 panic，避免单个工具拖垮整个 Run。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					outcomes[index] = toolOutcome{err: fmt.Errorf("%w: %s panic: %v", ErrToolFailed, call.Name, recovered)}
+				}
+			}()
 			// 工具可通过 Timeout() 声明自身超时；未声明或返回非正值时使用执行层默认值。
 			toolTimeout := r.limits.ToolTimeout
 			if provider, ok := tool.(interface{ Timeout() time.Duration }); ok {
@@ -516,22 +621,71 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 				}
 			}
 			toolContext, toolCancel := context.WithTimeout(runContext, toolTimeout)
+			defer toolCancel()
 			// 注入调用元数据，审批包装器据此把审批绑定到具体 tool_call_id。
 			toolContext = WithToolCall(toolContext, call.ID, call.Name)
 			output, toolErr := tool.Invoke(toolContext, call.Arguments)
-			toolCancel()
-			if toolErr != nil {
-				// 审批门禁拦截时立即结束本轮，不伪造工具结果；Run 由上层暂停等待决策。
-				var approvalErr *ApprovalRequiredError
-				if errors.As(toolErr, &approvalErr) {
+			outcomes[index] = toolOutcome{output: output, err: toolErr}
+		}
+		executed := make([]int, 0, len(runnable))
+		if len(runnable) > 0 {
+			if serial {
+				for _, index := range runnable {
+					call := completion.ToolCalls[index]
+					tool := toolImpls[index]
+					emit(sink, "tool.started", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "risk_level": tool.RiskLevel()})
+					executed = append(executed, index)
+					invoke(index)
+					// 一旦出现审批门禁，本批后续调用一律不执行：既避免审批前产生副作用，
+					// 也避免尚未决策时继续创建一串相互依赖的审批。
+					if errors.Is(outcomes[index].err, ErrApprovalRequired) {
+						break
+					}
+				}
+			} else {
+				for _, index := range runnable {
+					call := completion.ToolCalls[index]
+					tool := toolImpls[index]
+					emit(sink, "tool.started", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "risk_level": tool.RiskLevel()})
+				}
+				executed = append(executed, runnable...)
+				var waitGroup sync.WaitGroup
+				semaphore := make(chan struct{}, maxParallelTools)
+				for _, index := range runnable {
+					waitGroup.Add(1)
+					go func(index int) {
+						defer waitGroup.Done()
+						semaphore <- struct{}{}
+						defer func() { <-semaphore }()
+						invoke(index)
+					}(index)
+				}
+				waitGroup.Wait()
+			}
+		}
+		// 第二遍按原始顺序回填槽位与完成事件，保持 tool_calls 与 tool 消息一一对应。
+		var approvalErr *ApprovalRequiredError
+		var approvalCause error
+		for _, index := range executed {
+			call := completion.ToolCalls[index]
+			outcome := outcomes[index]
+			if outcome.err != nil {
+				var approval *ApprovalRequiredError
+				if errors.As(outcome.err, &approval) {
+					// 审批门禁拦截时不伪造工具结果；同一批里其他已执行的调用结果仍保留，
+					// 恢复后模型无需重新调用它们。Run 由上层暂停等待决策。
 					emit(sink, "tool.approval.required", map[string]any{
 						"tool": call.Name, "tool_call_id": call.ID,
-						"approval_id": approvalErr.ApprovalID, "risk_level": approvalErr.RiskLevel,
+						"approval_id": approval.ApprovalID, "risk_level": approval.RiskLevel,
 					})
-					result.Messages = messages
-					return result, toolErr
+					if approvalErr == nil {
+						approvalErr = approval
+						approvalCause = outcome.err
+					}
+					continue
 				}
 				status := "failed"
+				toolErr := outcome.err
 				var invalidArgs *InvalidArgumentsError
 				switch {
 				case errors.As(toolErr, &invalidArgs):
@@ -544,20 +698,35 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": status, "error": detail})
 				// 工具错误以不可信数据回填模型，由模型决定下一步，不直接终止 Run。
 				// 保留脱敏后的错误详情，模型才能区分参数错误、超时与业务失败并纠正调用。
-				content := fmt.Sprintf(`{"error":%q,"detail":%q}`, status, detail)
-				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: content})
+				slots[index] = Message{
+					Role: RoleTool, ToolCallID: call.ID, Name: call.Name,
+					Content: toolErrorObservation(status, detail, outcome.output, r.limits.MaxToolResultBytes),
+				}
+				slotSet[index] = true
 				continue
 			}
-			// 工具结果超过上限时拒绝进入上下文，避免挤占 Token 预算或注入超长内容。
-			if len(output) > r.limits.MaxToolResultBytes {
-				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "too_large"})
-				appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: `{"error":"tool_result_too_large"}`})
-				continue
+			// 工具结果超过上限时保留首尾并标注原始字节数：
+			// 直接丢弃会让模型完全失去观测结果，只能反复重试同一调用。
+			content, truncated := truncateToolResult(outcome.output, r.limits.MaxToolResultBytes)
+			if truncated {
+				emit(sink, "tool.completed", map[string]any{
+					"tool": call.Name, "tool_call_id": call.ID, "status": "truncated", "original_bytes": len(outcome.output),
+				})
+			} else {
+				emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "completed"})
 			}
-			emit(sink, "tool.completed", map[string]any{"tool": call.Name, "tool_call_id": call.ID, "status": "completed"})
-			appendMessage(Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: string(output)})
+			slots[index] = Message{Role: RoleTool, ToolCallID: call.ID, Name: call.Name, Content: content}
+			slotSet[index] = true
+		}
+		for index := range slots {
+			if slotSet[index] {
+				appendMessage(slots[index])
+			}
 		}
 		result.Messages = messages
+		if approvalErr != nil {
+			return result, approvalCause
+		}
 	}
 	// 步数耗尽时追加一次禁止工具的收尾调用，让模型基于已获得的工具结果生成结论，
 	// 避免“最后一步刚查到数据、却没有下一轮模型调用汇总”导致整轮失败。
@@ -566,7 +735,16 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 	emit(sink, "step.started", map[string]any{"step": finalStep, "final": true})
 	// 收尾调用不携带工具定义，因此预算只需为消息本身预留。
 	summaryMessages := r.messagesForModel(finalMessages, nil)
-	completion, err := r.model.Complete(runContext, summaryMessages, nil)
+	var completion Completion
+	var err error
+	if streamer, ok := r.model.(StreamingModel); ok && sink != nil {
+		// 收尾也走流式，避免最后一段答案在前端表现为长时间无输出。
+		emitter := &deltaEmitter{sink: sink, step: finalStep}
+		completion, err = streamer.CompleteStream(runContext, summaryMessages, nil, emitter.push)
+		emitter.flush()
+	} else {
+		completion, err = r.model.Complete(runContext, summaryMessages, nil)
+	}
 	if err != nil {
 		emit(sink, "step.failed", map[string]any{"step": finalStep, "final": true, "error": sanitizeError(err)})
 		emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})
@@ -592,6 +770,14 @@ func (r *Runner) Run(ctx context.Context, request Request, sink EventSink) (Resu
 		"step": finalStep, "final": true, "finish_reason": completion.FinishReason,
 		"input_tokens": completion.Usage.InputTokens, "output_tokens": completion.Usage.OutputTokens,
 	})
+	switch strings.ToLower(strings.TrimSpace(completion.FinishReason)) {
+	case "content_filter":
+		emit(sink, "run.failed", map[string]any{"reason": "content_filter", "step": finalStep, "final": true})
+		return result, fmt.Errorf("%w: final summary", ErrContentFiltered)
+	case "length":
+		emit(sink, "run.failed", map[string]any{"reason": "output_truncated", "step": finalStep, "final": true})
+		return result, fmt.Errorf("%w: final summary truncated", ErrStepLimit)
+	}
 	content := strings.TrimSpace(completion.Content)
 	if content == "" {
 		emit(sink, "run.failed", map[string]any{"reason": "step_limit", "steps": r.limits.MaxSteps})
@@ -634,20 +820,17 @@ func (e *deltaEmitter) flush() {
 	emit(e.sink, "message.delta", map[string]any{"step": e.step, "delta": text})
 }
 
-// maxToolsPerCall 单次模型调用下发的工具定义上限；超过后按相关性筛选。
-const maxToolsPerCall = 20
-
-// toolsForModel 返回本次调用应下发的工具定义，以及被省略的数量。
-// 工具数量在阈值内时全量下发；超过阈值时按与当前输入的词法相关性选择，
+// toolsForModel 返回本次调用应下发的工具定义，以及因数量限制未下发的工具名。
+// 工具数量在阈值内时全量下发；超过阈值时按与整段对话的词法相关性选择，
 // 既避免工具定义挤占上下文，也保留与当前任务最可能相关的工具。
-func (r *Runner) toolsForModel(messages []Message) ([]ToolSpec, int) {
+func (r *Runner) toolsForModel(messages []Message) ([]ToolSpec, []string) {
 	specs := r.registry.List()
-	if len(specs) <= maxToolsPerCall {
-		return specs, 0
+	if len(specs) <= r.maxTools {
+		return specs, nil
 	}
-	query := lastUserContent(messages)
+	query := conversationUserContent(messages, 6, 2000)
 	if query == "" {
-		return specs[:maxToolsPerCall], len(specs) - maxToolsPerCall
+		return specs[:r.maxTools], toolNames(specs[r.maxTools:])
 	}
 	type scoredSpec struct {
 		index int
@@ -658,21 +841,139 @@ func (r *Runner) toolsForModel(messages []Message) ([]ToolSpec, int) {
 		scored = append(scored, scoredSpec{index: index, score: textOverlap(query, spec.Name+" "+spec.Description)})
 	}
 	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
-	selected := make([]ToolSpec, 0, maxToolsPerCall)
-	for _, item := range scored[:maxToolsPerCall] {
+	selected := make([]ToolSpec, 0, r.maxTools)
+	selectedIndex := make(map[int]struct{}, r.maxTools)
+	for _, item := range scored[:r.maxTools] {
 		selected = append(selected, specs[item.index])
+		selectedIndex[item.index] = struct{}{}
 	}
-	return selected, len(specs) - len(selected)
-}
-
-// lastUserContent 返回最近一条用户消息内容，用于工具筛选与相关性判断。
-func lastUserContent(messages []Message) string {
-	for index := len(messages) - 1; index >= 0; index-- {
-		if messages[index].Role == RoleUser {
-			return strings.TrimSpace(messages[index].Content)
+	omitted := make([]string, 0, len(specs)-len(selected))
+	for index, spec := range specs {
+		if _, ok := selectedIndex[index]; !ok {
+			omitted = append(omitted, spec.Name)
 		}
 	}
-	return ""
+	return selected, omitted
+}
+
+// omittedToolsNote 把未下发定义的工具名告知模型：名称仍可通过 registry 调用，
+// 只是没有完整 Schema，避免“必要工具被词法筛选静默隐藏”。
+func omittedToolsNote(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	shown := names
+	if len(shown) > omittedToolsNoteLimit {
+		shown = shown[:omittedToolsNoteLimit]
+	}
+	note := "以下工具因数量限制未下发完整定义，但仍可按名称调用（参数需按工具语义推断）：" + strings.Join(shown, ", ")
+	if len(names) > len(shown) {
+		note += fmt.Sprintf(" 等共 %d 个", len(names))
+	}
+	return note
+}
+
+// toolNames 提取工具名列表。
+func toolNames(specs []ToolSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	return names
+}
+
+// conversationUserContent 拼接最近若干条用户消息，用于工具筛选。
+// 只看最后一条会漏掉多轮任务的前置约束；只看整段又会引入无关噪声，因此取近几条并做长度上限。
+func conversationUserContent(messages []Message, maxMessages, maxRunes int) string {
+	if maxMessages <= 0 {
+		maxMessages = 1
+	}
+	parts := make([]string, 0, maxMessages)
+	total := 0
+	for index := len(messages) - 1; index >= 0 && len(parts) < maxMessages; index-- {
+		if messages[index].Role != RoleUser {
+			continue
+		}
+		content := strings.TrimSpace(messages[index].Content)
+		if content == "" {
+			continue
+		}
+		runes := []rune(content)
+		if maxRunes > 0 && total+len(runes) > maxRunes {
+			remaining := maxRunes - total
+			if remaining <= 0 {
+				break
+			}
+			runes = runes[:remaining]
+		}
+		parts = append(parts, string(runes))
+		total += len(runes)
+	}
+	// parts 按时间倒序收集，拼接时恢复为正序，保持语义连贯。
+	for left, right := 0, len(parts)-1; left < right; left, right = left+1, right-1 {
+		parts[left], parts[right] = parts[right], parts[left]
+	}
+	return strings.Join(parts, "\n")
+}
+
+// toolOutcome 是单次工具调用的执行结果，供并行调度后按序回填。
+type toolOutcome struct {
+	// output 工具返回的原始 JSON。
+	output json.RawMessage
+	// err 工具执行错误；审批中断时携带 ApprovalRequiredError。
+	err error
+}
+
+// toolErrorObservation 保留工具随错误返回的结构化 payload，供模型修正参数或理解部分失败。
+// result 仅在工具确实返回合法 JSON 时附加；没有 payload 的错误保持原有 error/detail 结构。
+func toolErrorObservation(status, detail string, output json.RawMessage, limit int) string {
+	payload := map[string]any{"error": status, "detail": detail}
+	if len(output) > 0 && json.Valid(output) {
+		payload["result"] = output
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q,"detail":%q}`, status, detail)
+	}
+	content, _ := truncateToolResult(encoded, limit)
+	return content
+}
+
+// truncateToolResult 把超限结果裁剪为首尾保留的文本并标注原始字节数。
+// 直接丢弃会让模型完全失去观测结果，只能反复重试；保留首尾足以判断内容形态与关键片段。
+func truncateToolResult(output []byte, limit int) (string, bool) {
+	if limit <= 0 || len(output) <= limit {
+		return string(output), false
+	}
+	head := utf8BoundaryBefore(output, limit*2/3)
+	tailStart := utf8BoundaryAfter(output, len(output)-(limit-head))
+	marker := fmt.Sprintf("\n[... tool result truncated: original %d bytes, kept first %d and last %d bytes. "+
+		"The complete output is archived in the execution payload; if you need the omitted middle part, "+
+		"retry the same tool with a narrower filter, pagination or a smaller range instead of repeating the call unchanged ...]\n",
+		len(output), head, len(output)-tailStart)
+	return string(output[:head]) + marker + string(output[tailStart:]), true
+}
+
+// utf8BoundaryBefore 把字节下标回退到 UTF-8 字符起始位置，避免截断多字节字符。
+func utf8BoundaryBefore(data []byte, index int) int {
+	if index >= len(data) {
+		index = len(data) - 1
+	}
+	for index > 0 && !utf8.RuneStart(data[index]) {
+		index--
+	}
+	return index
+}
+
+// utf8BoundaryAfter 把字节下标前进到 UTF-8 字符起始位置，避免截断多字节字符。
+func utf8BoundaryAfter(data []byte, index int) int {
+	if index < 0 {
+		index = 0
+	}
+	for index < len(data) && !utf8.RuneStart(data[index]) {
+		index++
+	}
+	return index
 }
 
 // textOverlap 统计查询中的相邻二字片段在文本中出现的次数，兼容中英文。

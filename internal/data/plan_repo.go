@@ -241,6 +241,87 @@ func (r *PlanRepository) UpdatePlan(ctx context.Context, userID, planID uuid.UUI
 	return r.GetPlan(ctx, userID, planID)
 }
 
+// FindPausedPlanBySession 读取会话中最近一个暂停中的计划，用于新消息自动续跑。
+func (r *PlanRepository) FindPausedPlanBySession(ctx context.Context, userID, sessionID uuid.UUID) (biz.Plan, error) {
+	var planRecord planModel
+	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND session_id = ? AND status = ?", userID, sessionID, string(biz.PlanPaused)).
+			Order("created_at DESC").First(&planRecord).Error
+	}); err != nil {
+		return biz.Plan{}, catalogError("find paused plan by session", err)
+	}
+	return r.GetPlan(ctx, userID, planRecord.ID)
+}
+
+// RebindPlanRun 把暂停中的计划迁移到新的 Run 并恢复执行，保留已完成步骤。
+// 迁移时：无副作用的模型步骤与尚未执行的审批步骤退回 pending；仍在 running 的
+// 工具步骤保留原状，交给 recoverPlanSteps 按“副作用未知”处理；旧 Run 上未决策的
+// 审批作废，避免审批列表残留无法投递的请求。
+func (r *PlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (biz.Plan, error) {
+	var result *gorm.DB
+	var oldRunID uuid.UUID
+	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var planRecord planModel
+		if err := tx.Select("run_id").Where("id = ? AND user_id = ?", planID, userID).First(&planRecord).Error; err != nil {
+			return err
+		}
+		oldRunID = planRecord.RunID
+		result = tx.Model(&planModel{}).
+			Where("id = ? AND user_id = ? AND status = ? AND revision = ?", planID, userID, string(biz.PlanPaused), expectedRevision).
+			Updates(map[string]any{
+				"run_id": runID, "status": string(biz.PlanExecuting),
+				"deadline_at": deadlineAt, "revision": gorm.Expr("revision + 1"),
+				"error_code": "", "error_message": "", "updated_at": now.UTC(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		// 模型步骤没有外部副作用，可以安全重跑。
+		if err := tx.Model(&planStepModel{}).
+			Where("plan_id = ? AND user_id = ? AND status = ? AND tool_name = ''", planID, userID, string(biz.PlanStepRunning)).
+			Updates(map[string]any{
+				"status": string(biz.PlanStepPending), "lease_owner": "", "fence_token": int64(0),
+				// 中断不是业务失败，重置尝试次数，避免达到 MaxAttempts 后新 Run 永远领不到该步骤。
+				"attempts": 0, "started_at": nil, "finished_at": nil, "updated_at": now.UTC(),
+				"error_code": "", "error_message": "",
+			}).Error; err != nil {
+			return err
+		}
+		// 等待审批的步骤尚未执行，退回 pending 让新 Run 重新发起审批。
+		if err := tx.Model(&planStepModel{}).
+			Where("plan_id = ? AND user_id = ? AND status = ?", planID, userID, string(biz.PlanStepWaitingApproval)).
+			Updates(map[string]any{
+				"status": string(biz.PlanStepPending), "lease_owner": "", "fence_token": int64(0),
+				"attempts": 0, "execution_step_id": nil, "started_at": nil, "finished_at": nil,
+				"updated_at": now.UTC(), "error_code": "", "error_message": "",
+			}).Error; err != nil {
+			return err
+		}
+		// 旧 Run 上未决策的审批作废：计划已迁走，投递到旧 Run 的结果不会被任何执行器消费。
+		if oldRunID != uuid.Nil {
+			if err := tx.Model(&toolApprovalModel{}).
+				Where("user_id = ? AND run_id = ? AND status = ?", userID, oldRunID, string(biz.ApprovalPending)).
+				Updates(map[string]any{
+					"status": string(biz.ApprovalDenied), "decided_at": now.UTC(),
+					"error_code": "plan_rebound", "error_message": "计划已迁移到新的执行轮次，旧审批作废",
+					"updated_at": now.UTC(),
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return biz.Plan{}, catalogError("rebind plan run", err)
+	}
+	if result == nil || result.RowsAffected != 1 {
+		return biz.Plan{}, fmt.Errorf("%w: plan revision or status changed", biz.ErrPlanRevisionConflict)
+	}
+	return r.GetPlan(ctx, userID, planID)
+}
+
 // AddPlanUsage 累加计划的 Token 与费用，revision 递增用于展示最新事实。
 func (r *PlanRepository) AddPlanUsage(ctx context.Context, userID, planID uuid.UUID, inputTokens, outputTokens int64, estimatedCost float64, now time.Time) error {
 	if inputTokens == 0 && outputTokens == 0 && estimatedCost == 0 {

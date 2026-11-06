@@ -123,6 +123,64 @@ func TestRunServiceCancelAndEvents(t *testing.T) {
 	}
 }
 
+// TestRunServiceAdoptsPausedPlanOnNewRun 验证同一会话新建 Plan Run 时会续跑暂停中的计划，
+// 而不是丢弃既有进度重新规划。
+func TestRunServiceAdoptsPausedPlanOnNewRun(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	runRepo := mocks.NewMockRunRepository(ctrl)
+	sessionRepo := mocks.NewMockSessionRepository(ctrl)
+	planRepo := mocks.NewMockPlanRepository(ctrl)
+	service, err := biz.NewRunService(runRepo, sessionRepo, biz.WithPlanResume(planRepo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	sessionID := uuid.New()
+	oldRunID := uuid.New()
+	triggerMessageID := uuid.New()
+	sessionRepo.EXPECT().GetSession(gomock.Any(), principal.UserID, sessionID).
+		Return(biz.Session{ID: sessionID, UserID: principal.UserID, Status: biz.SessionActive}, nil)
+	sessionRepo.EXPECT().ListMessages(gomock.Any(), principal.UserID, sessionID, gomock.Any(), "").
+		Return(biz.Page[biz.Message]{Items: []biz.Message{{ID: triggerMessageID, Role: biz.MessageUser, Content: "继续", CreatedAt: time.Now().UTC()}}}, nil).
+		Times(2)
+	var createdRun biz.Run
+	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, run biz.Run) (biz.Run, error) {
+			createdRun = run
+			return run, nil
+		},
+	)
+	plan := biz.Plan{ID: uuid.New(), UserID: principal.UserID, SessionID: sessionID, RunID: oldRunID, Revision: 3, Status: biz.PlanPaused}
+	planRepo.EXPECT().FindPausedPlanBySession(gomock.Any(), principal.UserID, sessionID).Return(plan, nil)
+	runRepo.EXPECT().ListRuns(gomock.Any(), principal.UserID, sessionID, 20, "").DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, _ int, _ string) (biz.Page[biz.Run], error) {
+			return biz.Page[biz.Run]{Items: []biz.Run{{ID: createdRun.ID, Mode: biz.AgentModePlan}, {ID: oldRunID, Mode: biz.AgentModePlan}}}, nil
+		},
+	)
+	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, oldRunID).
+		Return(biz.Run{ID: oldRunID, UserID: principal.UserID, Status: biz.RunRunning}, nil)
+	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, oldRunID, biz.RunRunning, biz.RunCancelled, gomock.Any()).
+		Return(biz.Run{ID: oldRunID, UserID: principal.UserID, Status: biz.RunCancelled}, nil)
+	planRepo.EXPECT().RebindPlanRun(gomock.Any(), principal.UserID, plan.ID, gomock.Any(), int64(3), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ uuid.UUID, _ uuid.UUID, runID uuid.UUID, _ int64, _ *time.Time, _ time.Time) (biz.Plan, error) {
+			if runID != createdRun.ID {
+				t.Fatalf("plan rebound to %s, want new run %s", runID, createdRun.ID)
+			}
+			return plan, nil
+		})
+	runRepo.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, event biz.RunEvent) (biz.RunEvent, error) {
+			if event.EventType != "plan.resumed" {
+				t.Fatalf("resume event = %q", event.EventType)
+			}
+			return event, nil
+		},
+	)
+	if _, err := service.Create(context.Background(), principal, biz.CreateRunInput{SessionID: sessionID, Mode: biz.AgentModePlan}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestRecordPayloadAccessAuditsReason 验证载荷查阅理由校验与审计事件写入。
 func TestRecordPayloadAccessAuditsReason(t *testing.T) {
 	ctrl := gomock.NewController(t)

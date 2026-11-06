@@ -163,6 +163,17 @@ func TestRunRepositorySerializesSessionRuns(t *testing.T) {
 	if err != nil || claimed.Status != biz.RunRunning {
 		t.Fatalf("ClaimRun(first) = %#v, %#v, %v", claimed, fence, err)
 	}
+	// 并发 Attempt 乱序写入时，Run 只能保留最大序号，不能回退。
+	if err := runs.SetRunAttempt(ctx, user.ID, first.ID, 7, fence); err != nil {
+		t.Fatal(err)
+	}
+	if err := runs.SetRunAttempt(ctx, user.ID, first.ID, 3, fence); err != nil {
+		t.Fatal(err)
+	}
+	current, err := runs.GetRun(ctx, user.ID, first.ID)
+	if err != nil || current.AttemptNo != 7 {
+		t.Fatalf("attempt number regressed: %#v, %v", current, err)
+	}
 	// 前序 Run 运行中时，后续 Run 只能继续排队。
 	if _, _, err := runs.ClaimRun(ctx, user.ID, second.ID, "worker-b", time.Minute, time.Now().UTC()); !errors.Is(err, biz.ErrSessionRunActive) {
 		t.Fatalf("second ClaimRun() error = %v", err)

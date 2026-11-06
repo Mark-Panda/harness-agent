@@ -77,6 +77,29 @@ func TestChatContextBudgetOverflow(t *testing.T) {
 	}
 }
 
+// TestChatEstimatesUsageWhenMissing 验证非流式响应省略 usage 时也会回填预算用量。
+func TestChatEstimatesUsageWhenMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"req-no-usage","choices":[{"message":{"content":"","tool_calls":[{"id":"call-1","function":{"name":"search","arguments":"{\"q\":\"中文查询\"}"}}]},"finish_reason":"tool_calls"}]}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret-key", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Chat(context.Background(), ChatRequest{
+		Model:    ModelRef{RemoteModelName: "generation", ContextWindowTokens: 1_000_000, MaxOutputTokens: 100, Tools: true},
+		Messages: []ChatMessage{{Role: "user", Content: "hello"}}, MaxOutputTokens: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.InputTokens <= 0 || response.OutputTokens <= 0 {
+		t.Fatalf("estimated usage = %#v", response)
+	}
+}
+
 // TestChatStreamParsesSSE 验证流式请求携带 stream 参数，并正确累计文本、工具调用与用量。
 func TestChatStreamParsesSSE(t *testing.T) {
 	var sawStream bool
@@ -138,6 +161,26 @@ func TestChatStreamEstimatesUsageWhenMissing(t *testing.T) {
 	}
 	if response.OutputTokens <= 0 {
 		t.Fatalf("estimated output tokens = %d", response.OutputTokens)
+	}
+}
+
+// TestChatStreamRejectsMalformedEvent 验证损坏的数据帧不会被静默跳过并形成不完整工具调用。
+func TestChatStreamRejectsMalformedEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {not-json}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret-key", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ChatStream(context.Background(), ChatRequest{
+		Model: ModelRef{ContextWindowTokens: 1_000_000, MaxOutputTokens: 100, Stream: true},
+	}, func(string) {})
+	if !errors.Is(err, ErrRetryable) {
+		t.Fatalf("malformed stream error = %v", err)
 	}
 }
 

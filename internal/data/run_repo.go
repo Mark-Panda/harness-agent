@@ -361,9 +361,11 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 			return err
 		}
 		var active int64
+		// 只有“仍在续租的 running”或“等待审批”才占用会话；租约已过期的 running 视为
+		// 已放弃执行（例如计划暂停后 Worker 退出），不能继续阻塞同会话的新消息。
 		if err := tx.Model(&runModel{}).
-			Where("user_id = ? AND session_id = ? AND id <> ? AND status IN ?", userID, record.SessionID, runID,
-				[]string{string(biz.RunRunning), string(biz.RunWaitingApproval)}).
+			Where("user_id = ? AND session_id = ? AND id <> ? AND (status = ? OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?))",
+				userID, record.SessionID, runID, string(biz.RunWaitingApproval), string(biz.RunRunning), now).
 			Count(&active).Error; err != nil {
 			return err
 		}
@@ -375,9 +377,10 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 			"fencing_token": gorm.Expr("fencing_token + 1"),
 			"started_at":    gorm.Expr("COALESCE(started_at, ?)", now), "updated_at": now,
 		}
-		if biz.RunStatus(record.Status) == biz.RunQueued && record.DeadlineAt != nil {
+		if biz.RunStatus(record.Status) == biz.RunQueued && record.DeadlineAt != nil && record.StartedAt == nil {
 			// 排队等待不计入执行窗口：首次认领时把排队时长补回截止时间，
 			// 避免前序 Run 长时间执行导致后续 Run 一被认领就判定超时。
+			// 只在从未执行过的 Run 上补偿，避免计划暂停反复退回队列时把截止时间越推越远。
 			extended := record.DeadlineAt.Add(now.Sub(record.CreatedAt))
 			updates["deadline_at"] = extended
 		}
@@ -609,7 +612,8 @@ func (r *RunRepository) SetRunAttempt(ctx context.Context, userID, runID uuid.UU
 		result := tx.Model(&runModel{}).
 			Where("id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?",
 				runID, userID, string(biz.RunRunning), fence.Owner, fence.Token).
-			Updates(map[string]any{"attempt_no": attemptNo, "updated_at": time.Now().UTC()})
+			// Supervisor 并发 Worker 的 AttemptStarted 顺序不固定，数据库只能前进不能回退。
+			Updates(map[string]any{"attempt_no": gorm.Expr("GREATEST(attempt_no, ?)", attemptNo), "updated_at": time.Now().UTC()})
 		if result.Error != nil {
 			return result.Error
 		}

@@ -307,18 +307,47 @@ var textAttachmentExtensions = map[string]struct{}{
 	".sql": {}, ".sh": {}, ".bash": {}, ".zsh": {}, ".rst": {}, ".tex": {},
 }
 
-// extractAttachmentText 对文本类文件抽取内容，超出预算时截断并标记。
+// extractAttachmentText 抽取可注入上下文的文本，超出预算时截断并标记。
+// 纯文本直接读取；docx/xlsx/pdf 走结构化抽取；其余二进制文件只保存不解析。
 func extractAttachmentText(fileName, mimeType string, data []byte) (string, bool) {
-	if !isTextAttachment(fileName, mimeType) || !utf8.Valid(data) {
+	var text string
+	switch strings.ToLower(filepath.Ext(fileName)) {
+	case ".docx":
+		text = extractDocxText(data)
+	case ".xlsx":
+		text = extractXlsxText(data)
+	case ".pdf":
+		text = extractPDFText(data)
+		// 扫描件没有文本层：明确告知模型“文件存在但无可用文本”，
+		// 避免模型以为用户没有上传文件而重复追问。
+		if strings.TrimSpace(text) == "" {
+			return attachmentNoTextNote("PDF 未包含可抽取文本，可能是扫描件或纯图片；如需分析请提供文本版或 OCR 结果"), false
+		}
+	case ".doc", ".xls":
+		// 旧版 Office 二进制格式不在抽取范围内，返回明确提示而不是静默空内容。
+		return attachmentNoTextNote("旧版 Office 二进制格式暂不支持文本抽取；请另存为 .docx/.xlsx 或直接提供文本内容"), false
+	default:
+		if !isTextAttachment(fileName, mimeType) || !utf8.Valid(data) {
+			return "", false
+		}
+		text = string(data)
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\x00", "")
+	text = strings.TrimSpace(text)
+	if text == "" {
 		return "", false
 	}
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\x00", "")
 	if utf8.RuneCountInString(text) <= MaxExtractedChars {
 		return text, false
 	}
 	runes := []rune(text)
 	return string(runes[:MaxExtractedChars]), true
+}
+
+// attachmentNoTextNote 生成附件不可解析时的占位说明，随附件文本一起注入上下文。
+func attachmentNoTextNote(reason string) string {
+	return "【附件解析说明】" + reason
 }
 
 // isTextAttachment 判断文件是否属于文本类，二进制文件只保存不解析。

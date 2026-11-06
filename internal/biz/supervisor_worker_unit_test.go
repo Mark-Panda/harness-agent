@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -287,7 +288,8 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 			supervisorReply(t, w, "结果", http.StatusOK)
 		}
 	})
-	worker.config.SupervisorMaxTokens = 1
+	// 规划消耗 8 Token，Worker 再消耗 8 Token；上限允许规划完成，但在 Worker 后触发部分结果降级。
+	worker.config.SupervisorMaxTokens = 9
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
 	result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
 		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{})
@@ -297,6 +299,54 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "结果") {
 		t.Fatalf("partial result content = %q", result.Content)
+	}
+}
+
+func TestSupervisorFinalResultRecoveryKeepsStoredSummary(t *testing.T) {
+	calls := 0
+	worker, _, _, candidates, _ := supervisorFixture(t, func(_ string, w http.ResponseWriter) {
+		calls++
+		if calls == 1 {
+			supervisorReply(t, w, "第一次汇总", http.StatusOK)
+			return
+		}
+		supervisorReply(t, w, "第二次汇总", http.StatusOK)
+	})
+	sessions := &statefulSessionRepository{}
+	worker.sessions = sessions
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	tasks := []SupervisorTask{{
+		ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, WorkerName: "A", WorkerIndex: 1,
+		Status: SupervisorTaskCompleted, Result: map[string]any{"content": "Worker 结果"},
+	}}
+	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
+	first, err := worker.aggregateSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
+		&atomic.Int64{}, messages, supervisorUsage{}, tasks)
+	if err != nil || first.Content != "第一次汇总" {
+		t.Fatalf("first aggregate = %#v, %v", first, err)
+	}
+	recovered, err := worker.aggregateSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
+		&atomic.Int64{}, first.Messages, supervisorUsage{}, tasks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Content != "第一次汇总" || len(recovered.Messages) != len(first.Messages) || len(sessions.messages) != 1 {
+		t.Fatalf("recovery duplicated or replaced summary: %#v, stored=%d", recovered, len(sessions.messages))
+	}
+	if calls != 1 {
+		t.Fatalf("recovery called aggregation model %d times, want 1 total call", calls)
+	}
+}
+
+func TestSupervisorUsageFromEvents(t *testing.T) {
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
+	worker := &ExecutionWorker{runs: eventRunRepository{events: []RunEvent{
+		{Seq: 1, EventType: "model.attempt.completed", Payload: map[string]any{"input_tokens": 5, "output_tokens": 3, "estimated_cost": 0.1}},
+		{Seq: 2, EventType: "model.attempt.completed", Payload: map[string]any{"input_tokens": 7, "output_tokens": 2, "estimated_cost": 0.2}},
+	}}}
+	usage, has, err := worker.supervisorUsageFromEvents(context.Background(), run)
+	if err != nil || !has || usage.input != 12 || usage.output != 5 || usage.cost != 0.30000000000000004 {
+		t.Fatalf("usage = %#v, has=%v, err=%v", usage, has, err)
 	}
 }
 

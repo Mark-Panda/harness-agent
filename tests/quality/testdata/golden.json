@@ -36,14 +36,16 @@
       "id": "adversarial_unknown_tool",
       "kind": "unknown_tool",
       "prompt": "调用不存在的工具",
-      "tool": "missing_tool"
+      "tool": "missing_tool",
+      "expected_answer": "指定的工具不存在，已跳过调用。"
     },
     {
       "id": "adversarial_oversize_result",
       "kind": "oversize_result",
       "prompt": "返回超大工具结果",
       "tool": "dump",
-      "arguments": { "size": 131072 }
+      "arguments": { "size": 131072 },
+      "expected_answer": "工具返回内容过大，已截断后使用。"
     }
   ]
 }

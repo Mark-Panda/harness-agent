@@ -102,6 +102,36 @@ func (mr *MockPlanRepositoryMockRecorder) GetPlan(ctx, userID, planID any) *gomo
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPlan", reflect.TypeOf((*MockPlanRepository)(nil).GetPlan), ctx, userID, planID)
 }
 
+// FindPausedPlanBySession mocks base method.
+func (m *MockPlanRepository) FindPausedPlanBySession(ctx context.Context, userID, sessionID uuid.UUID) (biz.Plan, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "FindPausedPlanBySession", ctx, userID, sessionID)
+	ret0, _ := ret[0].(biz.Plan)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// FindPausedPlanBySession indicates an expected call of FindPausedPlanBySession.
+func (mr *MockPlanRepositoryMockRecorder) FindPausedPlanBySession(ctx, userID, sessionID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindPausedPlanBySession", reflect.TypeOf((*MockPlanRepository)(nil).FindPausedPlanBySession), ctx, userID, sessionID)
+}
+
+// RebindPlanRun mocks base method.
+func (m *MockPlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (biz.Plan, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RebindPlanRun", ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
+	ret0, _ := ret[0].(biz.Plan)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RebindPlanRun indicates an expected call of RebindPlanRun.
+func (mr *MockPlanRepositoryMockRecorder) RebindPlanRun(ctx, userID, planID, runID, expectedRevision, deadlineAt, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RebindPlanRun", reflect.TypeOf((*MockPlanRepository)(nil).RebindPlanRun), ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
+}
+
 // GetPlanByRun mocks base method.
 func (m *MockPlanRepository) GetPlanByRun(ctx context.Context, userID, runID uuid.UUID) (biz.Plan, error) {
 	m.ctrl.T.Helper()

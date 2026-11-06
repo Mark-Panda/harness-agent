@@ -217,6 +217,10 @@ type PlanRepository interface {
 	UpdatePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, fence PlanFence, update PlanStepUpdate) (PlanStep, error)
 	// ResolvePlanStep 以当前状态为前置条件推进等待审批或待执行步骤，不要求 fencing。
 	ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from PlanStepStatus, update PlanStepUpdate) (PlanStep, error)
+	// FindPausedPlanBySession 读取会话中最近一个暂停中的计划，用于新消息自动续跑。
+	FindPausedPlanBySession(ctx context.Context, userID, sessionID uuid.UUID) (Plan, error)
+	// RebindPlanRun 把暂停中的计划迁移到新的 Run 并恢复执行，保留已完成步骤。
+	RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (Plan, error)
 }
 
 // PlanTerminal 判断计划是否处于终态。

@@ -946,7 +946,7 @@ export default function ChatPage() {
           />
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] text-muted">
-              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 单个文件 ≤20MB，最多 5 个，文本类内容会自动提供给助手"}
+              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 单个文件 ≤20MB，最多 5 个，文本 / PDF / Word / Excel 内容会自动提供给助手"}
             </p>
             <div className="flex gap-2">
               <Button
@@ -1106,7 +1106,7 @@ function MessageBubble({
                   <span className="min-w-0 flex-1 truncate">{attachment.file_name}</span>
                   <span className="shrink-0 text-muted">{formatFileSize(attachment.size_bytes)}</span>
                   <span className="shrink-0 text-muted">
-                    {attachment.text_extracted ? (attachment.text_truncated ? "已读取（截断）" : "已读取内容") : "仅保存"}
+                    {attachment.text_extracted ? (attachment.text_truncated ? "已读取（截断）" : "已读取内容") : "仅保存原件"}
                   </span>
                 </button>
               ))}

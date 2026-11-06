@@ -213,6 +213,13 @@ func WithSupervisorTasks(tasks SupervisorTaskRepository) RunServiceOption {
 	}
 }
 
+// WithPlanResume 注入计划仓储，用于在同一会话新建 Plan Run 时续跑未完成计划。
+func WithPlanResume(plans PlanRepository) RunServiceOption {
+	return func(s *RunService) {
+		s.plans = plans
+	}
+}
+
 // WithRunDeadline 设置单次 Run 的总时长上限；零值使用默认 5 分钟。
 func WithRunDeadline(deadline time.Duration) RunServiceOption {
 	return func(s *RunService) {
@@ -233,6 +240,7 @@ type RunService struct {
 	budgets         BudgetChecker
 	calls           ModelCallRepository
 	supervisorTasks SupervisorTaskRepository
+	plans           PlanRepository
 	clock           func() time.Time
 	deadline        time.Duration
 }
@@ -312,6 +320,9 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	if err != nil {
 		return Run{}, err
 	}
+	// 同一会话存在暂停中的计划时，把计划迁移到新 Run 继续执行。
+	// 否则用户说“继续”会被当作新任务，既有步骤进度与已花费预算全部作废。
+	s.adoptPausedPlan(ctx, principal, input, created)
 	// Run 落库后入队；入队使用 Run ID 去重，客户端重试不会产生重复执行。
 	if s.enqueuer != nil && created.Status == RunQueued {
 		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
@@ -319,6 +330,126 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 		}
 	}
 	return created, nil
+}
+
+// adoptPausedPlan 把会话中最近一个暂停中的计划迁移到新 Run，保留已完成步骤继续执行。
+// 迁移失败或当前模式无法续跑时不阻断新 Run，但会写入可观测事件，避免静默丢失用户计划。
+func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, input CreateRunInput, created Run) {
+	if s.plans == nil {
+		return
+	}
+	plan, err := s.plans.FindPausedPlanBySession(ctx, principal.UserID, input.SessionID)
+	if err != nil || plan.ID == uuid.Nil || plan.RunID == created.ID {
+		return
+	}
+	if input.Mode != AgentModePlan {
+		// 非 Plan 模式无法驱动计划步骤：保持计划暂停等待显式恢复，同时让用户知道本次消息没有续跑计划。
+		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
+			"plan_id": plan.ID.String(), "reason": "run_mode_not_plan", "mode": string(input.Mode),
+		})
+		return
+	}
+	if !s.hasPlanResumeIntent(ctx, principal.UserID, created) {
+		// 暂停是用户显式控制；新任务不能无条件接管旧计划。显式“继续/恢复”或计划 Resume API 才会续跑。
+		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
+			"plan_id": plan.ID.String(), "reason": "resume_intent_missing",
+		})
+		return
+	}
+	latest, err := s.pausedPlanIsLatest(ctx, principal.UserID, created, plan)
+	if err != nil {
+		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
+			"plan_id": plan.ID.String(), "reason": "latest_plan_lookup_failed", "error": err.Error(),
+		})
+		return
+	}
+	if !latest {
+		// 用户暂停 A 后又创建了 B：“继续”不能再把 A 抢回来。此时应通过具体 Run 的 Resume API 选择计划。
+		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
+			"plan_id": plan.ID.String(), "reason": "resume_target_changed",
+		})
+		return
+	}
+	// 旧 Run 仍在后台轮询，必须先取消，否则它会继续按旧的 Run ID 重新规划并产生新的计划版本。
+	if _, err := s.Cancel(ctx, principal, plan.RunID); err != nil {
+		old, getErr := s.repo.GetRun(ctx, principal.UserID, plan.RunID)
+		if getErr != nil || !RunTerminal(old.Status) {
+			s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
+				"plan_id": plan.ID.String(), "reason": "cancel_previous_run_failed", "error": err.Error(),
+			})
+			return
+		}
+	}
+	deadline := created.DeadlineAt
+	if _, err := s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, deadline, s.clock()); err != nil {
+		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
+			"plan_id": plan.ID.String(), "reason": "rebind_failed", "error": err.Error(),
+		})
+		return
+	}
+	s.emitRunEvent(ctx, created, "plan.resumed", map[string]any{
+		"plan_id": plan.ID.String(), "previous_run_id": plan.RunID.String(),
+	})
+}
+
+// pausedPlanIsLatest 确认暂停计划仍属于会话最近一次 Plan 执行，避免恢复已经被新任务取代的旧计划。
+func (s *RunService) pausedPlanIsLatest(ctx context.Context, userID uuid.UUID, created Run, plan Plan) (bool, error) {
+	cursor := ""
+	for {
+		page, err := s.repo.ListRuns(ctx, userID, created.SessionID, 20, cursor)
+		if err != nil {
+			return false, err
+		}
+		for _, candidate := range page.Items {
+			if candidate.ID == created.ID || candidate.Mode != AgentModePlan {
+				continue
+			}
+			return candidate.ID == plan.RunID, nil
+		}
+		if page.NextCursor == "" {
+			// 没有其他 Plan Run 时，暂停计划就是当前唯一可恢复目标。
+			return true, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// hasPlanResumeIntent 只在当前触发消息明确表示续跑时返回 true。
+// 新消息一定是最近写入的用户消息，因此只需在既有触发消息回看窗口内确认内容。
+func (s *RunService) hasPlanResumeIntent(ctx context.Context, userID uuid.UUID, run Run) bool {
+	if run.TriggerMessageID == nil {
+		return false
+	}
+	page, err := s.sessions.ListMessages(ctx, userID, run.SessionID, triggerMessageLookback, "")
+	if err != nil {
+		return false
+	}
+	for _, message := range page.Items {
+		if message.ID == *run.TriggerMessageID && message.Role == MessageUser {
+			return isPlanResumeIntent(message.Content)
+		}
+	}
+	return false
+}
+
+// isPlanResumeIntent 识别简短的显式续跑指令，避免把包含“继续”一词的新任务误判为恢复计划。
+func isPlanResumeIntent(content string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(content))
+	normalized = strings.Trim(normalized, " 。！!．. ")
+	switch normalized {
+	case "继续", "继续执行", "接着", "接着执行", "恢复", "恢复执行", "续跑",
+		"continue", "continue plan", "resume", "resume plan":
+		return true
+	default:
+		return false
+	}
+}
+
+// emitRunEvent 追加 Run 事件；事件失败不影响主流程，但保证降级路径可审计。
+func (s *RunService) emitRunEvent(ctx context.Context, run Run, eventType string, payload map[string]any) {
+	_, _ = s.repo.AppendEvent(context.WithoutCancel(ctx), RunEvent{
+		RunID: run.ID, UserID: run.UserID, EventType: eventType, SchemaVersion: 1, Payload: payload,
+	})
 }
 
 // triggerMessageLookback 解析触发消息时最多回看的消息条数。

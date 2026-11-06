@@ -91,6 +91,77 @@ func collectEvents(events *[]StepEvent) EventSink {
 	return func(event StepEvent) { *events = append(*events, event) }
 }
 
+// TestRunnerEmptyResponseFails 验证模型既无正文也无推理内容时显式失败。
+func TestRunnerEmptyResponseFails(t *testing.T) {
+	model := &scriptedModel{completions: []Completion{{FinishReason: "stop"}}}
+	runner, err := NewRunner(model, newTestRegistry(), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []StepEvent
+	_, err = runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, collectEvents(&events))
+	if !errors.Is(err, ErrEmptyResponse) {
+		t.Fatalf("empty response error = %v", err)
+	}
+}
+
+// TestRunnerRejectsAbnormalFinishWithToolCalls 验证截断或审核拦截的工具调用不会执行。
+func TestRunnerRejectsAbnormalFinishWithToolCalls(t *testing.T) {
+	for _, test := range []struct {
+		finishReason string
+		want         error
+	}{{"length", ErrIncompleteToolCall}, {"content_filter", ErrContentFiltered}} {
+		t.Run(test.finishReason, func(t *testing.T) {
+			tool := &fakeTool{name: "search", output: json.RawMessage(`{"ok":true}`)}
+			model := &scriptedModel{completions: []Completion{{
+				FinishReason: test.finishReason,
+				ToolCalls:    []ToolCall{{ID: "call-1", Name: "search", Arguments: json.RawMessage(`{}`)}},
+			}}}
+			runner, err := NewRunner(model, newTestRegistry(tool), Limits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+			if tool.calls != 0 {
+				t.Fatalf("abnormal completion executed tool %d times", tool.calls)
+			}
+		})
+	}
+}
+
+// TestRunnerToolMessagesFollowToolCallOrder 验证同一批调用中“可执行结果”和
+// “未知工具结果”始终按 tool_calls 的原始顺序回填。
+func TestRunnerToolMessagesFollowToolCallOrder(t *testing.T) {
+	tool := &fakeTool{name: "search", output: json.RawMessage(`{"ok":true}`)}
+	model := &scriptedModel{completions: []Completion{
+		{FinishReason: "tool_calls", ToolCalls: []ToolCall{
+			{ID: "call_1", Name: "search", Arguments: json.RawMessage(`{}`)},
+			{ID: "call_2", Name: "missing", Arguments: json.RawMessage(`{}`)},
+		}},
+		{Content: "done", FinishReason: "stop"},
+	}}
+	runner, err := NewRunner(model, newTestRegistry(tool), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolMessages []Message
+	for _, message := range result.Messages {
+		if message.Role == RoleTool {
+			toolMessages = append(toolMessages, message)
+		}
+	}
+	if len(toolMessages) != 2 || toolMessages[0].ToolCallID != "call_1" || toolMessages[1].ToolCallID != "call_2" {
+		t.Fatalf("tool messages out of order: %#v", toolMessages)
+	}
+}
+
 // TestRunnerFinalAnswer 验证无工具调用时直接返回最终回答。
 func TestRunnerFinalAnswer(t *testing.T) {
 	model := &scriptedModel{completions: []Completion{{Content: "done", FinishReason: "stop", Usage: Usage{InputTokens: 10, OutputTokens: 5}}}}
@@ -108,6 +179,36 @@ func TestRunnerFinalAnswer(t *testing.T) {
 	}
 	if len(events) != 4 || events[0].Type != "step.started" || events[2].Type != "message.created" || events[3].Type != "run.completed" {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+// TestRunnerLengthContinuationReturnsCompleteContent 验证截断续写后的 Run 结果包含全部片段。
+func TestRunnerLengthContinuationReturnsCompleteContent(t *testing.T) {
+	model := &scriptedModel{completions: []Completion{
+		{Content: "前半段", FinishReason: "length"},
+		{Content: "后半段", FinishReason: "stop"},
+	}}
+	runner, err := NewRunner(model, newTestRegistry(), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "hi"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "前半段后半段" {
+		t.Fatalf("continued content = %q", result.Content)
+	}
+	var assistants int
+	var finalMessage string
+	for _, message := range result.Messages {
+		if message.Role == RoleAssistant {
+			assistants++
+			finalMessage = message.Content
+		}
+	}
+	if assistants != 2 || finalMessage != "前半段后半段" {
+		t.Fatalf("assistant segments = %d, final=%q, messages=%#v", assistants, finalMessage, result.Messages)
 	}
 }
 
@@ -228,8 +329,9 @@ func TestRunnerDoesNotSeedLoopDetectionFromHistory(t *testing.T) {
 	}
 }
 
-// TestRunnerRejectsOversizedToolResult 验证超限工具结果被替换为错误且不进入上下文。
-func TestRunnerRejectsOversizedToolResult(t *testing.T) {
+// TestRunnerTruncatesOversizedToolResult 验证超限工具结果被裁剪为首尾片段而不是整体丢弃，
+// 模型仍能看到内容形态与关键片段，避免同一调用被反复重试。
+func TestRunnerTruncatesOversizedToolResult(t *testing.T) {
 	tool := &fakeTool{name: "search", output: json.RawMessage(`"` + strings.Repeat("x", 70*1024) + `"`)}
 	call := ToolCall{ID: "call-1", Name: "search", Arguments: json.RawMessage(`{}`)}
 	model := &scriptedModel{completions: []Completion{
@@ -241,14 +343,17 @@ func TestRunnerRejectsOversizedToolResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	found := ""
 	for _, message := range result.Messages {
-		if message.Role == RoleTool && message.Content == `{"error":"tool_result_too_large"}` {
-			found = true
+		if message.Role == RoleTool {
+			found = message.Content
 		}
 	}
-	if !found {
-		t.Fatalf("oversized tool result was not rejected: %#v", result.Messages)
+	if !strings.Contains(found, "tool result truncated") || strings.Contains(found, "tool_result_too_large") {
+		t.Fatalf("oversized tool result was not truncated: %q", found[:min(len(found), 200)])
+	}
+	if len(found) > 64*1024+512 {
+		t.Fatalf("truncated result still too large: %d bytes", len(found))
 	}
 	if result.Content != "done" {
 		t.Fatalf("final answer = %q", result.Content)
@@ -336,8 +441,9 @@ func TestRunnerRepeatedToolCallReturnsObservation(t *testing.T) {
 	}
 }
 
-// TestRunnerAlternatingToolCallsAreDetected 验证 A-B-A 交替模式也会触发重复检测。
-func TestRunnerAlternatingToolCallsAreDetected(t *testing.T) {
+// TestRunnerAlternatingToolCallsAreNotBlocked 验证 A-B-A 这种穿插调用不会被误判为重复。
+// 重复检测只针对“连续相同”的调用，否则合法的状态轮询会在第 3 次被错误拦截。
+func TestRunnerAlternatingToolCallsAreNotBlocked(t *testing.T) {
 	first := &fakeTool{name: "a", output: json.RawMessage(`{"ok":true}`)}
 	second := &fakeTool{name: "b", output: json.RawMessage(`{"ok":true}`)}
 	model := &scriptedModel{completions: []Completion{
@@ -351,17 +457,13 @@ func TestRunnerAlternatingToolCallsAreDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Content != "final" || first.calls != 1 || second.calls != 1 {
+	if result.Content != "final" || first.calls != 2 || second.calls != 1 {
 		t.Fatalf("result = %#v, calls = %d/%d", result, first.calls, second.calls)
 	}
-	repeated := false
 	for _, message := range result.Messages {
 		if message.Role == RoleTool && strings.Contains(message.Content, "repeated_tool_call") {
-			repeated = true
+			t.Fatalf("alternating calls were wrongly treated as a loop: %#v", result.Messages)
 		}
-	}
-	if !repeated {
-		t.Fatalf("alternating duplicate was not detected: %#v", result.Messages)
 	}
 }
 
@@ -444,6 +546,33 @@ func TestRunnerToolFailureContinues(t *testing.T) {
 	}
 }
 
+// TestRunnerToolErrorPreservesPayload 验证工具业务错误返回的 JSON 仍会回填模型。
+func TestRunnerToolErrorPreservesPayload(t *testing.T) {
+	failing := &fakeTool{name: "fail", output: json.RawMessage(`{"is_error":true,"content":"missing field q"}`), err: errors.New("business")}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{{ID: "1", Name: "fail", Arguments: json.RawMessage(`{}`)}}},
+		{Content: "recovered", FinishReason: "stop"},
+	}}
+	runner, err := NewRunner(model, newTestRegistry(failing), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "x"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observation string
+	for _, message := range result.Messages {
+		if message.Role == RoleTool {
+			observation = message.Content
+		}
+	}
+	if !strings.Contains(observation, `"error":"failed"`) || !strings.Contains(observation, `"result"`) ||
+		!strings.Contains(observation, "missing field q") {
+		t.Fatalf("business payload was lost: %s", observation)
+	}
+}
+
 // approvalGateTool 模拟审批门禁：记录调用上下文并返回审批错误。
 type approvalGateTool struct {
 	receivedID   string
@@ -501,6 +630,41 @@ func TestRunnerStopsOnApprovalRequired(t *testing.T) {
 	}
 	if !approvalEvent {
 		t.Fatalf("approval event missing: %#v", events)
+	}
+}
+
+// TestRunnerApprovalStopsRemainingBatch 验证审批出现后，同批后续工具不会执行或伪造结果。
+func TestRunnerApprovalStopsRemainingBatch(t *testing.T) {
+	gate := &approvalGateTool{}
+	after := &fakeTool{name: "after", output: json.RawMessage(`{"ok":true}`)}
+	model := &scriptedModel{completions: []Completion{
+		{ToolCalls: []ToolCall{
+			{ID: "call-9", Name: "mcp_admin_delete", Arguments: json.RawMessage(`{}`)},
+			{ID: "call-after", Name: "after", Arguments: json.RawMessage(`{}`)},
+		}},
+		{Content: "should not run", FinishReason: "stop"},
+	}}
+	runner, err := NewRunner(model, newTestRegistry(gate, after), Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []StepEvent
+	result, err := runner.Run(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: "删除并继续"}}}, collectEvents(&events))
+	if !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if after.calls != 0 {
+		t.Fatalf("tool after approval executed %d times", after.calls)
+	}
+	for _, message := range result.Messages {
+		if message.Role == RoleTool {
+			t.Fatalf("unexpected tool result after approval: %#v", message)
+		}
+	}
+	for _, event := range events {
+		if event.Type == "tool.started" && event.Payload["tool"] == "after" {
+			t.Fatalf("unexecuted tool emitted started: %#v", event)
+		}
 	}
 }
 

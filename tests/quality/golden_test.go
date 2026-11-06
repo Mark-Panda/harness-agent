@@ -206,14 +206,14 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 					t.Fatalf("unknown tool content = %q", content)
 				}
 			case "oversize_result":
-				// 超限结果必须替换为错误标记，原文不得进入上下文。
+				// 超限结果必须裁剪为首尾片段并标注，原文不得整体进入上下文。
 				if err != nil {
 					t.Fatalf("oversize result should be recoverable: %v", err)
 				}
 				content := lastToolContent(result.Messages)
-				if !strings.Contains(content, `"error":"tool_result_too_large"`) ||
-					strings.Contains(content, strings.Repeat("x", 1024)) {
-					t.Fatalf("oversize tool content = %q", content)
+				if !strings.Contains(content, "tool result truncated") ||
+					len(content) > config.Thresholds.MaxToolResultBytes+512 {
+					t.Fatalf("oversize tool content length = %d", len(content))
 				}
 			default:
 				t.Fatalf("unknown scenario kind %q", scenario.Kind)

@@ -22,12 +22,6 @@ var ErrEmptyRegistry = errors.New("no executable MCP tools")
 // ErrToolBusiness MCP 工具返回 isError=true，结果仍作为不可信数据回填模型。
 var ErrToolBusiness = errors.New("MCP tool returned business error")
 
-// ErrToolOutputTooLarge 工具返回超过执行层允许的字节上限。
-var ErrToolOutputTooLarge = errors.New("MCP tool output too large")
-
-// MaxToolOutputBytes 是单个工具结果允许进入上下文的字节上限。
-const MaxToolOutputBytes = 64 * 1024
-
 // Server 是注册到执行层的单个 MCP 服务；风险等级决定是否需要人工审批。
 type Server struct {
 	// Name 服务展示名称，用于生成稳定工具前缀。
@@ -215,10 +209,7 @@ func (b binding) Invoke(ctx context.Context, arguments json.RawMessage) (json.Ra
 	if err != nil {
 		return nil, fmt.Errorf("encode MCP tool result: %w", err)
 	}
-	// 工具返回超过 64KB 时明确失败，避免截断后的 JSON 被模型当作完整数据。
-	if len(encoded) > MaxToolOutputBytes {
-		return nil, ErrToolOutputTooLarge
-	}
+	// 大结果交给 ReAct 执行层按预算保留首尾；此处提前拒绝会让模型完全丢失观测内容。
 	if result.IsError {
 		return encoded, ErrToolBusiness
 	}
