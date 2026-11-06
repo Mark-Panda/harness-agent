@@ -1,5 +1,6 @@
 // 会话对话：发送消息、创建 Run、消费 SSE 增量、审批工具并展示执行时间线。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 import { SafeMarkdown } from "../components/SafeMarkdown";
 import { useToast } from "../components/Toast";
@@ -158,6 +159,8 @@ export default function ChatPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [showJump, setShowJump] = useState(false);
+  // messagesExpanded 控制消息区放大阅读，方便查看长工具结果。
+  const [messagesExpanded, setMessagesExpanded] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   // stickToBottomRef 记录用户是否停留在底部，避免新内容把正在翻历史的用户拽回去。
@@ -594,7 +597,26 @@ export default function ChatPage() {
     if (persistedMessages.length + liveMessages.length > 0) {
       setShowJump(true);
     }
-  }, [persistedMessages.length, liveMessages.length, runActive]);
+  }, [persistedMessages.length, liveMessages.length, runActive, messagesExpanded]);
+
+  // 放大阅读时锁定页面滚动，并支持 Esc 恢复。
+  useEffect(() => {
+    if (!messagesExpanded) {
+      return;
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMessagesExpanded(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [messagesExpanded]);
 
   // scrollToLatest 主动回到底部，并恢复自动跟随。
   const scrollToLatest = () => {
@@ -650,15 +672,36 @@ export default function ChatPage() {
       <Card
         title={agent?.name ?? "对话"}
         description={canRun ? `${modeLabel(agent?.mode)} · 消息会自动保存，处理过程可随时回看` : "这个对话没有绑定可用助手，只能查看历史消息。"}
-        actions={runActive ? <Badge tone="warning">正在处理</Badge> : null}
+        actions={
+          <>
+            {runActive ? <Badge tone="warning">正在处理</Badge> : null}
+            <Button
+              size="sm"
+              variant="secondary"
+              aria-pressed={messagesExpanded}
+              onClick={() => setMessagesExpanded((current) => !current)}
+            >
+              {messagesExpanded ? "恢复窗口" : "放大阅读"}
+            </Button>
+          </>
+        }
       >
-        <div
-          ref={messageListRef}
-          className="flex max-h-[calc(100vh-24rem)] min-h-[340px] flex-col gap-4 overflow-y-auto rounded-[3px] border border-line bg-paper/60 px-4 py-5"
-          role="log"
-          aria-live="polite"
-          onScroll={onMessageScroll}
-        >
+        {(() => {
+          // 放大阅读必须用 Portal 挂到 body：页面根节点带入场动画的 transform，
+          // 会让 fixed 相对该容器定位，只有跳出这一层才能真正铺满视口。
+          const log = (
+            <div
+              ref={messageListRef}
+              className={cn(
+                "flex flex-col gap-4 overflow-y-auto px-4 py-5",
+                messagesExpanded
+                  ? "min-h-0 flex-1 rounded-b-[3px] bg-paper/60"
+                  : "max-h-[calc(100vh-24rem)] min-h-[340px] rounded-[3px] border border-line bg-paper/60",
+              )}
+              role="log"
+              aria-live="polite"
+              onScroll={onMessageScroll}
+            >
           {messages.loading ? (
             <LoadingState label="加载消息" />
           ) : persistedMessages.length === 0 && liveMessages.length === 0 ? (
@@ -770,7 +813,31 @@ export default function ChatPage() {
               有新内容，回到底部
             </button>
           ) : null}
-        </div>
+            </div>
+          );
+          if (!messagesExpanded) {
+            return log;
+          }
+          return createPortal(
+            <>
+              <button
+                type="button"
+                aria-label="退出放大阅读"
+                tabIndex={-1}
+                onClick={() => setMessagesExpanded(false)}
+                className="fixed inset-0 z-40 cursor-default bg-ink/25"
+              />
+              <div className="fixed inset-4 z-50 flex flex-col rounded-[3px] border border-line bg-paper-raised shadow-[0_24px_80px_rgb(31_27_21/0.28)]">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
+                  <p className="text-xs text-muted">放大阅读 · 按 Esc 或点击「恢复窗口」返回</p>
+                  <Button size="sm" variant="secondary" onClick={() => setMessagesExpanded(false)}>恢复窗口</Button>
+                </div>
+                {log}
+              </div>
+            </>,
+            document.body,
+          );
+        })()}
 
         {pendingApprovals.length > 0 ? (
           <div className="mt-4 rounded-[3px] border border-ochre bg-ochre-soft/60 p-3">
