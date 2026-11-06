@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 )
@@ -130,5 +131,23 @@ func TestToolPropagatesApprovalError(t *testing.T) {
 	_, err := adapted.InvokableRun(context.Background(), `{}`)
 	if !errors.Is(err, react.ErrApprovalRequired) {
 		t.Fatalf("approval error = %v", err)
+	}
+}
+
+// TestTruncateUTF8KeepsValidRunes 验证超长中文工具结果不会被字节截断成非法 UTF-8。
+func TestTruncateUTF8KeepsValidRunes(t *testing.T) {
+	output := strings.Repeat("中文结果", 30000)
+	truncated := truncateToolOutput(output)
+	if !utf8.ValidString(truncated) {
+		t.Fatal("truncated tool output contains invalid UTF-8")
+	}
+	if !strings.HasSuffix(truncated, "[... tool result truncated ...]") {
+		t.Fatalf("missing truncation marker")
+	}
+	if got := len(truncated) - len("\n[... tool result truncated ...]"); got > 64*1024 {
+		t.Fatalf("truncated size = %d", got)
+	}
+	if text := errorText(errors.New(strings.Repeat("中文错误", 100))); !utf8.ValidString(text) {
+		t.Fatal("truncated error text contains invalid UTF-8")
 	}
 }

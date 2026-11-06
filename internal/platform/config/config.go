@@ -292,8 +292,6 @@ type BudgetsConfig struct {
 type WorkerConfig struct {
 	// Enabled 是否在当前进程启动执行 Worker。
 	Enabled bool `yaml:"enabled"`
-	// Engine 编排引擎：custom（默认）或 eino。
-	Engine string `yaml:"engine"`
 	// WorkerID 实例标识；为空时启动时自动生成，多副本部署必须唯一。
 	WorkerID string `yaml:"worker_id"`
 	// Concurrency 单实例并发执行 Run 数。
@@ -629,9 +627,6 @@ func (c Config) Validate() error {
 		}
 		if worker.ReactMaxSteps < 0 || worker.ReactMaxSteps > 100 {
 			return fmt.Errorf("agent.worker.react_max_steps must be within [0, 100]")
-		}
-		if worker.Engine != "" && worker.Engine != "custom" && worker.Engine != "eino" {
-			return fmt.Errorf("agent.worker.engine must be custom or eino")
 		}
 		if worker.RunDeadline.Duration < 0 || (worker.RunDeadline.Duration > 0 && worker.RunDeadline.Duration < time.Minute) {
 			return fmt.Errorf("agent.worker.run_deadline must be positive and at least 1m")

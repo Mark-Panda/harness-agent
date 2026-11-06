@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/Mark-Panda/harness-agent/pkg/einoext"
 	"github.com/google/uuid"
 )
 
@@ -108,22 +109,12 @@ func (w *ExecutionWorker) supervisorUsageFromEvents(ctx context.Context, run Run
 	return usage, has, nil
 }
 
-// executeSupervisor 执行 Supervisor 模式：生成委派、并发运行 Worker、汇总结果。
-// engine=eino 时由 Eino Graph 编排加载、Worker 与汇总节点，custom 路径保持原有流程。
+// executeSupervisor 执行 Supervisor 模式：由 Eino Graph 编排加载、并发 Worker 与汇总。
 func (w *ExecutionWorker) executeSupervisor(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, messages []react.Message, tools react.Registry) (react.Result, error) {
 	if w.supervisor == nil {
 		return react.Result{}, fmt.Errorf("%w: supervisor task repository is not configured", ErrSupervisorInvalid)
 	}
-	if w.config.Engine == "eino" {
-		return w.executeSupervisorEino(ctx, run, fence, candidates, policyVersion, messages, tools)
-	}
-	var attempts atomic.Int64
-	attempts.Store(int64(run.AttemptNo))
-	tasks, usage, err := w.prepareSupervisorTasks(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools)
-	if err != nil {
-		return react.Result{}, err
-	}
-	return w.runSupervisorTasks(ctx, run, fence, candidates, policyVersion, &attempts, messages, tools, usage, tasks)
+	return w.executeSupervisorEino(ctx, run, fence, candidates, policyVersion, messages, tools)
 }
 
 // prepareSupervisorTasks 读取或生成委派任务，并恢复既往用量与中断任务。
@@ -389,26 +380,6 @@ func (w *ExecutionWorker) recoverSupervisorTasks(ctx context.Context, run Run, t
 	return w.supervisor.ListTasks(ctx, run.UserID, run.ID)
 }
 
-// runSupervisorTasks 并发执行待处理 Worker 任务并汇总结果。
-func (w *ExecutionWorker) runSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, usage supervisorUsage, tasks []SupervisorTask) (react.Result, error) {
-	pending := pendingSupervisorTasks(tasks)
-	if len(pending) > 0 {
-		outcome, err := w.runPendingSupervisorTasks(ctx, run, fence, candidates, policyVersion, attempts, messages, tools, usage, pending)
-		if err != nil {
-			return react.Result{}, err
-		}
-		// 子任务触发人工审批时保留审批记录并暂停主 Run，不能降级为普通失败后继续汇总。
-		if outcome.ApprovalError != nil {
-			return react.Result{}, outcome.ApprovalError
-		}
-		tasks = outcome.Tasks
-		if err := w.ensureSupervisorPartialAllowed(run, tasks, outcome.BudgetExceeded); err != nil {
-			return react.Result{}, err
-		}
-	}
-	return w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, usage, tasks)
-}
-
 // supervisorRunOutcome 是并发执行 Worker 后的状态快照。
 type supervisorRunOutcome struct {
 	Tasks          []SupervisorTask
@@ -576,7 +547,8 @@ func (w *ExecutionWorker) ensureSupervisorPartialAllowed(run Run, tasks []Superv
 
 // executeWorkerTask 在独立子会话中运行 Worker，返回结果与用量。
 func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, task SupervisorTask) (react.Result, int64, int64, float64, error) {
-	registry := scopedToolRegistry{inner: tools, allowed: task.ToolScope}
+	// 观测包装让 Worker 的工具调用同样落执行步骤与脱敏载荷；工具范围仍由任务白名单限制。
+	registry := w.runnerRegistry(scopedToolRegistry{inner: tools, allowed: task.ToolScope}, run)
 	// 子 Agent 必须继承主 Agent 已组装好的 system 提示（人设、Skill、用户画像、长期记忆与安全约束），
 	// 否则 Worker 拿不到用户偏好与既有记忆，会在信息缺失的前提下重复推理。
 	childSystem := w.parentSystemPrompt(run, messages) + "\n\n" + supervisorWorkerInstruction
@@ -598,6 +570,25 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 		childAttempts = 6
 	}
 	base := reserveSupervisorAttempts(attempts, int64(childAttempts))
+	workerStatus := StepFailed
+	workerCode := "worker_failed"
+	if w.steps != nil {
+		startedAt := w.clock()
+		workerStep, startErr := w.steps.StartStep(ctx, ExecutionStep{
+			RunID: run.ID, UserID: run.UserID, Kind: StepKindWorker,
+			Name: task.WorkerName, Status: StepRunning, AttemptNo: int(base), StartedAt: &startedAt,
+		})
+		if startErr != nil {
+			return react.Result{}, 0, 0, 0, startErr
+		}
+		// Worker 步骤作为父节点，子模型与工具步骤通过上下文挂载到该节点。
+		ctx = withParentStep(ctx, workerStep.ID)
+		defer func() {
+			_, _ = w.steps.FinishStep(context.WithoutCancel(ctx), run.UserID, workerStep.ID, StepUpdate{
+				Status: workerStatus, ErrorCode: workerCode, FinishedAt: w.clock(),
+			})
+		}()
+	}
 	observer := &runAttemptObserver{
 		worker: w, run: run, fence: fence, policyVersion: policyVersion,
 		callIDs: map[int]uuid.UUID{}, stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
@@ -615,17 +606,36 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	limits.Deadline = w.config.RunDeadline
 	limits.MaxTotalTokens = w.config.ReactMaxTotalTokens
 	limits.MaxCost = w.config.ReactMaxCost
-	runner, err := react.NewRunner(router, registry, limits, react.WithContextBudget(w.promptBudgetFor(candidates), trimRunnerContext))
+	// recorded 是待写入子会话的助手与工具消息；Eino 只推送增量，需要单独记录完整消息。
+	emitter := newRecordingEmitter(&einoWorkerEmitter{
+		sink: w.workerDeltaSink(ctx, run, fence, task.WorkerName), initialMessageIndex: len(childMessages),
+	})
+	agent, err := einoext.NewReactAgent(ctx, einoext.ReactConfig{
+		Router: router, Registry: registry, Emitter: emitter,
+		MaxSteps: limits.MaxSteps, MaxTotalTokens: limits.MaxTotalTokens, MaxCost: limits.MaxCost,
+		LoopThreshold: limits.DuplicateToolThreshold,
+		ContextBudget: w.promptBudgetFor(candidates), Trim: trimRunnerContext,
+	})
 	if err != nil {
+		workerCode, _ = failureDetails(err)
+		w.recordWorkerFailure(ctx, run, fence, task, err, emitter.Messages())
 		return react.Result{}, 0, 0, 0, err
 	}
-	result, err := runner.Run(ctx, react.Request{Messages: childMessages}, w.workerDeltaSink(ctx, run, fence, task.WorkerName))
+	result, err := agent.Run(ctx, childMessages)
 	if err != nil {
-		// Runner 会保留失败前已成功模型步的用量，调用方必须把它计入共享预算与任务事实。
+		// 失败前已产生的助手与工具消息写入事件，保留可回放的失败现场。
+		workerCode, _ = failureDetails(err)
+		if errors.Is(err, context.Canceled) {
+			workerStatus = StepCancelled
+			workerCode = "cancelled"
+		}
+		w.recordWorkerFailure(ctx, run, fence, task, err, emitter.Messages())
+		// Eino 会保留失败前已成功模型步的用量，调用方必须把它计入共享预算与任务事实。
 		return result, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, err
 	}
+	recorded := emitter.Messages()
 	writeContext := context.WithoutCancel(ctx)
-	for index, message := range result.Messages {
+	for index, message := range recorded {
 		if message.Ephemeral {
 			continue
 		}
@@ -637,7 +647,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			toolCalls = append(toolCalls, map[string]any{"id": call.ID, "name": call.Name, "arguments": string(call.Arguments)})
 		}
 		stored := Message{
-			ID: deterministicMessageID(task.ID, index), SessionID: task.ChildSessionID, UserID: run.UserID,
+			ID: deterministicMessageID(task.ID, index+len(childMessages)), SessionID: task.ChildSessionID, UserID: run.UserID,
 			Role: MessageRole(string(message.Role)), Content: message.Content, ToolCalls: toolCalls,
 			ToolCallID: message.ToolCallID, ToolName: message.Name,
 		}
@@ -648,7 +658,56 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			w.logger.Warn("persist worker message failed", "task_id", task.ID, "error", err)
 		}
 	}
+	workerStatus = StepCompleted
+	workerCode = ""
 	return result, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, nil
+}
+
+// recordWorkerFailure 把 Worker 失败前的助手与工具消息写入运行事件，避免失败现场只剩错误码。
+func (w *ExecutionWorker) recordWorkerFailure(ctx context.Context, run Run, fence RunFence, task SupervisorTask, cause error, recorded []react.Message) {
+	code, message := failureDetails(cause)
+	status := "failed"
+	if errors.Is(cause, context.Canceled) {
+		status = "cancelled"
+	}
+	transcript := make([]map[string]any, 0, len(recorded))
+	for _, item := range recorded {
+		if item.Ephemeral || (item.Role != react.RoleAssistant && item.Role != react.RoleTool) {
+			continue
+		}
+		if len(transcript) >= 20 {
+			break
+		}
+		entry := map[string]any{"role": string(item.Role), "content": truncateText(item.Content, 2000)}
+		if item.Name != "" {
+			entry["tool_name"] = item.Name
+		}
+		if item.ToolCallID != "" {
+			entry["tool_call_id"] = item.ToolCallID
+		}
+		if len(item.ToolCalls) > 0 {
+			calls := make([]map[string]any, 0, len(item.ToolCalls))
+			for _, call := range item.ToolCalls {
+				calls = append(calls, map[string]any{
+					"id": call.ID, "name": call.Name, "arguments": truncateText(string(call.Arguments), 1000),
+				})
+			}
+			entry["tool_calls"] = calls
+		}
+		transcript = append(transcript, entry)
+	}
+	payload := map[string]any{
+		"worker": task.WorkerName, "task_id": task.ID.String(),
+		"status": status, "code": code, "message": message,
+	}
+	if len(transcript) > 0 {
+		payload["transcript"] = transcript
+	}
+	if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
+		RunID: run.ID, UserID: run.UserID, EventType: "worker.failed", Payload: payload,
+	}, fence); err != nil {
+		w.logger.Warn("append worker failure event failed", "task_id", task.ID, "error", err)
+	}
 }
 
 // parentSystemPrompt 复用主 Agent 已组装好的 system 提示，保留用户画像、长期记忆、Skill 与安全约束。

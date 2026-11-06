@@ -44,6 +44,10 @@ func (w *ExecutionWorker) executeSupervisorEino(ctx context.Context, run Run, fe
 	}
 	state, err := runnable.Invoke(ctx, &supervisorGraphState{})
 	if err != nil {
+		// 父上下文取消时把仍未领取的子任务同步为取消，避免 Run 结束后留下永久 pending。
+		if ctx.Err() != nil {
+			_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(ctx), run.UserID, run.ID, "任务已取消", w.clock())
+		}
 		return react.Result{}, err
 	}
 	if state == nil {

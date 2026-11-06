@@ -4,13 +4,18 @@ package quality_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/Mark-Panda/harness-agent/pkg/einoext"
 )
 
 // goldenConfig 是版本化黄金集配置。
@@ -50,26 +55,166 @@ type goldenScenario struct {
 	ExpectedAnswer string `json:"expected_answer"`
 }
 
-// scriptedModel 按场景脚本返回工具调用与最终回答。
-type scriptedModel struct {
-	scenario goldenScenario
+// requestMessage 是模型请求中的最小消息结构。
+type requestMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
-// Complete 首步返回工具调用，非循环场景在看到工具结果后返回最终回答。
-func (m *scriptedModel) Complete(_ context.Context, messages []react.Message, _ []react.ToolSpec) (react.Completion, error) {
-	if m.scenario.Kind != "tool_loop" {
-		for _, message := range messages {
-			if message.Role == react.RoleTool {
-				return react.Completion{Content: m.scenario.ExpectedAnswer, FinishReason: "stop"}, nil
+// scriptedState 记录脚本模型收到过的请求，供不可信内容断言使用。
+type scriptedState struct {
+	mu       sync.Mutex
+	requests [][]requestMessage
+}
+
+// lastRequest 返回最近一次模型请求的消息。
+func (s *scriptedState) lastRequest() []requestMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.requests) == 0 {
+		return nil
+	}
+	return s.requests[len(s.requests)-1]
+}
+
+// record 保存请求消息。
+func (s *scriptedState) record(messages []requestMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, messages)
+}
+
+// newScriptedServer 按场景脚本返回工具调用或最终回答。
+// 工具循环场景在收到步数上限收尾指令后返回最终结论，验证 Eino 收尾节点生效。
+func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedState) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []requestMessage `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		state.record(body.Messages)
+
+		hasToolResult := false
+		stepLimit := false
+		for _, message := range body.Messages {
+			if message.Role == "tool" {
+				hasToolResult = true
+			}
+			if strings.Contains(message.Content, "已达到工具调用步数上限") {
+				stepLimit = true
 			}
 		}
+
+		content := ""
+		var toolCalls []any
+		switch scenario.Kind {
+		case "success", "oversize_result":
+			if hasToolResult {
+				content = scenario.ExpectedAnswer
+			} else {
+				toolCalls = scriptedToolCalls(scenario)
+			}
+		case "unknown_tool":
+			if hasToolResult {
+				content = scenario.ExpectedAnswer
+			} else {
+				toolCalls = scriptedToolCalls(scenario)
+			}
+		case "tool_loop":
+			if stepLimit {
+				content = "工具调用达到上限，已停止重复调用。"
+			} else {
+				toolCalls = scriptedToolCalls(scenario)
+			}
+		default:
+			t.Fatalf("unknown scenario kind %q", scenario.Kind)
+		}
+
+		finishReason := "stop"
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "req-" + scenario.ID,
+			"choices": []any{map[string]any{
+				"message":       map[string]any{"content": content, "tool_calls": toolCalls},
+				"finish_reason": finishReason,
+			}},
+			"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// scriptedToolCalls 构造场景工具调用。
+func scriptedToolCalls(scenario goldenScenario) []any {
+	arguments := string(scenario.Arguments)
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
 	}
-	return react.Completion{
-		ToolCalls: []react.ToolCall{{
-			ID: "call-" + m.scenario.ID, Name: m.scenario.Tool, Arguments: m.scenario.Arguments,
-		}},
-		FinishReason: "tool_calls",
-	}, nil
+	return []any{map[string]any{
+		"id": "call-" + scenario.ID,
+		"function": map[string]any{
+			"name": scenario.Tool, "arguments": arguments,
+		},
+	}}
+}
+
+// qualityEmitter 记录 Eino 输出的消息事件，供质量断言检查工具观察结果。
+type qualityEmitter struct {
+	mu       sync.Mutex
+	next     int
+	step     int
+	messages []map[string]any
+}
+
+// Emit 记录消息创建事件。
+func (e *qualityEmitter) Emit(eventType string, payload map[string]any) {
+	if eventType != "message.created" {
+		return
+	}
+	copied := make(map[string]any, len(payload))
+	for key, value := range payload {
+		copied[key] = value
+	}
+	e.mu.Lock()
+	e.messages = append(e.messages, copied)
+	e.mu.Unlock()
+}
+
+// NextMessageIndex 分配消息序号。
+func (e *qualityEmitter) NextMessageIndex() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.next++
+	return e.next
+}
+
+// NextStep 分配模型步序号。
+func (e *qualityEmitter) NextStep() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.step++
+	return e.step
+}
+
+// toolMessages 返回全部工具观察结果文本。
+func (e *qualityEmitter) toolMessages() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	result := make([]string, 0)
+	for _, message := range e.messages {
+		if message["role"] != "tool" {
+			continue
+		}
+		if content, ok := message["content"].(string); ok {
+			result = append(result, content)
+		}
+	}
+	return result
 }
 
 // goldenTool 返回场景预设输出。
@@ -137,27 +282,43 @@ func loadGoldenConfig(t *testing.T) goldenConfig {
 	return config
 }
 
-// TestGoldenAndAdversarialScenarios 执行全部黄金集与对抗集场景，校验质量阈值与失败分类。
+// TestGoldenAndAdversarialScenarios 执行全部黄金集与对抗集场景，校验 Eino 执行质量。
 func TestGoldenAndAdversarialScenarios(t *testing.T) {
 	config := loadGoldenConfig(t)
 	for _, scenario := range config.Scenarios {
 		scenario := scenario
 		t.Run(scenario.ID, func(t *testing.T) {
+			state := &scriptedState{}
+			server := newScriptedServer(t, scenario, state)
 			registry := &goldenRegistry{}
 			if scenario.Tool != "" && scenario.Kind != "unknown_tool" {
 				registry.tool = &goldenTool{scenario: scenario}
 			}
-			runner, err := react.NewRunner(&scriptedModel{scenario: scenario}, registry, react.Limits{
-				MaxSteps:               config.Thresholds.MaxSteps,
-				DuplicateToolThreshold: config.Thresholds.DuplicateToolThreshold,
-				MaxToolResultBytes:     config.Thresholds.MaxToolResultBytes,
+			router, err := model.NewRouter([]model.Candidate{{
+				Priority: 1,
+				Ref: model.ModelRef{
+					ProviderID: "quality", ModelID: scenario.ID, RemoteModelName: "quality-model",
+					ContextWindowTokens: 1_000_000, MaxOutputTokens: 4096, Tools: true,
+				},
+				BaseURL: server.URL, APIKey: "test-key",
+			}}, nil, model.RouterConfig{
+				MinContextTokens: 1_000_000, MaxAttemptsPerModel: 1, MaxAttemptsPerRun: 64,
+				MaxSwitchesPerRun: 1, RequestTimeout: 5 * time.Second,
+				BackoffBase: time.Millisecond, MaxBackoff: time.Millisecond,
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			emitter := &qualityEmitter{}
+			agent, err := einoext.NewReactAgent(context.Background(), einoext.ReactConfig{
+				Router: router, Registry: registry, Emitter: emitter,
+				MaxSteps: config.Thresholds.MaxSteps, MaxTotalTokens: 2_000_000,
+				LoopThreshold: config.Thresholds.DuplicateToolThreshold,
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err := runner.Run(context.Background(), react.Request{
-				Messages: []react.Message{{Role: react.RoleUser, Content: scenario.Prompt}},
-			}, nil)
+			result, err := agent.Run(context.Background(), []react.Message{{Role: react.RoleUser, Content: scenario.Prompt}})
 			switch scenario.Kind {
 			case "success":
 				if err != nil {
@@ -169,24 +330,20 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 				if result.Steps < 2 {
 					t.Fatalf("success scenario did not use the tool: steps=%d", result.Steps)
 				}
+				tools := emitter.toolMessages()
+				if len(tools) != 1 {
+					t.Fatalf("tool messages = %d", len(tools))
+				}
 				// 工具结果必须作为不可信 tool 消息进入上下文，不能伪装成 system 指令。
-				toolMessages := 0
-				for _, message := range result.Messages {
-					if message.Role == react.RoleSystem && strings.Contains(message.Content, "IGNORE ALL PREVIOUS INSTRUCTIONS") {
+				for _, message := range state.lastRequest() {
+					if message.Role == "system" && strings.Contains(message.Content, "IGNORE ALL PREVIOUS INSTRUCTIONS") {
 						t.Fatalf("tool output was promoted to a system message: %#v", message)
 					}
-					if message.Role == react.RoleTool {
-						toolMessages++
-					}
-				}
-				if toolMessages != 1 {
-					t.Fatalf("tool messages = %d", toolMessages)
 				}
 			case "tool_loop":
-				// 重复工具调用不再直接失败，而是回传可观测的 repeated_tool_call 错误且不重复执行工具；
-				// 模型始终不收敛时由步数上限兜底。
-				if !errors.Is(err, react.ErrStepLimit) {
-					t.Fatalf("tool loop error = %v", err)
+				// 重复工具调用返回可观测错误且不重复执行；步数耗尽后由收尾节点给出结论。
+				if err != nil {
+					t.Fatalf("tool loop should finish with summary: %v", err)
 				}
 				if registry.tool == nil {
 					t.Fatal("tool loop scenario registered no tool")
@@ -194,41 +351,45 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 				if want := config.Thresholds.DuplicateToolThreshold - 1; registry.tool.calls != want {
 					t.Fatalf("repeated tool call was executed %d times, want %d", registry.tool.calls, want)
 				}
-				if content := lastToolContent(result.Messages); !strings.Contains(content, `"error":"repeated_tool_call"`) {
-					t.Fatalf("repeated tool content = %q", content)
+				tools := emitter.toolMessages()
+				if len(tools) == 0 || !strings.Contains(tools[len(tools)-1], `"error":"repeated_tool_call"`) {
+					t.Fatalf("repeated tool content = %#v", tools)
+				}
+				if strings.TrimSpace(result.Content) == "" {
+					t.Fatal("step-limit summary is empty")
 				}
 			case "unknown_tool":
 				// 未知工具必须转成可恢复的工具错误，不得中断 Run 或执行任意工具。
 				if err != nil {
 					t.Fatalf("unknown tool should be recoverable: %v", err)
 				}
-				if content := lastToolContent(result.Messages); !strings.Contains(content, `"error":"unknown_tool"`) {
-					t.Fatalf("unknown tool content = %q", content)
+				tools := emitter.toolMessages()
+				if len(tools) == 0 || !strings.Contains(tools[len(tools)-1], `"error":"unknown_tool"`) {
+					t.Fatalf("unknown tool content = %#v", tools)
+				}
+				if result.Content != scenario.ExpectedAnswer {
+					t.Fatalf("answer = %q, want %q", result.Content, scenario.ExpectedAnswer)
 				}
 			case "oversize_result":
-				// 超限结果必须裁剪为首尾片段并标注，原文不得整体进入上下文。
+				// 超限结果必须裁剪并标注，原文不得整体进入上下文。
 				if err != nil {
 					t.Fatalf("oversize result should be recoverable: %v", err)
 				}
-				content := lastToolContent(result.Messages)
+				tools := emitter.toolMessages()
+				if len(tools) == 0 {
+					t.Fatal("oversize scenario produced no tool message")
+				}
+				content := tools[len(tools)-1]
 				if !strings.Contains(content, "tool result truncated") ||
 					len(content) > config.Thresholds.MaxToolResultBytes+512 {
 					t.Fatalf("oversize tool content length = %d", len(content))
+				}
+				if result.Content != scenario.ExpectedAnswer {
+					t.Fatalf("answer = %q, want %q", result.Content, scenario.ExpectedAnswer)
 				}
 			default:
 				t.Fatalf("unknown scenario kind %q", scenario.Kind)
 			}
 		})
 	}
-}
-
-// lastToolContent 返回最后一条 tool 消息内容，用于验证错误标记。
-func lastToolContent(messages []react.Message) string {
-	content := ""
-	for _, message := range messages {
-		if message.Role == react.RoleTool {
-			content = message.Content
-		}
-	}
-	return content
 }

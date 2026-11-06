@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/cloudwego/eino/components/tool"
@@ -44,6 +45,8 @@ func (t *Tool) Info(context.Context) (*schemaToolInfo, error) {
 func (t *Tool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
 	spec := t.inner.Spec()
 	callID := compose.GetToolCallID(ctx)
+	// 执行层工具包装依赖上下文中的调用元数据创建审批记录与幂等键。
+	ctx = react.WithToolCall(ctx, callID, spec.Name)
 	if t.emitter != nil {
 		t.emitter.Emit("tool.started", map[string]any{
 			"tool": spec.Name, "tool_call_id": callID, "risk_level": t.inner.RiskLevel(),
@@ -109,7 +112,22 @@ func truncateToolOutput(output string) string {
 	if len(output) <= maximum {
 		return output
 	}
-	return output[:maximum] + "\n[... tool result truncated ...]"
+	return truncateUTF8(output, maximum) + "\n[... tool result truncated ...]"
+}
+
+// truncateUTF8 按字节上限截断且不切断多字节字符，避免 PostgreSQL 拒绝非法 UTF-8。
+func truncateUTF8(text string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(text) <= maximum {
+		return text
+	}
+	cut := maximum
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut]
 }
 
 // schemaToolInfo 是 Eino ToolInfo 的别名，避免调用方直接依赖 schema 包。

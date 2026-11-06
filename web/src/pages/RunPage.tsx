@@ -91,6 +91,32 @@ export default function RunPage() {
   const [replayError, setReplayError] = useState<string | null>(null);
 
   const orderedSteps = [...(steps.data?.steps ?? [])].sort((left, right) => left.step_seq - right.step_seq);
+  // 按 parent_step_id 还原执行树：计划步骤与 Worker 步骤作为父节点，模型与工具步骤挂在其下。
+  const stepRows = useMemo(() => {
+    const byID = new Map(orderedSteps.map((step) => [step.id, step]));
+    const children = new Map<string, ExecutionStep[]>();
+    const roots: ExecutionStep[] = [];
+    for (const step of orderedSteps) {
+      if (step.parent_step_id && byID.has(step.parent_step_id)) {
+        const list = children.get(step.parent_step_id) ?? [];
+        list.push(step);
+        children.set(step.parent_step_id, list);
+      } else {
+        roots.push(step);
+      }
+    }
+    const rows: Array<{ step: ExecutionStep; depth: number }> = [];
+    const visit = (step: ExecutionStep, depth: number) => {
+      rows.push({ step, depth });
+      for (const child of children.get(step.id) ?? []) {
+        visit(child, depth + 1);
+      }
+    };
+    for (const root of roots) {
+      visit(root, 0);
+    }
+    return rows;
+  }, [orderedSteps]);
   const modelNames = useMemo(() => candidateNames(run.data?.model_policy_snapshot), [run.data?.model_policy_snapshot]);
 
   const loadPayloads = async (stepID: string) => {
@@ -372,12 +398,16 @@ export default function RunPage() {
       <Card title="步骤明细" description="按顺序展示助手做了什么；失败与重试都会保留。">
         {steps.loading ? (
           <LoadingState />
-        ) : orderedSteps.length === 0 ? (
+        ) : stepRows.length === 0 ? (
           <EmptyState title="还没有步骤" description="助手可能仍在排队，或还没有开始执行。" />
         ) : (
           <div className="flex flex-col gap-3">
-            {orderedSteps.map((step) => (
-              <article key={step.id} className="rounded-lg border border-line bg-paper-deep/40 p-3">
+            {stepRows.map(({ step, depth }) => (
+              <article
+                key={step.id}
+                className="rounded-lg border border-line bg-paper-deep/40 p-3"
+                style={depth > 0 ? { marginLeft: depth * 18 } : undefined}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge tone="neutral">#{step.step_seq}</Badge>
@@ -385,10 +415,11 @@ export default function RunPage() {
                     <span className="text-sm text-ink">{step.kind}</span>
                     <span className="text-xs text-muted">{step.name}</span>
                     {step.tool_name ? <span className="font-mono text-[11px] text-jade">{step.tool_name}</span> : null}
+                    {step.parent_step_id ? <span className="text-[11px] text-muted">子步骤</span> : null}
                     {step.risk_level ? <Badge tone={step.risk_level === "high" ? "danger" : step.risk_level === "medium" ? "warning" : "neutral"}>{step.risk_level === "high" ? "高风险" : step.risk_level === "medium" ? "需留意" : "低风险"}</Badge> : null}
                   </div>
                   <div className="flex items-center gap-2 text-xs text-muted">
-                    <span>尝试 {step.attempt_no}</span>
+                    <span>调用 #{step.attempt_no}</span>
                     <span>{formatDuration(step.started_at, step.finished_at)}</span>
                     <Button size="sm" variant="secondary" loading={payloadBusy && payloadStepID === step.id} onClick={() => void loadPayloads(step.id)}>查看输入输出</Button>
                   </div>

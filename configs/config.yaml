@@ -88,8 +88,6 @@ agent:
   worker:
     # 是否在当前进程启动执行 Worker。
     enabled: true
-    # 编排引擎：custom（默认）或 eino。
-    engine: custom
     # Worker 实例标识；多副本部署必须唯一，为空时启动自动生成。
     worker_id: ${WORKER_ID}
     # 单实例并发执行的 Run 数。

@@ -121,6 +121,11 @@ func (r *ExecutionStepRepository) StartStep(ctx context.Context, step biz.Execut
 	if step.AttemptNo <= 0 {
 		step.AttemptNo = 1
 	}
+	// risk_level 是带枚举检查的非空列；plan/worker 等非工具步骤没有风险等级，
+	// 必须显式回退为 low，否则 GORM 会写入空串并触发 check 约束失败。
+	if step.RiskLevel == "" {
+		step.RiskLevel = "low"
+	}
 	if step.CreatedAt.IsZero() {
 		step.CreatedAt = time.Now().UTC()
 	}

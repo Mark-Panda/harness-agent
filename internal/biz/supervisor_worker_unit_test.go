@@ -397,7 +397,7 @@ func TestSupervisorParentCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := worker.executeSupervisor(ctx, run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
-		[]react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{}); !errors.Is(err, ErrSupervisorAllFailed) {
+		[]react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled supervisor error = %v", err)
 	}
 	tasks, _ := repo.ListTasks(context.Background(), run.UserID, run.ID)

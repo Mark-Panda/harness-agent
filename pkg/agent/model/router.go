@@ -203,7 +203,7 @@ func WithJitter(jitter func(time.Duration) time.Duration) RouterOption {
 	}
 }
 
-// Router 实现 react.Model：在一次 ReAct 执行内保持模型粘性，并按确定性规则重试与切换。
+// Router 在一次 ReAct 执行内保持模型粘性，并按确定性规则重试与切换。
 // 同一个 Router 实例不跨 Run 复用，内部状态只服务于单次执行。
 type Router struct {
 	candidates []Candidate
@@ -242,12 +242,12 @@ func NewRouter(candidates []Candidate, health HealthStore, config RouterConfig, 
 	return router, nil
 }
 
-// Complete 实现 react.Model：执行一次带重试与受控切换的模型调用。
+// Complete 执行一次带重试与受控切换的非流式模型调用。
 func (r *Router) Complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec) (react.Completion, error) {
 	return r.complete(ctx, messages, tools, nil)
 }
 
-// CompleteStream 实现 react.StreamingModel：以 SSE 流式执行并在增量到达时回调 onDelta。
+// CompleteStream 以 SSE 流式执行并在增量到达时回调 onDelta。
 // 一旦已经向调用方输出过增量，失败后不再重试或切换候选，避免重复文本与工具调用。
 func (r *Router) CompleteStream(ctx context.Context, messages []react.Message, tools []react.ToolSpec, onDelta func(string)) (react.Completion, error) {
 	if onDelta == nil {

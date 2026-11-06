@@ -782,7 +782,7 @@ func run() error {
 			GlobalLimiter: globalLimiter, UserLimiter: userLimiter,
 			Health: routeHealth, Sandbox: sandboxRunner,
 		}, biz.WorkerConfig{
-			WorkerID: workerID, Engine: cfg.Agent.Worker.Engine, Concurrency: cfg.Agent.Worker.Concurrency,
+			WorkerID: workerID, Concurrency: cfg.Agent.Worker.Concurrency,
 			PollInterval: cfg.Agent.Worker.PollInterval.Duration, Lease: cfg.Agent.Worker.Lease.Duration,
 			Heartbeat: cfg.Agent.Worker.Heartbeat.Duration, CancelPoll: cfg.Agent.Worker.CancelPoll.Duration,
 			MaxPayloadBytes:           cfg.Agent.ExecutionRecords.MaxInlinePayloadBytes,

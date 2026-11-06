@@ -274,20 +274,35 @@ export default function ChatPage() {
           }
           break;
         }
-        case "step.started":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: `第 ${String(payload.step ?? "?")} 步开始`, tone: "info" });
-          break;
-        case "step.completed":
+        case "step.started": {
+          const worker = asString(payload.worker);
           pushTimeline({
             key: `${event.seq}:${event.event}`,
-            label: `第 ${String(payload.step ?? "?")} 步完成`,
+            label: `第 ${String(payload.step ?? "?")} 轮开始${worker ? `（${worker}）` : ""}`,
+            tone: "info",
+          });
+          break;
+        }
+        case "step.completed": {
+          const worker = asString(payload.worker);
+          pushTimeline({
+            key: `${event.seq}:${event.event}`,
+            label: `第 ${String(payload.step ?? "?")} 轮完成${worker ? `（${worker}）` : ""}`,
             detail: `输入 ${String(payload.input_tokens ?? 0)} / 输出 ${String(payload.output_tokens ?? 0)} Token`,
             tone: "success",
           });
           break;
-        case "tool.started":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: `调用工具 ${asString(payload.tool) ?? ""}`, detail: asString(payload.risk_level) ?? undefined, tone: "info" });
+        }
+        case "tool.started": {
+          const worker = asString(payload.worker);
+          pushTimeline({
+            key: `${event.seq}:${event.event}`,
+            label: `调用工具 ${asString(payload.tool) ?? ""}${worker ? `（${worker}）` : ""}`,
+            detail: asString(payload.risk_level) ?? undefined,
+            tone: "info",
+          });
           break;
+        }
         case "tool.approval.required":
           pushTimeline({ key: `${event.seq}:${event.event}`, label: `等待人工审批：${asString(payload.tool) ?? ""}`, tone: "warning" });
           void refreshApprovals(runID);
@@ -296,14 +311,27 @@ export default function ChatPage() {
           pushTimeline({ key: `${event.seq}:${event.event}`, label: `审批已${payload.decision === "deny" ? "拒绝" : "通过"}`, tone: payload.decision === "deny" ? "danger" : "success" });
           void refreshApprovals(runID);
           break;
-        case "tool.completed":
+        case "tool.completed": {
+          const worker = asString(payload.worker);
           pushTimeline({
             key: `${event.seq}:${event.event}`,
-            label: `工具 ${asString(payload.tool) ?? ""} ${String(payload.status ?? "")}`,
+            label: `工具 ${asString(payload.tool) ?? ""} ${String(payload.status ?? "")}${worker ? `（${worker}）` : ""}`,
             detail: asString(payload.error) ?? undefined,
             tone: payload.status === "completed" ? "success" : "warning",
           });
           break;
+        }
+        case "worker.failed": {
+          const status = asString(payload.status);
+          const transcript = Array.isArray(payload.transcript) ? payload.transcript.length : 0;
+          pushTimeline({
+            key: `${event.seq}:${event.event}`,
+            label: `Worker ${asString(payload.worker) ?? ""}${status === "cancelled" ? " 已取消" : " 失败"}`,
+            detail: [asString(payload.code), asString(payload.message), transcript > 0 ? `保留 ${transcript} 条过程消息` : ""].filter(Boolean).join(" · ") || undefined,
+            tone: status === "cancelled" ? "warning" : "danger",
+          });
+          break;
+        }
         case "context.assembled":
           pushTimeline({ key: `${event.seq}:${event.event}`, label: "上下文已组装", detail: payload.reasons ? JSON.stringify(payload.reasons) : undefined, tone: "info" });
           break;

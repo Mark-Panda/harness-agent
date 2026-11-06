@@ -12,11 +12,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// einoSupervisorFixture 构造启用 Eino 编排的 Supervisor Worker。
+// einoSupervisorFixture 构造可调用 executeSupervisor 的 Supervisor Worker。
 func einoSupervisorFixture(t *testing.T, handler func(body string, w http.ResponseWriter)) (*ExecutionWorker, *memorySupervisorRepo, *memorySupervisorSessions, []model.Candidate) {
 	t.Helper()
 	worker, repo, sessions, candidates, _ := supervisorFixture(t, handler)
-	worker.config.Engine = "eino"
 	return worker, repo, sessions, candidates
 }
 

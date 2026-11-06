@@ -24,6 +24,10 @@ type ReactConfig struct {
 	Emitter Emitter
 	// MaxSteps 最大模型调用步数。
 	MaxSteps int
+	// MaxTotalTokens 输入加输出 Token 上限，零表示不限制。
+	MaxTotalTokens int
+	// MaxCost 估算费用上限，零表示不限制。
+	MaxCost float64
 	// LoopThreshold 连续重复工具调用阈值。
 	LoopThreshold int
 	// ContextBudget 每次模型调用前的 Prompt Token 预算。
@@ -50,7 +54,7 @@ func NewReactAgent(ctx context.Context, config ReactConfig) (*ReactAgent, error)
 	if maxSteps <= 0 {
 		maxSteps = 12
 	}
-	chatModel := NewChatModel(config.Router, config.Emitter, maxSteps)
+	chatModel := NewChatModel(config.Router, config.Emitter, maxSteps, config.MaxTotalTokens, config.MaxCost)
 	tools := WrapRegistry(config.Registry, config.Emitter)
 	agent, err := einoagent.NewAgent(ctx, &einoagent.AgentConfig{
 		ToolCallingModel: chatModel,
@@ -58,8 +62,13 @@ func NewReactAgent(ctx context.Context, config ReactConfig) (*ReactAgent, error)
 			Tools: tools,
 			// 串行执行保证审批门禁、事件顺序与工具副作用顺序稳定。
 			ExecuteSequentially: true,
-			UnknownToolsHandler: func(context.Context, string, string) (string, error) {
-				return `{"error":"unknown_tool","hint":"该工具不存在，请使用已注册工具或直接回答。"}`, nil
+			UnknownToolsHandler: func(ctx context.Context, name, arguments string) (string, error) {
+				content := `{"error":"unknown_tool","hint":"该工具不存在，请使用已注册工具或直接回答。"}`
+				// 未知工具同样要落库为 tool 消息，否则历史中会留下没有结果的 tool_calls。
+				if emitter, ok := EmitterFromContext(ctx); ok && emitter != nil {
+					EmitMessage(ctx, emitter.NextMessageIndex(), string(react.RoleTool), content, compose.GetToolCallID(ctx), name, nil)
+				}
+				return content, nil
 			},
 		},
 		// Eino 的 MaxStep 统计图节点步数，ReAct 一轮通常包含模型与工具两个节点。

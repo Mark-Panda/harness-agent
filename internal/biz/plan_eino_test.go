@@ -14,11 +14,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// einoPlanFixture 构造启用 Eino 编排的计划 Worker。
+// einoPlanFixture 构造可直接调用 executePlan 的计划 Worker。
 func einoPlanFixture(t *testing.T, handler func(body string, w http.ResponseWriter)) (*ExecutionWorker, *memoryPlanRepo, *model.Router) {
 	t.Helper()
 	worker, plans, router, _ := planWorkerFixture(t, handler)
-	worker.config.Engine = "eino"
 	return worker, plans, router
 }
 
