@@ -68,7 +68,7 @@ func NewSupervisorTaskRepository(db *gorm.DB) *SupervisorTaskRepository {
 }
 
 // CreateTasks 在同一事务内创建全部子任务与审计事件。
-func (r *SupervisorTaskRepository) CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []biz.SupervisorTask, event biz.OutboxEvent) ([]biz.SupervisorTask, error) {
+func (r *SupervisorTaskRepository) CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []biz.SupervisorTask, event biz.OutboxEvent, fence biz.RunFence) ([]biz.SupervisorTask, error) {
 	if len(tasks) == 0 {
 		return []biz.SupervisorTask{}, nil
 	}
@@ -77,6 +77,9 @@ func (r *SupervisorTaskRepository) CreateTasks(ctx context.Context, userID, pare
 		return nil, err
 	}
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, time.Now(), false); err != nil {
+			return err
+		}
 		if err := tx.Create(&records).Error; err != nil {
 			return err
 		}
@@ -117,14 +120,17 @@ func (r *SupervisorTaskRepository) ListTasks(ctx context.Context, userID, parent
 }
 
 // StartTask 以 pending 状态为前置条件领取任务并写入 attempts。
-func (r *SupervisorTaskRepository) StartTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+func (r *SupervisorTaskRepository) StartTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	var record supervisorTaskModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, now, false); err != nil {
+			return err
+		}
 		return tx.Raw(`
 UPDATE supervisor_tasks
 SET status = 'running', attempts = attempts + 1, started_at = COALESCE(started_at, ?), updated_at = ?
-WHERE id = ? AND user_id = ? AND status = 'pending' AND attempts < max_attempts
-RETURNING *`, now.UTC(), now.UTC(), taskID, userID).Scan(&record).Error
+WHERE id = ? AND user_id = ? AND parent_run_id = ? AND status = 'pending' AND attempts < max_attempts
+RETURNING *`, now.UTC(), now.UTC(), taskID, userID, parentRunID).Scan(&record).Error
 	}); err != nil {
 		return biz.SupervisorTask{}, catalogError("start supervisor task", err)
 	}
@@ -135,14 +141,17 @@ RETURNING *`, now.UTC(), now.UTC(), taskID, userID).Scan(&record).Error
 }
 
 // RetryTask 把仍有重试次数的 running 任务重置为 pending，用于审批恢复与瞬时故障重试。
-func (r *SupervisorTaskRepository) RetryTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+func (r *SupervisorTaskRepository) RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	var record supervisorTaskModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, now, false); err != nil {
+			return err
+		}
 		return tx.Raw(`
 UPDATE supervisor_tasks
 SET status = 'pending', started_at = NULL, finished_at = NULL, error_code = '', error_message = '', updated_at = ?
-WHERE id = ? AND user_id = ? AND status = 'running' AND attempts < max_attempts
-RETURNING *`, now.UTC(), taskID, userID).Scan(&record).Error
+WHERE id = ? AND user_id = ? AND parent_run_id = ? AND status = 'running' AND attempts < max_attempts
+RETURNING *`, now.UTC(), taskID, userID, parentRunID).Scan(&record).Error
 	}); err != nil {
 		return biz.SupervisorTask{}, catalogError("retry supervisor task", err)
 	}
@@ -153,7 +162,7 @@ RETURNING *`, now.UTC(), taskID, userID).Scan(&record).Error
 }
 
 // FinishTask 以 running 状态为前置条件推进终态，迟到结果被拒绝。
-func (r *SupervisorTaskRepository) FinishTask(ctx context.Context, userID, taskID uuid.UUID, status biz.SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time) (biz.SupervisorTask, error) {
+func (r *SupervisorTaskRepository) FinishTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, status biz.SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	if !biz.SupervisorTaskTerminal(status) {
 		return biz.SupervisorTask{}, fmt.Errorf("%w: unsupported terminal status %s", biz.ErrInvalidConfig, status)
 	}
@@ -163,11 +172,14 @@ func (r *SupervisorTaskRepository) FinishTask(ctx context.Context, userID, taskI
 	}
 	var record supervisorTaskModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, now, status == biz.SupervisorTaskCancelled || status == biz.SupervisorTaskUnknown); err != nil {
+			return err
+		}
 		return tx.Raw(`
 UPDATE supervisor_tasks
 SET status = ?, result_json = ?, error_code = ?, error_message = ?, finished_at = ?, updated_at = ?
-WHERE id = ? AND user_id = ? AND status = 'running'
-RETURNING *`, string(status), encoded, errorCode, errorMessage, now.UTC(), now.UTC(), taskID, userID).Scan(&record).Error
+WHERE id = ? AND user_id = ? AND parent_run_id = ? AND status = 'running'
+RETURNING *`, string(status), encoded, errorCode, errorMessage, now.UTC(), now.UTC(), taskID, userID, parentRunID).Scan(&record).Error
 	}); err != nil {
 		return biz.SupervisorTask{}, catalogError("finish supervisor task", err)
 	}
@@ -178,8 +190,11 @@ RETURNING *`, string(status), encoded, errorCode, errorMessage, now.UTC(), now.U
 }
 
 // CancelPendingTasks 取消主 Run 下所有待执行任务。
-func (r *SupervisorTaskRepository) CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time) error {
+func (r *SupervisorTaskRepository) CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time, fence biz.RunFence) error {
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, now, true); err != nil {
+			return err
+		}
 		return tx.Model(&supervisorTaskModel{}).
 			Where("user_id = ? AND parent_run_id = ? AND status = 'pending'", userID, parentRunID).
 			Updates(map[string]any{
@@ -189,6 +204,24 @@ func (r *SupervisorTaskRepository) CancelPendingTasks(ctx context.Context, userI
 	})
 	if err != nil {
 		return catalogError("cancel pending supervisor tasks", err)
+	}
+	return nil
+}
+
+// lockSupervisorRunFence holds a shared row lock until the task mutation commits.
+// Reclaiming the run requires an exclusive lock on the same row.
+func lockSupervisorRunFence(tx *gorm.DB, userID, runID uuid.UUID, fence biz.RunFence, now time.Time, allowCancelled bool) error {
+	var locked struct{ ID uuid.UUID }
+	err := tx.Raw(`
+SELECT id FROM agent_runs
+WHERE id = ? AND user_id = ? AND lease_owner = ? AND fencing_token = ?
+  AND ((status = 'running' AND lease_expires_at > ?) OR (? AND status = 'cancelled'))
+FOR SHARE`, runID, userID, fence.Owner, fence.Token, now.UTC(), allowCancelled).Scan(&locked).Error
+	if err != nil {
+		return err
+	}
+	if locked.ID == uuid.Nil {
+		return fmt.Errorf("%w: supervisor run lease is no longer active", biz.ErrResourceConflict)
 	}
 	return nil
 }

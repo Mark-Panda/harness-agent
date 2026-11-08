@@ -3,6 +3,7 @@ package biz_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -176,7 +177,15 @@ func TestWorkerPausesRunForHighRiskToolApproval(t *testing.T) {
 	approvals.EXPECT().ListApprovals(gomock.Any(), userID, runID).Return(nil, nil)
 	runs.EXPECT().SetRunAttempt(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), fence).Return(nil).AnyTimes()
 	runs.EXPECT().AppendEventFenced(gomock.Any(), gomock.Any(), fence).Return(biz.RunEvent{}, nil).AnyTimes()
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Message{}, nil).AnyTimes()
+	var persistedCallID string
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+			if len(message.ToolCalls) > 0 {
+				persistedCallID, _ = message.ToolCalls[0]["id"].(string)
+			}
+			return message, nil
+		},
+	).AnyTimes()
 	var approvalID uuid.UUID
 	var createdApproval biz.ToolApproval
 	approvals.EXPECT().CreateApproval(gomock.Any(), gomock.Any()).DoAndReturn(
@@ -209,7 +218,7 @@ func TestWorkerPausesRunForHighRiskToolApproval(t *testing.T) {
 	if modelCalls != 1 {
 		t.Fatalf("model calls = %d, want 1", modelCalls)
 	}
-	if approvalID == uuid.Nil || createdApproval.ToolCallID != "call-1" || createdApproval.RiskLevel != "high" {
+	if approvalID == uuid.Nil || persistedCallID == "" || createdApproval.ToolCallID != persistedCallID || createdApproval.RiskLevel != "high" {
 		t.Fatalf("unexpected approval: %#v", createdApproval)
 	}
 	if createdApproval.StepID == nil || *createdApproval.StepID != waitingStepID {
@@ -351,6 +360,55 @@ func TestWorkerReconcilesUnknownApprovalExecution(t *testing.T) {
 
 	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
 		t.Fatalf("ProcessOne() = %t, %v", processed, err)
+	}
+}
+
+func TestWorkerExpiresApprovalWithoutLosingRunnableJob(t *testing.T) {
+	databaseError := errors.New("database unavailable")
+	for _, tc := range []struct {
+		name          string
+		transitionErr error
+	}{
+		{name: "expires and completes"},
+		{name: "approval concurrently resumed run", transitionErr: biz.ErrResourceConflict},
+		{name: "database error retries", transitionErr: databaseError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+			userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
+			job := jobFixture(userID, runID)
+			run := biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval, UpdatedAt: time.Now().Add(-7 * 24 * time.Hour)}
+			jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+			runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
+			approvals.EXPECT().ListApprovals(gomock.Any(), userID, runID).Return([]biz.ToolApproval{
+				{ID: approvalID, Status: biz.ApprovalPending},
+				{ID: uuid.New(), Status: biz.ApprovalDenied},
+			}, nil)
+			approvals.EXPECT().DecideApproval(gomock.Any(), userID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).
+				Return(biz.ToolApproval{ID: approvalID, Status: biz.ApprovalDenied}, nil)
+			runs.EXPECT().TransitionRun(gomock.Any(), userID, runID, biz.RunWaitingApproval, biz.RunFailed,
+				gomock.Cond(func(value any) bool {
+					fields, ok := value.(map[string]any)
+					return ok && fields["error_code"] == "approval_timeout"
+				})).
+				Return(biz.Run{ID: runID, Status: biz.RunFailed}, tc.transitionErr)
+			switch tc.transitionErr {
+			case nil:
+				runs.EXPECT().AppendEvent(gomock.Any(), gomock.Cond(func(value any) bool {
+					event, ok := value.(biz.RunEvent)
+					return ok && event.RunID == runID && event.EventType == "run.failed" && event.Payload["code"] == "approval_timeout"
+				})).Return(biz.RunEvent{}, nil)
+				jobs.EXPECT().Complete(gomock.Any(), job.ID, "worker-1", job.FencingToken).Return(nil)
+			case biz.ErrResourceConflict:
+				jobs.EXPECT().Release(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any()).Return(nil)
+			default:
+				jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			}
+			if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
+				t.Fatalf("ProcessOne() = %t, %v", processed, err)
+			}
+		})
 	}
 }
 

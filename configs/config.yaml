@@ -406,3 +406,6 @@ feishu:
     auto_reply_in_bound_topic: true
     # 是否允许在群聊根消息下直接回复作为兜底。
     allow_root_reply_fallback: false
+    # 授权群成员在话题内 @ 机器人。每项填写 app_id、tenant_key、chat_id 与已发布的 model_policy_id。
+    # 每位发言人使用自己的 Run 预算。共享对话使用平台模型策略，禁用工具和个人记忆。
+    shared_chats: []

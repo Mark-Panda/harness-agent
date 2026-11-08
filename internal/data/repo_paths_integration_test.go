@@ -140,29 +140,34 @@ func TestSupervisorRetryTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := NewRunRepository(appDB).CreateRun(ctx, biz.Run{
+	runs := NewRunRepository(appDB)
+	run, err := runs.CreateRun(ctx, biz.Run{
 		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModeSupervisor, Status: biz.RunQueued,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, fence, err := runs.ClaimRun(ctx, user.ID, run.ID, "worker", time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	repo := NewSupervisorTaskRepository(appDB)
 	tasks, err := repo.CreateTasks(ctx, user.ID, run.ID, []biz.SupervisorTask{
 		{ID: uuid.New(), ChildSessionID: child.ID, WorkerName: "A", WorkerIndex: 1, Task: "任务", ToolScope: []string{}, Status: biz.SupervisorTaskPending, MaxAttempts: 2, Depth: 1},
-	}, testOutboxEvent(user.ID, "supervisor.tasks.created"))
+	}, testOutboxEvent(user.ID, "supervisor.tasks.created"), fence)
 	if err != nil || len(tasks) != 1 {
 		t.Fatalf("CreateTasks() = %#v, %v", tasks, err)
 	}
-	now := time.Now().UTC()
 	// pending 任务不可重试。
-	if _, err := repo.RetryTask(ctx, user.ID, tasks[0].ID, now); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("retry pending error = %v", err)
 	}
-	started, err := repo.StartTask(ctx, user.ID, tasks[0].ID, now)
+	started, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	retried, err := repo.RetryTask(ctx, user.ID, tasks[0].ID, now)
+	retried, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence)
 	if err != nil || retried.Status != biz.SupervisorTaskPending {
 		t.Fatalf("RetryTask() = %#v, %v", retried, err)
 	}
@@ -170,10 +175,10 @@ func TestSupervisorRetryTask(t *testing.T) {
 		t.Fatalf("retry must keep attempts: got %d want %d", retried.Attempts, started.Attempts)
 	}
 	// 尝试次数耗尽后拒绝重试。
-	if _, err := repo.StartTask(ctx, user.ID, tasks[0].ID, now); err != nil {
+	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.RetryTask(ctx, user.ID, tasks[0].ID, now); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("retry exhausted error = %v", err)
 	}
 }

@@ -19,6 +19,45 @@ import (
 	gomock "go.uber.org/mock/gomock"
 )
 
+// MockRunDeadlineExtender is a mock of RunDeadlineExtender interface.
+type MockRunDeadlineExtender struct {
+	ctrl     *gomock.Controller
+	recorder *MockRunDeadlineExtenderMockRecorder
+	isgomock struct{}
+}
+
+// MockRunDeadlineExtenderMockRecorder is the mock recorder for MockRunDeadlineExtender.
+type MockRunDeadlineExtenderMockRecorder struct {
+	mock *MockRunDeadlineExtender
+}
+
+// NewMockRunDeadlineExtender creates a new mock instance.
+func NewMockRunDeadlineExtender(ctrl *gomock.Controller) *MockRunDeadlineExtender {
+	mock := &MockRunDeadlineExtender{ctrl: ctrl}
+	mock.recorder = &MockRunDeadlineExtenderMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockRunDeadlineExtender) EXPECT() *MockRunDeadlineExtenderMockRecorder {
+	return m.recorder
+}
+
+// ExtendRunDeadline mocks base method.
+func (m *MockRunDeadlineExtender) ExtendRunDeadline(ctx context.Context, userID, runID uuid.UUID, deadline time.Time) (biz.Run, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ExtendRunDeadline", ctx, userID, runID, deadline)
+	ret0, _ := ret[0].(biz.Run)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ExtendRunDeadline indicates an expected call of ExtendRunDeadline.
+func (mr *MockRunDeadlineExtenderMockRecorder) ExtendRunDeadline(ctx, userID, runID, deadline any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExtendRunDeadline", reflect.TypeOf((*MockRunDeadlineExtender)(nil).ExtendRunDeadline), ctx, userID, runID, deadline)
+}
+
 // MockRunRepository is a mock of RunRepository interface.
 type MockRunRepository struct {
 	ctrl     *gomock.Controller

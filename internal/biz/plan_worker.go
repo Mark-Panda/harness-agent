@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -626,8 +627,7 @@ func (r lowRiskToolRegistry) List() []react.ToolSpec {
 
 // carryCompletedPlanSteps 把上一版本中已完成步骤的结果复制到新版本。
 // 重规划与人工修订都会创建全新的 PlanStep；若不复制结果，已产生副作用且成功的步骤
-// 会因为状态回到 pending 而再次执行。匹配条件至少包含步骤序号、标题与工具名，
-// 人工修订时还要求描述一致，确保用户修改过的步骤仍会重新执行。
+// 会因为状态回到 pending 而再次执行。仅复用参数一致且所有依赖也可复用的结果。
 func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription bool) []PlanStep {
 	if len(steps) == 0 || len(previous.Steps) == 0 {
 		return steps
@@ -638,7 +638,15 @@ func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 			completed[step.StepNo] = step
 		}
 	}
+	order := make([]int, len(steps))
 	for index := range steps {
+		order[index] = index
+	}
+	slices.SortFunc(order, func(left, right int) int {
+		return steps[left].StepNo - steps[right].StepNo
+	})
+	carried := make(map[int]PlanStepStatus, len(steps))
+	for _, index := range order {
 		old, exists := completed[steps[index].StepNo]
 		if !exists {
 			continue
@@ -650,7 +658,17 @@ func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 		if matchDescription && strings.TrimSpace(old.Description) != strings.TrimSpace(steps[index].Description) {
 			continue
 		}
+		if !slices.Equal(slices.Sorted(slices.Values(old.DependsOn)), slices.Sorted(slices.Values(steps[index].DependsOn))) ||
+			!dependenciesCompleted(steps[index].DependsOn, carried) {
+			continue
+		}
+		oldArgs, oldErr := json.Marshal(planArguments(old.Arguments))
+		newArgs, newErr := json.Marshal(planArguments(steps[index].Arguments))
+		if oldErr != nil || newErr != nil || !bytes.Equal(oldArgs, newArgs) {
+			continue
+		}
 		steps[index].Status = PlanStepCompleted
+		carried[steps[index].StepNo] = PlanStepCompleted
 		steps[index].Result = old.Result
 		steps[index].Attempts = old.Attempts
 		steps[index].StartedAt = old.StartedAt

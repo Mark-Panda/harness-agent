@@ -26,6 +26,8 @@ var (
 	ErrRPC = errors.New("MCP JSON-RPC error")
 	// ErrTransport 网络或响应解析失败。
 	ErrTransport = errors.New("MCP transport error")
+	// ErrToolOutcomeUnknown indicates a tools/call request may have been executed.
+	ErrToolOutcomeUnknown = errors.New("MCP tool outcome unknown")
 	// ErrSessionExpired 服务端已回收会话（HTTP 404），需要重新初始化。
 	ErrSessionExpired = errors.New("MCP session expired")
 )
@@ -410,6 +412,9 @@ func (c *Client) CallToolWithMeta(ctx context.Context, name string, arguments js
 
 // callTool 执行一次 tools/call，供会话重置后的重试复用。
 func (c *Client) callTool(ctx context.Context, name string, arguments json.RawMessage, meta map[string]any) (CallResult, error) {
+	if err := ctx.Err(); err != nil {
+		return CallResult{}, err
+	}
 	params := map[string]any{"name": name, "arguments": json.RawMessage(`{}`)}
 	if len(arguments) > 0 {
 		params["arguments"] = arguments
@@ -419,11 +424,14 @@ func (c *Client) callTool(ctx context.Context, name string, arguments json.RawMe
 	}
 	response, err := c.call(ctx, "tools/call", params, false)
 	if err != nil {
+		if errors.Is(err, ErrTransport) {
+			err = errors.Join(ErrToolOutcomeUnknown, err)
+		}
 		return CallResult{}, err
 	}
 	var result CallResult
 	if err := json.Unmarshal(response.Result, &result); err != nil {
-		return CallResult{}, fmt.Errorf("%w: decode tools/call result", ErrTransport)
+		return CallResult{}, fmt.Errorf("%w: %w: decode tools/call result", ErrToolOutcomeUnknown, ErrTransport)
 	}
 	return result, nil
 }

@@ -35,6 +35,49 @@ type Scope struct {
 	IdentitySubject string
 }
 
+type runCreationTransactionKey struct{}
+
+type runCreationTransaction struct {
+	db          *gorm.DB
+	tx          *gorm.DB
+	afterCommit []func(context.Context)
+}
+
+func runCreationTransactionFromContext(ctx context.Context, db *gorm.DB) *runCreationTransaction {
+	transaction, _ := ctx.Value(runCreationTransactionKey{}).(*runCreationTransaction)
+	if transaction != nil && transaction.db == db {
+		return transaction
+	}
+	return nil
+}
+
+// NewRunCreationTransaction lets repositories sharing db join Run creation.
+// A nested call uses a savepoint so a failed plan adoption can be rolled back independently.
+func NewRunCreationTransaction(db *gorm.DB) func(context.Context, func(context.Context) error) error {
+	return func(ctx context.Context, fn func(context.Context) error) error {
+		parent := runCreationTransactionFromContext(ctx, db)
+		conn := db
+		if parent != nil {
+			conn = parent.tx
+		}
+		transaction := &runCreationTransaction{db: db}
+		if err := conn.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			transaction.tx = tx
+			return fn(context.WithValue(ctx, runCreationTransactionKey{}, transaction))
+		}); err != nil {
+			return err
+		}
+		if parent != nil {
+			parent.afterCommit = append(parent.afterCommit, transaction.afterCommit...)
+		} else {
+			for _, notify := range transaction.afterCommit {
+				notify(context.WithoutCancel(ctx))
+			}
+		}
+		return nil
+	}
+}
+
 // OpenPostgres 打开 PostgreSQL 连接池并完成健康检查。
 func OpenPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(withPostgresTimeouts(dsn)), &gorm.Config{
@@ -80,6 +123,11 @@ func redactDSNError(err error, dsn string) error {
 // WithScope 在单个事务内设置 RLS 会话变量后执行 fn，事务结束自动清理作用域。
 // 关键步骤：所有 set_config 使用 is_local=true，确保作用域不会泄漏到连接池中的后续请求。
 func WithScope(ctx context.Context, db *gorm.DB, scope Scope, fn func(*gorm.DB) error) error {
+	transaction := runCreationTransactionFromContext(ctx, db)
+	if transaction != nil {
+		// Keep each repository's error handling local to its savepoint.
+		db = transaction.tx
+	}
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		settings := []struct {
 			key   string
@@ -100,11 +148,15 @@ func WithScope(ctx context.Context, db *gorm.DB, scope Scope, fn func(*gorm.DB) 
 		if scope.System {
 			settings[0].value = "on"
 		}
-		if scope.RegistrationEnabled {
+		if scope.RegistrationEnabled || transaction != nil {
+			value := ""
+			if scope.RegistrationEnabled {
+				value = "on"
+			}
 			settings = append(settings, struct {
 				key   string
 				value string
-			}{key: "app.registration_enabled", value: "on"})
+			}{key: "app.registration_enabled", value: value})
 		}
 		for _, setting := range settings {
 			if err := tx.Exec("SELECT set_config(?, ?, true)", setting.key, setting.value).Error; err != nil {

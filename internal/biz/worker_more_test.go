@@ -317,3 +317,58 @@ func TestWorkerEmitsModelSwitchEvent(t *testing.T) {
 		t.Fatalf("model.switched event was not persisted: %v", eventTypes)
 	}
 }
+
+func TestWorkerPreservesQueueOnRunReadOrClaimFailure(t *testing.T) {
+	fault := errors.New("database unavailable")
+	for _, tc := range []struct {
+		name             string
+		getErr, claimErr error
+	}{
+		{name: "run deleted", getErr: biz.ErrResourceNotFound},
+		{name: "run read failed", getErr: fault},
+		{name: "run claim failed", claimErr: fault},
+		{name: "queue failure must not panic", getErr: fault},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			userID, runID := uuid.New(), uuid.New()
+			worker, jobs, runs, _, _ := newWorker(t, ctrl, time.Hour, uuid.NewString(), "https://models.example.com")
+			job := jobFixture(userID, runID)
+			jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+			run := biz.Run{ID: runID, UserID: userID, Status: biz.RunQueued}
+			runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, tc.getErr)
+			if tc.getErr == nil {
+				runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).
+					Return(biz.Run{}, biz.RunFence{}, tc.claimErr)
+			}
+			if errors.Is(tc.getErr, biz.ErrResourceNotFound) {
+				jobs.EXPECT().Complete(gomock.Any(), job.ID, "worker-1", job.FencingToken).Return(nil)
+			} else {
+				var writeErr error
+				if tc.name == "queue failure must not panic" {
+					writeErr = fault
+				}
+				jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(writeErr)
+			}
+			if claimed, err := worker.ProcessOne(context.Background()); err != nil || !claimed {
+				t.Fatalf("ProcessOne() = %t, %v", claimed, err)
+			}
+		})
+	}
+}
+
+func TestWorkerRecoversPanickingRunAndReleasesJobForRetry(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID := uuid.New(), uuid.New()
+	worker, jobs, runs, _, _ := newWorker(t, ctrl, time.Hour, uuid.NewString(), "https://models.example.com")
+	job := jobFixture(userID, runID)
+	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).DoAndReturn(func(context.Context, uuid.UUID, uuid.UUID) (biz.Run, error) {
+		panic("run repository panicked")
+	})
+	jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), "execution panicked: run repository panicked", gomock.Any()).
+		Return(errors.New("queue write unavailable"))
+	if claimed, err := worker.ProcessOne(context.Background()); err != nil || !claimed {
+		t.Fatalf("ProcessOne() = %t, %v", claimed, err)
+	}
+}

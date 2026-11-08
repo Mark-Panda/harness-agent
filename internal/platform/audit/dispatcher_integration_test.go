@@ -1,6 +1,6 @@
 //go:build integration
 
-package audit
+package audit_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/data"
+	"github.com/Mark-Panda/harness-agent/internal/platform/audit"
 	"github.com/Mark-Panda/harness-agent/internal/platform/clock"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -19,15 +20,15 @@ func TestDispatcherPublishesOutboxExactlyOnce(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {
 		t.Skip("requires PostgreSQL")
 	}
-	admin, err := data.OpenPostgres("postgres://harness:harness@localhost:5432/harness?sslmode=disable", 1)
+	admin, err := data.OpenPostgres(integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	app, err := data.OpenPostgres("postgres://harness_app:harness@localhost:5432/harness?sslmode=disable", 1)
+	app, err := data.OpenPostgres(integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, err := data.OpenPostgres("postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable", 1)
+	auth, err := data.OpenPostgres(integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,11 +37,11 @@ func TestDispatcherPublishesOutboxExactlyOnce(t *testing.T) {
 	}
 	_ = admin.Exec("DELETE FROM audit_logs WHERE partition_id = ?", "2099-01-02").Error
 	fixed := clock.NewFixed(time.Date(2099, time.January, 2, 0, 0, 0, 0, time.UTC))
-	recorder, err := NewRecorder(auth, []byte("01234567890123456789012345678901"), fixed)
+	recorder, err := audit.NewRecorder(auth, []byte("01234567890123456789012345678901"), fixed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatcher, err := NewDispatcher(auth, recorder, fixed)
+	dispatcher, err := audit.NewDispatcher(auth, recorder, fixed)
 	if err != nil {
 		t.Fatal(err)
 	}

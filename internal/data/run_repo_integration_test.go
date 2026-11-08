@@ -12,7 +12,130 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
+
+type runCreationNotifierFunc func(context.Context, uuid.UUID)
+
+func (notify runCreationNotifierFunc) Publish(ctx context.Context, runID uuid.UUID) {
+	notify(ctx, runID)
+}
+
+func TestRunCreationRollsBackWhenEnqueueFails(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	user, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "atomic_run_" + uuid.NewString(), PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := adminDB.Exec("DELETE FROM jobs WHERE user_id = ?", user.ID).Error; err != nil {
+			t.Error(err)
+		}
+		if err := adminDB.Exec("DELETE FROM users WHERE id = ?", user.ID).Error; err != nil {
+			t.Error(err)
+		}
+	})
+	sessions := NewSessionRepository(appDB)
+	session, err := sessions.CreateSession(ctx, biz.Session{
+		ID: uuid.New(), UserID: user.ID, Title: "atomic run creation", Source: biz.SessionSourceWeb, Status: biz.SessionActive, Version: 1,
+	}, testOutboxEvent(user.ID, "test.session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue, plans := NewJobRepository(appDB), NewPlanRepository(appDB)
+	var notified []uuid.UUID
+	runs := NewRunRepository(appDB, WithRunEventNotifier(runCreationNotifierFunc(func(ctx context.Context, runID uuid.UUID) {
+		notified = append(notified, runID)
+		exists, err := queue.HasRunJob(ctx, user.ID, runID)
+		if err != nil || !exists {
+			t.Errorf("notified before job commit: exists=%v err=%v", exists, err)
+		}
+	})))
+	previous, err := runs.CreateRun(ctx, biz.Run{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan, Status: biz.RunRunning,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := plans.CreatePlan(ctx, user.ID, biz.Plan{
+		ID: uuid.New(), SessionID: session.ID, RunID: previous.ID, UserID: user.ID, Version: 1,
+		Status: biz.PlanPaused, Goal: "resume this plan", MaxSteps: 5,
+	}, testOutboxEvent(user.ID, "test.plan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.AppendMessage(ctx, biz.Message{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Role: biz.MessageUser, Content: "继续",
+	}, testOutboxEvent(user.ID, "test.message")); err != nil {
+		t.Fatal(err)
+	}
+	service, err := biz.NewRunService(runs, sessions, biz.WithRunEnqueuer(queue),
+		biz.WithPlanResume(plans),
+		biz.WithRunCreationTransaction(NewRunCreationTransaction(appDB)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := biz.Principal{UserID: user.ID}
+	input := biz.CreateRunInput{SessionID: session.ID, Mode: biz.AgentModePlan, IdempotencyKey: "enqueue-retry"}
+	enqueueErr := errors.New("injected enqueue failure")
+	if err := appDB.Callback().Create().After("gorm:create").Register("test:fail-job-insert", func(tx *gorm.DB) {
+		if tx.Statement.Table == "jobs" {
+			_ = tx.AddError(enqueueErr)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, principal, input); !errors.Is(err, enqueueErr) {
+		t.Fatalf("Create error = %v, want %v", err, enqueueErr)
+	}
+	page, err := runs.ListRuns(ctx, user.ID, session.ID, 20, "")
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != previous.ID || page.Items[0].Status != biz.RunRunning {
+		t.Fatalf("runs after enqueue rollback = %v, err=%v", page.Items, err)
+	}
+	paused, err := plans.GetPlan(ctx, user.ID, plan.ID)
+	if err != nil || paused.RunID != previous.ID || paused.Status != biz.PlanPaused || len(notified) != 0 {
+		t.Fatalf("plan after enqueue rollback = %#v, err=%v, notifications=%v", paused, err, notified)
+	}
+	if err := appDB.Callback().Create().Remove("test:fail-job-insert"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.Create(ctx, principal, input)
+	if err != nil || created.Status != biz.RunQueued {
+		t.Fatalf("retry after rollback = %#v, err=%v", created, err)
+	}
+	rebound, err := plans.GetPlanByRun(ctx, user.ID, created.ID)
+	if err != nil || rebound.ID != plan.ID || rebound.Status != biz.PlanExecuting || len(notified) != 1 || notified[0] != created.ID {
+		t.Fatalf("plan after enqueue commit = %#v, err=%v, notifications=%v", rebound, err, notified)
+	}
+	replayed, err := service.Create(ctx, principal, input)
+	if err != nil || replayed.ID != created.ID {
+		t.Fatalf("idempotent retry = %#v, err=%v", replayed, err)
+	}
+	// Reproduce a queued Run left without a job by an older server.
+	if err := adminDB.Exec("DELETE FROM jobs WHERE user_id = ? AND dedupe_key = ?", user.ID, "run:"+created.ID.String()).Error; err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := service.Create(ctx, principal, input)
+	if err != nil || repaired.ID != created.ID {
+		t.Fatalf("repair of queued Run = %#v, err=%v", repaired, err)
+	}
+	var jobs int64
+	err = WithScope(ctx, appDB, Scope{UserID: user.ID}, func(tx *gorm.DB) error {
+		return tx.Model(&jobModel{}).Where("user_id = ? AND dedupe_key = ?", user.ID, "run:"+created.ID.String()).Count(&jobs).Error
+	})
+	if err != nil || jobs != 1 {
+		t.Fatalf("jobs for committed run = %d, err=%v", jobs, err)
+	}
+}
 
 // TestRunRepositoryLifecycleAndEventCursor 验证 Run 创建、事件单调序号、游标与跨用户隔离。
 func TestRunRepositoryLifecycleAndEventCursor(t *testing.T) {

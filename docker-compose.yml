@@ -109,7 +109,7 @@ services:
     cpus: 2
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health/ready | grep -Eq '^[{].*\"status\":\"(ready|degraded)\"[}]'"]
       interval: 5s
       timeout: 3s
       retries: 20

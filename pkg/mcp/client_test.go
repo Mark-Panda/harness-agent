@@ -294,7 +294,7 @@ func TestClientNotifyAndEmptySSE(t *testing.T) {
 	if err := client.notify(context.Background(), "notifications/initialized", map[string]any{}); err != nil {
 		t.Fatalf("notify() = %v", err)
 	}
-	if _, err := client.CallTool(context.Background(), "tool", nil); !errors.Is(err, ErrTransport) {
+	if _, err := client.CallTool(context.Background(), "tool", nil); !errors.Is(err, ErrTransport) || !errors.Is(err, ErrToolOutcomeUnknown) {
 		t.Fatalf("empty SSE error = %v", err)
 	}
 }

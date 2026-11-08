@@ -1,6 +1,6 @@
 //go:build integration
 
-package audit
+package audit_test
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/data"
+	"github.com/Mark-Panda/harness-agent/internal/platform/audit"
 	"github.com/Mark-Panda/harness-agent/internal/platform/clock"
 )
 
@@ -17,11 +18,11 @@ func TestAuditChainAndAppendOnlyProtection(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {
 		t.Skip("requires PostgreSQL")
 	}
-	admin, err := data.OpenPostgres("postgres://harness:harness@localhost:5432/harness?sslmode=disable", 1)
+	admin, err := data.OpenPostgres(integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, err := data.OpenPostgres("postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable", 1)
+	auth, err := data.OpenPostgres(integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,12 +33,12 @@ func TestAuditChainAndAppendOnlyProtection(t *testing.T) {
 	_ = admin.Exec("DELETE FROM audit_logs WHERE partition_id = ?", partition).Error
 	_ = admin.Exec("DELETE FROM audit_checkpoints WHERE partition_id = ?", partition).Error
 	fixed := clock.NewFixed(time.Date(2099, time.January, 1, 0, 0, 0, 0, time.UTC))
-	recorder, err := NewRecorder(auth, []byte("01234567890123456789012345678901"), fixed)
+	recorder, err := audit.NewRecorder(auth, []byte("01234567890123456789012345678901"), fixed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, action := range []string{"auth.login", "auth.refresh"} {
-		if err := recorder.Record(context.Background(), Event{
+		if err := recorder.Record(context.Background(), audit.Event{
 			ActorType: "user", ActorID: "user-1", Action: action, ResourceType: "session", ResourceID: "session-1",
 			Outcome: "success", Source: "integration-test", Metadata: map[string]any{"result": "ok", "password": "drop"},
 		}); err != nil {
@@ -88,4 +89,11 @@ func TestAuditChainAndAppendOnlyProtection(t *testing.T) {
 	if err := admin.Exec("DELETE FROM audit_logs WHERE partition_id = ?", partition).Error; err != nil {
 		t.Fatalf("retention cleanup failed: %v", err)
 	}
+}
+
+func integrationDSN(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

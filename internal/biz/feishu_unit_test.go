@@ -282,10 +282,20 @@ type feishuRunCreatorStub struct {
 	calls int
 }
 
-func (s *feishuRunCreatorStub) Create(_ context.Context, _ biz.Principal, input biz.CreateRunInput) (biz.Run, error) {
+func (s *feishuRunCreatorStub) Create(_ context.Context, principal biz.Principal, input biz.CreateRunInput) (biz.Run, error) {
 	s.calls++
 	s.input = input
-	return s.run, s.err
+	run := s.run
+	if run.UserID == uuid.Nil {
+		run.UserID = principal.UserID
+	}
+	if run.SessionID == uuid.Nil {
+		run.SessionID = input.SessionID
+	}
+	if run.TriggerMessageID == nil {
+		run.TriggerMessageID = input.TriggerMessageID
+	}
+	return run, s.err
 }
 
 // feishuOutboundStub 模拟外发记录的创建、领取与状态流转。
@@ -508,7 +518,7 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	conversations := &feishuConversationStub{}
 	messages := &feishuMessagesStub{created: true}
 	runID := uuid.New()
-	runs := &feishuRunCreatorStub{run: biz.Run{ID: runID, UserID: userID, SessionID: uuid.New(), Status: biz.RunQueued}}
+	runs := &feishuRunCreatorStub{run: biz.Run{ID: runID, UserID: userID, Status: biz.RunQueued}}
 	agentID := uuid.New()
 	version := 1
 	hot := &feishuHotStoreStub{}

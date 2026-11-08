@@ -68,6 +68,8 @@ type Session struct {
 	Source SessionSource
 	// MemoryPolicy 记忆策略：private/group/disabled，默认 private。
 	MemoryPolicy SessionMemoryPolicy
+	// FeishuGroupProjection 标记仅供单次共享群聊 Run 使用的会话。
+	FeishuGroupProjection bool
 	// Status 生命周期状态。
 	Status SessionStatus
 	// Version 乐观锁版本号，归档等写操作使用。
@@ -323,6 +325,9 @@ func (s *SessionService) SetMemoryPolicy(ctx context.Context, principal Principa
 		return Session{}, fmt.Errorf("%w: only active sessions can change memory policy", ErrResourceConflict)
 	}
 	// 群聊话题不得启用私有记忆，避免所有者把个人画像与长期记忆注入共享上下文。
+	if policy == SessionMemoryPrivate && session.FeishuGroupProjection {
+		return Session{}, invalid("group sessions cannot enable private memory")
+	}
 	if policy == SessionMemoryPrivate && s.shared != nil {
 		shared, err := s.shared.IsSharedSession(ctx, principal.UserID, sessionID)
 		if err != nil {
@@ -355,6 +360,9 @@ func (s *SessionService) AppendMessage(ctx context.Context, principal Principal,
 	}
 	if session.Status != SessionActive {
 		return Message{}, fmt.Errorf("%w: cannot append messages to an inactive session", ErrResourceConflict)
+	}
+	if session.FeishuGroupProjection {
+		return Message{}, ErrForbidden
 	}
 	message.ID = uuid.New()
 	message.UserID = principal.UserID

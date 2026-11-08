@@ -218,6 +218,17 @@ func (r *ModelCallRepository) ListModelCalls(ctx context.Context, userID, runID 
 	return calls, nil
 }
 
+// SumModelCallUsage reads all usage for the Run without the audit list's page limit.
+func (r *ModelCallRepository) SumModelCallUsage(ctx context.Context, userID, runID uuid.UUID) (biz.ModelCallUsage, error) {
+	var usage biz.ModelCallUsage
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&modelCallModel{}).
+			Select("COUNT(*) AS count, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(estimated_cost), 0) AS estimated_cost").
+			Where("user_id = ? AND run_id = ?", userID, runID).Scan(&usage).Error
+	})
+	return usage, catalogError("sum run model usage", err)
+}
+
 // toBizModelCall 将数据库行转换为领域模型调用记录。
 func toBizModelCall(record modelCallModel) (biz.ModelCall, error) {
 	var manifest map[string]any

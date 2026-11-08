@@ -57,7 +57,8 @@ test-coverage:
 	go test -coverprofile=coverage/biz.out ./internal/biz
 	go test -coverprofile=coverage/service.out ./internal/service
 	go test -coverprofile=coverage/auth.out ./internal/platform/auth
-	go test -coverprofile=coverage/agent.out ./pkg/agent/...
+	# 模型路由也通过 Eino 和 Worker 的单测执行，合并统计这些入口。
+	go test -coverpkg=./pkg/agent/... -coverprofile=coverage/agent.out ./pkg/agent/... ./pkg/einoext ./internal/biz ./tests/quality
 	go test -coverprofile=coverage/mcp.out ./pkg/mcp
 	go test -coverprofile=coverage/memory.out ./pkg/memory
 	python3 scripts/check_coverage.py coverage/biz.out 80
@@ -100,7 +101,7 @@ docker-stop:
 	docker compose down
 
 smoke:
-	curl --fail --silent --show-error http://localhost:8080/health/ready
+	curl --fail --silent --show-error http://localhost:8080/health/ready | grep -E '^[{].*"status":"(ready|degraded)"[}]$$'
 	curl --fail --silent --show-error http://localhost:8080/api/v1/health
 	curl --fail --silent --show-error http://localhost:8080/api/v1/sse/probe
 	curl --fail --silent --show-error http://localhost:8080/ > /dev/null

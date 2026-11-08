@@ -12,6 +12,8 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 // TestJobRepositoryEnqueueDedupeAndRequeue 验证各类任务入队幂等、去重键隔离与失败任务重放。
@@ -155,5 +157,74 @@ func TestJobRepositoryEnqueueDedupeAndRequeue(t *testing.T) {
 	claimed, found, err := jobs.Claim(ctx, "worker-requeue", "agent.run", time.Minute, time.Now().UTC())
 	if err != nil || !found || claimed.Type != "agent.run" || claimed.Payload["run_id"] != runID.String() {
 		t.Fatalf("claim requeued job = %#v found=%v err=%v", claimed, found, err)
+	}
+}
+
+func TestJobRepositoryFailRejectsLeaseReclaimedDuringUpdate(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	job := jobModel{
+		ID: uuid.New(), JobType: "test.lease." + uuid.NewString(), Payload: datatypes.JSON(`{}`),
+		Status: "pending", MaxAttempts: 3, AvailableAt: now,
+	}
+	system := Scope{System: true}
+	if err := WithScope(ctx, appDB, system, func(tx *gorm.DB) error { return tx.Create(&job).Error }); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := WithScope(ctx, appDB, system, func(tx *gorm.DB) error { return tx.Delete(&job).Error }); err != nil {
+			t.Error(err)
+		}
+	})
+
+	queue := NewJobRepository(appDB)
+	replacement := NewJobRepository(openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable")))
+	first, found, err := queue.Claim(ctx, "worker-one", job.JobType, time.Second, now)
+	if err != nil || !found {
+		t.Fatalf("first claim found=%v err=%v", found, err)
+	}
+	var reclaimed biz.Job
+	// Force the replacement worker to claim the expired lease at the update boundary.
+	err = appDB.Callback().Update().Before("gorm:update").Register("test:reclaim-job", func(tx *gorm.DB) {
+		var found bool
+		var err error
+		reclaimed, found, err = replacement.Claim(ctx, "worker-two", job.JobType, time.Minute, now.Add(2*time.Second))
+		if err != nil || !found {
+			t.Errorf("replacement claim found=%v err=%v", found, err)
+			_ = tx.AddError(errors.New("failed to force lease takeover"))
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Fail(ctx, first.ID, first.LeaseOwner, first.FencingToken, time.Time{}, "stale failure", now.Add(2*time.Second)); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Errorf("stale failure = %v, want lease conflict", err)
+	}
+	if err := appDB.Callback().Update().Remove("test:reclaim-job"); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := now.Add(10 * time.Second)
+	if err := queue.Fail(ctx, reclaimed.ID, reclaimed.LeaseOwner, reclaimed.FencingToken, retryAt, "retryable failure", now.Add(3*time.Second)); err != nil {
+		t.Fatalf("replacement worker lost its lease: %v", err)
+	}
+	if _, found, err := queue.Claim(ctx, "worker-three", job.JobType, time.Minute, retryAt.Add(-time.Second)); err != nil || found {
+		t.Fatalf("job claim before backoff ends found=%v err=%v", found, err)
+	}
+	last, found, err := queue.Claim(ctx, "worker-three", job.JobType, time.Minute, retryAt)
+	if err != nil || !found || last.Attempts != job.MaxAttempts {
+		t.Fatalf("last attempt found=%v attempts=%d err=%v", found, last.Attempts, err)
+	}
+	finishedAt := retryAt.Add(time.Second)
+	if err := queue.Fail(ctx, last.ID, last.LeaseOwner, last.FencingToken, time.Time{}, "attempts exhausted", finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	var dead jobModel
+	err = WithScope(ctx, appDB, system, func(tx *gorm.DB) error { return tx.First(&dead, "id = ?", job.ID).Error })
+	if err != nil || dead.Status != "dead" || dead.CompletedAt == nil || !dead.CompletedAt.Equal(finishedAt) {
+		t.Fatalf("dead job = %#v, err=%v", dead, err)
 	}
 }

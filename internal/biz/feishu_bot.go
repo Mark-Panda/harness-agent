@@ -309,7 +309,7 @@ type FeishuBotBinding struct {
 	BotName string
 	// BotOpenID 机器人 open_id。
 	BotOpenID string
-	// UserID 绑定助手的所属用户，也是唯一允许使用该机器人的飞书用户。
+	// UserID 绑定助手的所属用户，只有该用户可以使用此助手的执行配置。
 	UserID uuid.UUID
 	// AgentID 绑定的助手版本 ID。
 	AgentID uuid.UUID

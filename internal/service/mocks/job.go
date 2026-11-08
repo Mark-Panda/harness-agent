@@ -129,6 +129,44 @@ func (mr *MockJobQueueMockRecorder) Renew(ctx, jobID, workerID, fencingToken, le
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Renew", reflect.TypeOf((*MockJobQueue)(nil).Renew), ctx, jobID, workerID, fencingToken, lease, now)
 }
 
+// MockRunJobReplayer is a mock of RunJobReplayer interface.
+type MockRunJobReplayer struct {
+	ctrl     *gomock.Controller
+	recorder *MockRunJobReplayerMockRecorder
+	isgomock struct{}
+}
+
+// MockRunJobReplayerMockRecorder is the mock recorder for MockRunJobReplayer.
+type MockRunJobReplayerMockRecorder struct {
+	mock *MockRunJobReplayer
+}
+
+// NewMockRunJobReplayer creates a new mock instance.
+func NewMockRunJobReplayer(ctrl *gomock.Controller) *MockRunJobReplayer {
+	mock := &MockRunJobReplayer{ctrl: ctrl}
+	mock.recorder = &MockRunJobReplayerMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockRunJobReplayer) EXPECT() *MockRunJobReplayerMockRecorder {
+	return m.recorder
+}
+
+// RequeueRun mocks base method.
+func (m *MockRunJobReplayer) RequeueRun(ctx context.Context, runID uuid.UUID, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RequeueRun", ctx, runID, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RequeueRun indicates an expected call of RequeueRun.
+func (mr *MockRunJobReplayerMockRecorder) RequeueRun(ctx, runID, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RequeueRun", reflect.TypeOf((*MockRunJobReplayer)(nil).RequeueRun), ctx, runID, now)
+}
+
 // MockRunEnqueuer is a mock of RunEnqueuer interface.
 type MockRunEnqueuer struct {
 	ctrl     *gomock.Controller
@@ -165,4 +203,43 @@ func (m *MockRunEnqueuer) EnqueueRun(ctx context.Context, userID, runID uuid.UUI
 func (mr *MockRunEnqueuerMockRecorder) EnqueueRun(ctx, userID, runID, availableAt any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnqueueRun", reflect.TypeOf((*MockRunEnqueuer)(nil).EnqueueRun), ctx, userID, runID, availableAt)
+}
+
+// MockRunJobLookup is a mock of RunJobLookup interface.
+type MockRunJobLookup struct {
+	ctrl     *gomock.Controller
+	recorder *MockRunJobLookupMockRecorder
+	isgomock struct{}
+}
+
+// MockRunJobLookupMockRecorder is the mock recorder for MockRunJobLookup.
+type MockRunJobLookupMockRecorder struct {
+	mock *MockRunJobLookup
+}
+
+// NewMockRunJobLookup creates a new mock instance.
+func NewMockRunJobLookup(ctrl *gomock.Controller) *MockRunJobLookup {
+	mock := &MockRunJobLookup{ctrl: ctrl}
+	mock.recorder = &MockRunJobLookupMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockRunJobLookup) EXPECT() *MockRunJobLookupMockRecorder {
+	return m.recorder
+}
+
+// HasRunJob mocks base method.
+func (m *MockRunJobLookup) HasRunJob(ctx context.Context, userID, runID uuid.UUID) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HasRunJob", ctx, userID, runID)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// HasRunJob indicates an expected call of HasRunJob.
+func (mr *MockRunJobLookupMockRecorder) HasRunJob(ctx, userID, runID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasRunJob", reflect.TypeOf((*MockRunJobLookup)(nil).HasRunJob), ctx, userID, runID)
 }

@@ -96,3 +96,41 @@ func (mr *MockBudgetCheckerMockRecorder) Check(ctx, userID, agentID, providerID 
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Check", reflect.TypeOf((*MockBudgetChecker)(nil).Check), ctx, userID, agentID, providerID)
 }
+
+// MockUsageRecorder is a mock of UsageRecorder interface.
+type MockUsageRecorder struct {
+	ctrl     *gomock.Controller
+	recorder *MockUsageRecorderMockRecorder
+	isgomock struct{}
+}
+
+// MockUsageRecorderMockRecorder is the mock recorder for MockUsageRecorder.
+type MockUsageRecorderMockRecorder struct {
+	mock *MockUsageRecorder
+}
+
+// NewMockUsageRecorder creates a new mock instance.
+func NewMockUsageRecorder(ctrl *gomock.Controller) *MockUsageRecorder {
+	mock := &MockUsageRecorder{ctrl: ctrl}
+	mock.recorder = &MockUsageRecorderMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockUsageRecorder) EXPECT() *MockUsageRecorderMockRecorder {
+	return m.recorder
+}
+
+// RecordUsage mocks base method.
+func (m *MockUsageRecorder) RecordUsage(ctx context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID, inputTokens, outputTokens int64, estimatedCost float64, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RecordUsage", ctx, userID, agentID, providerID, inputTokens, outputTokens, estimatedCost, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RecordUsage indicates an expected call of RecordUsage.
+func (mr *MockUsageRecorderMockRecorder) RecordUsage(ctx, userID, agentID, providerID, inputTokens, outputTokens, estimatedCost, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordUsage", reflect.TypeOf((*MockUsageRecorder)(nil).RecordUsage), ctx, userID, agentID, providerID, inputTokens, outputTokens, estimatedCost, now)
+}

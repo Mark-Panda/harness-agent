@@ -16,6 +16,20 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+func TestRunAPICannotClaimFeishuIdempotencyKeys(t *testing.T) {
+	handler := &platformHTTPHandler{}
+	for _, key := range []string{"feishu:om_message", " feishu.group:" + uuid.NewString()} {
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"mode":"react"}`))
+		request.SetPathValue("id", uuid.NewString())
+		request.Header.Set(idempotencyKeyHeader, key)
+		response := httptest.NewRecorder()
+		handler.createRun(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_configuration") {
+			t.Fatalf("reserved idempotency key returned %d %s", response.Code, response.Body.String())
+		}
+	}
+}
+
 // TestRunAPIAuthenticationAndCancellation 验证 Run 接口鉴权、身份隔离与取消语义。
 func TestRunAPIAuthenticationAndCancellation(t *testing.T) {
 	ctrl := gomock.NewController(t)

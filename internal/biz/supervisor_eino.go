@@ -21,7 +21,7 @@ const (
 // 子任务事实源仍是 PostgreSQL；图状态只保存本轮编排的任务快照、共享用量与结果。
 type supervisorGraphState struct {
 	Tasks          []SupervisorTask
-	Usage          supervisorUsage
+	Budget         *supervisorBudget
 	Result         react.Result
 	HasPending     bool
 	BudgetExceeded bool
@@ -46,7 +46,7 @@ func (w *ExecutionWorker) executeSupervisorEino(ctx context.Context, run Run, fe
 	if err != nil {
 		// 父上下文取消时把仍未领取的子任务同步为取消，避免 Run 结束后留下永久 pending。
 		if ctx.Err() != nil {
-			_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(ctx), run.UserID, run.ID, "任务已取消", w.clock())
+			_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(ctx), run.UserID, run.ID, "任务已取消", w.clock(), fence)
 		}
 		return react.Result{}, err
 	}
@@ -64,19 +64,19 @@ func (w *ExecutionWorker) buildSupervisorGraph(
 	graph := compose.NewGraph[*supervisorGraphState, *supervisorGraphState]()
 
 	load := compose.InvokableLambda(func(ctx context.Context, state *supervisorGraphState) (*supervisorGraphState, error) {
-		tasks, usage, err := w.prepareSupervisorTasks(ctx, run, fence, candidates, policyVersion, attempts, messages, tools)
+		tasks, budget, err := w.prepareSupervisorTasks(ctx, run, fence, candidates, policyVersion, attempts, messages, tools)
 		if err != nil {
 			return nil, err
 		}
 		state.Tasks = tasks
-		state.Usage = usage
+		state.Budget = budget
 		state.HasPending = len(pendingSupervisorTasks(tasks)) > 0
 		return state, nil
 	})
 
 	workers := compose.InvokableLambda(func(ctx context.Context, state *supervisorGraphState) (*supervisorGraphState, error) {
 		outcome, err := w.runPendingSupervisorTasks(ctx, run, fence, candidates, policyVersion, attempts, messages, tools,
-			state.Usage, pendingSupervisorTasks(state.Tasks))
+			state.Budget, pendingSupervisorTasks(state.Tasks))
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +98,7 @@ func (w *ExecutionWorker) buildSupervisorGraph(
 		if err := w.ensureSupervisorPartialAllowed(run, tasks, state.BudgetExceeded); err != nil {
 			return nil, err
 		}
-		result, err := w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, state.Usage, tasks)
+		result, err := w.aggregateSupervisor(ctx, run, fence, candidates, policyVersion, attempts, messages, state.Budget, tasks)
 		if err != nil {
 			return nil, err
 		}

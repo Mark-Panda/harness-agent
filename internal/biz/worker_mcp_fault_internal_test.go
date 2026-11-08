@@ -2,15 +2,73 @@ package biz
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
+
+func TestPrepareMCPToolsCachesDiscoveryWithLongestToolTimeout(t *testing.T) {
+	var discoveries atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode MCP request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var result any
+		switch request.Method {
+		case "initialize":
+			result = map[string]any{"protocolVersion": "2025-06-18"}
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+			return
+		case "tools/list":
+			discoveries.Add(1)
+			result = map[string]any{"tools": []map[string]string{{"name": "search"}}}
+		default:
+			t.Errorf("unexpected MCP method %s", request.Method)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+	}))
+	t.Cleanup(server.Close)
+	id := uuid.New()
+	worker := &ExecutionWorker{
+		mcps: faultMCPRepository{record: MCP{ID: id, Name: "live", Endpoint: server.URL, Status: "enabled", AuthType: "none",
+			ToolTimeouts: map[string]int{"search": 10, "ignored": 0}}},
+		mcpCache: mcp.NewClientCache(time.Minute),
+		config:   WorkerConfig{MCPTimeout: time.Second}, logger: slog.Default(),
+		mcpClient: func(endpoint string, headers http.Header, timeout time.Duration, _ bool) (*mcp.Client, error) {
+			if endpoint != server.URL || timeout != 10*time.Second {
+				t.Errorf("MCP client setup: endpoint=%s timeout=%v", endpoint, timeout)
+			}
+			return mcp.NewClientWithHeaders(endpoint, headers, timeout, mcp.WithHTTPClient(server.Client()))
+		},
+	}
+	run := mcpRunWithSnapshot(id.String())
+	for range 2 {
+		tools, err := worker.prepareMCPTools(context.Background(), run, RunFence{})
+		if err != nil || len(tools.List()) != 1 {
+			t.Fatalf("prepare MCP tools: registry=%v err=%v", tools, err)
+		}
+	}
+	if got := discoveries.Load(); got != 1 {
+		t.Fatalf("tools/list called %d times, want one", got)
+	}
+}
 
 // faultMCPRepository 返回固定的 MCP 元数据或注入读取错误。
 type faultMCPRepository struct {

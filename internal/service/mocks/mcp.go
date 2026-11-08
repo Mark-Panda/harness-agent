@@ -155,3 +155,42 @@ func (mr *MockMCPCredentialRepositoryMockRecorder) GetMCPCredential(ctx, mcpID a
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMCPCredential", reflect.TypeOf((*MockMCPCredentialRepository)(nil).GetMCPCredential), ctx, mcpID)
 }
+
+// MockMCPProber is a mock of MCPProber interface.
+type MockMCPProber struct {
+	ctrl     *gomock.Controller
+	recorder *MockMCPProberMockRecorder
+	isgomock struct{}
+}
+
+// MockMCPProberMockRecorder is the mock recorder for MockMCPProber.
+type MockMCPProberMockRecorder struct {
+	mock *MockMCPProber
+}
+
+// NewMockMCPProber creates a new mock instance.
+func NewMockMCPProber(ctrl *gomock.Controller) *MockMCPProber {
+	mock := &MockMCPProber{ctrl: ctrl}
+	mock.recorder = &MockMCPProberMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockMCPProber) EXPECT() *MockMCPProberMockRecorder {
+	return m.recorder
+}
+
+// ListTools mocks base method.
+func (m *MockMCPProber) ListTools(ctx context.Context, endpoint, authType, secret string) ([]biz.MCPTool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListTools", ctx, endpoint, authType, secret)
+	ret0, _ := ret[0].([]biz.MCPTool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListTools indicates an expected call of ListTools.
+func (mr *MockMCPProberMockRecorder) ListTools(ctx, endpoint, authType, secret any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTools", reflect.TypeOf((*MockMCPProber)(nil).ListTools), ctx, endpoint, authType, secret)
+}

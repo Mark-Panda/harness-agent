@@ -541,6 +541,10 @@ func (r *FeishuConversationRepositoryImpl) IsSharedSession(ctx context.Context, 
 	}
 	var count int64
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := tx.Model(&sessionModel{}).Where("user_id = ? AND id = ? AND feishu_group_projection", userID, sessionID).
+			Count(&count).Error; err != nil || count > 0 {
+			return err
+		}
 		return tx.Model(&externalBindingModel{}).
 			Where("user_id = ? AND session_id = ? AND thread_id IS NOT NULL AND thread_id <> ?", userID, sessionID, "p2p").
 			Count(&count).Error

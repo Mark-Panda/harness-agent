@@ -44,47 +44,47 @@ func (m *MockSupervisorTaskRepository) EXPECT() *MockSupervisorTaskRepositoryMoc
 }
 
 // CancelPendingTasks mocks base method.
-func (m *MockSupervisorTaskRepository) CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time) error {
+func (m *MockSupervisorTaskRepository) CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time, fence biz.RunFence) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CancelPendingTasks", ctx, userID, parentRunID, reason, now)
+	ret := m.ctrl.Call(m, "CancelPendingTasks", ctx, userID, parentRunID, reason, now, fence)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // CancelPendingTasks indicates an expected call of CancelPendingTasks.
-func (mr *MockSupervisorTaskRepositoryMockRecorder) CancelPendingTasks(ctx, userID, parentRunID, reason, now any) *gomock.Call {
+func (mr *MockSupervisorTaskRepositoryMockRecorder) CancelPendingTasks(ctx, userID, parentRunID, reason, now, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelPendingTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).CancelPendingTasks), ctx, userID, parentRunID, reason, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelPendingTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).CancelPendingTasks), ctx, userID, parentRunID, reason, now, fence)
 }
 
 // CreateTasks mocks base method.
-func (m *MockSupervisorTaskRepository) CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []biz.SupervisorTask, event biz.OutboxEvent) ([]biz.SupervisorTask, error) {
+func (m *MockSupervisorTaskRepository) CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []biz.SupervisorTask, event biz.OutboxEvent, fence biz.RunFence) ([]biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CreateTasks", ctx, userID, parentRunID, tasks, event)
+	ret := m.ctrl.Call(m, "CreateTasks", ctx, userID, parentRunID, tasks, event, fence)
 	ret0, _ := ret[0].([]biz.SupervisorTask)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // CreateTasks indicates an expected call of CreateTasks.
-func (mr *MockSupervisorTaskRepositoryMockRecorder) CreateTasks(ctx, userID, parentRunID, tasks, event any) *gomock.Call {
+func (mr *MockSupervisorTaskRepositoryMockRecorder) CreateTasks(ctx, userID, parentRunID, tasks, event, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).CreateTasks), ctx, userID, parentRunID, tasks, event)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).CreateTasks), ctx, userID, parentRunID, tasks, event, fence)
 }
 
 // FinishTask mocks base method.
-func (m *MockSupervisorTaskRepository) FinishTask(ctx context.Context, userID, taskID uuid.UUID, status biz.SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time) (biz.SupervisorTask, error) {
+func (m *MockSupervisorTaskRepository) FinishTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, status biz.SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "FinishTask", ctx, userID, taskID, status, result, errorCode, errorMessage, now)
+	ret := m.ctrl.Call(m, "FinishTask", ctx, userID, parentRunID, taskID, status, result, errorCode, errorMessage, now, fence)
 	ret0, _ := ret[0].(biz.SupervisorTask)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // FinishTask indicates an expected call of FinishTask.
-func (mr *MockSupervisorTaskRepositoryMockRecorder) FinishTask(ctx, userID, taskID, status, result, errorCode, errorMessage, now any) *gomock.Call {
+func (mr *MockSupervisorTaskRepositoryMockRecorder) FinishTask(ctx, userID, parentRunID, taskID, status, result, errorCode, errorMessage, now, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FinishTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).FinishTask), ctx, userID, taskID, status, result, errorCode, errorMessage, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FinishTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).FinishTask), ctx, userID, parentRunID, taskID, status, result, errorCode, errorMessage, now, fence)
 }
 
 // ListTasks mocks base method.
@@ -103,31 +103,31 @@ func (mr *MockSupervisorTaskRepositoryMockRecorder) ListTasks(ctx, userID, paren
 }
 
 // RetryTask mocks base method.
-func (m *MockSupervisorTaskRepository) RetryTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+func (m *MockSupervisorTaskRepository) RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RetryTask", ctx, userID, taskID, now)
+	ret := m.ctrl.Call(m, "RetryTask", ctx, userID, parentRunID, taskID, now, fence)
 	ret0, _ := ret[0].(biz.SupervisorTask)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // RetryTask indicates an expected call of RetryTask.
-func (mr *MockSupervisorTaskRepositoryMockRecorder) RetryTask(ctx, userID, taskID, now any) *gomock.Call {
+func (mr *MockSupervisorTaskRepositoryMockRecorder) RetryTask(ctx, userID, parentRunID, taskID, now, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RetryTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).RetryTask), ctx, userID, taskID, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RetryTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).RetryTask), ctx, userID, parentRunID, taskID, now, fence)
 }
 
 // StartTask mocks base method.
-func (m *MockSupervisorTaskRepository) StartTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+func (m *MockSupervisorTaskRepository) StartTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "StartTask", ctx, userID, taskID, now)
+	ret := m.ctrl.Call(m, "StartTask", ctx, userID, parentRunID, taskID, now, fence)
 	ret0, _ := ret[0].(biz.SupervisorTask)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // StartTask indicates an expected call of StartTask.
-func (mr *MockSupervisorTaskRepositoryMockRecorder) StartTask(ctx, userID, taskID, now any) *gomock.Call {
+func (mr *MockSupervisorTaskRepositoryMockRecorder) StartTask(ctx, userID, parentRunID, taskID, now, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).StartTask), ctx, userID, taskID, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).StartTask), ctx, userID, parentRunID, taskID, now, fence)
 }

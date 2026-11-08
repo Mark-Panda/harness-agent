@@ -14,6 +14,7 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/einoext"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
 
@@ -86,12 +87,6 @@ type supervisorUsage struct {
 	cost   float64
 }
 
-// supervisorBudgetExceeded 判断共享 Token 或费用上限是否已耗尽。
-func (w *ExecutionWorker) supervisorBudgetExceeded(input, output int64, cost float64) bool {
-	return (w.config.SupervisorMaxTokens > 0 && input+output > w.config.SupervisorMaxTokens) ||
-		(w.config.SupervisorMaxCost > 0 && cost > w.config.SupervisorMaxCost)
-}
-
 // supervisorUsageFromEvents 从模型 Attempt 事实恢复规划、Worker 与既往汇总的全部用量。
 // 返回值 has 为 false 时表示当前 Run 尚无模型调用记录，调用方应回退到任务结果统计。
 func (w *ExecutionWorker) supervisorUsageFromEvents(ctx context.Context, run Run) (supervisorUsage, bool, error) {
@@ -122,46 +117,32 @@ func (w *ExecutionWorker) executeSupervisor(ctx context.Context, run Run, fence 
 }
 
 // prepareSupervisorTasks 读取或生成委派任务，并恢复既往用量与中断任务。
-func (w *ExecutionWorker) prepareSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry) ([]SupervisorTask, supervisorUsage, error) {
+func (w *ExecutionWorker) prepareSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry) ([]SupervisorTask, *supervisorBudget, error) {
 	tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
 	if err != nil {
-		return nil, supervisorUsage{}, err
+		return nil, nil, err
 	}
-	if len(tasks) == 0 {
-		draft, draftUsage, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, attempts, messages, tools)
-		if err != nil {
-			return nil, supervisorUsage{}, err
-		}
-		usage := supervisorUsage{
-			input: int64(draftUsage.Usage.InputTokens), output: int64(draftUsage.Usage.OutputTokens), cost: draftUsage.EstimatedCost,
-		}
-		if w.supervisorBudgetExceeded(usage.input, usage.output, usage.cost) {
-			return nil, usage, ErrSupervisorBudget
-		}
-		tasks, err = w.persistSupervisorTasks(ctx, run, fence, tools, draft)
-		if err != nil {
-			w.logger.Error("persist supervisor tasks failed", "run_id", run.ID, "error", err)
-			return nil, supervisorUsage{}, err
-		}
-		return tasks, usage, nil
-	}
-	usage := supervisorUsage{}
-	recoveredUsage, hasUsage, usageErr := w.supervisorUsageFromEvents(ctx, run)
-	if usageErr != nil {
-		return nil, supervisorUsage{}, usageErr
-	}
-	if hasUsage {
-		usage = recoveredUsage
-	}
-	tasks, err = w.recoverSupervisorTasks(ctx, run, tasks)
+	budget, err := w.recoverSupervisorBudget(ctx, run, tasks)
 	if err != nil {
-		return nil, supervisorUsage{}, err
+		return nil, nil, err
 	}
-	return tasks, usage, nil
+	if len(tasks) > 0 {
+		tasks, err = w.recoverSupervisorTasks(ctx, run, fence, tasks)
+		return tasks, budget, err
+	}
+	draft, _, err := w.generateSupervision(ctx, run, fence, candidates, policyVersion, attempts, budget, messages, tools)
+	if err != nil {
+		return nil, nil, err
+	}
+	tasks, err = w.persistSupervisorTasks(ctx, run, fence, tools, draft)
+	if err != nil {
+		w.logger.Error("persist supervisor tasks failed", "run_id", run.ID, "error", err)
+	}
+	return tasks, budget, err
 }
 
 // generateSupervision 调用 Supervisor 模型生成 Worker 委派。
-func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry) (SupervisorDraft, react.Completion, error) {
+func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, budget *supervisorBudget, messages []react.Message, tools react.Registry) (SupervisorDraft, react.Completion, error) {
 	planMessages := make([]react.Message, 0, len(messages)+2)
 	planMessages = append(planMessages, react.Message{Role: react.RoleSystem, Content: supervisorPlannerSystem(tools.List())})
 	// 委派规划必须看到 Agent 人设、Skill 与完整对话上下文，否则会遗漏用户约束或多轮任务目标。
@@ -188,7 +169,7 @@ func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fenc
 	complete := func(messages []react.Message) (react.Completion, error) {
 		// 委派规划（含一次自修复）都受 Prompt 预算约束，先裁剪再调用，避免长会话超出模型窗口。
 		messages = trimRunnerContext(messages, w.config.PromptTokenBudget)
-		return w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, messages, nil)
+		return w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, budget, messages, nil)
 	}
 	return planSupervisorDraft(planMessages, complete, w.config.SupervisorMaxWorkers, tools)
 }
@@ -358,7 +339,7 @@ func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, f
 		UserID: run.UserID, EventType: "supervisor.tasks.created", AggregateType: "run", AggregateID: run.ID.String(),
 		DedupeKey: "supervisor.tasks.created:" + run.ID.String(),
 		Payload:   map[string]any{"workers": len(tasks)},
-	})
+	}, fence)
 	if err != nil {
 		if errors.Is(err, ErrResourceConflict) {
 			return w.supervisor.ListTasks(ctx, run.UserID, run.ID)
@@ -369,22 +350,36 @@ func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, f
 	return created, nil
 }
 
-// recoverSupervisorTasks 处理上次崩溃遗留的 running 任务：
-// 仍有重试次数时重置为 pending，让审批恢复或基础设施重试继续执行；否则标记失败避免永久孤儿。
-func (w *ExecutionWorker) recoverSupervisorTasks(ctx context.Context, run Run, tasks []SupervisorTask) ([]SupervisorTask, error) {
+const supervisorUnknownToolCode = "tool_execution_unknown"
+
+// recoverSupervisorTasks retries interrupted model-only tasks. A task with tool
+// access may have executed an operation before its transcript was saved.
+func (w *ExecutionWorker) recoverSupervisorTasks(ctx context.Context, run Run, fence RunFence, tasks []SupervisorTask) ([]SupervisorTask, error) {
 	now := w.clock()
+	for _, task := range tasks {
+		if task.Status == SupervisorTaskUnknown && task.ErrorCode == supervisorUnknownToolCode {
+			return nil, fmt.Errorf("%w: supervisor task %s requires reconciliation", ErrToolResultPersistence, task.ID)
+		}
+		if task.Status == SupervisorTaskRunning && len(task.ToolScope) > 0 {
+			if _, err := w.supervisor.FinishTask(ctx, run.UserID, run.ID, task.ID, SupervisorTaskUnknown, nil,
+				supervisorUnknownToolCode, "Worker 重启时工具结果未知，需人工对账", now, fence); err != nil && !errors.Is(err, ErrResourceConflict) {
+				return nil, fmt.Errorf("%w: record interrupted task %s: %v", ErrToolResultPersistence, task.ID, err)
+			}
+			return nil, fmt.Errorf("%w: interrupted supervisor task %s had tool access", ErrToolResultPersistence, task.ID)
+		}
+	}
 	for _, task := range tasks {
 		if task.Status != SupervisorTaskRunning {
 			continue
 		}
 		if task.Attempts < task.MaxAttempts {
-			if _, err := w.supervisor.RetryTask(ctx, run.UserID, task.ID, now); err != nil && !errors.Is(err, ErrResourceConflict) {
+			if _, err := w.supervisor.RetryTask(ctx, run.UserID, run.ID, task.ID, now, fence); err != nil && !errors.Is(err, ErrResourceConflict) {
 				return nil, err
 			}
 			continue
 		}
-		if _, err := w.supervisor.FinishTask(ctx, run.UserID, task.ID, SupervisorTaskFailed, nil,
-			"worker_restarted", "Worker 重启时任务结果未知", now); err != nil && !errors.Is(err, ErrResourceConflict) {
+		if _, err := w.supervisor.FinishTask(ctx, run.UserID, run.ID, task.ID, SupervisorTaskFailed, nil,
+			"worker_restarted", "Worker 重启时任务结果未知", now, fence); err != nil && !errors.Is(err, ErrResourceConflict) {
 			return nil, err
 		}
 	}
@@ -413,7 +408,7 @@ func pendingSupervisorTasks(tasks []SupervisorTask) []SupervisorTask {
 }
 
 // runPendingSupervisorTasks 并发执行待处理 Worker 任务，返回最新任务快照与预算、审批状态。
-func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, usage supervisorUsage, pending []SupervisorTask) (supervisorRunOutcome, error) {
+func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, budget *supervisorBudget, pending []SupervisorTask) (supervisorRunOutcome, error) {
 	if len(pending) == 0 {
 		return supervisorRunOutcome{}, nil
 	}
@@ -421,21 +416,6 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 	defer cancelTasks()
 	semaphore := make(chan struct{}, w.config.SupervisorMaxWorkers)
 	var wait sync.WaitGroup
-	var sharedInput, sharedOutput atomic.Int64
-	sharedInput.Store(usage.input)
-	sharedOutput.Store(usage.output)
-	var costMu sync.Mutex
-	sharedCost := usage.cost
-	addCost := func(value float64) {
-		costMu.Lock()
-		sharedCost += value
-		costMu.Unlock()
-	}
-	currentCost := func() float64 {
-		costMu.Lock()
-		defer costMu.Unlock()
-		return sharedCost
-	}
 	var budgetExceeded atomic.Bool
 	// 子任务触发人工审批时必须暂停主 Run，禁止把审批信号降级为普通失败后继续汇总。
 	var approvalMu sync.Mutex
@@ -443,15 +423,19 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 	// 子任务结果写库失败时任务行仍是 running，既不能发完成事件也不能继续汇总。
 	var settlementMu sync.Mutex
 	var settlementErr error
+	var uncertainToolErr error
 	recordSettlementError := func(err error) {
 		settlementMu.Lock()
-		if settlementErr == nil {
+		if supervisorToolResultUncertain(err) {
+			uncertainToolErr = errors.Join(uncertainToolErr, err)
+		} else if settlementErr == nil {
 			settlementErr = err
 		}
 		settlementMu.Unlock()
+		cancelTasks()
 	}
 	settle := func(taskID uuid.UUID, status SupervisorTaskStatus, usage map[string]any, code, message string) bool {
-		if _, err := w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, taskID, status, usage, code, message, w.clock()); err != nil {
+		if _, err := w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, run.ID, taskID, status, usage, code, message, w.clock(), fence); err != nil {
 			w.logger.Error("finish supervisor task failed", "run_id", run.ID, "task_id", taskID,
 				"status", string(status), "error", err)
 			recordSettlementError(err)
@@ -459,10 +443,14 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 		}
 		return true
 	}
+schedule:
 	for _, task := range pending {
-		task := task
+		select {
+		case semaphore <- struct{}{}:
+		case <-taskCtx.Done():
+			break schedule
+		}
 		wait.Add(1)
-		semaphore <- struct{}{}
 		go func() {
 			defer wait.Done()
 			defer func() { <-semaphore }()
@@ -475,9 +463,12 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 				}
 			}()
 			for {
-				started, startErr := w.supervisor.StartTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, w.clock())
+				if taskCtx.Err() != nil {
+					return
+				}
+				started, startErr := w.supervisor.StartTask(taskCtx, run.UserID, run.ID, task.ID, w.clock(), fence)
 				if startErr != nil {
-					if errors.Is(startErr, ErrResourceConflict) {
+					if taskCtx.Err() != nil || errors.Is(startErr, ErrResourceConflict) {
 						// 已被其他 Worker 领取或已终态：跳过，避免重复执行。
 						return
 					}
@@ -489,21 +480,19 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 				w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.started", map[string]any{
 					"task_id": started.ID.String(), "worker": started.WorkerName, "index": started.WorkerIndex,
 				})
-				result, inputTokens, outputTokens, cost, runErr := w.executeWorkerTask(taskCtx, run, fence, candidates, policyVersion, attempts, messages, tools, started)
+				result, inputTokens, outputTokens, cost, runErr := w.executeWorkerTask(taskCtx, run, fence, candidates, policyVersion, attempts, budget, messages, tools, started)
 				usageResult := map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens, "estimated_cost": cost}
-				// 成功与失败 Worker 都必须计入共享预算；失败前的模型调用同样真实消耗了 Token。
-				sharedInput.Add(inputTokens)
-				sharedOutput.Add(outputTokens)
-				addCost(cost)
-				if w.supervisorBudgetExceeded(sharedInput.Load(), sharedOutput.Load(), currentCost()) {
-					budgetExceeded.Store(true)
-					cancelTasks()
-					_ = w.supervisor.CancelPendingTasks(context.WithoutCancel(taskCtx), run.UserID, run.ID, "共享预算耗尽", w.clock())
-					w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.budget_exceeded", map[string]any{
-						"input_tokens": sharedInput.Load(), "output_tokens": sharedOutput.Load(), "estimated_cost": currentCost(),
-					})
-				}
 				if runErr != nil {
+					if supervisorToolResultUncertain(runErr) {
+						recordSettlementError(runErr)
+						settle(task.ID, SupervisorTaskUnknown, usageResult, supervisorUnknownToolCode, sanitizeExecutionError(runErr))
+						return
+					}
+					if errors.Is(runErr, ErrSupervisorBudget) {
+						budgetExceeded.Store(true)
+						settle(task.ID, SupervisorTaskCancelled, usageResult, "budget_exceeded", "共享预算耗尽")
+						return
+					}
 					// 审批门禁拦截不是任务失败：保留子会话现场并把任务重置为 pending，
 					// 审批结果回填到子会话后从断点继续，而不是丢弃整个 Worker 结果。
 					if errors.Is(runErr, react.ErrApprovalRequired) {
@@ -512,7 +501,7 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 							approvalError = runErr
 						}
 						approvalMu.Unlock()
-						if _, retryErr := w.supervisor.RetryTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, w.clock()); retryErr != nil {
+						if _, retryErr := w.supervisor.RetryTask(context.WithoutCancel(taskCtx), run.UserID, run.ID, task.ID, w.clock(), fence); retryErr != nil {
 							settle(task.ID, SupervisorTaskFailed, usageResult, "approval_required", "子任务触发人工审批，需主 Run 暂停")
 						}
 						w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.approval_required", map[string]any{
@@ -523,16 +512,13 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 					status := SupervisorTaskFailed
 					code, message := failureDetails(runErr)
 					w.logger.Warn("supervisor worker failed", "task_id", task.ID, "worker", task.WorkerName, "error", runErr)
-					retryable := taskCtx.Err() == nil && !budgetExceeded.Load() && !isBusinessFailure(runErr)
+					retryable := !isBusinessFailure(runErr)
 					if taskCtx.Err() != nil {
 						status = SupervisorTaskCancelled
 						code, message = "task_cancelled", "任务已取消"
-					} else if budgetExceeded.Load() {
-						status = SupervisorTaskCancelled
-						code, message = "budget_exceeded", "共享预算耗尽"
 					} else if retryable && started.Attempts < started.MaxAttempts {
 						// 基础设施/模型瞬时故障在剩余次数内直接重试，避免整轮委派直接失败。
-						if _, retryErr := w.supervisor.RetryTask(context.WithoutCancel(taskCtx), run.UserID, task.ID, w.clock()); retryErr == nil {
+						if _, retryErr := w.supervisor.RetryTask(context.WithoutCancel(taskCtx), run.UserID, run.ID, task.ID, w.clock(), fence); retryErr == nil {
 							w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.retrying", map[string]any{
 								"task_id": task.ID.String(), "worker": task.WorkerName, "code": code,
 							})
@@ -565,18 +551,24 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 		}()
 	}
 	wait.Wait()
-	settlementMu.Lock()
-	settleErr := settlementErr
-	settlementMu.Unlock()
-	if settleErr != nil {
+	if uncertainToolErr != nil {
+		return supervisorRunOutcome{}, uncertainToolErr
+	}
+	if settleErr := settlementErr; settleErr != nil {
 		// 任务状态未知时继续汇总会把成功结果当缺失、失败结果当成功。
 		return supervisorRunOutcome{}, fmt.Errorf("%w: %v", ErrSupervisorTaskSettlement, settleErr)
 	}
-	approvalMu.Lock()
-	pendingApproval := approvalError
-	approvalMu.Unlock()
-	if pendingApproval != nil {
-		return supervisorRunOutcome{ApprovalError: pendingApproval}, nil
+	if err := ctx.Err(); err != nil {
+		return supervisorRunOutcome{}, err
+	}
+	if approvalError != nil {
+		return supervisorRunOutcome{ApprovalError: approvalError}, nil
+	}
+	if budgetExceeded.Load() {
+		usage := budget.usage()
+		w.emitPlanEvent(ctx, run, fence, "supervisor.budget_exceeded", map[string]any{
+			"input_tokens": usage.input, "output_tokens": usage.output, "estimated_cost": usage.cost, "stage": "workers",
+		})
 	}
 	tasks, err := w.supervisor.ListTasks(ctx, run.UserID, run.ID)
 	if err != nil {
@@ -605,7 +597,7 @@ func (w *ExecutionWorker) ensureSupervisorPartialAllowed(run Run, tasks []Superv
 }
 
 // executeWorkerTask 在独立子会话中运行 Worker，返回结果与用量。
-func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools react.Registry, task SupervisorTask) (react.Result, int64, int64, float64, error) {
+func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, budget *supervisorBudget, messages []react.Message, tools react.Registry, task SupervisorTask) (react.Result, int64, int64, float64, error) {
 	// 审批记录归属子会话，审批通过后结果才能回填到 Worker 上下文。
 	ctx = withApprovalSession(ctx, task.ChildSessionID)
 	// 观测包装让 Worker 的工具调用同样落执行步骤与脱敏载荷；工具范围仍由任务白名单限制。
@@ -667,6 +659,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	}
 	config := w.config.Routing
 	config.InitialAttemptNo = 0
+	config.AttemptBudget = budget
 	config.MaxAttemptsPerRun = childAttempts
 	config.MaxSwitchesPerRun = 2
 	router, err := model.NewRouter(candidates, w.health, config, offsetAttemptObserver{inner: observer, offset: base})
@@ -715,11 +708,13 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			workerStatus = StepCancelled
 			workerCode = "cancelled"
 		}
-		// 可重试失败会通过 RetryTask 从中断点回放子会话历史；必须先落盘已完成的
-		// 助手/工具消息，否则重试会重复执行已经成功且有副作用的工具调用。
-		if ctx.Err() == nil && !isBusinessFailure(err) {
-			if persistErr := w.persistWorkerMessages(ctx, run, task, truncateUnfinishedToolCalls(recorded), len(childMessages)); persistErr != nil {
-				w.logger.Warn("persist worker messages before retry failed", "run_id", run.ID, "task_id", task.ID, "error", persistErr)
+		// Retry only after completed tool messages are durably replayable.
+		if ctx.Err() == nil && !isBusinessFailure(err) && !supervisorToolResultUncertain(err) {
+			replayable := truncateUnfinishedToolCalls(recorded)
+			if hasSupervisorToolResult(recorded[len(replayable):]) {
+				err = errors.Join(ErrToolResultPersistence, err)
+			} else if persistErr := w.persistWorkerMessages(ctx, run, task, replayable, len(childMessages)); persistErr != nil {
+				err = errors.Join(err, persistErr)
 			}
 		}
 		w.recordWorkerFailure(ctx, run, fence, task, err, recorded)
@@ -787,10 +782,26 @@ func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, ta
 			UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message", AggregateID: stored.ID.String(),
 			DedupeKey: "message.created.agent:" + stored.ID.String(), Payload: map[string]any{"parent_run_id": run.ID.String(), "task_id": task.ID.String()},
 		}); err != nil {
+			if hasSupervisorToolResult(recorded) {
+				return errors.Join(ErrToolResultPersistence, err)
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+func hasSupervisorToolResult(messages []react.Message) bool {
+	for _, message := range messages {
+		if message.Role == react.RoleTool && !message.Ephemeral {
+			return true
+		}
+	}
+	return false
+}
+
+func supervisorToolResultUncertain(err error) bool {
+	return errors.Is(err, ErrToolResultPersistence) || errors.Is(err, ErrApprovalExecutionUnknown)
 }
 
 // loadChildHistory 读取子会话中此前的助手与工具消息，供审批恢复或重试时续跑。
@@ -899,17 +910,12 @@ func lastUserMessageContent(messages []react.Message) string {
 }
 
 // aggregateSupervisor 汇总 Worker 结果，显式标注部分失败与缺失结果。
-func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, usage supervisorUsage, tasks []SupervisorTask) (react.Result, error) {
-	recordedUsage, hasRecordedUsage, err := w.supervisorUsageFromEvents(ctx, run)
-	if err != nil {
+func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, budget *supervisorBudget, tasks []SupervisorTask) (react.Result, error) {
+	if err := ctx.Err(); err != nil {
 		return react.Result{}, err
 	}
-	if hasRecordedUsage {
-		usage = recordedUsage
-	}
 	completed, failed, cancelled := 0, 0, 0
-	totalInput, totalOutput := usage.input, usage.output
-	totalCost := usage.cost
+	usage := budget.usage()
 	var builder strings.Builder
 	builder.WriteString("Worker 执行结果：\n")
 	for _, task := range tasks {
@@ -928,21 +934,14 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 			failed++
 			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=pending：结果缺失\n", task.WorkerIndex, task.WorkerName))
 		}
-		if !hasRecordedUsage && task.Result != nil {
-			totalInput += supervisorInt64(task.Result["input_tokens"])
-			totalOutput += supervisorInt64(task.Result["output_tokens"])
-			if cost, ok := task.Result["estimated_cost"].(float64); ok {
-				totalCost += cost
-			}
-		}
 	}
 	if len(messages) > 0 {
 		last := messages[len(messages)-1]
 		if last.Role == react.RoleAssistant && last.ID == deterministicSupervisorFinalMessageID(run.ID) && last.RunID == run.ID.String() {
 			// 最终消息已存在时直接恢复，不再重复调用汇总模型或重复累加其用量。
 			return react.Result{
-				Content: last.Content, Steps: len(tasks), TotalTokens: int(totalInput + totalOutput),
-				InputTokens: int(totalInput), OutputTokens: int(totalOutput), EstimatedCost: totalCost,
+				Content: last.Content, Steps: len(tasks), TotalTokens: int(usage.input + usage.output),
+				InputTokens: int(usage.input), OutputTokens: int(usage.output), EstimatedCost: usage.cost,
 				Messages: messages, FinalMessageID: last.ID,
 			}, nil
 		}
@@ -961,27 +960,20 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 		{Role: react.RoleSystem, Content: supervisorAggregatorInstruction},
 		{Role: react.RoleUser, Content: aggregatePrompt},
 	}
-	// 多 Worker 结果可能很长，汇总调用同样受 Prompt 预算约束。
-	// 已达到共享上限时不再额外调用汇总模型；调用后超限则丢弃生成文本并回退确定性部分结果。
+	// Fall back to the completed worker results when no aggregation call fits.
 	content := builder.String()
-	overBudget := w.supervisorBudgetExceeded(totalInput, totalOutput, totalCost)
-	if !overBudget {
-		completion, err := w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts,
-			trimRunnerContext(aggregateMessages, w.config.PromptTokenBudget), nil)
-		if err == nil {
-			totalInput += int64(completion.Usage.InputTokens)
-			totalOutput += int64(completion.Usage.OutputTokens)
-			totalCost += completion.EstimatedCost
-			overBudget = w.supervisorBudgetExceeded(totalInput, totalOutput, totalCost)
-			if !overBudget && strings.TrimSpace(completion.Content) != "" {
-				content = strings.TrimSpace(completion.Content)
-			}
-		}
+	completion, aggregateErr := w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, budget,
+		trimRunnerContext(aggregateMessages, w.config.PromptTokenBudget), nil)
+	if err := ctx.Err(); err != nil {
+		return react.Result{}, err
 	}
-	if overBudget {
-		content = builder.String()
+	usage = budget.usage()
+	if aggregateErr == nil && strings.TrimSpace(completion.Content) != "" {
+		content = strings.TrimSpace(completion.Content)
+	}
+	if errors.Is(aggregateErr, ErrSupervisorBudget) {
 		w.emitPlanEvent(ctx, run, fence, "supervisor.budget_exceeded", map[string]any{
-			"input_tokens": totalInput, "output_tokens": totalOutput, "estimated_cost": totalCost, "stage": "aggregate",
+			"input_tokens": usage.input, "output_tokens": usage.output, "estimated_cost": usage.cost, "stage": "aggregate",
 		})
 	}
 	if len(content) > 32768 {
@@ -1009,11 +1001,11 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 	}
 	w.emitPlanEvent(ctx, run, fence, "supervisor.completed", map[string]any{
 		"completed": completed, "failed": failed, "cancelled": cancelled, "partial": partial,
-		"total_input_tokens": totalInput, "total_output_tokens": totalOutput, "estimated_cost": totalCost,
+		"total_input_tokens": usage.input, "total_output_tokens": usage.output, "estimated_cost": usage.cost,
 	})
 	return react.Result{
-		Content: content, Steps: len(tasks), TotalTokens: int(totalInput + totalOutput),
-		InputTokens: int(totalInput), OutputTokens: int(totalOutput), EstimatedCost: totalCost,
+		Content: content, Steps: len(tasks), TotalTokens: int(usage.input + usage.output),
+		InputTokens: int(usage.input), OutputTokens: int(usage.output), EstimatedCost: usage.cost,
 		Messages: resultMessages, FinalMessageID: stored.ID.String(),
 	}, nil
 }
@@ -1024,7 +1016,7 @@ func deterministicSupervisorFinalMessageID(runID uuid.UUID) string {
 }
 
 // supervisorComplete 创建一次性 Router 并执行模型调用，attempt 序号按预留块隔离。
-func (w *ExecutionWorker) supervisorComplete(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, messages []react.Message, tools []react.ToolSpec) (react.Completion, error) {
+func (w *ExecutionWorker) supervisorComplete(ctx context.Context, run Run, fence RunFence, candidates []model.Candidate, policyVersion *int, attempts *atomic.Int64, budget *supervisorBudget, messages []react.Message, tools []react.ToolSpec) (react.Completion, error) {
 	base := reserveSupervisorAttempts(attempts, 6)
 	observer := &runAttemptObserver{
 		worker: w, run: run, fence: fence, policyVersion: policyVersion,
@@ -1032,6 +1024,7 @@ func (w *ExecutionWorker) supervisorComplete(ctx context.Context, run Run, fence
 	}
 	config := w.config.Routing
 	config.InitialAttemptNo = 0
+	config.AttemptBudget = budget
 	config.MaxAttemptsPerRun = 6
 	config.MaxSwitchesPerRun = 1
 	router, err := model.NewRouter(candidates, w.health, config, offsetAttemptObserver{inner: observer, offset: base})
@@ -1079,10 +1072,24 @@ type scopedToolRegistry struct {
 func (r scopedToolRegistry) Lookup(name string) (react.Tool, bool) {
 	for _, allowed := range r.allowed {
 		if allowed == name {
-			return r.inner.Lookup(name)
+			tool, exists := r.inner.Lookup(name)
+			if !exists {
+				return nil, false
+			}
+			return supervisorScopedTool{Tool: tool}, true
 		}
 	}
 	return nil, false
+}
+
+type supervisorScopedTool struct{ react.Tool }
+
+func (t supervisorScopedTool) Invoke(ctx context.Context, arguments json.RawMessage) (json.RawMessage, error) {
+	output, err := t.Tool.Invoke(ctx, arguments)
+	if errors.Is(err, mcp.ErrToolOutcomeUnknown) {
+		return nil, errors.Join(ErrToolResultPersistence, react.NewInfrastructureError("mcp_tool_outcome", err))
+	}
+	return output, err
 }
 
 // List 仅返回允许列表中的工具定义。

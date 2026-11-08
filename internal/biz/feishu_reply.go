@@ -320,7 +320,13 @@ func (w *FeishuReplyWorker) promoteThread(ctx context.Context, outbound FeishuOu
 	if w.conversations == nil || threadID == "" || !isBootstrapAlias(outbound) {
 		return
 	}
-	if _, err := w.conversations.PromoteConversationThread(ctx, outbound.UserID, outbound.SessionID, outbound.ThreadID, threadID); err != nil {
+	updated, err := w.conversations.PromoteConversationThread(ctx, outbound.UserID, outbound.SessionID, outbound.ThreadID, threadID)
+	if err == nil && updated == 0 {
+		if promoter, ok := w.conversations.(feishuGroupThreadPromoter); ok {
+			_, err = promoter.PromoteGroupConversationThread(ctx, outbound, threadID)
+		}
+	}
+	if err != nil {
 		w.logger.Warn("promote feishu thread failed", "outbound_id", outbound.ID, "thread_id", threadID, "error", err)
 	}
 }
@@ -366,6 +372,17 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 		jobOutcome = "failure"
 		w.failOutbound(ctx, outbound, err)
 		return
+	}
+	if isFeishuSharedGroup(run) && run.Status == RunCompleted {
+		if completer, ok := w.outbound.(feishuGroupReplyCompleter); ok {
+			// 卡片与文本降级的共同可见正文，避免后续发言人读取投递时被截掉的答案。
+			visible := truncateUTF8Bytes(text, max(0, w.config.MaxTextBytes-len(title)-1-len("…")))
+			if err := completer.CompleteGroupReply(context.WithoutCancel(ctx), outbound, w.config.WorkerID, visible, w.clock()); err != nil {
+				jobOutcome = "failure"
+				w.failOutbound(ctx, outbound, err)
+			}
+			return
+		}
 	}
 	_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
 }

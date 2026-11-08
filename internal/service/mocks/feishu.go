@@ -178,6 +178,84 @@ func (mr *MockFeishuIdentityStoreMockRecorder) Resolve(ctx, tenantKey, openID an
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Resolve", reflect.TypeOf((*MockFeishuIdentityStore)(nil).Resolve), ctx, tenantKey, openID)
 }
 
+// MockSessionAgentBinder is a mock of SessionAgentBinder interface.
+type MockSessionAgentBinder struct {
+	ctrl     *gomock.Controller
+	recorder *MockSessionAgentBinderMockRecorder
+	isgomock struct{}
+}
+
+// MockSessionAgentBinderMockRecorder is the mock recorder for MockSessionAgentBinder.
+type MockSessionAgentBinderMockRecorder struct {
+	mock *MockSessionAgentBinder
+}
+
+// NewMockSessionAgentBinder creates a new mock instance.
+func NewMockSessionAgentBinder(ctrl *gomock.Controller) *MockSessionAgentBinder {
+	mock := &MockSessionAgentBinder{ctrl: ctrl}
+	mock.recorder = &MockSessionAgentBinderMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockSessionAgentBinder) EXPECT() *MockSessionAgentBinderMockRecorder {
+	return m.recorder
+}
+
+// BindSessionAgent mocks base method.
+func (m *MockSessionAgentBinder) BindSessionAgent(ctx context.Context, userID, sessionID, agentID uuid.UUID, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BindSessionAgent", ctx, userID, sessionID, agentID, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// BindSessionAgent indicates an expected call of BindSessionAgent.
+func (mr *MockSessionAgentBinderMockRecorder) BindSessionAgent(ctx, userID, sessionID, agentID, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BindSessionAgent", reflect.TypeOf((*MockSessionAgentBinder)(nil).BindSessionAgent), ctx, userID, sessionID, agentID, now)
+}
+
+// MockFeishuConversationAppScopedRepository is a mock of FeishuConversationAppScopedRepository interface.
+type MockFeishuConversationAppScopedRepository struct {
+	ctrl     *gomock.Controller
+	recorder *MockFeishuConversationAppScopedRepositoryMockRecorder
+	isgomock struct{}
+}
+
+// MockFeishuConversationAppScopedRepositoryMockRecorder is the mock recorder for MockFeishuConversationAppScopedRepository.
+type MockFeishuConversationAppScopedRepositoryMockRecorder struct {
+	mock *MockFeishuConversationAppScopedRepository
+}
+
+// NewMockFeishuConversationAppScopedRepository creates a new mock instance.
+func NewMockFeishuConversationAppScopedRepository(ctrl *gomock.Controller) *MockFeishuConversationAppScopedRepository {
+	mock := &MockFeishuConversationAppScopedRepository{ctrl: ctrl}
+	mock.recorder = &MockFeishuConversationAppScopedRepositoryMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockFeishuConversationAppScopedRepository) EXPECT() *MockFeishuConversationAppScopedRepositoryMockRecorder {
+	return m.recorder
+}
+
+// FindConversationForApp mocks base method.
+func (m *MockFeishuConversationAppScopedRepository) FindConversationForApp(ctx context.Context, appID, tenantKey, chatID, threadID, rootMessageID string) (biz.FeishuConversationBinding, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "FindConversationForApp", ctx, appID, tenantKey, chatID, threadID, rootMessageID)
+	ret0, _ := ret[0].(biz.FeishuConversationBinding)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// FindConversationForApp indicates an expected call of FindConversationForApp.
+func (mr *MockFeishuConversationAppScopedRepositoryMockRecorder) FindConversationForApp(ctx, appID, tenantKey, chatID, threadID, rootMessageID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindConversationForApp", reflect.TypeOf((*MockFeishuConversationAppScopedRepository)(nil).FindConversationForApp), ctx, appID, tenantKey, chatID, threadID, rootMessageID)
+}
+
 // MockFeishuConversationRepository is a mock of FeishuConversationRepository interface.
 type MockFeishuConversationRepository struct {
 	ctrl     *gomock.Controller

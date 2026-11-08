@@ -83,7 +83,7 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
-	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+	err = WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		// dedupe_key 上是部分唯一索引，ON CONFLICT 不指定列才能匹配到该索引。
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record)
 		if result.Error != nil {
@@ -95,7 +95,7 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 		// 已有同 Run 的 pending 任务：重复入队通常发生在“审批决策/恢复需要立即唤醒”场景。
 		// 若旧任务被退避到了更晚的 available_at，直接返回会推迟唤醒；这里只在提前时前移。
 		return tx.Model(&jobModel{}).
-			Where("dedupe_key = ? AND status = ? AND available_at > ?", dedupe, "pending", availableAt).
+			Where("user_id = ? AND dedupe_key = ? AND status = ? AND available_at > ?", userID, dedupe, "pending", availableAt).
 			Updates(map[string]any{"available_at": availableAt, "updated_at": time.Now().UTC()}).Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
@@ -103,6 +103,16 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 		return nil
 	}
 	return catalogError("enqueue run job", err)
+}
+
+// HasRunJob 检查幂等重试的 Run 是否已入队，避免重复接管暂停计划。
+func (r *JobRepository) HasRunJob(ctx context.Context, userID, runID uuid.UUID) (bool, error) {
+	var count int64
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&jobModel{}).
+			Where("user_id = ? AND dedupe_key = ?", userID, "run:"+runID.String()).Count(&count).Error
+	})
+	return count > 0, catalogError("check run job", err)
 }
 
 // RequeueRun 把同一 Run 的失败或死信任务重置为 pending，供人工重放。
@@ -400,28 +410,28 @@ func (r *JobRepository) Fail(ctx context.Context, jobID uuid.UUID, workerID stri
 	if len(reason) > 1024 {
 		reason = reason[:1024]
 	}
-	status := "pending"
+	if retryAt.IsZero() {
+		retryAt = now
+	}
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		var record jobModel
-		if err := tx.First(&record, "id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?",
-			jobID, workerID, fencingToken).Error; err != nil {
-			return err
+		result := tx.Model(&jobModel{}).
+			Where("id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?", jobID, workerID, fencingToken).
+			Updates(map[string]any{
+				"status":           gorm.Expr("CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END"),
+				"available_at":     gorm.Expr("CASE WHEN attempts < max_attempts THEN ? ELSE available_at END", retryAt),
+				"completed_at":     gorm.Expr("CASE WHEN attempts >= max_attempts THEN ? ELSE completed_at END", now),
+				"last_error":       reason,
+				"lease_owner":      "",
+				"lease_expires_at": nil,
+				"updated_at":       now,
+			})
+		if result.Error != nil {
+			return result.Error
 		}
-		if record.Attempts >= record.MaxAttempts {
-			status = "dead"
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: job lease is no longer valid", biz.ErrResourceConflict)
 		}
-		updates := map[string]any{
-			"status": status, "last_error": reason, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
-		}
-		if status == "pending" {
-			if retryAt.IsZero() {
-				retryAt = now
-			}
-			updates["available_at"] = retryAt
-		} else {
-			updates["completed_at"] = now
-		}
-		return tx.Model(&jobModel{}).Where("id = ?", jobID).Updates(updates).Error
+		return nil
 	})
 	return catalogError("fail job", err)
 }
@@ -431,6 +441,8 @@ var _ biz.JobQueue = (*JobRepository)(nil)
 
 // 编译期断言 Run 入队端口实现。
 var _ biz.RunEnqueuer = (*JobRepository)(nil)
+
+var _ biz.RunJobLookup = (*JobRepository)(nil)
 
 // 编译期断言摘要任务入队端口实现。
 var _ biz.SummaryJobQueue = (*JobRepository)(nil)

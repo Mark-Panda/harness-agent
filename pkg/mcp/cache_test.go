@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -10,6 +11,32 @@ import (
 	"testing"
 	"time"
 )
+
+func TestClientCacheEvictsStaleToolsAndRetriesFailedDiscovery(t *testing.T) {
+	cache := NewClientCache(0)
+	cache.maxEntries = 2
+	now := time.Now()
+	cache.entries["expired"] = &clientCacheEntry{expires: now.Add(-time.Minute)}
+	cache.entries["oldest"] = &clientCacheEntry{expires: now.Add(time.Minute)}
+	cache.entries["latest"] = &clientCacheEntry{expires: now.Add(2 * time.Minute)}
+	var listCalls int32
+	server := countListCalls(t, &listCalls)
+	discoveryErr := errors.New("discovery failed")
+	if _, _, err := cache.Get(context.Background(), "new", func(context.Context) (*Client, error) {
+		return nil, discoveryErr
+	}); !errors.Is(err, discoveryErr) {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if _, ok := cache.entries["latest"]; !ok || len(cache.entries) != 1 {
+		t.Fatalf("unexpected cached clients after failed discovery: %v", cache.entries)
+	}
+	client, tools, err := cache.Get(context.Background(), "new", func(context.Context) (*Client, error) {
+		return NewClient(server.URL, "", "", time.Second, WithHTTPClient(server.Client()))
+	})
+	if err != nil || client == nil || len(tools) != 1 || atomic.LoadInt32(&listCalls) != 1 {
+		t.Fatalf("failed discovery was cached: tools=%v err=%v", tools, err)
+	}
+}
 
 // countListCalls 统计 tools/list 次数，用于验证缓存命中不重复发现。
 func countListCalls(t *testing.T, calls *int32) *httptest.Server {

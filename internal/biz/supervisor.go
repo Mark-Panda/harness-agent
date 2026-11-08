@@ -86,17 +86,17 @@ type SupervisorTask struct {
 // SupervisorTaskRepository 定义 Supervisor 子任务持久化契约；所有查询强制携带 user_id。
 type SupervisorTaskRepository interface {
 	// CreateTasks 在同一事务内创建全部子任务与审计事件。
-	CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []SupervisorTask, event OutboxEvent) ([]SupervisorTask, error)
+	CreateTasks(ctx context.Context, userID, parentRunID uuid.UUID, tasks []SupervisorTask, event OutboxEvent, fence RunFence) ([]SupervisorTask, error)
 	// ListTasks 按 Worker 序号列出主 Run 的子任务。
 	ListTasks(ctx context.Context, userID, parentRunID uuid.UUID) ([]SupervisorTask, error)
 	// StartTask 以 pending 状态为前置条件领取任务，写入 attempts 与开始时间。
-	StartTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (SupervisorTask, error)
+	StartTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence RunFence) (SupervisorTask, error)
 	// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于审批恢复与瞬时故障重试。
-	RetryTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (SupervisorTask, error)
+	RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence RunFence) (SupervisorTask, error)
 	// FinishTask 以 running 状态为前置条件推进终态，阻止迟到结果回写。
-	FinishTask(ctx context.Context, userID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time) (SupervisorTask, error)
+	FinishTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time, fence RunFence) (SupervisorTask, error)
 	// CancelPendingTasks 取消主 Run 下所有待执行任务，用于预算超限或父取消。
-	CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time) error
+	CancelPendingTasks(ctx context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time, fence RunFence) error
 }
 
 // SupervisorWorker 是 Planner 输出的单个 Worker 委派。
@@ -171,7 +171,7 @@ func ParseSupervisorDraft(raw string, maxWorkers int) (SupervisorDraft, error) {
 // SupervisorTaskTerminal 判断子任务是否终态。
 func SupervisorTaskTerminal(status SupervisorTaskStatus) bool {
 	switch status {
-	case SupervisorTaskCompleted, SupervisorTaskFailed, SupervisorTaskCancelled:
+	case SupervisorTaskCompleted, SupervisorTaskFailed, SupervisorTaskCancelled, SupervisorTaskUnknown:
 		return true
 	default:
 		return false

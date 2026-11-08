@@ -1,6 +1,7 @@
 package biz
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -1478,6 +1479,9 @@ func (w *ExecutionWorker) runSink(ctx context.Context, run Run, fence RunFence, 
 		// 中间消息先幂等落库再推送事件，确保 SSE 不出现无法回查的消息。
 		if event.Type == "message.created" {
 			if err := w.persistRunnerMessage(ctx, run, event.Payload); err != nil {
+				if event.Payload["role"] == string(MessageTool) {
+					err = errors.Join(ErrToolResultPersistence, err)
+				}
 				state.Fail(err)
 				return
 			}
@@ -1573,6 +1577,10 @@ func (w *ExecutionWorker) workerDeltaSink(ctx context.Context, run Run, fence Ru
 // resolveMemoryPolicy 读取会话记忆策略；读取失败或未知取值时按 group 降级，
 // 避免把个人长期记忆与结构化画像注入共享群聊。
 func (w *ExecutionWorker) resolveMemoryPolicy(ctx context.Context, run Run) SessionMemoryPolicy {
+	if isFeishuSharedGroup(run) {
+		// 群聊历史已由接入层投影。跳过个人记忆与衍生摘要，确保删除后的正文不会通过摘要回注。
+		return SessionMemoryDisabled
+	}
 	if w.sessionPolicies == nil {
 		return SessionMemoryPrivate
 	}
@@ -1726,7 +1734,7 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 	// 附件抽取文本按消息注入到对应轮次，与记忆策略无关；读取失败只降级为无附件内容。
 	// 只注入最近几轮用户消息的附件：历史附件每轮全量重发会持续挤占上下文预算。
 	attachmentText := map[uuid.UUID]string{}
-	if w.attachments != nil {
+	if w.attachments != nil && !isFeishuSharedGroup(run) {
 		items, err := w.attachments.ListTextContexts(ctx, run.UserID, run.SessionID)
 		if err != nil {
 			w.logger.Warn("load attachment texts failed; continuing without them", "run_id", run.ID, "error", err)
@@ -1872,6 +1880,17 @@ func trimReasonPayload(reasons []memory.TrimReason) []map[string]any {
 // 缓存故障只降级为数据库读取，不得返回空上下文或扩大用户数据范围。
 // 返回值 degraded 表示 Redis 读取或回填失败，已回退 PostgreSQL。
 func (w *ExecutionWorker) loadHistory(ctx context.Context, run Run) ([]Message, bool, error) {
+	if isFeishuSharedGroup(run) {
+		reader, ok := w.sessions.(feishuGroupRunHistoryReader)
+		if !ok || run.TriggerMessageID == nil {
+			return nil, false, invalid("shared feishu runs require projected history")
+		}
+		history, err := reader.ListFeishuGroupRunHistory(ctx, run.UserID, run.SessionID, run.ID)
+		if err == nil && !historyContainsMessage(history, *run.TriggerMessageID) {
+			err = ErrTriggerMessageMissing
+		}
+		return history, false, err
+	}
 	degraded := false
 	if w.hotMessages != nil {
 		cached, hit, err := w.hotMessages.Load(ctx, run.UserID, run.SessionID)
@@ -2233,9 +2252,13 @@ func (w *ExecutionWorker) appendHotMessage(ctx context.Context, run Run, message
 	if w.hotMessages == nil {
 		return
 	}
-	if err := w.hotMessages.Append(ctx, run.UserID, run.SessionID, message); err != nil {
+	sessionID := message.SessionID
+	if sessionID == uuid.Nil {
+		sessionID = run.SessionID
+	}
+	if err := w.hotMessages.Append(ctx, run.UserID, sessionID, message); err != nil {
 		w.logger.Warn("append hot message failed; invalidating cache", "run_id", run.ID, "error", err)
-		_ = w.hotMessages.Invalidate(ctx, run.UserID, run.SessionID)
+		_ = w.hotMessages.Invalidate(ctx, run.UserID, sessionID)
 	}
 }
 
@@ -2558,6 +2581,7 @@ func (o *runAttemptObserver) AttemptStarted(ctx context.Context, record model.At
 			"model_id": record.ModelID, "provider_id": record.ProviderID,
 		},
 		RequestHash: record.RequestHash, Status: ModelCallRunning, CreatedAt: record.StartedAt,
+		InputTokens: int64(record.InputTokens), OutputTokens: int64(record.OutputTokens), EstimatedCost: record.EstimatedCost,
 	})
 	if err != nil {
 		return err
@@ -2712,7 +2736,7 @@ func (o *runAttemptObserver) ModelSwitched(ctx context.Context, record model.Swi
 // 审批仓储可用时保留中高风险工具（执行前必须人工批准）；不可用时仅保留低风险工具，失败关闭。
 // 任何工具发现降级都会写入 tool.discovery.degraded 事件，避免模型在静默缺失工具时给出错误结论。
 func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run, fence RunFence) (react.Registry, error) {
-	if w.mcps == nil {
+	if w.mcps == nil || isFeishuSharedGroup(run) {
 		return emptyToolRegistry{}, nil
 	}
 	entries := snapshotMCPs(run.ConfigSnapshot)
@@ -3388,8 +3412,12 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 	spec := t.inner.Spec()
 	// 高风险工具的调用元数据与幂等键必须在步骤落库时固化，供审批与崩溃恢复使用。
 	toolCall, hasCall := react.ToolCallFromContext(ctx)
+	needsApproval := approvalRequired(t.inner.RiskLevel())
 	stepIdempotencyKey := ""
-	if approvalRequired(t.inner.RiskLevel()) && hasCall {
+	if needsApproval && !validApprovalArguments(arguments) {
+		return nil, &react.InvalidArgumentsError{Detail: "approval arguments must be a JSON object or array"}
+	}
+	if needsApproval && hasCall {
 		stepIdempotencyKey = approvalIdempotencyKey(t.run.ID, toolCall.ID)
 	}
 	startedAt := t.worker.clock()
@@ -3413,7 +3441,7 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		return nil, react.NewInfrastructureError("save_tool_input", payloadErr)
 	}
 	// 中高风险工具在步骤与脱敏入参落库后创建审批，绝不直接执行。
-	if approvalRequired(t.inner.RiskLevel()) {
+	if needsApproval {
 		if !hasCall {
 			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 				Status: StepFailed, ErrorCode: "approval_context_missing", FinishedAt: t.worker.clock(),
@@ -3470,6 +3498,12 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 			map[string]string{"agent_mode": toolMode, "tool": spec.Name, "status": "succeeded"}, time.Since(invokeStart).Seconds())
 	}
 	if invokeErr != nil {
+		if errors.Is(invokeErr, ErrToolResultPersistence) {
+			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
+				Status: StepReconciliationRequired, ErrorCode: "tool_execution_unknown", FinishedAt: t.worker.clock(),
+			})
+			return nil, invokeErr
+		}
 		// 父上下文取消与 MCP 传输故障属于基础设施问题，必须上抛而不是回填模型。
 		if infraErr := toolInfrastructureError(ctx, invokeErr); infraErr != nil {
 			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
@@ -3511,7 +3545,7 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 	if _, err := t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 		Status: StepCompleted, FinishedAt: t.worker.clock(),
 	}); err != nil {
-		return nil, react.NewInfrastructureError("finish_step", err)
+		return nil, fmt.Errorf("%w: %w", ErrToolResultPersistence, react.NewInfrastructureError("finish_step", err))
 	}
 	return output, nil
 }
@@ -3599,6 +3633,9 @@ func (t approvalTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 	if !approvalRequired(t.inner.RiskLevel()) {
 		return t.worker.invokeTool(ctx, t.inner, arguments)
 	}
+	if !validApprovalArguments(arguments) {
+		return nil, &react.InvalidArgumentsError{Detail: "approval arguments must be a JSON object or array"}
+	}
 	call, exists := react.ToolCallFromContext(ctx)
 	if !exists {
 		return nil, fmt.Errorf("%w: tool call context is missing", react.ErrApprovalRequired)
@@ -3612,12 +3649,17 @@ func (t approvalTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		IdempotencyKey: approvalIdempotencyKey(t.run.ID, call.ID),
 	})
 	if err != nil {
-		return nil, err
+		return nil, react.NewInfrastructureError("create_approval", err)
 	}
 	return nil, &react.ApprovalRequiredError{
 		ApprovalID: approval.ID.String(), ToolCallID: call.ID,
 		ToolName: call.Name, RiskLevel: t.inner.RiskLevel(),
 	}
+}
+
+func validApprovalArguments(arguments json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(arguments)
+	return json.Valid(trimmed) && (trimmed[0] == '{' || trimmed[0] == '[')
 }
 
 // sanitizeExecutionError 截断工具错误文本，避免超长内容进入载荷。

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -526,9 +527,17 @@ type FeishuReplyConfig struct {
 }
 
 type FeishuGroupConfig struct {
-	RequireTopic           bool `yaml:"require_topic"`
-	AutoReplyInBoundTopic  bool `yaml:"auto_reply_in_bound_topic"`
-	AllowRootReplyFallback bool `yaml:"allow_root_reply_fallback"`
+	RequireTopic           bool                     `yaml:"require_topic"`
+	AutoReplyInBoundTopic  bool                     `yaml:"auto_reply_in_bound_topic"`
+	AllowRootReplyFallback bool                     `yaml:"allow_root_reply_fallback"`
+	SharedChats            []FeishuSharedChatConfig `yaml:"shared_chats"`
+}
+
+type FeishuSharedChatConfig struct {
+	AppID     string `yaml:"app_id"`
+	TenantKey string `yaml:"tenant_key"`
+	ChatID    string `yaml:"chat_id"`
+	PolicyID  string `yaml:"model_policy_id"`
 }
 
 func LoadEnvironment(environment string) (*Config, error) {
@@ -809,6 +818,13 @@ func (c Config) Validate() error {
 	}
 	if c.Feishu.Group.RequireTopic && c.Feishu.Group.AllowRootReplyFallback {
 		return fmt.Errorf("feishu root reply fallback cannot be enabled when topics are required")
+	}
+	for _, chat := range c.Feishu.Group.SharedChats {
+		policyID, err := uuid.Parse(strings.TrimSpace(chat.PolicyID))
+		if err != nil || policyID == uuid.Nil || strings.TrimSpace(chat.AppID) == "" ||
+			strings.TrimSpace(chat.TenantKey) == "" || strings.TrimSpace(chat.ChatID) == "" {
+			return fmt.Errorf("feishu.group.shared_chats requires app_id, tenant_key, chat_id and a valid model_policy_id")
+		}
 	}
 	if err := c.validateFeishu(); err != nil {
 		return err

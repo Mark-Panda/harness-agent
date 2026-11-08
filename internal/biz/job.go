@@ -58,3 +58,8 @@ type RunEnqueuer interface {
 	// EnqueueRun 幂等入队 Run 执行任务。
 	EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error
 }
+
+// RunJobLookup lets an idempotent Create distinguish an existing job from a Run that still needs enqueue.
+type RunJobLookup interface {
+	HasRunJob(ctx context.Context, userID, runID uuid.UUID) (bool, error)
+}

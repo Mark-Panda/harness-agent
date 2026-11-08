@@ -185,6 +185,13 @@ func WithRunEnqueuer(queue RunEnqueuer) RunServiceOption {
 	}
 }
 
+// WithRunCreationTransaction groups Run creation, plan adoption, and enqueue on the same database.
+func WithRunCreationTransaction(transaction func(context.Context, func(context.Context) error) error) RunServiceOption {
+	return func(s *RunService) {
+		s.creationTransaction = transaction
+	}
+}
+
 // WithExecutionSteps 注入执行步骤与载荷读取端口，用于执行树查询。
 func WithExecutionSteps(steps ExecutionStepRepository) RunServiceOption {
 	return func(s *RunService) {
@@ -250,6 +257,8 @@ type RunService struct {
 	plans           PlanRepository
 	clock           func() time.Time
 	deadline        time.Duration
+
+	creationTransaction func(context.Context, func(context.Context) error) error
 }
 
 // NewRunService 构造 Run 服务；可选能力通过 Option 注入，便于单测替换依赖。
@@ -282,6 +291,18 @@ type CreateRunInput struct {
 
 // Create 创建排队中的 Run；会话归属与模式在此校验。
 func (s *RunService) Create(ctx context.Context, principal Principal, input CreateRunInput) (Run, error) {
+	return s.create(ctx, principal, input, uuid.Nil)
+}
+
+// CreateFeishuGroup 创建发言人自己的纯模型 Run。共享群聊仅使用平台策略快照。
+func (s *RunService) CreateFeishuGroup(ctx context.Context, principal Principal, policyID uuid.UUID, input CreateRunInput) (Run, error) {
+	if policyID == uuid.Nil || input.Mode != AgentModeReact || input.AgentID != nil || input.AgentVersion != nil || input.TriggerMessageID == nil {
+		return Run{}, invalid("shared feishu runs require a model policy and a projected trigger")
+	}
+	return s.create(ctx, principal, input, policyID)
+}
+
+func (s *RunService) create(ctx context.Context, principal Principal, input CreateRunInput, groupPolicyID uuid.UUID) (Run, error) {
 	if principal.UserID == uuid.Nil {
 		return Run{}, ErrForbidden
 	}
@@ -298,6 +319,10 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	if session.Status != SessionActive {
 		return Run{}, fmt.Errorf("%w: runs require an active session", ErrResourceConflict)
 	}
+	if (groupPolicyID != uuid.Nil) != session.FeishuGroupProjection ||
+		(session.FeishuGroupProjection && (session.Source != SessionSourceFeishu || session.MemoryPolicy == SessionMemoryPrivate || session.AgentID != nil)) {
+		return Run{}, ErrForbidden
+	}
 	if input.Mode != AgentModeReact && input.Mode != AgentModePlan && input.Mode != AgentModeSupervisor {
 		return Run{}, invalid("unsupported run mode")
 	}
@@ -311,7 +336,7 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	if err != nil {
 		return Run{}, err
 	}
-	configSnapshot, policySnapshot, err := s.buildSnapshots(ctx, principal, input)
+	configSnapshot, policySnapshot, err := s.buildRunSnapshots(ctx, principal, input, groupPolicyID)
 	if err != nil {
 		return Run{}, err
 	}
@@ -323,19 +348,63 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 		TriggerMessageID: triggerMessageID, TriggerMessageAt: triggerMessageAt,
 		ConfigSnapshot: configSnapshot, ModelPolicySnapshot: policySnapshot,
 	}
+	if s.creationTransaction == nil {
+		return s.createAndEnqueue(ctx, principal, run)
+	}
+	var created Run
+	if err := s.creationTransaction(ctx, func(txCtx context.Context) error {
+		var err error
+		created, err = s.createAndEnqueue(txCtx, principal, run)
+		return err
+	}); err != nil {
+		return Run{}, err
+	}
+	return created, nil
+}
+
+func (s *RunService) buildRunSnapshots(ctx context.Context, principal Principal, input CreateRunInput, groupPolicyID uuid.UUID) (map[string]any, map[string]any, error) {
+	if groupPolicyID == uuid.Nil {
+		return s.buildSnapshots(ctx, principal, input)
+	}
+	if s.snapshots == nil {
+		return nil, nil, invalid("shared feishu runs require a model policy repository")
+	}
+	policy, err := s.snapshots.GetPolicy(ctx, groupPolicyID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if policy.Status != PolicyPublished {
+		return nil, nil, fmt.Errorf("%w: shared feishu policy is not published", ErrResourceConflict)
+	}
+	policySnapshot, err := s.snapshotModelPolicy(ctx, policy)
+	return map[string]any{"feishu_shared_group": true}, policySnapshot, err
+}
+
+func (s *RunService) createAndEnqueue(ctx context.Context, principal Principal, run Run) (Run, error) {
 	created, err := s.repo.CreateRun(ctx, run)
 	if err != nil {
 		return Run{}, err
 	}
-	// 同一会话存在暂停中的计划时，把计划迁移到新 Run 继续执行。
-	// 否则用户说“继续”会被当作新任务，既有步骤进度与已花费预算全部作废。
-	adopted := s.adoptPausedPlan(ctx, principal, input, created)
-	// Run 落库后入队；入队使用 Run ID 去重，客户端重试不会产生重复执行。
-	if s.enqueuer != nil && created.Status == RunQueued {
+	if created.Status != RunQueued {
+		return created, nil
+	}
+	var alreadyEnqueued bool
+	if lookup, ok := s.enqueuer.(RunJobLookup); ok && created.ID != run.ID {
+		alreadyEnqueued, err = lookup.HasRunJob(ctx, created.UserID, created.ID)
+		if err != nil {
+			return Run{}, err
+		}
+	}
+	// 旧版本遗留的排队 Run 可以通过幂等重试补齐任务；已入队的 Run 不再接管计划。
+	var adopted *Plan
+	if !alreadyEnqueued {
+		adopted = s.adoptPausedPlan(ctx, principal, created)
+	}
+	if s.enqueuer != nil {
 		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
-			// 入队失败必须收敛刚创建的 Run，否则它会永久停留在 queued 且没有任何 Worker 会执行；
-			// 已接管的暂停计划同时恢复为 paused，等待下一次“继续”再恢复。
-			s.abortUnqueuedRun(ctx, principal, created, adopted, err)
+			if s.creationTransaction == nil {
+				s.abortUnqueuedRun(ctx, principal, created, adopted, err)
+			}
 			return Run{}, err
 		}
 	}
@@ -370,18 +439,18 @@ func (s *RunService) abortUnqueuedRun(ctx context.Context, principal Principal, 
 
 // adoptPausedPlan 把会话中最近一个暂停中的计划迁移到新 Run，保留已完成步骤继续执行。
 // 迁移失败或当前模式无法续跑时不阻断新 Run，但会写入可观测事件，避免静默丢失用户计划。
-func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, input CreateRunInput, created Run) *Plan {
+func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, created Run) *Plan {
 	if s.plans == nil {
 		return nil
 	}
-	plan, err := s.plans.FindPausedPlanBySession(ctx, principal.UserID, input.SessionID)
+	plan, err := s.plans.FindPausedPlanBySession(ctx, principal.UserID, created.SessionID)
 	if err != nil || plan.ID == uuid.Nil || plan.RunID == created.ID {
 		return nil
 	}
-	if input.Mode != AgentModePlan {
+	if created.Mode != AgentModePlan {
 		// 非 Plan 模式无法驱动计划步骤：保持计划暂停等待显式恢复，同时让用户知道本次消息没有续跑计划。
 		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "run_mode_not_plan", "mode": string(input.Mode),
+			"plan_id": plan.ID.String(), "reason": "run_mode_not_plan", "mode": string(created.Mode),
 		})
 		return nil
 	}
@@ -406,21 +475,29 @@ func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, i
 		})
 		return nil
 	}
-	// 旧 Run 仍在后台轮询，必须先取消，否则它会继续按旧的 Run ID 重新规划并产生新的计划版本。
-	if _, err := s.Cancel(ctx, principal, plan.RunID); err != nil {
-		old, getErr := s.repo.GetRun(ctx, principal.UserID, plan.RunID)
-		if getErr != nil || !RunTerminal(old.Status) {
-			s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
-				"plan_id": plan.ID.String(), "reason": "cancel_previous_run_failed", "error": err.Error(),
-			})
-			return nil
+	var rebound Plan
+	reason := "rebind_failed"
+	adopt := func(ctx context.Context) error {
+		// 旧 Run 仍在后台轮询，先取消以避免它再次生成计划。
+		if _, err := s.Cancel(ctx, principal, plan.RunID); err != nil {
+			old, getErr := s.repo.GetRun(ctx, principal.UserID, plan.RunID)
+			if getErr != nil || !RunTerminal(old.Status) {
+				reason = "cancel_previous_run_failed"
+				return err
+			}
 		}
+		var err error
+		rebound, err = s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, created.DeadlineAt, s.clock())
+		return err
 	}
-	deadline := created.DeadlineAt
-	rebound, err := s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, deadline, s.clock())
+	if s.creationTransaction != nil {
+		err = s.creationTransaction(ctx, adopt)
+	} else {
+		err = adopt(ctx)
+	}
 	if err != nil {
 		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "rebind_failed", "error": err.Error(),
+			"plan_id": plan.ID.String(), "reason": reason, "error": err.Error(),
 		})
 		return nil
 	}
@@ -556,16 +633,30 @@ func (s *RunService) buildSnapshots(ctx context.Context, principal Principal, in
 	if policy.Version != *agent.ModelPolicyVersion || policy.Status != PolicyPublished {
 		return nil, nil, fmt.Errorf("%w: agent policy version is not published", ErrResourceConflict)
 	}
+	policySnapshot, err := s.snapshotModelPolicy(ctx, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+	configSnapshot := map[string]any{
+		"agent": map[string]any{
+			"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "version": agent.Version,
+		},
+		"published_snapshot": agent.ConfigSnapshot,
+	}
+	return configSnapshot, policySnapshot, nil
+}
+
+func (s *RunService) snapshotModelPolicy(ctx context.Context, policy ModelPolicy) (map[string]any, error) {
 	modelIDs := make([]uuid.UUID, 0, len(policy.Candidates))
 	for _, candidate := range policy.Candidates {
 		modelIDs = append(modelIDs, candidate.ModelID)
 	}
 	models, err := s.snapshots.ListModelsByIDs(ctx, modelIDs)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(models) != len(modelIDs) {
-		return nil, nil, fmt.Errorf("%w: policy snapshot contains missing models", ErrResourceConflict)
+		return nil, fmt.Errorf("%w: policy snapshot contains missing models", ErrResourceConflict)
 	}
 	byID := make(map[uuid.UUID]Model, len(models))
 	for _, model := range models {
@@ -576,31 +667,31 @@ func (s *RunService) buildSnapshots(ctx context.Context, principal Principal, in
 	for _, candidate := range policy.Candidates {
 		model, exists := byID[candidate.ModelID]
 		if !exists {
-			return nil, nil, fmt.Errorf("%w: candidate model %s", ErrResourceNotFound, candidate.ModelID)
+			return nil, fmt.Errorf("%w: candidate model %s", ErrResourceNotFound, candidate.ModelID)
 		}
 		// 候选切换只能选择已启用、已核验且满足 1M+ 的生成模型。
 		if model.Kind != ModelKindChat || model.Status != ModelEnabled || model.VerifiedAt == nil || model.VerificationSource == "" {
-			return nil, nil, invalid("candidate %s is not an enabled and verified generation model", model.ID)
+			return nil, invalid("candidate %s is not an enabled and verified generation model", model.ID)
 		}
 		if model.ContextWindowTokens < policy.MinContextTokens {
-			return nil, nil, invalid("candidate %s does not satisfy the policy context minimum", model.ID)
+			return nil, invalid("candidate %s does not satisfy the policy context minimum", model.ID)
 		}
 		// 创建 Run 前再次校验数据区域约束，避免历史策略快照绕过合规硬过滤。
 		if region, regionErr := candidateDataRegion(candidate.Constraints); regionErr != nil {
-			return nil, nil, regionErr
+			return nil, regionErr
 		} else if region != "" && model.DataRegion != region {
-			return nil, nil, invalid("candidate %s data_region %q does not satisfy constraint %q", model.ID, model.DataRegion, region)
+			return nil, invalid("candidate %s data_region %q does not satisfy constraint %q", model.ID, model.DataRegion, region)
 		}
 		provider, exists := providerCache[model.ProviderID]
 		if !exists {
 			provider, err = s.snapshots.GetProvider(ctx, model.ProviderID)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			providerCache[model.ProviderID] = provider
 		}
 		if provider.Status != ProviderEnabled {
-			return nil, nil, invalid("provider %s is disabled", provider.ID)
+			return nil, invalid("provider %s is disabled", provider.ID)
 		}
 		candidates = append(candidates, map[string]any{
 			"priority": candidate.Priority, "model_id": model.ID.String(), "provider_id": model.ProviderID.String(),
@@ -613,19 +704,12 @@ func (s *RunService) buildSnapshots(ctx context.Context, principal Principal, in
 		})
 	}
 	if len(candidates) == 0 {
-		return nil, nil, invalid("published policy has no routable candidates")
+		return nil, invalid("published policy has no routable candidates")
 	}
-	configSnapshot := map[string]any{
-		"agent": map[string]any{
-			"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "version": agent.Version,
-		},
-		"published_snapshot": agent.ConfigSnapshot,
-	}
-	policySnapshot := map[string]any{
+	return map[string]any{
 		"policy_id": policy.ID.String(), "policy_version": policy.Version,
 		"min_context_tokens": policy.MinContextTokens, "rules": policy.Rules, "candidates": candidates,
-	}
-	return configSnapshot, policySnapshot, nil
+	}, nil
 }
 
 // Get 读取当前用户的 Run。

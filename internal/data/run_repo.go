@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // runModel 对应 agent_runs 表：一次执行的快照与状态。
@@ -151,7 +152,9 @@ func (r *RunRepository) CreateRun(ctx context.Context, run biz.Run) (biz.Run, er
 func (r *RunRepository) findRunByIdempotencyKey(ctx context.Context, userID uuid.UUID, key string) (biz.Run, error) {
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.First(&record, "user_id = ? AND idempotency_key = ?", userID, key).Error
+		// Serialize concurrent repairs of a queued Run created before atomic enqueue.
+		return tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&record, "user_id = ? AND idempotency_key = ?", userID, key).Error
 	})
 	if err != nil {
 		return biz.Run{}, catalogError("get idempotent run", err)
@@ -700,6 +703,12 @@ func (r *RunRepository) AppendEventFenced(ctx context.Context, event biz.RunEven
 // notifyEvent 在事件提交后广播通知；未配置通知器时静默跳过。
 func (r *RunRepository) notifyEvent(ctx context.Context, runID uuid.UUID) {
 	if r.notifier == nil || runID == uuid.Nil {
+		return
+	}
+	if transaction := runCreationTransactionFromContext(ctx, r.db); transaction != nil {
+		transaction.afterCommit = append(transaction.afterCommit, func(ctx context.Context) {
+			r.notifier.Publish(ctx, runID)
+		})
 		return
 	}
 	r.notifier.Publish(ctx, runID)

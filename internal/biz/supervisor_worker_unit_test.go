@@ -16,6 +16,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
 
@@ -29,7 +30,7 @@ type memorySupervisorRepo struct {
 func newMemorySupervisorRepo() *memorySupervisorRepo {
 	return &memorySupervisorRepo{tasks: map[uuid.UUID]SupervisorTask{}}
 }
-func (r *memorySupervisorRepo) CreateTasks(_ context.Context, userID, parentRunID uuid.UUID, tasks []SupervisorTask, _ OutboxEvent) ([]SupervisorTask, error) {
+func (r *memorySupervisorRepo) CreateTasks(_ context.Context, userID, parentRunID uuid.UUID, tasks []SupervisorTask, _ OutboxEvent, _ RunFence) ([]SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now().UTC()
@@ -57,7 +58,7 @@ func (r *memorySupervisorRepo) ListTasks(_ context.Context, _ uuid.UUID, parentR
 	sort.Slice(result, func(i, j int) bool { return result[i].WorkerIndex < result[j].WorkerIndex })
 	return result, nil
 }
-func (r *memorySupervisorRepo) StartTask(_ context.Context, userID, taskID uuid.UUID, now time.Time) (SupervisorTask, error) {
+func (r *memorySupervisorRepo) StartTask(_ context.Context, userID, _ uuid.UUID, taskID uuid.UUID, now time.Time, _ RunFence) (SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	task, ok := r.tasks[taskID]
@@ -70,7 +71,7 @@ func (r *memorySupervisorRepo) StartTask(_ context.Context, userID, taskID uuid.
 	r.tasks[taskID] = task
 	return task, nil
 }
-func (r *memorySupervisorRepo) RetryTask(_ context.Context, userID, taskID uuid.UUID, _ time.Time) (SupervisorTask, error) {
+func (r *memorySupervisorRepo) RetryTask(_ context.Context, userID, _ uuid.UUID, taskID uuid.UUID, _ time.Time, _ RunFence) (SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	task, ok := r.tasks[taskID]
@@ -83,7 +84,7 @@ func (r *memorySupervisorRepo) RetryTask(_ context.Context, userID, taskID uuid.
 	r.tasks[taskID] = task
 	return task, nil
 }
-func (r *memorySupervisorRepo) FinishTask(_ context.Context, userID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, code, message string, now time.Time) (SupervisorTask, error) {
+func (r *memorySupervisorRepo) FinishTask(_ context.Context, userID, _ uuid.UUID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, code, message string, now time.Time, _ RunFence) (SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	task, ok := r.tasks[taskID]
@@ -98,7 +99,7 @@ func (r *memorySupervisorRepo) FinishTask(_ context.Context, userID, taskID uuid
 	r.tasks[taskID] = task
 	return task, nil
 }
-func (r *memorySupervisorRepo) CancelPendingTasks(_ context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time) error {
+func (r *memorySupervisorRepo) CancelPendingTasks(_ context.Context, userID, parentRunID uuid.UUID, reason string, now time.Time, _ RunFence) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, task := range r.tasks {
@@ -317,12 +318,13 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 			supervisorReply(t, w, "结果", http.StatusOK)
 		}
 	})
-	// 规划消耗 8 Token，Worker 再消耗 8 Token；上限允许规划完成，但在 Worker 后触发部分结果降级。
-	worker.config.SupervisorMaxTokens = 9
+	// Planning and the worker each consume three units of output cost.
+	candidates[0].OutputPricePerMillion = 1_000_000
+	worker.config.SupervisorMaxCost = 6
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
 	result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
 		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{})
-	// 预算耗尽但已有 Worker 产出时降级为部分结果，而不是整体失败。
+	// With no budget for aggregation, preserve the completed worker result.
 	if err != nil {
 		t.Fatalf("budget degradation error = %v", err)
 	}
@@ -350,12 +352,12 @@ func TestSupervisorFinalResultRecoveryKeepsStoredSummary(t *testing.T) {
 	}}
 	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
 	first, err := worker.aggregateSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
-		&atomic.Int64{}, messages, supervisorUsage{}, tasks)
+		&atomic.Int64{}, messages, worker.newSupervisorBudget(supervisorUsage{}), tasks)
 	if err != nil || first.Content != "第一次汇总" {
 		t.Fatalf("first aggregate = %#v, %v", first, err)
 	}
 	recovered, err := worker.aggregateSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
-		&atomic.Int64{}, first.Messages, supervisorUsage{}, tasks)
+		&atomic.Int64{}, first.Messages, worker.newSupervisorBudget(supervisorUsage{}), tasks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +549,7 @@ func TestSupervisorPlannerSystemListsExactTools(t *testing.T) {
 // failingFinishSupervisorRepo 模拟子任务结果写库失败的仓储。
 type failingFinishSupervisorRepo struct{ *memorySupervisorRepo }
 
-func (r *failingFinishSupervisorRepo) FinishTask(_ context.Context, _, _ uuid.UUID, _ SupervisorTaskStatus, _ map[string]any, _, _ string, _ time.Time) (SupervisorTask, error) {
+func (r *failingFinishSupervisorRepo) FinishTask(_ context.Context, _, _, _ uuid.UUID, _ SupervisorTaskStatus, _ map[string]any, _, _ string, _ time.Time, _ RunFence) (SupervisorTask, error) {
 	return SupervisorTask{}, errors.New("database unavailable")
 }
 
@@ -583,5 +585,115 @@ func TestExecuteSupervisorSettlementFailureRequiresReconciliation(t *testing.T) 
 		nil, []react.Message{{Role: react.RoleUser, Content: "请处理任务"}}, emptyToolRegistry{})
 	if !errors.Is(err, ErrSupervisorTaskSettlement) {
 		t.Fatalf("executeSupervisor() error = %v, want ErrSupervisorTaskSettlement", err)
+	}
+}
+
+func TestSupervisorDoesNotCallModelWhenResumedBudgetIsExhausted(t *testing.T) {
+	var calls atomic.Int32
+	worker, repo, _, candidates, _ := supervisorFixture(t, func(_ string, w http.ResponseWriter) {
+		calls.Add(1)
+		supervisorReply(t, w, "unexpected", http.StatusOK)
+	})
+	worker.config.SupervisorMaxTokens = 100
+	worker.runs = eventRunRepository{events: []RunEvent{
+		{Seq: 1, EventType: "model.attempt.completed", Payload: map[string]any{"input_tokens": 90, "output_tokens": 10}},
+	}}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	task := SupervisorTask{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, WorkerName: "A", WorkerIndex: 1,
+		Task: "work", Status: SupervisorTaskPending, MaxAttempts: 2, Depth: 1}
+	repo.tasks[task.ID] = task
+	_, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "work"}}, emptyToolRegistry{})
+	if !errors.Is(err, ErrSupervisorBudget) || calls.Load() != 0 {
+		t.Fatalf("resumed Supervisor error=%v model calls=%d; want budget error before model calls", err, calls.Load())
+	}
+}
+
+func TestSupervisorPropagatesUncertainToolResultWithoutRetry(t *testing.T) {
+	for _, tc := range []struct{ toolError, wantError error }{
+		{ErrToolResultPersistence, ErrToolResultPersistence},
+		{ErrApprovalExecutionUnknown, ErrApprovalExecutionUnknown},
+		{mcp.ErrToolOutcomeUnknown, ErrToolResultPersistence},
+	} {
+		t.Run(tc.toolError.Error(), func(t *testing.T) {
+			var workerCalls atomic.Int32
+			worker, _, _, candidates, _ := supervisorFixture(t, func(body string, w http.ResponseWriter) {
+				if strings.Contains(body, "请输出 Worker 委派 JSON") {
+					supervisorReply(t, w, `{"workers":[{"name":"A","task":"work","tools":["tool"]}]}`, http.StatusOK)
+					return
+				}
+				workerCalls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"tool\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
+			})
+			candidates[0].Ref.Tools = true
+			run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+			registry := fakePlanRegistry{tool: fakePlanTool{risk: "low", err: errors.Join(tc.toolError, react.NewInfrastructureError("write", errors.New("database down")))}}
+			_, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+				candidates, nil, []react.Message{{Role: react.RoleUser, Content: "work"}}, registry)
+			if !errors.Is(err, tc.wantError) || workerCalls.Load() != 1 {
+				t.Fatalf("Supervisor error=%v worker model calls=%d; want %v after exactly one call", err, workerCalls.Load(), tc.wantError)
+			}
+		})
+	}
+}
+
+func TestSupervisorConcurrentWorkersShareProviderBudget(t *testing.T) {
+	var calls atomic.Int32
+	var outputCap atomic.Int64
+	worker, repo, _, candidates, _ := supervisorFixture(t, func(body string, w http.ResponseWriter) {
+		var request struct {
+			MaxTokens int64 `json:"max_tokens"`
+		}
+		if err := json.Unmarshal([]byte(body), &request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		outputCap.Store(request.MaxTokens)
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"completed worker"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":5}}`)
+	})
+	candidates[0].OutputPricePerMillion = 1_000_000
+	worker.config.SupervisorMaxCost = 5
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	for index, name := range []string{"A", "B"} {
+		task := SupervisorTask{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID,
+			WorkerName: name, WorkerIndex: index + 1, Task: "work", Status: SupervisorTaskPending, MaxAttempts: 2, Depth: 1}
+		repo.tasks[task.ID] = task
+	}
+	result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "work"}}, emptyToolRegistry{})
+	if err != nil || calls.Load() != 1 || outputCap.Load() != 5 || result.EstimatedCost != 5 {
+		t.Fatalf("result=%#v error=%v calls=%d cap=%d; want one call capped at five tokens", result, err, calls.Load(), outputCap.Load())
+	}
+	tasks, _ := repo.ListTasks(context.Background(), run.UserID, run.ID)
+	completed, cancelled := 0, 0
+	for _, task := range tasks {
+		switch task.Status {
+		case SupervisorTaskCompleted:
+			completed++
+		case SupervisorTaskCancelled:
+			cancelled++
+		}
+	}
+	if completed != 1 || cancelled != 1 || !strings.Contains(result.Content, "completed worker") {
+		t.Fatalf("completed=%d cancelled=%d result=%q", completed, cancelled, result.Content)
+	}
+}
+
+func TestSupervisorRouterRetriesShareProviderBudget(t *testing.T) {
+	var calls atomic.Int32
+	worker, _, _, candidates, _ := supervisorFixture(t, func(_ string, w http.ResponseWriter) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	worker.config.Routing.MaxAttemptsPerModel = 2
+	candidates[0].OutputPricePerMillion = 1_000_000
+	worker.config.SupervisorMaxCost = 5
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	_, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "work"}}, emptyToolRegistry{})
+	if !errors.Is(err, ErrSupervisorBudget) || calls.Load() != 1 {
+		t.Fatalf("Supervisor error=%v model calls=%d; want budget error before router retry", err, calls.Load())
 	}
 }

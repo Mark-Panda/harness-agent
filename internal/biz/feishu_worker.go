@@ -2,6 +2,7 @@ package biz
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -20,6 +21,18 @@ type FeishuRunCreator interface {
 	Create(ctx context.Context, principal Principal, input CreateRunInput) (Run, error)
 }
 
+type feishuGroupRunCreator interface {
+	CreateFeishuGroup(ctx context.Context, principal Principal, policyID uuid.UUID, input CreateRunInput) (Run, error)
+}
+
+// FeishuSharedChat 显式授权某个飞书应用在指定租户和群中为群成员执行模型对话。
+type FeishuSharedChat struct {
+	AppID, TenantKey, ChatID string
+	PolicyID                 uuid.UUID
+}
+
+type feishuChatScope struct{ appID, tenantKey, chatID string }
+
 // FeishuEventWorkerConfig 是事件 Worker 的轮询、租约与业务策略配置。
 type FeishuEventWorkerConfig struct {
 	// WorkerID 实例标识，写入任务租约。
@@ -34,9 +47,12 @@ type FeishuEventWorkerConfig struct {
 	DefaultAgentID *uuid.UUID
 	// DefaultAgentVersion 默认 Agent 版本。
 	DefaultAgentVersion *int
-	// DefaultAgentOwnerID 默认助手所属用户；默认应用只服务该用户，
-	// 与已登记机器人的“只服务属主”策略保持一致。
+	// DefaultAgentOwnerID 默认助手所属用户，只有该用户可以使用默认助手的执行配置。
 	DefaultAgentOwnerID *uuid.UUID
+	// DefaultAppID 将默认应用的群聊授权绑定到真实 App ID。
+	DefaultAppID string
+	// SharedChats 是管理员授权的共享群聊范围。
+	SharedChats []FeishuSharedChat
 	// Mode 默认编排模式。
 	Mode AgentMode
 	// BotOpenID 机器人 open_id，用于精确判断是否被 @。
@@ -84,7 +100,8 @@ type FeishuEventWorkerDependencies struct {
 	// Sessions 会话读取端口，用于校验归属与状态。
 	Sessions SessionRepository
 	// Messages 入站消息幂等写入端口。
-	Messages FeishuInboundMessageStore
+	Messages      FeishuInboundMessageStore
+	GroupMessages FeishuGroupMessageStore
 	// Runs Run 创建端口。
 	Runs FeishuRunCreator
 	// Outbound 外发回复仓储。
@@ -109,6 +126,9 @@ type FeishuEventWorker struct {
 	conversations FeishuConversationRepository
 	sessions      SessionRepository
 	messages      FeishuInboundMessageStore
+	groupMessages FeishuGroupMessageStore
+	groupRuns     feishuGroupRunCreator
+	sharedChats   map[feishuChatScope]uuid.UUID
 	runs          FeishuRunCreator
 	outbound      FeishuOutboundStore
 	hotMessages   HotMessageStore
@@ -129,6 +149,24 @@ func NewFeishuEventWorker(dependencies FeishuEventWorkerDependencies, config Fei
 	if strings.TrimSpace(config.WorkerID) == "" {
 		return nil, invalid("feishu event worker id is required")
 	}
+	groupRuns, groupRunsAvailable := dependencies.Runs.(feishuGroupRunCreator)
+	if len(config.SharedChats) > 0 {
+		_, appScoped := dependencies.Conversations.(FeishuConversationAppScopedRepository)
+		if dependencies.GroupMessages == nil || !groupRunsAvailable || !appScoped {
+			return nil, invalid("shared feishu chats require group projection, group runs and app-scoped conversations")
+		}
+	}
+	sharedChats := make(map[feishuChatScope]uuid.UUID, len(config.SharedChats))
+	for _, chat := range config.SharedChats {
+		scope := feishuChatScope{strings.TrimSpace(chat.AppID), strings.TrimSpace(chat.TenantKey), strings.TrimSpace(chat.ChatID)}
+		if scope.appID == "" || scope.tenantKey == "" || scope.chatID == "" || chat.PolicyID == uuid.Nil {
+			return nil, invalid("shared feishu chats require app, tenant, chat and policy IDs")
+		}
+		if _, exists := sharedChats[scope]; exists {
+			return nil, invalid("duplicate shared feishu chat")
+		}
+		sharedChats[scope] = chat.PolicyID
+	}
 	logger := dependencies.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -141,6 +179,7 @@ func NewFeishuEventWorker(dependencies FeishuEventWorkerDependencies, config Fei
 		jobs: dependencies.Jobs, events: dependencies.Events, identities: dependencies.Identities,
 		conversations: dependencies.Conversations, sessions: dependencies.Sessions,
 		messages: dependencies.Messages, runs: dependencies.Runs, outbound: dependencies.Outbound,
+		groupMessages: dependencies.GroupMessages, groupRuns: groupRuns, sharedChats: sharedChats,
 		hotMessages: dependencies.HotMessages,
 		bots:        dependencies.Bots,
 		config:      config.normalize(), clock: clock, logger: logger, speakerFacts: dependencies.SpeakerFacts,
@@ -310,9 +349,18 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 			botName = bot.Name
 		}
 	}
-	// 群聊只处理明确 @ 机器人的消息；单聊始终响应。
-	if messageEvent.ChatType == feishu.ChatTypeGroup && !messageEvent.Triggered(botOpenID, botName) {
-		return FeishuEventIgnored, nil
+	groupPolicyID := uuid.Nil
+	if messageEvent.ChatType == feishu.ChatTypeGroup {
+		groupPolicyID = w.sharedChats[feishuChatScope{record.AppID, record.TenantKey, messageEvent.ChatID}]
+		if groupPolicyID != uuid.Nil {
+			// 共享群聊只信任准确的机器人标识，拒绝未知应用和同名 mention。
+			if (routedBot == nil && record.AppID != w.config.DefaultAppID) ||
+				botOpenID == "" || !messageEvent.Triggered(botOpenID, "") {
+				return FeishuEventIgnored, nil
+			}
+		} else if !messageEvent.Triggered(botOpenID, botName) {
+			return FeishuEventIgnored, nil
+		}
 	}
 	text := messageEvent.Text()
 	if text == "" {
@@ -327,16 +375,18 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	}
 	identity, err := w.identities.Resolve(ctx, record.TenantKey, messageEvent.SenderOpenID)
 	if err != nil {
+		if errors.Is(err, ErrForbidden) && groupPolicyID != uuid.Nil {
+			return FeishuEventIgnored, nil
+		}
 		return "", err
 	}
 	// 回填事件归属用户；账号删除据此清理可能包含正文的原始事件载荷。
 	if err := w.events.BindUser(ctx, record.EventID, identity.UserID); err != nil {
 		return "", err
 	}
-	// 机器人绑定只服务助手所属用户本人；群聊中的其他成员不能作为发言人驱动该机器人，
-	// 否则任何群成员都能借道属主的 Agent、工具与预算执行操作。
 	var routeAgentID *uuid.UUID
 	var routeAgentVersion *int
+	var routeOwnerID uuid.UUID
 	routeMode := w.config.Mode
 	if routedBot != nil {
 		binding, found, err := w.bots.FindFeishuBotBinding(ctx, routedBot.ID)
@@ -346,9 +396,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		if !found {
 			return FeishuEventIgnored, nil
 		}
-		// 机器人绑定只服务助手所属用户本人：绑定契约明确 UserID 是唯一允许使用该机器人的
-		// 飞书用户，群聊中也不能让其他成员借道驱动属主的 Agent 与工具。
-		if binding.UserID != identity.UserID {
+		if groupPolicyID == uuid.Nil && binding.UserID != identity.UserID {
 			return FeishuEventIgnored, nil
 		}
 		// 助手取消发布或归档后绑定会被解除；此处兜底避免旧绑定继续执行。
@@ -358,21 +406,24 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		agentID, agentVersion := binding.AgentID, binding.AgentVersion
 		routeAgentID, routeAgentVersion = &agentID, &agentVersion
 		routeMode = binding.AgentMode
+		routeOwnerID = binding.UserID
 	} else {
 		if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
 			// 未登记机器人且未配置默认助手时直接忽略，避免事件无限重试进入死信。
 			return FeishuEventIgnored, nil
 		}
-		// 默认应用与已登记机器人使用同一策略：只服务默认助手的属主。
-		// 否则会以发言人身份套用属主的 Agent，Run 快照按 user_id 校验必然失败，
-		// 且一旦放开就等于允许任意飞书用户借道属主的 Agent、工具与预算。
-		if w.config.DefaultAgentOwnerID == nil || *w.config.DefaultAgentOwnerID != identity.UserID {
+		// 默认助手只对属主开放，授权共享群聊使用独立的模型策略。
+		if w.config.DefaultAgentOwnerID == nil || (groupPolicyID == uuid.Nil && *w.config.DefaultAgentOwnerID != identity.UserID) {
 			return FeishuEventIgnored, nil
 		}
 		routeAgentID, routeAgentVersion = w.config.DefaultAgentID, w.config.DefaultAgentVersion
+		routeOwnerID = *w.config.DefaultAgentOwnerID
 	}
 	if routeAgentID == nil || routeAgentVersion == nil {
 		return FeishuEventIgnored, nil
+	}
+	if groupPolicyID != uuid.Nil {
+		return w.processSharedChat(ctx, record, messageEvent, identity.UserID, routeOwnerID, groupPolicyID, text, threadID, rootMessageID, routedBot == nil)
 	}
 	// 未登记机器人使用默认应用，沿用迁移前的空 app_id 绑定，避免历史会话被拆成新话题。
 	conversationAppID := record.AppID
@@ -391,8 +442,8 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	}
 	// 会话归属校验：话题会话的所有者是首次绑定的用户，默认应用（未登记机器人）同样适用。
 	// 群聊中其他成员不得以会话所有者身份驱动 Agent、工具与预算。
-	if messageEvent.ChatType == feishu.ChatTypeGroup && binding.UserID != identity.UserID {
-		w.logger.Warn("feishu group sender is not conversation owner",
+	if binding.UserID != identity.UserID {
+		w.logger.Warn("feishu sender is not conversation owner",
 			"session_id", binding.SessionID, "chat_id", messageEvent.ChatID)
 		return FeishuEventIgnored, nil
 	}
@@ -459,12 +510,20 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if err != nil {
 		return "", err
 	}
+	if run.UserID != binding.UserID || run.SessionID != session.ID ||
+		run.TriggerMessageID == nil || *run.TriggerMessageID != stored.ID {
+		return "", fmt.Errorf("%w: Feishu run does not match the triggering message", ErrResourceConflict)
+	}
 	ctx = logging.WithRunID(ctx, run.ID.String())
 	// 先创建外发记录占位，Run 完成后由回复 Worker 增量更新卡片。
-	err = w.outbound.CreateOutbound(ctx, FeishuOutbound{
-		ID: uuid.New(), UserID: binding.UserID, SessionID: session.ID, RunID: run.ID, AppID: record.AppID,
+	return w.createReply(ctx, record.AppID, messageEvent, threadID, binding.UserID, session.ID, run.ID)
+}
+
+func (w *FeishuEventWorker) createReply(ctx context.Context, appID string, messageEvent feishu.MessageEvent, threadID string, userID, sessionID, runID uuid.UUID) (string, error) {
+	err := w.outbound.CreateOutbound(ctx, FeishuOutbound{
+		ID: uuid.New(), UserID: userID, SessionID: sessionID, RunID: runID, AppID: appID,
 		ChatID: messageEvent.ChatID, ThreadID: threadID, ReplyToMessageID: messageEvent.MessageID,
-		Kind: "card", Status: "pending", DedupeKey: "feishu.run:" + run.ID.String(),
+		Kind: "card", Status: "pending", DedupeKey: "feishu.run:" + runID.String(),
 	})
 	if err != nil {
 		return "", err

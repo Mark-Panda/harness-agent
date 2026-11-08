@@ -107,8 +107,9 @@ func TestExecuteSupervisorEinoBudgetPartial(t *testing.T) {
 			supervisorReply(t, w, "结果", http.StatusOK)
 		}
 	})
-	// 规划与 Worker 各消耗 8 Token；上限允许规划完成，但在 Worker 后触发部分结果降级。
-	worker.config.SupervisorMaxTokens = 9
+	// 规划与 Worker 各消耗 3 个输出 Token，汇总调用没有剩余额度。
+	candidates[0].OutputPricePerMillion = 1_000_000
+	worker.config.SupervisorMaxCost = 6
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
 	result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
 		candidates, nil, []react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{})

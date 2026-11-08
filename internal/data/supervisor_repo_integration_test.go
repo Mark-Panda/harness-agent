@@ -66,12 +66,17 @@ func TestSupervisorTaskRepositoryLifecycle(t *testing.T) {
 		t.Fatalf("child session parent binding = %#v", childA)
 	}
 
+	now := time.Now().UTC()
+	_, fence, err := runs.ClaimRun(ctx, user.ID, run.ID, "first-worker", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	repo := NewSupervisorTaskRepository(appDB)
 	tasks := []biz.SupervisorTask{
-		{ID: uuid.New(), ChildSessionID: childA.ID, WorkerName: "A", WorkerIndex: 1, Task: "任务A", ToolScope: []string{}, Status: biz.SupervisorTaskPending, MaxAttempts: 1, Depth: 1},
+		{ID: uuid.New(), ChildSessionID: childA.ID, WorkerName: "A", WorkerIndex: 1, Task: "任务A", ToolScope: []string{}, Status: biz.SupervisorTaskPending, MaxAttempts: 2, Depth: 1},
 		{ID: uuid.New(), ChildSessionID: childB.ID, WorkerName: "B", WorkerIndex: 2, Task: "任务B", ToolScope: []string{}, Status: biz.SupervisorTaskPending, MaxAttempts: 1, Depth: 1},
 	}
-	created, err := repo.CreateTasks(ctx, user.ID, run.ID, tasks, testOutboxEvent(user.ID, "supervisor.tasks.created"))
+	created, err := repo.CreateTasks(ctx, user.ID, run.ID, tasks, testOutboxEvent(user.ID, "supervisor.tasks.created"), fence)
 	if err != nil || len(created) != 2 {
 		t.Fatalf("CreateTasks() = %#v, %v", created, err)
 	}
@@ -79,21 +84,44 @@ func TestSupervisorTaskRepositoryLifecycle(t *testing.T) {
 	if err != nil || len(listed) != 2 || listed[0].WorkerName != "A" {
 		t.Fatalf("ListTasks() = %#v, %v", listed, err)
 	}
-	started, err := repo.StartTask(ctx, user.ID, tasks[0].ID, time.Now().UTC())
+	started, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence)
 	if err != nil || started.Status != biz.SupervisorTaskRunning || started.Attempts != 1 {
 		t.Fatalf("StartTask() = %#v, %v", started, err)
 	}
-	if _, err := repo.StartTask(ctx, user.ID, tasks[0].ID, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, now, fence); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("duplicate start error = %v", err)
 	}
-	finished, err := repo.FinishTask(ctx, user.ID, tasks[0].ID, biz.SupervisorTaskCompleted, map[string]any{"content": "done"}, "", "", time.Now().UTC())
+	reclaimTime := now.Add(2 * time.Minute)
+	_, nextFence, err := runs.ClaimRun(ctx, user.ID, run.ID, "next-worker", time.Minute, reclaimTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[1].ID, reclaimTime, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale start error = %v", err)
+	}
+	if _, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale retry error = %v", err)
+	}
+	if _, err := repo.FinishTask(ctx, user.ID, run.ID, tasks[0].ID, biz.SupervisorTaskCompleted, nil, "", "", reclaimTime, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale settlement error = %v", err)
+	}
+	if err := repo.CancelPendingTasks(ctx, user.ID, run.ID, "stale cancellation", reclaimTime, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale cancellation error = %v", err)
+	}
+	finished, err := repo.FinishTask(ctx, user.ID, run.ID, tasks[0].ID, biz.SupervisorTaskCompleted, map[string]any{"content": "done"}, "", "", reclaimTime, nextFence)
 	if err != nil || finished.Status != biz.SupervisorTaskCompleted || finished.Result["content"] != "done" {
 		t.Fatalf("FinishTask() = %#v, %v", finished, err)
 	}
-	if _, err := repo.FinishTask(ctx, user.ID, tasks[0].ID, biz.SupervisorTaskCompleted, nil, "", "", time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := repo.FinishTask(ctx, user.ID, run.ID, tasks[0].ID, biz.SupervisorTaskCompleted, nil, "", "", reclaimTime, nextFence); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("late finish error = %v", err)
 	}
-	if err := repo.CancelPendingTasks(ctx, user.ID, run.ID, "parent cancelled", time.Now().UTC()); err != nil {
+	if err := repo.CancelPendingTasks(ctx, user.ID, run.ID, "parent cancelled", reclaimTime, nextFence); err != nil {
 		t.Fatal(err)
 	}
 	listed, _ = repo.ListTasks(ctx, user.ID, run.ID)

@@ -30,7 +30,8 @@ type sessionModel struct {
 	// Source 来源渠道：web/feishu/api。
 	Source string
 	// MemoryPolicy 记忆策略：private/group/disabled。
-	MemoryPolicy string
+	MemoryPolicy          string
+	FeishuGroupProjection bool
 	// Status 生命周期：active/archived/deleted。
 	Status string
 	// Version 乐观锁版本号，归档与追加消息时递增。
@@ -410,8 +411,9 @@ func toBizSession(record sessionModel) biz.Session {
 		ID: record.ID, UserID: record.UserID, AgentID: record.AgentID,
 		ParentSessionID: record.ParentSessionID, ParentRunID: record.ParentRunID,
 		Title: record.Title, Source: biz.SessionSource(record.Source),
-		MemoryPolicy: normalizeSessionMemoryPolicy(biz.SessionMemoryPolicy(record.MemoryPolicy)),
-		Status:       biz.SessionStatus(record.Status), Version: record.Version, LastMessageAt: record.LastMessageAt,
+		MemoryPolicy:          normalizeSessionMemoryPolicy(biz.SessionMemoryPolicy(record.MemoryPolicy)),
+		FeishuGroupProjection: record.FeishuGroupProjection,
+		Status:                biz.SessionStatus(record.Status), Version: record.Version, LastMessageAt: record.LastMessageAt,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 }

@@ -267,7 +267,7 @@ func TestReactAgentPersistsUnknownToolObservation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch calls.Add(1) {
-		case 1:
+		case 1, 2:
 			fmt.Fprint(w, "data: {\"id\":\"req-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-missing\",\"function\":{\"name\":\"missing\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
 		default:
 			fmt.Fprint(w, "data: {\"id\":\"req-2\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
@@ -301,20 +301,30 @@ func TestReactAgentPersistsUnknownToolObservation(t *testing.T) {
 	if err != nil || result.Content != "done" {
 		t.Fatalf("result = %#v, %v", result, err)
 	}
-	found := false
+	assistantIDs := make(map[string]bool)
+	observations := make(map[string]bool)
 	for _, message := range emitter.messages {
+		toolCalls, _ := message["tool_calls"].([]map[string]any)
+		for _, call := range toolCalls {
+			id, _ := call["id"].(string)
+			if id == "" || assistantIDs[id] {
+				t.Fatalf("provider reused a tool call ID without disambiguation: %#v", emitter.messages)
+			}
+			assistantIDs[id] = true
+		}
 		if message["role"] != "tool" {
 			continue
 		}
 		if content, _ := message["content"].(string); strings.Contains(content, "unknown_tool") {
-			found = true
-			if message["tool_call_id"] != "call-missing" {
+			id, _ := message["tool_call_id"].(string)
+			if !assistantIDs[id] || observations[id] {
 				t.Fatalf("unknown tool message lost call id: %#v", message)
 			}
+			observations[id] = true
 		}
 	}
-	if !found {
-		t.Fatalf("unknown tool observation was not persisted: %#v", emitter.messages)
+	if len(observations) != 2 {
+		t.Fatalf("expected two distinct tool observations: %#v", emitter.messages)
 	}
 }
 

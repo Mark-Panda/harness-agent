@@ -109,3 +109,11 @@ type ModelCallRepository interface {
 	// ListModelCalls 按 Run 顺序读取 Attempt 记录，用于审计与切换分析。
 	ListModelCalls(ctx context.Context, userID, runID uuid.UUID, limit int) ([]ModelCall, error)
 }
+
+// ModelCallUsage totals persisted attempts, including reservations for in-flight calls.
+type ModelCallUsage struct {
+	Count         int64
+	InputTokens   int64
+	OutputTokens  int64
+	EstimatedCost float64
+}

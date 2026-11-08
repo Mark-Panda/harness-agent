@@ -102,6 +102,9 @@ func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimit
 	}
 	mux.HandleFunc("GET /health/live", healthHandler("alive"))
 	mux.HandleFunc("GET /health/ready", readinessHandler)
+	mux.HandleFunc("GET /healthz", healthHandler("ok"))
+	mux.HandleFunc("GET /readyz", readinessHandler)
+	mux.HandleFunc("/health/", http.NotFound)
 	mux.HandleFunc("GET /metrics", metricsHandler(metricsToken))
 	mux.HandleFunc("GET /api/v1/health", healthHandler("ok"))
 	mux.HandleFunc("GET /api/v1/sse/probe", sseProbeHandler)

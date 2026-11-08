@@ -685,6 +685,33 @@ func TestObservedToolCreatesApprovalForHighRisk(t *testing.T) {
 	}
 }
 
+func TestObservedToolDoesNotRequestApprovalForMalformedArguments(t *testing.T) {
+	steps := &fakeStepRepository{}
+	approvals := &fakeApprovalRepository{}
+	worker := newObservedWorker(steps)
+	worker.approvals = approvals
+	inner := &fakeRuntimeTool{name: "mcp_admin_delete", risk: "high"}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
+	tool := observedTool{inner: inner, worker: worker, run: run}
+	ctx := react.WithToolCall(context.Background(), "call-1", inner.name)
+	_, err := tool.Invoke(ctx, json.RawMessage(`{"id":`))
+	var invalid *react.InvalidArgumentsError
+	if !errors.As(err, &invalid) || len(approvals.approvals) != 0 || inner.calls != 0 {
+		t.Fatalf("malformed arguments requested approval or ran the tool: approvals=%d calls=%d err=%v",
+			len(approvals.approvals), inner.calls, err)
+	}
+}
+
+func TestObservedToolSettlementFailureRequiresReconciliation(t *testing.T) {
+	steps := &fakeStepRepository{failFinish: true}
+	inner := &fakeRuntimeTool{name: "mcp_update", risk: "low", output: json.RawMessage(`{"ok":true}`)}
+	tool := observedTool{inner: inner, worker: newObservedWorker(steps), run: Run{ID: uuid.New(), UserID: uuid.New()}}
+	_, err := tool.Invoke(context.Background(), json.RawMessage(`{}`))
+	if inner.calls != 1 || !errors.Is(err, ErrToolResultPersistence) || !errors.Is(err, react.ErrToolInfrastructure) {
+		t.Fatalf("tool settlement error = %v, calls = %d", err, inner.calls)
+	}
+}
+
 // TestApprovalHelpers 验证审批辅助函数的稳定语义。
 func TestApprovalHelpers(t *testing.T) {
 	if approvalRequired("low") || !approvalRequired("medium") || !approvalRequired("high") || !approvalRequired("unknown") {
@@ -932,6 +959,8 @@ type fakeHotStore struct {
 	appendErr    error
 	appended     []Message
 	invalidCalls int
+	appendScope  uuid.UUID
+	invalidScope uuid.UUID
 }
 
 // Load 返回预设命中状态。
@@ -950,7 +979,8 @@ func (f *fakeHotStore) Save(_ context.Context, _ uuid.UUID, _ uuid.UUID, message
 }
 
 // Append 记录追加调用或返回预设错误。
-func (f *fakeHotStore) Append(_ context.Context, _ uuid.UUID, _ uuid.UUID, message Message) error {
+func (f *fakeHotStore) Append(_ context.Context, _ uuid.UUID, sessionID uuid.UUID, message Message) error {
+	f.appendScope = sessionID
 	if f.appendErr != nil {
 		return f.appendErr
 	}
@@ -959,8 +989,9 @@ func (f *fakeHotStore) Append(_ context.Context, _ uuid.UUID, _ uuid.UUID, messa
 }
 
 // Invalidate 记录清理调用。
-func (f *fakeHotStore) Invalidate(context.Context, uuid.UUID, uuid.UUID) error {
+func (f *fakeHotStore) Invalidate(_ context.Context, _ uuid.UUID, sessionID uuid.UUID) error {
 	f.invalidCalls++
+	f.invalidScope = sessionID
 	return nil
 }
 
@@ -1228,13 +1259,14 @@ func TestAppendHotMessageInvalidatesOnFailure(t *testing.T) {
 	hot := &fakeHotStore{}
 	worker := &ExecutionWorker{hotMessages: hot, logger: slog.Default()}
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
-	worker.appendHotMessage(context.Background(), run, Message{ID: uuid.New(), Content: "ok"})
-	if len(hot.appended) != 1 || hot.invalidCalls != 0 {
+	childSessionID := uuid.New()
+	worker.appendHotMessage(context.Background(), run, Message{ID: uuid.New(), SessionID: childSessionID, Content: "ok"})
+	if len(hot.appended) != 1 || hot.invalidCalls != 0 || hot.appendScope != childSessionID {
 		t.Fatalf("append = %#v, invalidations=%d", hot.appended, hot.invalidCalls)
 	}
 	hot.appendErr = errors.New("redis down")
-	worker.appendHotMessage(context.Background(), run, Message{ID: uuid.New(), Content: "fail"})
-	if hot.invalidCalls != 1 {
+	worker.appendHotMessage(context.Background(), run, Message{ID: uuid.New(), SessionID: childSessionID, Content: "fail"})
+	if hot.invalidCalls != 1 || hot.invalidScope != childSessionID {
 		t.Fatalf("invalidations = %d", hot.invalidCalls)
 	}
 }

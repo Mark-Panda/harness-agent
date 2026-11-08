@@ -21,13 +21,14 @@ func testHandler() http.Handler {
 
 func TestHealthAndSSEProbe(t *testing.T) {
 	handler := testHandler()
-	for _, path := range []string{"/health/live", "/health/ready", "/api/v1/health"} {
+	for _, path := range []string{"/health/live", "/health/ready", "/healthz", "/readyz", "/api/v1/health"} {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		// 入站请求 ID 必须原样回写，便于日志与 Trace 关联。
 		request.Header.Set("X-Request-ID", "req-test-1")
 		handler.ServeHTTP(recorder, request)
-		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "status") {
+		if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != "application/json" ||
+			!strings.Contains(recorder.Body.String(), "status") {
 			t.Fatalf("%s returned %d %s", path, recorder.Code, recorder.Body.String())
 		}
 		if recorder.Header().Get("X-Request-ID") != "req-test-1" {
@@ -69,7 +70,7 @@ func TestSPAFallbackAndAssetCaching(t *testing.T) {
 
 func TestMissingAPIAndAssetReturnNotFound(t *testing.T) {
 	handler := testHandler()
-	for _, path := range []string{"/api/v1/missing", "/assets/missing.js"} {
+	for _, path := range []string{"/api/v1/missing", "/assets/missing.js", "/health/missing"} {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusNotFound {

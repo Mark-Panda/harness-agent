@@ -317,7 +317,7 @@ func (c *Client) doChat(ctx context.Context, request ChatRequest, onDelta func(s
 	if outputBudget <= 0 {
 		outputBudget = request.Model.MaxOutputTokens
 	}
-	if outputBudget > request.Model.MaxOutputTokens {
+	if request.Model.MaxOutputTokens > 0 && outputBudget > request.Model.MaxOutputTokens {
 		outputBudget = request.Model.MaxOutputTokens
 	}
 	// 上下文窗口为零表示策略未声明窗口，此时不做硬性拒绝；非零时仍按保守估算校验。

@@ -122,6 +122,7 @@ func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...
 		}
 	}
 	// 步骤完成事件在续写合并后发出，Token 口径包含两次真实调用。
+	normalizeToolCallIDs(&completion)
 	m.finishStep(ctx, step, completion, nil)
 	m.setLastContent(completion.Content)
 	if budgetErr := m.emitAssistant(ctx, completion); budgetErr != nil {
@@ -177,6 +178,7 @@ func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, _ ...ei
 			completion = continued
 		}
 		// 步骤事件在续写合并后发出，Token 口径与真实调用一致。
+		normalizeToolCallIDs(&completion)
 		m.finishStep(ctx, step, completion, nil)
 		// 预算耗尽必须在发送工具调用帧之前终止，避免 Eino 继续执行工具产生副作用。
 		m.setLastContent(completion.Content)
@@ -223,7 +225,7 @@ func (m *ChatModel) summarize(ctx context.Context, input []*schema.Message) (*sc
 	m.recordUsage(completion)
 	m.finishStep(ctx, step, completion, err)
 	if err != nil {
-		return nil, fmt.Errorf("%w: final summary failed: %v", react.ErrStepLimit, err)
+		return nil, fmt.Errorf("%w: final summary failed: %w", react.ErrStepLimit, err)
 	}
 	// 收尾答案被截断或审核拦截时不能当作有效结论返回。
 	if reasonErr := completionError(completion); reasonErr != nil {
@@ -260,7 +262,7 @@ func (m *ChatModel) summarizeStream(ctx context.Context, input []*schema.Message
 		m.recordUsage(completion)
 		m.finishStep(ctx, step, completion, err)
 		if err != nil {
-			sender.send(nil, fmt.Errorf("%w: final summary failed: %v", react.ErrStepLimit, err))
+			sender.send(nil, fmt.Errorf("%w: final summary failed: %w", react.ErrStepLimit, err))
 			return
 		}
 		if reasonErr := completionError(completion); reasonErr != nil {
@@ -307,7 +309,7 @@ func (m *ChatModel) continueCompletion(ctx context.Context, messages []react.Mes
 	continued, err := m.router.Complete(ctx, m.continuationMessages(messages, partial), nil)
 	m.recordUsage(continued)
 	if err != nil {
-		return partial, fmt.Errorf("%w: continuation failed: %v", react.ErrStepLimit, err)
+		return partial, fmt.Errorf("%w: continuation failed: %w", react.ErrStepLimit, err)
 	}
 	return m.mergeContinuation(partial, continued)
 }
@@ -333,7 +335,7 @@ func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message
 	})
 	m.recordUsage(continued)
 	if err != nil {
-		return partial, fmt.Errorf("%w: continuation failed: %v", react.ErrStepLimit, err)
+		return partial, fmt.Errorf("%w: continuation failed: %w", react.ErrStepLimit, err)
 	}
 	// 读取端已关闭时不再合并续写结果，避免把未送达的文本计入最终答案。
 	if sendErr := sender.Err(); sendErr != nil {
@@ -367,6 +369,9 @@ func (m *ChatModel) continuationMessages(messages []react.Message, partial react
 
 // mergeContinuation 合并续写结果与用量；调用次数已在 recordUsage 中按真实调用累计。
 func (m *ChatModel) mergeContinuation(partial, continued react.Completion) (react.Completion, error) {
+	if err := completionError(continued); err != nil {
+		return partial, err
+	}
 	if len(continued.ToolCalls) > 0 {
 		return partial, fmt.Errorf("%w: continuation returned tool calls", react.ErrIncompleteToolCall)
 	}

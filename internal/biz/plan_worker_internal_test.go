@@ -110,3 +110,25 @@ func TestPlanStepMessages(t *testing.T) {
 		}
 	}
 }
+
+func TestCarryCompletedPlanStepsChecksEffectiveArgumentsAndDependencies(t *testing.T) {
+	previous := Plan{Steps: []PlanStep{
+		{StepNo: 1, Title: "fetch", ToolName: "get", Arguments: map[string]any{"id": "old"}, Status: PlanStepCompleted},
+		{StepNo: 2, Title: "process", ToolName: "process", DependsOn: []int{1}, Status: PlanStepCompleted},
+		{StepNo: 3, Title: "keep", ToolName: "keep", Status: PlanStepCompleted},
+		{StepNo: 4, Title: "removed dependency", ToolName: "other", DependsOn: []int{3}, Status: PlanStepCompleted},
+	}}
+	for _, matchDescription := range []bool{true, false} {
+		steps := carryCompletedPlanSteps([]PlanStep{
+			{StepNo: 1, Title: "fetch", ToolName: "get", Arguments: map[string]any{"id": "new"}, Status: PlanStepPending},
+			{StepNo: 2, Title: "process", ToolName: "process", DependsOn: []int{1}, Status: PlanStepPending},
+			{StepNo: 3, Title: "keep", ToolName: "keep", Arguments: map[string]any{}, Status: PlanStepPending},
+			{StepNo: 4, Title: "removed dependency", ToolName: "other", Status: PlanStepPending},
+		}, previous, matchDescription)
+		for index, want := range []PlanStepStatus{PlanStepPending, PlanStepPending, PlanStepCompleted, PlanStepPending} {
+			if steps[index].Status != want {
+				t.Errorf("matchDescription=%t step %d status=%s, want %s", matchDescription, index+1, steps[index].Status, want)
+			}
+		}
+	}
+}

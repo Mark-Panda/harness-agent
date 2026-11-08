@@ -19,6 +19,45 @@ import (
 	gomock "go.uber.org/mock/gomock"
 )
 
+// MockPlanDeadlineExtender is a mock of PlanDeadlineExtender interface.
+type MockPlanDeadlineExtender struct {
+	ctrl     *gomock.Controller
+	recorder *MockPlanDeadlineExtenderMockRecorder
+	isgomock struct{}
+}
+
+// MockPlanDeadlineExtenderMockRecorder is the mock recorder for MockPlanDeadlineExtender.
+type MockPlanDeadlineExtenderMockRecorder struct {
+	mock *MockPlanDeadlineExtender
+}
+
+// NewMockPlanDeadlineExtender creates a new mock instance.
+func NewMockPlanDeadlineExtender(ctrl *gomock.Controller) *MockPlanDeadlineExtender {
+	mock := &MockPlanDeadlineExtender{ctrl: ctrl}
+	mock.recorder = &MockPlanDeadlineExtenderMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockPlanDeadlineExtender) EXPECT() *MockPlanDeadlineExtenderMockRecorder {
+	return m.recorder
+}
+
+// ExtendPlanDeadline mocks base method.
+func (m *MockPlanDeadlineExtender) ExtendPlanDeadline(ctx context.Context, userID, planID uuid.UUID, deadline, now time.Time) (biz.Plan, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ExtendPlanDeadline", ctx, userID, planID, deadline, now)
+	ret0, _ := ret[0].(biz.Plan)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ExtendPlanDeadline indicates an expected call of ExtendPlanDeadline.
+func (mr *MockPlanDeadlineExtenderMockRecorder) ExtendPlanDeadline(ctx, userID, planID, deadline, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExtendPlanDeadline", reflect.TypeOf((*MockPlanDeadlineExtender)(nil).ExtendPlanDeadline), ctx, userID, planID, deadline, now)
+}
+
 // MockPlanRepository is a mock of PlanRepository interface.
 type MockPlanRepository struct {
 	ctrl     *gomock.Controller
@@ -87,21 +126,6 @@ func (mr *MockPlanRepositoryMockRecorder) CreatePlan(ctx, userID, plan, event an
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreatePlan", reflect.TypeOf((*MockPlanRepository)(nil).CreatePlan), ctx, userID, plan, event)
 }
 
-// GetPlan mocks base method.
-func (m *MockPlanRepository) GetPlan(ctx context.Context, userID, planID uuid.UUID) (biz.Plan, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetPlan", ctx, userID, planID)
-	ret0, _ := ret[0].(biz.Plan)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// GetPlan indicates an expected call of GetPlan.
-func (mr *MockPlanRepositoryMockRecorder) GetPlan(ctx, userID, planID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPlan", reflect.TypeOf((*MockPlanRepository)(nil).GetPlan), ctx, userID, planID)
-}
-
 // FindPausedPlanBySession mocks base method.
 func (m *MockPlanRepository) FindPausedPlanBySession(ctx context.Context, userID, sessionID uuid.UUID) (biz.Plan, error) {
 	m.ctrl.T.Helper()
@@ -117,19 +141,19 @@ func (mr *MockPlanRepositoryMockRecorder) FindPausedPlanBySession(ctx, userID, s
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindPausedPlanBySession", reflect.TypeOf((*MockPlanRepository)(nil).FindPausedPlanBySession), ctx, userID, sessionID)
 }
 
-// RebindPlanRun mocks base method.
-func (m *MockPlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (biz.Plan, error) {
+// GetPlan mocks base method.
+func (m *MockPlanRepository) GetPlan(ctx context.Context, userID, planID uuid.UUID) (biz.Plan, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RebindPlanRun", ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
+	ret := m.ctrl.Call(m, "GetPlan", ctx, userID, planID)
 	ret0, _ := ret[0].(biz.Plan)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// RebindPlanRun indicates an expected call of RebindPlanRun.
-func (mr *MockPlanRepositoryMockRecorder) RebindPlanRun(ctx, userID, planID, runID, expectedRevision, deadlineAt, now any) *gomock.Call {
+// GetPlan indicates an expected call of GetPlan.
+func (mr *MockPlanRepositoryMockRecorder) GetPlan(ctx, userID, planID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RebindPlanRun", reflect.TypeOf((*MockPlanRepository)(nil).RebindPlanRun), ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPlan", reflect.TypeOf((*MockPlanRepository)(nil).GetPlan), ctx, userID, planID)
 }
 
 // GetPlanByRun mocks base method.
@@ -160,6 +184,21 @@ func (m *MockPlanRepository) ListPlanVersions(ctx context.Context, userID, runID
 func (mr *MockPlanRepositoryMockRecorder) ListPlanVersions(ctx, userID, runID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListPlanVersions", reflect.TypeOf((*MockPlanRepository)(nil).ListPlanVersions), ctx, userID, runID)
+}
+
+// RebindPlanRun mocks base method.
+func (m *MockPlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (biz.Plan, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RebindPlanRun", ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
+	ret0, _ := ret[0].(biz.Plan)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RebindPlanRun indicates an expected call of RebindPlanRun.
+func (mr *MockPlanRepositoryMockRecorder) RebindPlanRun(ctx, userID, planID, runID, expectedRevision, deadlineAt, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RebindPlanRun", reflect.TypeOf((*MockPlanRepository)(nil).RebindPlanRun), ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
 }
 
 // ResolvePlanStep mocks base method.

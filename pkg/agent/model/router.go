@@ -122,6 +122,13 @@ type AttemptObserver interface {
 	ModelSwitched(ctx context.Context, record SwitchRecord) error
 }
 
+// AttemptBudget reserves budget before a provider request, including each retry.
+// The returned cap must be positive. Settle receives nil if the attempt never
+// started, or the final record when the provider has been called.
+type AttemptBudget interface {
+	ReserveAttempt(ctx context.Context, candidate Candidate, inputTokens int64, maxOutputTokens int) (cap int, settle func(*AttemptRecord) error, err error)
+}
+
 // RouterConfig 是单 Run 的路由上限与退避参数，来源为 YAML 配置。
 type RouterConfig struct {
 	// MinContextTokens 生成类模型的上下文硬准入下限，必须大于等于 1M。
@@ -148,6 +155,8 @@ type RouterConfig struct {
 	Temperature float64
 	// Limiter 供应商级并发舱壁，可为空表示不限制并发。
 	Limiter ConcurrencyLimiter
+	// AttemptBudget optionally coordinates provider calls across routers in a run.
+	AttemptBudget AttemptBudget
 }
 
 // normalize 补齐零值默认，避免错误配置导致无界重试或零超时。
@@ -305,19 +314,7 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 		if err != nil {
 			return react.Completion{}, err
 		}
-		started := time.Now()
-		record := AttemptRecord{
-			AttemptNo: r.config.InitialAttemptNo + r.total + 1,
-			ModelID:   candidate.Ref.ModelID, ProviderID: candidate.Ref.ProviderID,
-			RemoteModelName: candidate.Ref.RemoteModelName, StartedAt: started,
-			Status: "running", RequestHash: requestHash, InputTokens: int(inputTokens),
-			MessageCount: len(chatMessages), ToolCount: len(definitions), ToolNames: toolNames(definitions),
-		}
-		// 调用前先落库请求清单；持久化失败时禁止发起调用，避免出现无审计的模型请求。
-		if err := r.started(ctx, record); err != nil {
-			return react.Completion{}, err
-		}
-		// 供应商级舱壁：等待槽位期间受 Run Deadline 约束，避免超卖供应商配额。
+		// Acquire the provider slot before reserving the run budget.
 		release := func() {}
 		if r.config.Limiter != nil {
 			acquired, acquireErr := r.config.Limiter.Acquire(ctx, "provider:"+candidate.Ref.ProviderID)
@@ -329,6 +326,33 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			} else if acquired != nil {
 				release = acquired
 			}
+		}
+		settle := func(*AttemptRecord) error { return nil }
+		if r.config.AttemptBudget != nil {
+			outputBudget, settle, err = r.config.AttemptBudget.ReserveAttempt(ctx, candidate, inputTokens, outputBudget)
+			if err != nil {
+				release()
+				return react.Completion{}, err
+			}
+		}
+		started := time.Now()
+		record := AttemptRecord{
+			AttemptNo: r.config.InitialAttemptNo + r.total + 1,
+			ModelID:   candidate.Ref.ModelID, ProviderID: candidate.Ref.ProviderID,
+			RemoteModelName: candidate.Ref.RemoteModelName, StartedAt: started,
+			Status: "running", RequestHash: requestHash, InputTokens: int(inputTokens),
+			MessageCount: len(chatMessages), ToolCount: len(definitions), ToolNames: toolNames(definitions),
+		}
+		if r.config.AttemptBudget != nil {
+			// Until the provider reports usage, keep the full reservation recoverable.
+			record.OutputTokens = outputBudget
+			record.EstimatedCost = estimateCost(candidate, record.InputTokens, outputBudget)
+		}
+		// 调用前先落库请求清单；持久化失败时禁止发起调用，避免出现无审计的模型请求。
+		if err := r.started(ctx, record); err != nil {
+			_ = settle(nil)
+			release()
+			return react.Completion{}, err
 		}
 		chatRequest := ChatRequest{
 			Model: candidate.Ref, Messages: chatMessages, Tools: definitions,
@@ -361,6 +385,7 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			record.OutputTokens = response.OutputTokens
 			record.ResponseText = response.Content
 			record.EstimatedCost = estimateCost(candidate, response.InputTokens, response.OutputTokens)
+			budgetErr := settle(&record)
 			// attempts 只统计当前模型连续失败的尝试次数；成功即结束本轮失败序列，
 			// 否则 ReAct 多轮调用会把历史成功次数累加，导致一次瞬时 429 被误判为重试超限。
 			r.attempts = 0
@@ -368,6 +393,9 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			r.recordSuccess(ctx, candidate)
 			if err := r.finished(ctx, record); err != nil {
 				return react.Completion{}, err
+			}
+			if budgetErr != nil {
+				return react.Completion{}, budgetErr
 			}
 			return react.Completion{
 				Content: response.Content, ReasoningContent: response.ReasoningContent, FinishReason: response.FinishReason,
@@ -382,12 +410,14 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			record.Status = "cancelled"
 			record.ErrorClass = classOf(ctxErr)
 			record.ErrorMessage = sanitizedMessage(ctxErr)
-			_ = r.finished(ctx, record)
+			_ = settle(&record)
+			_ = r.finished(context.WithoutCancel(ctx), record)
 			return react.Completion{}, ctxErr
 		}
 		record.Status = "failed"
 		record.ErrorClass = ClassifyError(callErr)
 		record.ErrorMessage = sanitizedMessage(callErr)
+		_ = settle(&record)
 		// 已经向用户输出过增量后不能再重试或切换：重放会产生重复文本，
 		// 工具调用增量也可能已被上游消费。此处直接失败，由 Run 终态明确告知用户。
 		if streamed {

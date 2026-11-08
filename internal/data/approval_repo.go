@@ -1,8 +1,10 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -86,7 +88,10 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 	if approval.IdempotencyKey == "" {
 		return biz.ToolApproval{}, fmt.Errorf("%w: approval idempotency key is required", biz.ErrInvalidConfig)
 	}
-	arguments := normalizeApprovalJSON(approval.Arguments)
+	arguments := bytes.TrimSpace(approval.Arguments)
+	if !json.Valid(arguments) || (arguments[0] != '{' && arguments[0] != '[') {
+		return biz.ToolApproval{}, fmt.Errorf("%w: approval arguments must be a JSON object or array", biz.ErrInvalidConfig)
+	}
 	var result datatypes.JSON
 	if len(approval.ResultJSON) > 0 && json.Valid(approval.ResultJSON) {
 		result = datatypes.JSON(approval.ResultJSON)
@@ -119,18 +124,21 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			if err := tx.First(&stored, "user_id = ? AND run_id = ? AND tool_call_id = ?",
-				approval.UserID, approval.RunID, approval.ToolCallID).Error; err != nil {
-				return err
-			}
-			// provider 可能复用 tool_call_id（本地/兼容网关常见，空 ID 也会复用）：
-			// 参数不同却复用旧审批会执行错误参数，必须显式冲突，禁止静默复用。
-			if canonicalApprovalArguments(json.RawMessage(stored.Arguments)) != canonicalApprovalArguments(arguments) {
-				return fmt.Errorf("%w: approval tool call %q reused with different arguments",
+			// Legacy approvals omit session_id for the Run's main session. Compare the
+			// effective session and let PostgreSQL compare JSONB without float rounding.
+			err := tx.Where("user_id = ? AND run_id = ? AND tool_call_id = ?", approval.UserID, approval.RunID, approval.ToolCallID).
+				Where("tool_name = ? AND risk_level = ? AND arguments = ?::jsonb", approval.ToolName, approval.RiskLevel, string(arguments)).
+				Where(`EXISTS (
+					SELECT 1 FROM agent_runs AS ar
+					WHERE ar.id = tool_approvals.run_id AND ar.user_id = tool_approvals.user_id
+					  AND COALESCE(tool_approvals.session_id, ar.session_id) = COALESCE(?::uuid, ar.session_id)
+				)`, sessionID).
+				First(&stored).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: approval tool call %q reused with different execution details",
 					biz.ErrResourceConflict, approval.ToolCallID)
 			}
-			// 冲突命中的是旧记录，必须返回库中的既有审批而不是本次插入值。
-			return nil
+			return err
 		}
 		stored = record
 		return nil
@@ -327,33 +335,6 @@ func (r *ToolApprovalRepository) MarkApprovalDelivered(ctx context.Context, user
 		return biz.ToolApproval{}, catalogError("mark tool approval delivered", err)
 	}
 	return toBizApproval(record)
-}
-
-// normalizeApprovalJSON 确保参数是合法 JSON 对象或数组，非法内容降级为空对象。
-func normalizeApprovalJSON(raw json.RawMessage) json.RawMessage {
-	trimmed := string(raw)
-	if len(trimmed) == 0 || !json.Valid(raw) {
-		return json.RawMessage(`{}`)
-	}
-	switch trimmed[0] {
-	case '{', '[':
-		return raw
-	default:
-		return json.RawMessage(`{}`)
-	}
-}
-
-// canonicalApprovalArguments 返回与键序/空白无关的参数表示，用于判断同一 tool_call_id 的参数是否真的相同。
-func canonicalApprovalArguments(raw json.RawMessage) string {
-	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return string(raw)
-	}
-	normalized, err := json.Marshal(value)
-	if err != nil {
-		return string(raw)
-	}
-	return string(normalized)
 }
 
 // toBizApproval 将数据库行转换为领域审批。

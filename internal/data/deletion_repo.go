@@ -403,6 +403,9 @@ func (e *DeletionExecutor) DeleteAccount(ctx context.Context, userID uuid.UUID) 
 	}
 	var sessionIDs []uuid.UUID
 	err := WithScope(ctx, e.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT id FROM users WHERE id = ? FOR UPDATE", userID).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&sessionModel{}).Where("user_id = ?", userID).Pluck("id", &sessionIDs).Error; err != nil {
 			return err
 		}
@@ -424,8 +427,9 @@ func (e *DeletionExecutor) DeleteAccount(ctx context.Context, userID uuid.UUID) 
 			"DELETE FROM supervisor_tasks WHERE user_id = ?",
 			"DELETE FROM plan_steps WHERE user_id = ?",
 			"DELETE FROM plans WHERE user_id = ?",
-			"DELETE FROM external_conversation_bindings WHERE user_id = ?",
 			"DELETE FROM feishu_outbound_messages WHERE user_id = ?",
+			"DELETE FROM external_conversation_bindings WHERE user_id = ?",
+			"DELETE FROM feishu_group_messages WHERE sender_user_id = ?",
 			"DELETE FROM agent_runs WHERE user_id = ?",
 			"DELETE FROM memory_vectors WHERE user_id = ?",
 			"DELETE FROM memory_facts WHERE user_id = ?",

@@ -504,6 +504,7 @@ func run() error {
 	runService, err := biz.NewRunService(runRepository, sessionRepository,
 		biz.WithRunSnapshots(data.NewRunSnapshotRepository(agentRepository, catalogRepository)),
 		biz.WithRunEnqueuer(jobRepository),
+		biz.WithRunCreationTransaction(data.NewRunCreationTransaction(appDB)),
 		biz.WithExecutionSteps(stepRepository),
 		biz.WithToolApprovals(approvalRepository),
 		biz.WithBudgets(budgetService),
@@ -585,7 +586,7 @@ func run() error {
 		}
 		eventRepository := data.NewFeishuEventRepository(appDB, credentialKeys)
 		ingestService, err := biz.NewFeishuIngestService(verifier, eventRepository, jobRepository, biz.FeishuIngestConfig{
-			MaxBodyBytes: cfg.Feishu.MaxBodyBytes,
+			MaxBodyBytes: cfg.Feishu.MaxBodyBytes, DefaultAppID: cfg.Feishu.AppID,
 		})
 		if err != nil {
 			return err
@@ -643,13 +644,32 @@ func run() error {
 			defaultAgentOwnerID = &owner
 			defaultAgentID, defaultVersion = &parsed, &version
 		}
+		sharedChats := make([]biz.FeishuSharedChat, 0, len(cfg.Feishu.Group.SharedChats))
+		for _, chat := range cfg.Feishu.Group.SharedChats {
+			policyID, parseErr := uuid.Parse(strings.TrimSpace(chat.PolicyID))
+			if parseErr != nil {
+				return fmt.Errorf("parse feishu shared chat model policy id: %w", parseErr)
+			}
+			policy, loadErr := catalogRepository.GetPolicy(context.Background(), policyID)
+			if loadErr != nil {
+				return fmt.Errorf("load feishu shared chat model policy: %w", loadErr)
+			}
+			if policy.Status != biz.PolicyPublished {
+				return fmt.Errorf("feishu shared chat model policy %s is not published", policyID)
+			}
+			sharedChats = append(sharedChats, biz.FeishuSharedChat{
+				AppID: chat.AppID, TenantKey: chat.TenantKey, ChatID: chat.ChatID, PolicyID: policyID,
+			})
+		}
+		feishuMessages := data.NewFeishuMessageRepository(appDB)
 		feishuWorkerDependencies := biz.FeishuEventWorkerDependencies{
 			Jobs:          jobRepository,
 			Events:        eventRepository,
 			Identities:    data.NewFeishuIdentityRepository(authDB),
 			Conversations: data.NewFeishuConversationRepository(appDB),
 			Sessions:      sessionRepository,
-			Messages:      data.NewFeishuMessageRepository(appDB),
+			Messages:      feishuMessages,
+			GroupMessages: feishuMessages,
 			Runs:          runService,
 			Outbound:      data.NewFeishuOutboundRepository(appDB),
 			HotMessages:   hotMessages,
@@ -665,7 +685,8 @@ func run() error {
 			PollInterval: cfg.Feishu.Worker.PollInterval.Duration, Lease: cfg.Feishu.Worker.Lease.Duration,
 			DefaultAgentID: defaultAgentID, DefaultAgentVersion: defaultVersion,
 			DefaultAgentOwnerID: defaultAgentOwnerID,
-			Mode:                biz.AgentMode(cfg.Feishu.Mode), BotOpenID: cfg.Feishu.BotOpenID, BotName: cfg.Feishu.BotName,
+			DefaultAppID:        strings.TrimSpace(cfg.Feishu.AppID), SharedChats: sharedChats,
+			Mode: biz.AgentMode(cfg.Feishu.Mode), BotOpenID: cfg.Feishu.BotOpenID, BotName: cfg.Feishu.BotName,
 			RequireTopic: cfg.Feishu.Group.RequireTopic, AllowRootReplyFallback: cfg.Feishu.Group.AllowRootReplyFallback,
 		})
 		if err != nil {

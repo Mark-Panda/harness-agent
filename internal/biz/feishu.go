@@ -304,6 +304,7 @@ type FeishuReplySender interface {
 type FeishuIngestConfig struct {
 	// MaxBodyBytes 允许的最大请求体字节数。
 	MaxBodyBytes int64
+	DefaultAppID string
 }
 
 // FeishuIngestService 负责验签、解密、幂等入库与快速 ACK。
@@ -312,6 +313,7 @@ type FeishuIngestService struct {
 	events       FeishuEventStore
 	enqueuer     FeishuEventEnqueuer
 	maxBodyBytes int64
+	defaultAppID string
 	now          func() time.Time
 	// botCredentials 与 opener 用于按机器人 ID 动态构造验签器；为空时只支持默认应用回调。
 	botCredentials FeishuBotCredentialReader
@@ -336,7 +338,8 @@ func NewFeishuIngestService(verifier *feishu.Verifier, events FeishuEventStore, 
 	}
 	return &FeishuIngestService{
 		verifier: verifier, events: events, enqueuer: enqueuer,
-		maxBodyBytes: config.MaxBodyBytes, now: func() time.Time { return time.Now().UTC() },
+		maxBodyBytes: config.MaxBodyBytes, defaultAppID: strings.TrimSpace(config.DefaultAppID),
+		now: func() time.Time { return time.Now().UTC() },
 	}, nil
 }
 
@@ -354,7 +357,7 @@ func (s *FeishuIngestService) WithBotVerification(credentials FeishuBotCredentia
 
 // Handle 校验并持久化事件，成功后仅入队异步任务，不在请求内调用模型。
 func (s *FeishuIngestService) Handle(ctx context.Context, request feishu.Request) (FeishuIngestResult, error) {
-	return s.handleWithVerifier(ctx, s.verifier, "", request)
+	return s.handleWithVerifier(ctx, s.verifier, s.defaultAppID, request)
 }
 
 // HandleForBot 使用管理员登记的机器人应用凭据验签并处理回调。

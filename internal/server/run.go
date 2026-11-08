@@ -36,10 +36,15 @@ func (h *platformHTTPHandler) createRun(w http.ResponseWriter, r *http.Request) 
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	idempotencyKey := strings.TrimSpace(r.Header.Get(idempotencyKeyHeader))
+	if strings.HasPrefix(idempotencyKey, "feishu:") || strings.HasPrefix(idempotencyKey, "feishu.group:") {
+		writePlatformError(w, fmt.Errorf("%w: reserved Run idempotency key", biz.ErrInvalidConfig))
+		return
+	}
 	// HTTP 幂等键同时作为 Run 的业务幂等键，双重防止重复创建。
 	run, err := h.service.Runs.Create(r.Context(), requestPrincipal(r), biz.CreateRunInput{
 		SessionID: sessionID, AgentID: request.AgentID, AgentVersion: request.AgentVersion,
-		Mode: request.Mode, IdempotencyKey: strings.TrimSpace(r.Header.Get(idempotencyKeyHeader)),
+		Mode: request.Mode, IdempotencyKey: idempotencyKey,
 		TriggerMessageID: request.TriggerMessageID,
 	})
 	writePlatformResult(w, http.StatusCreated, runResponse(run), err)

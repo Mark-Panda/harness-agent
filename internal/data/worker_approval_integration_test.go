@@ -281,7 +281,8 @@ func TestExecutionWorkerApprovalRoundTrip(t *testing.T) {
 		ordered[len(ordered)-1-index] = message
 	}
 	if ordered[0].Role != biz.MessageUser || ordered[1].Role != biz.MessageAssistant ||
-		ordered[2].Role != biz.MessageTool || ordered[2].ToolCallID != "call-approve-1" ||
+		ordered[2].Role != biz.MessageTool || ordered[2].ToolCallID == "" || len(ordered[1].ToolCalls) != 1 ||
+		ordered[1].ToolCalls[0]["id"] != ordered[2].ToolCallID ||
 		ordered[3].Role != biz.MessageAssistant {
 		t.Fatalf("unexpected message order: %#v", ordered)
 	}
