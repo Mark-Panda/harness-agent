@@ -329,53 +329,82 @@ func (s *RunService) Create(ctx context.Context, principal Principal, input Crea
 	}
 	// 同一会话存在暂停中的计划时，把计划迁移到新 Run 继续执行。
 	// 否则用户说“继续”会被当作新任务，既有步骤进度与已花费预算全部作废。
-	s.adoptPausedPlan(ctx, principal, input, created)
+	adopted := s.adoptPausedPlan(ctx, principal, input, created)
 	// Run 落库后入队；入队使用 Run ID 去重，客户端重试不会产生重复执行。
 	if s.enqueuer != nil && created.Status == RunQueued {
 		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
+			// 入队失败必须收敛刚创建的 Run，否则它会永久停留在 queued 且没有任何 Worker 会执行；
+			// 已接管的暂停计划同时恢复为 paused，等待下一次“继续”再恢复。
+			s.abortUnqueuedRun(ctx, principal, created, adopted, err)
 			return Run{}, err
 		}
 	}
 	return created, nil
 }
 
+// abortUnqueuedRun 在 Run 入队失败时做补偿：把 Run 推进到失败终态并恢复被接管的暂停计划。
+func (s *RunService) abortUnqueuedRun(ctx context.Context, principal Principal, created Run, adopted *Plan, cause error) {
+	// 入队失败后请求上下文可能很快取消，补偿动作必须脱离取消信号完成。
+	writeContext := context.WithoutCancel(ctx)
+	message := truncateUTF8Bytes(cause.Error(), 512)
+	if _, err := s.repo.TransitionRun(writeContext, created.UserID, created.ID, RunQueued, RunFailed, map[string]any{
+		"error_code": "run_enqueue_failed", "error_message": message, "finished_at": s.clock(),
+	}); err != nil {
+		return
+	}
+	s.emitRunEvent(writeContext, created, "run.failed", map[string]any{
+		"code": "run_enqueue_failed", "message": message,
+	})
+	if adopted == nil || s.plans == nil {
+		return
+	}
+	// RebindPlanRun 已把计划推进到 executing；入队失败后没有执行者，重新置为 paused，
+	// 下一次带恢复意图的消息仍可接管该计划。
+	if _, err := s.plans.UpdatePlan(writeContext, principal.UserID, adopted.ID, PlanExecuting, PlanPaused,
+		adopted.Revision, PlanFence{}, PlanUpdate{ErrorCode: "run_enqueue_failed", ErrorMessage: message}); err != nil {
+		s.emitRunEvent(writeContext, created, "plan.resume_failed", map[string]any{
+			"plan_id": adopted.ID.String(), "reason": "restore_paused_failed", "error": err.Error(),
+		})
+	}
+}
+
 // adoptPausedPlan 把会话中最近一个暂停中的计划迁移到新 Run，保留已完成步骤继续执行。
 // 迁移失败或当前模式无法续跑时不阻断新 Run，但会写入可观测事件，避免静默丢失用户计划。
-func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, input CreateRunInput, created Run) {
+func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, input CreateRunInput, created Run) *Plan {
 	if s.plans == nil {
-		return
+		return nil
 	}
 	plan, err := s.plans.FindPausedPlanBySession(ctx, principal.UserID, input.SessionID)
 	if err != nil || plan.ID == uuid.Nil || plan.RunID == created.ID {
-		return
+		return nil
 	}
 	if input.Mode != AgentModePlan {
 		// 非 Plan 模式无法驱动计划步骤：保持计划暂停等待显式恢复，同时让用户知道本次消息没有续跑计划。
 		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
 			"plan_id": plan.ID.String(), "reason": "run_mode_not_plan", "mode": string(input.Mode),
 		})
-		return
+		return nil
 	}
 	if !s.hasPlanResumeIntent(ctx, principal.UserID, created) {
 		// 暂停是用户显式控制；新任务不能无条件接管旧计划。显式“继续/恢复”或计划 Resume API 才会续跑。
 		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
 			"plan_id": plan.ID.String(), "reason": "resume_intent_missing",
 		})
-		return
+		return nil
 	}
 	latest, err := s.pausedPlanIsLatest(ctx, principal.UserID, created, plan)
 	if err != nil {
 		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
 			"plan_id": plan.ID.String(), "reason": "latest_plan_lookup_failed", "error": err.Error(),
 		})
-		return
+		return nil
 	}
 	if !latest {
 		// 用户暂停 A 后又创建了 B：“继续”不能再把 A 抢回来。此时应通过具体 Run 的 Resume API 选择计划。
 		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
 			"plan_id": plan.ID.String(), "reason": "resume_target_changed",
 		})
-		return
+		return nil
 	}
 	// 旧 Run 仍在后台轮询，必须先取消，否则它会继续按旧的 Run ID 重新规划并产生新的计划版本。
 	if _, err := s.Cancel(ctx, principal, plan.RunID); err != nil {
@@ -384,19 +413,21 @@ func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, i
 			s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
 				"plan_id": plan.ID.String(), "reason": "cancel_previous_run_failed", "error": err.Error(),
 			})
-			return
+			return nil
 		}
 	}
 	deadline := created.DeadlineAt
-	if _, err := s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, deadline, s.clock()); err != nil {
+	rebound, err := s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, deadline, s.clock())
+	if err != nil {
 		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
 			"plan_id": plan.ID.String(), "reason": "rebind_failed", "error": err.Error(),
 		})
-		return
+		return nil
 	}
 	s.emitRunEvent(ctx, created, "plan.resumed", map[string]any{
 		"plan_id": plan.ID.String(), "previous_run_id": plan.RunID.String(),
 	})
+	return &rebound
 }
 
 // pausedPlanIsLatest 确认暂停计划仍属于会话最近一次 Plan 执行，避免恢复已经被新任务取代的旧计划。
@@ -816,7 +847,28 @@ func (s *RunService) Cancel(ctx context.Context, principal Principal, runID uuid
 	if err != nil {
 		return Run{}, err
 	}
+	// 取消会联动拒绝该 Run 上仍待决策的工具审批，避免审批列表残留永远无法执行的请求。
+	// 计划不在此处取消：暂停中的计划会被新 Run 重新绑定并恢复，取消 Run 只是释放旧执行窗口。
+	s.cancelLinkedArtifacts(ctx, principal.UserID, runID, now)
 	return cancelled, nil
+}
+
+// cancelLinkedArtifacts 尽力收敛取消 Run 关联的待审批记录。
+// Run 已经是终态，清理失败不应把用户的取消操作变成错误，因此这里只做 best-effort 收敛。
+func (s *RunService) cancelLinkedArtifacts(ctx context.Context, userID, runID uuid.UUID, now time.Time) {
+	if s.approvals == nil {
+		return
+	}
+	approvals, err := s.approvals.ListApprovals(ctx, userID, runID)
+	if err != nil {
+		return
+	}
+	for _, approval := range approvals {
+		if approval.Status != ApprovalPending {
+			continue
+		}
+		_, _ = s.approvals.DecideApproval(ctx, userID, approval.ID, ApprovalDecisionDeny, userID, now)
+	}
 }
 
 // ListSteps 读取 Run 的执行步骤；调用方须先通过 GetRun 校验归属。

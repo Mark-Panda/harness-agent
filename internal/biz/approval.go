@@ -56,6 +56,8 @@ type ToolApproval struct {
 	RunID uuid.UUID
 	// StepID 请求审批的工具步骤，可为空。
 	StepID *uuid.UUID
+	// SessionID 发起工具调用的会话；Supervisor 子任务审批需要回填到子会话，零值表示主会话。
+	SessionID uuid.UUID
 	// UserID 所属用户，RLS 隔离键；决策人必须与之一致。
 	UserID uuid.UUID
 	// ToolCallID 模型产生的工具调用 ID。

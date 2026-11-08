@@ -325,6 +325,10 @@ func TestRunServiceEnqueueFailureIsReturned(t *testing.T) {
 	)
 	runRepo.EXPECT().CreateRun(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, run biz.Run) (biz.Run, error) { return run, nil })
 	queue.EXPECT().EnqueueRun(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("queue unavailable"))
+	// 入队失败必须把刚创建的 Run 收敛为失败终态，否则它会永久停留在 queued。
+	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, gomock.Any(), biz.RunQueued, biz.RunFailed, gomock.Any()).
+		Return(biz.Run{}, nil)
+	runRepo.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
 	if _, err := service.Create(context.Background(), principal, biz.CreateRunInput{
 		SessionID: sessionID, AgentID: &agentID, AgentVersion: &version, Mode: biz.AgentModeReact,
 	}); err == nil {

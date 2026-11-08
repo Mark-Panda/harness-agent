@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -468,7 +469,16 @@ func (w *SummaryWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止摘要协程：记录堆栈后继续处理下一个任务。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("summary worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim summary job failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -499,6 +509,15 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		}
 		finishJob(outcome)
 	}()
+	// 单次 panic 不得终止进程：记录堆栈并把任务退回重试，避免摘要任务停留在租约中。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			failureClass = "panic"
+			w.logger.Error("summary job panicked", "job_id", job.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			w.failJob(context.WithoutCancel(ctx), job, fmt.Errorf("summary job panicked: %v", recovered))
+		}
+	}()
 	task, err := decodeSummaryTask(job)
 	if err != nil {
 		w.logger.Error("invalid summary job payload", "job_id", job.ID, "error", err)
@@ -509,7 +528,13 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 	// 会话归档或删除后不再生成新摘要，避免继续消耗模型额度。
 	session, err := w.sessions.GetSession(ctx, task.UserID, task.SessionID)
 	if err != nil {
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		// 只有确认会话不存在才结束任务；瞬时故障直接完成会让这批消息的摘要永久丢失。
+		if errors.Is(err, ErrResourceNotFound) {
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
+		failureClass = "retryable_failure"
+		w.failJob(ctx, job, err)
 		return
 	}
 	if session.Status != SessionActive {

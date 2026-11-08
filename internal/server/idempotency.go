@@ -2,11 +2,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
@@ -17,6 +19,9 @@ const idempotencyKeyHeader = "Idempotency-Key"
 
 // maxIdempotentBodyBytes 限制参与指纹计算的请求体大小，与写接口上限保持一致。
 const maxIdempotentBodyBytes = 4*1024*1024 + 64*1024
+
+// idempotencyStoreTimeout 限制完成落库的等待时间，避免连接异常时长期占用请求。
+const idempotencyStoreTimeout = 5 * time.Second
 
 // withIdempotency 包装写接口：按 Idempotency-Key 做指纹校验、并发生效与结果回放。
 func withIdempotency(service *biz.IdempotencyService, resourceType string, next http.HandlerFunc) http.HandlerFunc {
@@ -56,14 +61,20 @@ func withIdempotency(service *biz.IdempotencyService, resourceType string, next 
 		recorder := &idempotentResponseWriter{header: make(http.Header), status: http.StatusOK}
 		next(recorder, r)
 		resourceID := responseResourceID(recorder.body.Bytes())
+		// 业务已执行完毕，结束标记必须落库：使用不随客户端断开取消的上下文，
+		// 否则客户端提前断开会把已成功的写操作标记为失败，重试时重复创建资源。
+		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyStoreTimeout)
+		defer cancel()
 		if recorder.status >= 200 && recorder.status < 300 {
 			// 成功结果必须落库后才能回放；落库失败时返回 500，避免客户端误以为已持久化。
-			if err := service.Complete(r.Context(), principal.UserID, key, recorder.status, recorder.body.Bytes(), resourceID); err != nil {
+			if err := service.Complete(storeCtx, principal.UserID, key, recorder.status, recorder.body.Bytes(), resourceID); err != nil {
+				// 释放占位，避免键永久停留在 in_progress 导致同键重试一直被拒绝。
+				_ = service.Fail(storeCtx, principal.UserID, key)
 				writeErrorCode(w, http.StatusInternalServerError, "idempotency_store_failed")
 				return
 			}
 		} else {
-			_ = service.Fail(r.Context(), principal.UserID, key)
+			_ = service.Fail(storeCtx, principal.UserID, key)
 		}
 		for name, values := range recorder.header {
 			for _, value := range values {

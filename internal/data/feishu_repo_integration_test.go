@@ -80,7 +80,7 @@ func TestFeishuEventRepositoryLifecycle(t *testing.T) {
 	ctx := context.Background()
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 	eventID := "feishu_it_event_" + suffix
-	repository := NewFeishuEventRepository(appDB)
+	repository := NewFeishuEventRepository(appDB, nil)
 	t.Cleanup(func() {
 		_ = adminDB.Exec("DELETE FROM feishu_event_receipts WHERE event_id = ?", eventID).Error
 	})

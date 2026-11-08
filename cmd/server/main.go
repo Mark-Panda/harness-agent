@@ -583,7 +583,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure feishu verifier: %w", err)
 		}
-		eventRepository := data.NewFeishuEventRepository(appDB)
+		eventRepository := data.NewFeishuEventRepository(appDB, credentialKeys)
 		ingestService, err := biz.NewFeishuIngestService(verifier, eventRepository, jobRepository, biz.FeishuIngestConfig{
 			MaxBodyBytes: cfg.Feishu.MaxBodyBytes,
 		})
@@ -616,12 +616,31 @@ func run() error {
 		// 默认应用机器人仅在配置了默认助手时启用；只使用注册机器人时可留空。
 		var defaultAgentID *uuid.UUID
 		var defaultVersion *int
+		var defaultAgentOwnerID *uuid.UUID
 		if raw := strings.TrimSpace(cfg.Feishu.DefaultAgentID); raw != "" {
 			parsed, parseErr := uuid.Parse(raw)
 			if parseErr != nil {
 				return fmt.Errorf("parse feishu default agent id: %w", parseErr)
 			}
 			version := cfg.Feishu.DefaultAgentVersion
+			// 启动期校验默认助手：版本必须匹配且已发布、编排模式必须与 feishu.mode 一致。
+			// 否则事件到达后才会在 Run 快照校验处失败，默认应用也无法确定应以谁的身份执行。
+			agent, loadErr := agentRepository.GetAgentAdmin(context.Background(), parsed)
+			if loadErr != nil {
+				return fmt.Errorf("load feishu default agent: %w", loadErr)
+			}
+			if agent.Version != version {
+				return fmt.Errorf("feishu default agent version mismatch: configured %d, found %d", version, agent.Version)
+			}
+			if agent.Status != biz.AgentPublished {
+				return fmt.Errorf("feishu default agent %s is not published", parsed)
+			}
+			if string(agent.Mode) != cfg.Feishu.Mode {
+				return fmt.Errorf("feishu default agent mode %q does not match feishu.mode %q", agent.Mode, cfg.Feishu.Mode)
+			}
+			// 默认应用沿用“机器人只服务属主”的策略，执行身份固定为默认助手属主。
+			owner := agent.UserID
+			defaultAgentOwnerID = &owner
 			defaultAgentID, defaultVersion = &parsed, &version
 		}
 		feishuWorkerDependencies := biz.FeishuEventWorkerDependencies{
@@ -645,7 +664,8 @@ func run() error {
 			WorkerID: workerID, Concurrency: cfg.Feishu.Worker.Concurrency,
 			PollInterval: cfg.Feishu.Worker.PollInterval.Duration, Lease: cfg.Feishu.Worker.Lease.Duration,
 			DefaultAgentID: defaultAgentID, DefaultAgentVersion: defaultVersion,
-			Mode: biz.AgentMode(cfg.Feishu.Mode), BotOpenID: cfg.Feishu.BotOpenID, BotName: cfg.Feishu.BotName,
+			DefaultAgentOwnerID: defaultAgentOwnerID,
+			Mode:                biz.AgentMode(cfg.Feishu.Mode), BotOpenID: cfg.Feishu.BotOpenID, BotName: cfg.Feishu.BotName,
 			RequireTopic: cfg.Feishu.Group.RequireTopic, AllowRootReplyFallback: cfg.Feishu.Group.AllowRootReplyFallback,
 		})
 		if err != nil {

@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -188,7 +190,16 @@ func (w *FeishuReplyWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止投递协程：记录堆栈后继续处理下一条外发记录。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("feishu reply worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim feishu outbound failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -319,13 +330,34 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 	finishJob := beginJob()
 	jobOutcome := "success"
 	defer func() { finishJob(jobOutcome) }()
+	// 单次 panic 不得终止进程：记录堆栈并延后外发，避免记录停留在租约中无人投递。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			jobOutcome = "failure"
+			w.logger.Error("feishu reply handling panicked", "outbound_id", outbound.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollInterval))
+		}
+	}()
 	run, err := w.runs.GetRun(ctx, outbound.UserID, outbound.RunID)
 	if err != nil {
-		// Run 已被删除时直接结束外发，避免永久重试。
-		_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
+		if errors.Is(err, ErrResourceNotFound) {
+			// Run 已被删除时直接结束外发，避免永久重试。
+			_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
+			return
+		}
+		// 瞬时故障不能当作 Run 已删除：否则用户永远收不到最终答复。
+		jobOutcome = "failure"
+		w.failOutbound(ctx, outbound, err)
 		return
 	}
-	terminal, title, text := w.render(ctx, run)
+	terminal, title, text, err := w.render(ctx, run)
+	if err != nil {
+		// 渲染失败按基础设施故障重试，避免把读取故障固化成“没有生成回复”发给用户。
+		jobOutcome = "failure"
+		w.failOutbound(ctx, outbound, err)
+		return
+	}
 	if !terminal {
 		w.waitRun(ctx, outbound, run, title, text)
 		return
@@ -339,25 +371,29 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 }
 
 // render 把 Run 状态映射为卡片标题与正文；终态返回 true。
-func (w *FeishuReplyWorker) render(ctx context.Context, run Run) (bool, string, string) {
+// 返回错误表示读取最终内容时遇到基础设施故障，调用方应重试而不是降级为错误答复。
+func (w *FeishuReplyWorker) render(ctx context.Context, run Run) (bool, string, string, error) {
 	switch run.Status {
 	case RunCompleted:
 		runID := run.ID
 		message, err := w.outbound.LatestAssistantMessage(ctx, run.UserID, run.SessionID, &runID)
-		if err != nil || strings.TrimSpace(message.Content) == "" {
-			return true, "执行完成", "任务已执行完成，但没有生成可展示的回复。"
+		if err != nil && !errors.Is(err, ErrResourceNotFound) {
+			return false, "", "", err
 		}
-		return true, "执行完成", message.Content
+		if strings.TrimSpace(message.Content) == "" {
+			return true, "执行完成", "任务已执行完成，但没有生成可展示的回复。", nil
+		}
+		return true, "执行完成", message.Content, nil
 	case RunFailed:
-		return true, "执行失败", "任务执行失败，请稍后重试或在 Web 端查看执行详情。"
+		return true, "执行失败", "任务执行失败，请稍后重试或在 Web 端查看执行详情。", nil
 	case RunCancelled:
-		return true, "已取消", "任务已取消。"
+		return true, "已取消", "任务已取消。", nil
 	case RunWaitingApproval:
-		return false, "等待审批", "任务正在等待人工审批，请到 Web 端处理。"
+		return false, "等待审批", "任务正在等待人工审批，请到 Web 端处理。", nil
 	case RunReconciliationRequired:
-		return true, "需要对账", "任务需要人工对账，请在 Web 端查看执行详情。"
+		return true, "需要对账", "任务需要人工对账，请在 Web 端查看执行详情。", nil
 	default:
-		return false, "正在处理", "已收到你的消息，正在执行，请稍候。"
+		return false, "正在处理", "已收到你的消息，正在执行，请稍候。", nil
 	}
 }
 

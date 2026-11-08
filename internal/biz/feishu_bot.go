@@ -130,7 +130,7 @@ func (s *FeishuBotService) WithTester(tester FeishuBotTester) *FeishuBotService 
 	return s
 }
 
-// Create 创建机器人；应用密钥必填，Verification Token 与 Encrypt Key 可选。
+// Create 创建机器人；应用密钥必填，且 Verification Token 与 Encrypt Key 至少配置一项。
 func (s *FeishuBotService) Create(ctx context.Context, principal Principal, input FeishuBotInput) (FeishuBot, error) {
 	if err := RequireAdmin(principal); err != nil {
 		return FeishuBot{}, err
@@ -141,6 +141,10 @@ func (s *FeishuBotService) Create(ctx context.Context, principal Principal, inpu
 	}
 	if strings.TrimSpace(input.AppSecret) == "" {
 		return FeishuBot{}, invalid("feishu bot app secret is required")
+	}
+	// 没有任何可验证凭据的回调只能 fail-open，必须在创建时拒绝。
+	if strings.TrimSpace(input.VerificationToken) == "" && strings.TrimSpace(input.EncryptKey) == "" {
+		return FeishuBot{}, invalid("feishu bot verification token or encrypt key is required")
 	}
 	secret := FeishuBotSecret{
 		AppSecret: strings.TrimSpace(input.AppSecret), VerificationToken: strings.TrimSpace(input.VerificationToken),
@@ -190,6 +194,10 @@ func (s *FeishuBotService) Update(ctx context.Context, principal Principal, botI
 		}
 		if strings.TrimSpace(secret.AppSecret) == "" {
 			return FeishuBot{}, invalid("feishu bot app secret is required")
+		}
+		// 更新后同样必须保留至少一项回调验证凭据，否则该机器人会退化为 fail-open。
+		if strings.TrimSpace(secret.VerificationToken) == "" && strings.TrimSpace(secret.EncryptKey) == "" {
+			return FeishuBot{}, invalid("feishu bot verification token or encrypt key is required")
 		}
 		sealed, err := s.sealSecret(secret)
 		if err != nil {

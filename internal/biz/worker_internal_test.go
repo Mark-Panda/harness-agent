@@ -452,7 +452,10 @@ func TestPrepareMCPToolsSkipsHighRiskWithoutApprovals(t *testing.T) {
 		},
 	}}
 	run := Run{ConfigSnapshot: map[string]any{"published_snapshot": snapshot}}
-	registry := worker.prepareMCPTools(context.Background(), run)
+	registry, err := worker.prepareMCPTools(context.Background(), run, RunFence{})
+	if err != nil {
+		t.Fatalf("prepare MCP tools: %v", err)
+	}
 	if _, exists := registry.Lookup("mcp_admin_delete_all"); exists {
 		t.Fatal("high risk tool was exposed without approval")
 	}
@@ -1090,7 +1093,7 @@ func TestRecoverReactResultDoesNotFinishPartialContinuation(t *testing.T) {
 	}
 }
 
-func TestPersistRunnerMessageUsesStoredContentForEvents(t *testing.T) {
+func TestPersistRunnerMessageRejectsReusedIDWithDifferentContent(t *testing.T) {
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
 	messageID := deterministicMessageID(run.ID, 3)
 	sessions := &statefulSessionRepository{messages: map[uuid.UUID]Message{
@@ -1098,11 +1101,8 @@ func TestPersistRunnerMessageUsesStoredContentForEvents(t *testing.T) {
 	}}
 	worker := &ExecutionWorker{sessions: sessions}
 	payload := map[string]any{"index": 3, "role": "assistant", "content": "第二次内容"}
-	if err := worker.persistRunnerMessage(context.Background(), run, payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["content"] != "首次内容" || payload["message_id"] != messageID.String() {
-		t.Fatalf("event payload was not normalized to stored record: %#v", payload)
+	if err := worker.persistRunnerMessage(context.Background(), run, payload); err == nil {
+		t.Fatalf("expected conflict error when a deterministic message ID is reused with different content")
 	}
 }
 

@@ -76,16 +76,24 @@ func TestToolApprovalRepositoryLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 同一 Run 与 tool_call_id 重复创建必须返回既有记录，不产生第二条审批。
+	// 同一 Run 与 tool_call_id 重复创建必须返回既有记录，不产生第二条审批；
+	// 参数仅空白/键序不同但语义相同，仍视为同一次调用。
 	again, err := approvals.CreateApproval(ctx, biz.ToolApproval{
 		RunID: runID, UserID: userA.ID, ToolCallID: "call-1", ToolName: "mcp_admin_delete",
-		Arguments: json.RawMessage(`{}`), RiskLevel: "high", IdempotencyKey: "idem-other",
+		Arguments: json.RawMessage(`{ "id" : "x" }`), RiskLevel: "high", IdempotencyKey: "idem-other",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again.ID != created.ID || again.IdempotencyKey != "idem-1" {
 		t.Fatalf("idempotent create = %#v, want %s", again, created.ID)
+	}
+	// tool_call_id 被复用但参数不同：必须显式冲突，避免以旧审批执行新参数。
+	if _, err := approvals.CreateApproval(ctx, biz.ToolApproval{
+		RunID: runID, UserID: userA.ID, ToolCallID: "call-1", ToolName: "mcp_admin_delete",
+		Arguments: json.RawMessage(`{"id":"y"}`), RiskLevel: "high", IdempotencyKey: "idem-other",
+	}); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("reused tool call error = %v", err)
 	}
 	list, err := approvals.ListApprovals(ctx, userA.ID, runID)
 	if err != nil || len(list) != 1 {

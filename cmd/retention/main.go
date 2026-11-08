@@ -51,7 +51,8 @@ func run(apply bool) error {
 		feishuRetention = 7 * 24 * time.Hour
 	}
 	feishuCutoff := now.Add(-feishuRetention)
-	counts, err := data.PurgeExpired(context.Background(), db, executionCutoff, auditCutoff, feishuCutoff, apply)
+	counts, err := data.PurgeExpired(context.Background(), db, []byte(cfg.Audit.PseudonymKey),
+		executionCutoff, auditCutoff, feishuCutoff, apply)
 	if err != nil {
 		return err
 	}

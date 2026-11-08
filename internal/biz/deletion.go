@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -307,7 +308,16 @@ func (w *DeletionWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止删除协程：记录堆栈后继续处理下一个请求。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("deletion worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim deletion request failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -331,6 +341,19 @@ func (w *DeletionWorker) ProcessOne(ctx context.Context) (bool, error) {
 func (w *DeletionWorker) handle(ctx context.Context, request DeletionRequest) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// 单次 panic 不得终止进程：记录堆栈后把请求退回重试，避免请求停留在租约里无人推进。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("deletion request panicked", "request_id", request.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			cancel()
+			retryAt := w.clock().Add(backoffDelay(request.Attempts))
+			if err := w.requests.Fail(context.WithoutCancel(ctx), request.ID, w.config.WorkerID, request.FencingToken,
+				retryAt, "deletion panicked", w.clock()); err != nil {
+				w.logger.Warn("record deletion panic failure failed", "request_id", request.ID, "error", err)
+			}
+		}
+	}()
 	leaseLost := make(chan struct{})
 	done := make(chan struct{})
 	go func() {

@@ -46,6 +46,10 @@ func TestExecutionWorkerPlanMode(t *testing.T) {
 		if strings.Contains(body, "生成可执行计划") {
 			content = planner
 		}
+		// 计划汇总器调用需要可区分的最终答案；P1-7 修正预算后该调用会真实成功。
+		if strings.Contains(body, "计划目标：") {
+			content = "汇总后的最终答案"
+		}
 		response := map[string]any{
 			"id":      "req-" + suffix,
 			"choices": []any{map[string]any{"message": map[string]any{"content": content}, "finish_reason": "stop"}},
@@ -146,7 +150,8 @@ func TestExecutionWorkerPlanMode(t *testing.T) {
 	}
 	assistantFound := false
 	for _, message := range messages.Items {
-		if message.Role == biz.MessageAssistant && strings.Contains(message.Content, "计划执行完成") {
+		// 汇总器成功时最终消息为模型汇总文本；失败回退时为“计划执行完成”拼接。
+		if message.Role == biz.MessageAssistant && (strings.Contains(message.Content, "汇总后的最终答案") || strings.Contains(message.Content, "计划执行完成")) {
 			assistantFound = true
 		}
 	}

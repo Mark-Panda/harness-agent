@@ -354,7 +354,7 @@ func (s *FeishuIngestService) WithBotVerification(credentials FeishuBotCredentia
 
 // Handle 校验并持久化事件，成功后仅入队异步任务，不在请求内调用模型。
 func (s *FeishuIngestService) Handle(ctx context.Context, request feishu.Request) (FeishuIngestResult, error) {
-	return s.handleWithVerifier(ctx, s.verifier, request)
+	return s.handleWithVerifier(ctx, s.verifier, "", request)
 }
 
 // HandleForBot 使用管理员登记的机器人应用凭据验签并处理回调。
@@ -391,7 +391,9 @@ func (s *FeishuIngestService) HandleForBot(ctx context.Context, botID uuid.UUID,
 	if err != nil {
 		return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot verifier is invalid", ErrInvalidConfig)
 	}
-	return s.handleWithVerifier(ctx, verifier, request)
+	// 回调路由按 botID 选择凭据，事件头中的 app_id 必须与该机器人登记的应用一致，
+	// 防止把其他应用的事件投递到本机器人并触发其绑定的助手。
+	return s.handleWithVerifier(ctx, verifier, bot.AppID, request)
 }
 
 // AcceptTrusted 接收已由飞书长连接认证的事件载荷；连接本身由应用凭据建立，因此跳过 HTTP 签名与 Token 校验。
@@ -442,16 +444,16 @@ func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feis
 	return FeishuIngestResult{Accepted: true}, nil
 }
 
-// handle 执行验签、解密、幂等入库与任务入队。
-func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
+// handleWithVerifier 在验签器就绪后进入统一处理流程，并携带期望的应用 ID。
+func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, request feishu.Request) (FeishuIngestResult, error) {
 	if verifier == nil {
 		return FeishuIngestResult{}, fmt.Errorf("%w: feishu verifier is not configured", ErrInvalidConfig)
 	}
-	return s.handle(ctx, verifier, request)
+	return s.handle(ctx, verifier, expectedAppID, request)
 }
 
-// handle 使用指定验签器处理请求。
-func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verifier, request feishu.Request) (FeishuIngestResult, error) {
+// handle 执行验签、解密、幂等入库与任务入队。
+func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, request feishu.Request) (FeishuIngestResult, error) {
 	if len(request.Body) == 0 {
 		return FeishuIngestResult{}, invalid("feishu event body is empty")
 	}
@@ -465,6 +467,10 @@ func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verif
 	envelope, err := feishu.DecodeEnvelope(plaintext)
 	if err != nil {
 		return FeishuIngestResult{}, err
+	}
+	// URL 验证请求没有业务头 app_id，只在事件自带 app_id 时做一致性校验。
+	if expectedAppID != "" && strings.TrimSpace(envelope.Header.AppID) != "" && envelope.Header.AppID != expectedAppID {
+		return FeishuIngestResult{}, invalid("feishu event app id mismatch")
 	}
 	// URL 验证请求必须在验签后校验 Verification Token，再原样返回 challenge。
 	if envelope.IsURLVerification() {

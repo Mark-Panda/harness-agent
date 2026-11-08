@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -519,7 +520,16 @@ func (w *FactExtractionWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止事实提取协程：记录堆栈后继续处理下一个任务。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("fact worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim fact job failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -541,6 +551,14 @@ func (w *FactExtractionWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 加载来源消息、提取事实并按策略写入。
 func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
+	// 单次 panic 不得终止进程：记录堆栈并把任务退回重试，避免任务停留在租约中。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("fact extraction job panicked", "job_id", job.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			w.failJob(context.WithoutCancel(ctx), job, fmt.Errorf("fact extraction panicked: %v", recovered))
+		}
+	}()
 	task, err := decodeFactTask(job)
 	if err != nil {
 		w.logger.Error("invalid fact job payload", "job_id", job.ID, "error", err)

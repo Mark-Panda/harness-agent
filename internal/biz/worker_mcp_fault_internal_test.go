@@ -92,11 +92,44 @@ func TestPrepareMCPToolsFailsClosedOnSlowOrUnavailableServer(t *testing.T) {
 				},
 			}
 			run := mcpRunWithSnapshot(test.record.ID.String())
-			registry := worker.prepareMCPTools(context.Background(), run)
+			registry, err := worker.prepareMCPTools(context.Background(), run, RunFence{})
+			if err != nil {
+				t.Fatalf("prepare MCP tools: %v", err)
+			}
 			if len(registry.List()) != 0 {
 				t.Fatalf("failed MCP must degrade to empty registry, got %d tools", len(registry.List()))
 			}
 		})
+	}
+}
+
+// capturingRunRepository 记录写入的 Run 事件，用于断言降级事件。
+type capturingRunRepository struct {
+	stubRunRepository
+	events []RunEvent
+}
+
+func (r *capturingRunRepository) AppendEventFenced(_ context.Context, event RunEvent, _ RunFence) (RunEvent, error) {
+	r.events = append(r.events, event)
+	return event, nil
+}
+
+// TestPrepareMCPToolsEmitsDegradationEvent 验证工具发现失败会写入显式降级事件。
+func TestPrepareMCPToolsEmitsDegradationEvent(t *testing.T) {
+	runs := &capturingRunRepository{}
+	worker := &ExecutionWorker{
+		mcps:      faultMCPRepository{err: context.DeadlineExceeded},
+		runs:      runs,
+		logger:    slog.Default(),
+		config:    WorkerConfig{MCPTimeout: time.Second}.normalize(),
+		mcpClient: func(string, http.Header, time.Duration, bool) (*mcp.Client, error) { return nil, nil },
+	}
+	run := mcpRunWithSnapshot(uuid.NewString())
+	if _, err := worker.prepareMCPTools(context.Background(), run, RunFence{Owner: "worker", Token: 1}); err != nil {
+		t.Fatalf("prepare MCP tools: %v", err)
+	}
+	if len(runs.events) != 1 || runs.events[0].EventType != "tool.discovery.degraded" {
+		t.Fatalf("degradation events = %#v", runs.events)
 	}
 }
 
@@ -109,7 +142,11 @@ func TestPrepareMCPToolsSkipsCredentialReadFailure(t *testing.T) {
 		mcpClient: func(string, http.Header, time.Duration, bool) (*mcp.Client, error) { return nil, nil },
 	}
 	run := mcpRunWithSnapshot(uuid.NewString())
-	if tools := worker.prepareMCPTools(context.Background(), run).List(); len(tools) != 0 {
+	registry, err := worker.prepareMCPTools(context.Background(), run, RunFence{})
+	if err != nil {
+		t.Fatalf("prepare MCP tools: %v", err)
+	}
+	if tools := registry.List(); len(tools) != 0 {
 		t.Fatalf("credential failure must not expose tools: %d", len(tools))
 	}
 }

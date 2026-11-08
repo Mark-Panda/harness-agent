@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mark-Panda/harness-agent/internal/platform/observability"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/einoext"
@@ -130,6 +131,9 @@ type WorkerConfig struct {
 	MCPAllowPrivateNetwork bool
 	// ApprovalPoll 等待人工审批时的任务轮询间隔，默认 5 秒。
 	ApprovalPoll time.Duration
+	// ApprovalTimeout 人工审批等待的独立超时，默认 24 小时。
+	// 审批等待不计入 Run 的执行时长预算，但必须有上界，否则无人处理的审批会让会话永久不可用。
+	ApprovalTimeout time.Duration
 	// PromptTokenBudget 单次模型请求的上下文 Token 预算，零表示不裁剪。
 	PromptTokenBudget int
 	// ReserveOutputTokens 为模型输出预留的 Token 数，用于按候选模型窗口动态收窄 Prompt 预算。
@@ -195,6 +199,9 @@ func (c WorkerConfig) normalize() WorkerConfig {
 	}
 	if c.ApprovalPoll <= 0 {
 		c.ApprovalPoll = 5 * time.Second
+	}
+	if c.ApprovalTimeout <= 0 {
+		c.ApprovalTimeout = 24 * time.Hour
 	}
 	if c.PromptTokenBudget < 0 {
 		c.PromptTokenBudget = 0
@@ -478,8 +485,13 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 	}
 	run, err := w.runs.GetRun(ctx, userID, runID)
 	if err != nil {
-		// Run 已被删除或不存在时不重试，避免死信堆积。
-		_ = w.jobs.Complete(ctx, job.ID, w.config.WorkerID, job.FencingToken)
+		if errors.Is(err, ErrResourceNotFound) {
+			// Run 已被删除或不存在时不重试，避免死信堆积。
+			_ = w.jobs.Complete(ctx, job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
+		// 瞬时故障不能当作 Run 已删除：否则排队中的 Run 会永久失去可执行任务。
+		w.retryJob(ctx, job, w.clock().Add(w.config.PollInterval), "get run: "+err.Error())
 		return
 	}
 	// 终态与人工对账状态都不得继续自动执行；对账 Run 由人工处理后另行推进。
@@ -488,9 +500,26 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		return
 	}
 	if run.Status == RunWaitingApproval {
-		// 审批尚未完成时退回任务等待，不计入失败次数，避免长时间等待耗尽重试预算。
-		w.releaseJob(ctx, job, w.config.ApprovalPoll, "run is waiting for approval")
-		return
+		// 审批等待不消耗 Run 的执行时长预算：deadline_at 在暂停期间保持不变，
+		// 恢复时由 ResumeRun 按暂停时长整体顺延，因此这里只能按独立的审批超时回收。
+		// 否则默认 5 分钟的执行预算会让几乎所有人工审批在决策前就被判为超时。
+		if w.approvalWaitExpired(run) {
+			w.expireWaitingApprovalRun(ctx, job, run)
+			return
+		}
+		// 审批决策与 ResumeRun 是两次独立写入：进程崩溃或瞬时故障会留下“审批已全部决策
+		// 但 Run 仍停在 waiting_approval”的状态。不主动恢复只能等审批超时后失败。
+		resumed, err := w.resumeDecidedApprovalRun(ctx, run)
+		if err != nil {
+			w.retryJob(ctx, job, w.clock().Add(w.config.PollInterval), "resume decided approval run: "+err.Error())
+			return
+		}
+		if !resumed {
+			// 审批尚未完成时退回任务等待，不计入失败次数，避免长时间等待耗尽重试预算。
+			w.releaseJob(ctx, job, w.config.ApprovalPoll, "run is waiting for approval")
+			return
+		}
+		// 已恢复执行：继续走认领流程，立即占用会话而不是再等一个轮询周期。
 	}
 
 	claimed, fence, err := w.runs.ClaimRun(ctx, userID, runID, w.config.WorkerID, w.config.Lease, w.clock())
@@ -522,8 +551,15 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		defer cancel()
 	}
 	if run.DeadlineAt != nil && !run.DeadlineAt.After(w.clock()) {
-		w.failRun(execCtx, run, fence, "run_deadline_exceeded", "run deadline has passed")
-		_ = w.jobs.Complete(ctx, job.ID, w.config.WorkerID, job.FencingToken)
+		// execCtx 在此刻已经因 deadline 到期而 Done，用它写终态必然失败，
+		// 必须剥离取消与截止时间后落库，否则 Run 会永久停留在 running。
+		failCtx := context.WithoutCancel(ctx)
+		if err := w.failRun(failCtx, run, fence, "run_deadline_exceeded", "run deadline has passed"); err != nil {
+			// 终态写入失败时任务必须回到队列重试，不能完成任务后让 running Run 永久无任务可执行。
+			w.retryJob(failCtx, job, w.clock().Add(backoffDelay(job.Attempts)), "fail deadline run: "+err.Error())
+			return
+		}
+		_ = w.jobs.Complete(failCtx, job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
 
@@ -531,7 +567,13 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		ticker := time.NewTicker(w.config.CancelPoll)
+		// 同一个 ticker 同时承担取消轮询与租约续约：续约间隔必须不慢于 Heartbeat，
+		// 否则 cancel_poll 被调大后租约会在两次续约之间过期，其他 Worker 可重复认领同一 Run。
+		renewInterval := w.config.CancelPoll
+		if w.config.Heartbeat > 0 && w.config.Heartbeat < renewInterval {
+			renewInterval = w.config.Heartbeat
+		}
+		ticker := time.NewTicker(renewInterval)
 		deferredCancel := 0
 		defer ticker.Stop()
 		for {
@@ -573,7 +615,7 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		}
 	}()
 
-	result, executionErr := w.execute(execCtx, run, fence)
+	result, streamed, executionErr := w.execute(execCtx, run, fence)
 	// 先停止并等待心跳协程退出，再检查租约：心跳可能在 cancel 之后才写入 leaseLost，
 	// 提前检查会漏判丢租约并错误提交终态。
 	cancel()
@@ -595,22 +637,40 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		}
 		// 审批门禁拦截：暂停 Run 并退回任务等待人工决策，不产生失败终态。
 		if errors.Is(executionErr, react.ErrApprovalRequired) || errors.Is(executionErr, ErrApprovalPending) {
+			w.emitApprovalRequired(ctx, run, fence, executionErr)
 			w.pauseForApproval(ctx, run, fence)
 			w.releaseJob(ctx, job, w.config.ApprovalPoll, "run is waiting for approval")
 			return
 		}
 		// 审批已进入执行态但结果未知：转入人工对账，禁止自动重试可能的副作用。
 		if errors.Is(executionErr, ErrApprovalExecutionUnknown) {
-			w.reconcileUnknownApproval(ctx, run, fence, executionErr)
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			failureClass = "approval_execution_unknown"
+			if err := w.reconcileRun(ctx, run, fence, "tool_execution_unknown", executionErr); err != nil {
+				// 对账状态未落库时完成任务会让 Run 永久停在 running，必须退回复试。
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "mark reconciliation required: "+err.Error())
+				return
+			}
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			return
 		}
 		// 工具副作用已执行但结果落库失败：同样禁止自动重试，交给人工对账。
 		if errors.Is(executionErr, ErrToolResultPersistence) {
-			w.reconcileUnknownApproval(ctx, run, fence, executionErr)
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			failureClass = "tool_result_persist_failed"
+			if err := w.reconcileRun(ctx, run, fence, "tool_execution_unknown", executionErr); err != nil {
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "mark reconciliation required: "+err.Error())
+				return
+			}
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
+		// 子任务结果写库失败时任务状态未知，同样只能人工对账，不能当作已完成继续汇总。
+		if errors.Is(executionErr, ErrSupervisorTaskSettlement) {
+			failureClass = "supervisor_task_settlement_failed"
+			if err := w.reconcileRun(ctx, run, fence, "supervisor_task_settlement_failed", executionErr); err != nil {
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "mark reconciliation required: "+err.Error())
+				return
+			}
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			return
 		}
 		if errors.Is(executionErr, context.Canceled) || errors.Is(executionErr, context.DeadlineExceeded) {
@@ -624,13 +684,32 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		code, message := failureDetails(executionErr)
 		failureClass = code
 		if errors.Is(executionErr, ErrNoUserMessage) || errors.Is(executionErr, ErrTriggerMessageMissing) || errors.Is(executionErr, ErrInvalidRunSnapshot) || isBusinessFailure(executionErr) {
-			w.failRun(context.WithoutCancel(ctx), run, fence, code, message)
+			if err := w.failRun(context.WithoutCancel(ctx), run, fence, code, message); err != nil {
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "fail run: "+err.Error())
+				return
+			}
 			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
+		// 已向外推送过流式增量的执行不能整轮重试：重放会再次产生同名 step 的 delta，
+		// 前端会出现重复文本。此时直接以失败终态收敛，保留已有的部分输出事件。
+		if streamed {
+			if err := w.failRun(context.WithoutCancel(ctx), run, fence, "execution_aborted", message); err != nil {
+				// 这里同样不能让任务完成：失败终态未落库时 Run 仍需重试收敛，
+				// 即使重放产生重复增量，也好过 Run 永久停留在 running。
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "fail streamed run: "+err.Error())
+				return
+			}
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			failureClass = "streamed_failure_no_retry"
 			return
 		}
 		// 基础设施失败：预算内退避重试；最后一次仍失败时明确终止 Run，避免永久卡住。
 		if job.Attempts >= job.MaxAttempts {
-			w.failRun(context.WithoutCancel(ctx), run, fence, "execution_aborted", message)
+			if err := w.failRun(context.WithoutCancel(ctx), run, fence, "execution_aborted", message); err != nil {
+				w.retryJob(ctx, job, w.clock().Add(backoffDelay(job.Attempts)), "fail run: "+err.Error())
+				return
+			}
 			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 			return
 		}
@@ -648,7 +727,7 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		payload["message_id"] = result.FinalMessageID
 	} else if len(result.Messages) > 0 {
 		index := len(result.Messages) - 1
-		payload["message_id"] = deterministicMessageID(run.ID, index).String()
+		payload["message_id"] = deterministicRunMessageID(run, index).String()
 	}
 	if _, err := w.runs.FinishRunWithEvent(context.WithoutCancel(ctx), run.UserID, run.ID, RunRunning, RunCompleted, nil,
 		RunEvent{RunID: run.ID, UserID: run.UserID, EventType: "run.completed", Payload: payload}, fence, w.clock()); err != nil {
@@ -847,13 +926,9 @@ func truncateTextByTokens(text string, budget int) string {
 }
 
 // promptBudgetFor 返回本次 Run 实际可用的 Prompt 预算：
-// 取配置上限与「候选模型最小窗口 - 输出预留 - 安全余量」中的较小值；
-// 候选未声明窗口时保留配置值。
-func (w *ExecutionWorker) promptBudgetFor(candidates []model.Candidate) int {
-	budget := w.config.PromptTokenBudget
-	if budget <= 0 || len(candidates) == 0 {
-		return budget
-	}
+// 取配置上限与「候选模型最小窗口 - 输出预留 - 安全余量 - 工具定义」中的较小值；
+// 工具定义会随每次请求发送，必须计入上下文预算，否则裁剪后的消息加工具会超出窗口。
+func (w *ExecutionWorker) promptBudgetFor(candidates []model.Candidate, toolTokens int) int {
 	var minWindow int64
 	for _, candidate := range candidates {
 		window := candidate.Ref.ContextWindowTokens
@@ -864,7 +939,27 @@ func (w *ExecutionWorker) promptBudgetFor(candidates []model.Candidate) int {
 			minWindow = window
 		}
 	}
-	if minWindow == 0 {
+	return w.promptBudgetWithWindow(minWindow, toolTokens)
+}
+
+// promptBudgetForRouter 按路由候选集计算预算，供无法直接访问候选列表的步骤复用。
+func (w *ExecutionWorker) promptBudgetForRouter(router *model.Router, toolTokens int) int {
+	if router == nil {
+		return w.promptBudgetWithWindow(0, toolTokens)
+	}
+	return w.promptBudgetWithWindow(router.MinContextWindow(), toolTokens)
+}
+
+// promptBudgetWithWindow 结合模型窗口与工具定义开销计算最终 Prompt 预算。
+func (w *ExecutionWorker) promptBudgetWithWindow(minWindow int64, toolTokens int) int {
+	budget := w.config.PromptTokenBudget
+	if budget <= 0 {
+		return budget
+	}
+	if toolTokens > 0 && toolTokens < budget {
+		budget -= toolTokens
+	}
+	if minWindow <= 0 {
 		return budget
 	}
 	available := int(minWindow) - w.config.ReserveOutputTokens - w.config.SafetyMarginTokens
@@ -1028,21 +1123,59 @@ func truncateRunes(text string, maximum int) string {
 	return string(runes[:maximum]) + "…"
 }
 
-// listAllRunEvents 分页读取 Run 的全部事件，供完成恢复与用量恢复使用。
-func (w *ExecutionWorker) listAllRunEvents(ctx context.Context, run Run) ([]RunEvent, error) {
+// runEventTypeLister 是事件仓储的可选能力：按事件类型过滤读取，
+// 避免恢复路径把海量流式增量事件读入内存。
+type runEventTypeLister interface {
+	ListEventsByTypes(ctx context.Context, userID, runID uuid.UUID, afterSeq int64, limit int, eventTypes []string) ([]RunEvent, error)
+}
+
+// listAllRunEvents 分页读取 Run 的事件；eventTypes 非空时只读取指定类型，
+// 仓储未实现过滤能力时退化为内存过滤，保持兼容。
+func (w *ExecutionWorker) listAllRunEvents(ctx context.Context, run Run, eventTypes ...string) ([]RunEvent, error) {
 	items := make([]RunEvent, 0, 256)
 	after := int64(0)
+	filtered, supportsFilter := w.runs.(runEventTypeLister)
 	for {
-		batch, err := w.runs.ListEvents(ctx, run.UserID, run.ID, after, 200)
+		var batch []RunEvent
+		var err error
+		if len(eventTypes) > 0 && supportsFilter {
+			batch, err = filtered.ListEventsByTypes(ctx, run.UserID, run.ID, after, 200, eventTypes)
+		} else {
+			batch, err = w.runs.ListEvents(ctx, run.UserID, run.ID, after, 200)
+		}
 		if err != nil {
 			return nil, err
 		}
+		rawLen := len(batch)
+		lastSeq := after
+		if rawLen > 0 {
+			lastSeq = batch[rawLen-1].Seq
+		}
+		if len(eventTypes) > 0 && !supportsFilter {
+			batch = filterRunEventTypes(batch, eventTypes)
+		}
 		items = append(items, batch...)
-		if len(batch) < 200 {
+		if rawLen < 200 {
 			return items, nil
 		}
-		after = batch[len(batch)-1].Seq
+		// 分页游标必须使用原始批次的最后序号，避免过滤后事件变少导致重复读取。
+		after = lastSeq
 	}
+}
+
+// filterRunEventTypes 保留指定类型的事件，用于未实现仓储过滤时的兼容路径。
+func filterRunEventTypes(events []RunEvent, eventTypes []string) []RunEvent {
+	allowed := make(map[string]struct{}, len(eventTypes))
+	for _, eventType := range eventTypes {
+		allowed[eventType] = struct{}{}
+	}
+	filtered := make([]RunEvent, 0, len(events))
+	for _, event := range events {
+		if _, ok := allowed[event.EventType]; ok {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
 }
 
 // eventNumber 兼容事件载荷中的 int、int64 与 JSON float64 数字。
@@ -1069,7 +1202,7 @@ func (w *ExecutionWorker) recoverReactResult(ctx context.Context, run Run, messa
 	if last.Role != react.RoleAssistant || len(last.ToolCalls) > 0 || last.ID == "" || last.RunID != run.ID.String() || strings.TrimSpace(last.Content) == "" {
 		return react.Result{}, false, nil
 	}
-	events, err := w.listAllRunEvents(ctx, run)
+	events, err := w.listAllRunEvents(ctx, run, "step.completed", "message.truncated", "model.attempt.completed")
 	if err != nil {
 		return react.Result{}, false, err
 	}
@@ -1122,30 +1255,130 @@ func (w *ExecutionWorker) recoverReactResult(ctx context.Context, run Run, messa
 	}, true, nil
 }
 
+// runEventSink 记录事件落库的首个错误，并在失败时取消执行上下文，
+// 避免落库失败后继续产生副作用与丢事件。
+type runEventSink struct {
+	mu       sync.Mutex
+	err      error
+	streamed bool
+	cancel   context.CancelCauseFunc
+	flush    func()
+}
+
+// MarkStreamed 记录本次执行是否已向用户推送流式增量。
+// 已推送的执行不能整轮重试，否则事件流会再次出现同名 step 的 delta。
+func (s *runEventSink) MarkStreamed() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.streamed = true
+	s.mu.Unlock()
+}
+
+// Streamed 返回是否已经推送过流式增量。
+func (s *runEventSink) Streamed() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamed
+}
+
+// Fail 记录首个落库错误并取消执行；后续错误不再覆盖首个根因。
+func (s *runEventSink) Fail(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+		if s.cancel != nil {
+			s.cancel(err)
+		}
+	}
+	s.mu.Unlock()
+}
+
+// Err 返回首个落库错误；没有失败时返回 nil。
+func (s *runEventSink) Err() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// SetFlush 注册增量缓冲刷新函数，执行结束时必须调用 Flush 收尾。
+func (s *runEventSink) SetFlush(flush func()) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.flush = flush
+	s.mu.Unlock()
+}
+
+// Flush 刷出尚未落库的增量事件。
+func (s *runEventSink) Flush() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	flush := s.flush
+	s.mu.Unlock()
+	if flush != nil {
+		flush()
+	}
+}
+
+// streamSinkKey 用 Context 传递流式状态记录器，避免在 Supervisor 调用链上层层增加参数。
+type streamSinkKey struct{}
+
+// withStreamSink 把流式状态记录器注入上下文；执行链路内的增量事件据此标记已推流。
+func withStreamSink(ctx context.Context, sink *runEventSink) context.Context {
+	return context.WithValue(ctx, streamSinkKey{}, sink)
+}
+
+// markStreamedFromContext 标记当前执行已推送过流式增量。
+func markStreamedFromContext(ctx context.Context) {
+	if sink, ok := ctx.Value(streamSinkKey{}).(*runEventSink); ok {
+		sink.MarkStreamed()
+	}
+}
+
 // execute 构建上下文与路由模型并运行 ReAct 循环，事件通过栅栏写入 run_events。
-func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) (react.Result, error) {
+func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) (react.Result, bool, error) {
+	// 事件落库失败会取消该上下文，让 Runner 立即停止而不是继续产生副作用。
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
 	// 先加载 MCP 工具：恢复审批结果时需要执行已批准的工具。
-	tools := w.prepareMCPTools(ctx, run)
+	tools, err := w.prepareMCPTools(ctx, run, fence)
+	if err != nil {
+		return react.Result{}, false, err
+	}
 	// 审批恢复必须在组装上下文之前完成，确保结果已落库为 tool 消息。
 	if err := w.resumeApprovals(ctx, run, fence, tools); err != nil {
-		return react.Result{}, err
+		return react.Result{}, false, err
 	}
 	messages, err := w.buildMessages(ctx, run, fence)
 	if err != nil {
-		return react.Result{}, err
+		return react.Result{}, false, err
 	}
 	if run.Mode == AgentModeReact {
 		recovered, ok, recoverErr := w.recoverReactResult(ctx, run, messages)
 		if recoverErr != nil {
-			return react.Result{}, recoverErr
+			return react.Result{}, false, recoverErr
 		}
 		if ok {
-			return recovered, nil
+			return recovered, false, nil
 		}
 	}
 	candidates, policyVersion, err := w.buildCandidates(ctx, run)
 	if err != nil {
-		return react.Result{}, err
+		return react.Result{}, false, err
 	}
 	observer := &runAttemptObserver{
 		worker: w, run: run, fence: fence, policyVersion: policyVersion,
@@ -1159,25 +1392,41 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 		MaxBackoff: w.config.Routing.MaxBackoff, MaxRetryAfter: w.config.Routing.MaxRetryAfter,
 		Temperature: w.config.Routing.Temperature,
 	}
-	// Plan 模式一次 Run 会执行多个步骤；尝试与切换预算按最大步骤数放大，
-	// 否则默认 6 次尝试会提前阻断多步骤计划。步骤级重试仍受 MaxAttemptsPerModel 限制。
+	// Plan 模式一次 Run 会执行多个步骤，且每个步骤最多发起 planStepMaxModelCalls 次模型调用；
+	// 计划执行复用同一个 Router，attempt 预算必须按「步骤数 × 每步调用数」放大，
+	// 否则默认 6 次尝试会在长计划中途耗尽。步骤级重试仍受 MaxAttemptsPerModel 限制。
 	if run.Mode == AgentModePlan {
 		steps := DefaultPlanLimits().MaxSteps
-		routing.MaxAttemptsPerRun = routing.MaxAttemptsPerModel*steps + routing.MaxSwitchesPerRun*steps
-		routing.MaxSwitchesPerRun = routing.MaxSwitchesPerRun * steps
+		callsPerStep := planStepMaxModelCalls
+		// 先补齐路由默认值，避免配置未显式设置时公式把预算算成零。
+		attemptsPerModel := routing.MaxAttemptsPerModel
+		if attemptsPerModel <= 0 {
+			attemptsPerModel = 2
+		}
+		switchesPerRun := routing.MaxSwitchesPerRun
+		if switchesPerRun <= 0 {
+			switchesPerRun = 2
+		}
+		routing.MaxAttemptsPerRun = attemptsPerModel*(steps*callsPerStep+planPlannerMaxModelCalls) +
+			switchesPerRun*(steps+planPlannerMaxModelCalls)
+		routing.MaxSwitchesPerRun = switchesPerRun * (steps + planPlannerMaxModelCalls)
 	}
 	router, err := model.NewRouter(candidates, w.health, routing, observer)
 	if err != nil {
-		return react.Result{}, fmt.Errorf("%w: %v", ErrInvalidRunSnapshot, err)
+		return react.Result{}, false, fmt.Errorf("%w: %v", ErrInvalidRunSnapshot, err)
 	}
 	if run.Mode == AgentModePlan {
-		return w.executePlan(ctx, run, fence, router, messages, tools)
+		result, streamed, err := w.executePlan(ctx, run, fence, router, messages, tools)
+		return result, streamed, err
 	}
 	if run.Mode == AgentModeSupervisor {
-		return w.executeSupervisor(ctx, run, fence, candidates, policyVersion, messages, tools)
+		// Supervisor 的增量由各 Worker 转发，用独立记录器跨图收集，节点出错时也不会丢失推流事实。
+		streamState := &runEventSink{}
+		result, err := w.executeSupervisor(withStreamSink(ctx, streamState), run, fence, candidates, policyVersion, messages, tools)
+		return result, streamState.Streamed(), err
 	}
 	if run.Mode != AgentModeReact {
-		return react.Result{}, fmt.Errorf("%w: run mode %s is not implemented", ErrInvalidConfig, run.Mode)
+		return react.Result{}, false, fmt.Errorf("%w: run mode %s is not implemented", ErrInvalidConfig, run.Mode)
 	}
 	limits := react.DefaultLimits()
 	limits.MaxSteps = w.config.ReactMaxSteps
@@ -1186,40 +1435,50 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	limits.MaxCost = w.config.ReactMaxCost
 	// 为 Runner 包装观测与审批门禁；高风险工具在模型侧可见，但调用前必须人工批准。
 	registry := w.runnerRegistry(tools, run)
-	var appendErr error
+	sinkState := &runEventSink{cancel: stop}
 	emitter := &einoWorkerEmitter{
-		sink: w.runSink(ctx, run, fence, &appendErr), runID: run.ID, initialMessageIndex: len(messages),
+		sink: w.runSink(ctx, run, fence, sinkState), runID: run.ID, attemptNo: run.AttemptNo,
+		initialMessageIndex: len(messages),
 	}
 	agent, agentErr := einoext.NewReactAgent(ctx, einoext.ReactConfig{
 		Router: router, Registry: registry, Emitter: emitter,
 		MaxSteps: limits.MaxSteps, MaxTotalTokens: limits.MaxTotalTokens, MaxCost: limits.MaxCost,
 		LoopThreshold: limits.DuplicateToolThreshold,
-		ContextBudget: w.promptBudgetFor(candidates), Trim: trimRunnerContext,
+		ContextBudget: w.promptBudgetFor(candidates, int(model.EstimateToolTokens(registry.List()))), Trim: trimRunnerContext,
 	})
 	if agentErr != nil {
-		return react.Result{}, agentErr
+		return react.Result{}, false, agentErr
 	}
 	result, runErr := agent.Run(ctx, messages)
-	if appendErr != nil {
-		return result, fmt.Errorf("persist run event: %w", appendErr)
+	sinkState.Flush()
+	if sinkErr := sinkState.Err(); sinkErr != nil {
+		return result, sinkState.Streamed(), fmt.Errorf("persist run event: %w", sinkErr)
 	}
-	return result, runErr
+	return result, sinkState.Streamed(), runErr
 }
 
 // runSink 构造统一的事件落库与推送回调：中间消息先幂等落库，事件按栅栏写入。
-func (w *ExecutionWorker) runSink(ctx context.Context, run Run, fence RunFence, appendErr *error) react.EventSink {
-	return func(event react.StepEvent) {
-		if *appendErr != nil {
+// 流式增量按步骤与语义合并后再落库，避免每个 token 一次事务造成写放大。
+func (w *ExecutionWorker) runSink(ctx context.Context, run Run, fence RunFence, state *runEventSink) react.EventSink {
+	var (
+		deltaMu           sync.Mutex
+		deltaActive       bool
+		deltaStep         int
+		deltaFinal        bool
+		deltaContinuation bool
+		deltaText         strings.Builder
+	)
+	write := func(event react.StepEvent) {
+		if state.Err() != nil {
 			return
 		}
-		// run.completed 需要在最终消息落库后与终态同事务写入。
-		if event.Type == "run.completed" {
-			return
+		if event.Type == "message.delta" {
+			state.MarkStreamed()
 		}
 		// 中间消息先幂等落库再推送事件，确保 SSE 不出现无法回查的消息。
 		if event.Type == "message.created" {
 			if err := w.persistRunnerMessage(ctx, run, event.Payload); err != nil {
-				*appendErr = err
+				state.Fail(err)
 				return
 			}
 		}
@@ -1227,10 +1486,65 @@ func (w *ExecutionWorker) runSink(ctx context.Context, run Run, fence RunFence, 
 		if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
 			RunID: run.ID, UserID: run.UserID, EventType: event.Type, Payload: event.Payload,
 		}, fence); err != nil {
-			*appendErr = err
+			state.Fail(err)
 		}
 	}
+	flush := func() {
+		deltaMu.Lock()
+		if !deltaActive {
+			deltaMu.Unlock()
+			return
+		}
+		payload := map[string]any{"step": deltaStep, "delta": deltaText.String()}
+		if deltaFinal {
+			payload["final"] = true
+		}
+		if deltaContinuation {
+			payload["continuation"] = true
+		}
+		deltaActive = false
+		deltaText.Reset()
+		deltaMu.Unlock()
+		write(react.StepEvent{Type: "message.delta", Payload: payload})
+	}
+	state.SetFlush(flush)
+	return func(event react.StepEvent) {
+		if state.Err() != nil {
+			return
+		}
+		// run.completed 需要在最终消息落库后与终态同事务写入。
+		if event.Type == "run.completed" {
+			return
+		}
+		if event.Type == "message.delta" {
+			step := int(eventNumber(event.Payload["step"]))
+			final, _ := event.Payload["final"].(bool)
+			continuation, _ := event.Payload["continuation"].(bool)
+			text, _ := event.Payload["delta"].(string)
+			deltaMu.Lock()
+			// 步骤或语义变化时先刷出旧缓冲，保证事件顺序与字段含义不混合。
+			if deltaActive && (deltaStep != step || deltaFinal != final || deltaContinuation != continuation) {
+				deltaMu.Unlock()
+				flush()
+				deltaMu.Lock()
+			}
+			deltaActive, deltaStep, deltaFinal, deltaContinuation = true, step, final, continuation
+			deltaText.WriteString(text)
+			buffered := deltaText.Len()
+			deltaMu.Unlock()
+			if buffered >= deltaFlushBytes {
+				flush()
+			}
+			return
+		}
+		// 非增量事件前先刷出缓冲，保证 message.created 等事件顺序正确。
+		flush()
+		write(event)
+	}
 }
+
+// deltaFlushBytes 是流式增量的合并阈值：达到该字节数后落库一次，兼顾实时性与写放大。
+const deltaFlushBytes = 256
 
 // workerDeltaSink 转发指定 Worker 的执行事件并标注 worker，
 // 让主 Run 的 SSE 时间线能看到子 Agent 的轮次与工具调用；完整消息仍由子会话落库。
@@ -1239,6 +1553,9 @@ func (w *ExecutionWorker) workerDeltaSink(ctx context.Context, run Run, fence Ru
 		// 子会话消息由 Worker 完成后单独落库，这里只转发执行过程事件，避免消息重复。
 		if event.Type == "message.created" {
 			return
+		}
+		if event.Type == "message.delta" {
+			markStreamedFromContext(ctx)
 		}
 		payload := make(map[string]any, len(event.Payload)+1)
 		for key, value := range event.Payload {
@@ -1570,14 +1887,35 @@ func (w *ExecutionWorker) loadHistory(ctx context.Context, run Run) ([]Message, 
 			degraded = true
 		}
 	}
-	page, err := w.sessions.ListMessages(ctx, run.UserID, run.SessionID, w.config.HistoryLimit, "")
-	if err != nil {
-		return nil, degraded, err
+	// 分页读取直到满足 HistoryLimit：单页上限会把大于 100 的热窗口静默截断，
+	// 导致缓存命中与 PostgreSQL 重建看到不同长度的历史。
+	historyLimit := w.config.HistoryLimit
+	if historyLimit <= 0 {
+		historyLimit = w.config.normalize().HistoryLimit
 	}
-	// 仓储按时间倒序返回，执行器需要正序上下文。
-	history := make([]Message, 0, len(page.Items))
-	for i := len(page.Items) - 1; i >= 0; i-- {
-		history = append(history, page.Items[i])
+	var pages []Page[Message]
+	fetched, cursor := 0, ""
+	nextCursor := ""
+	for fetched < historyLimit {
+		page, err := w.sessions.ListMessages(ctx, run.UserID, run.SessionID, historyLimit-fetched, cursor)
+		if err != nil {
+			return nil, degraded, err
+		}
+		pages = append(pages, page)
+		fetched += len(page.Items)
+		if len(page.Items) == 0 || page.NextCursor == "" {
+			nextCursor = ""
+			break
+		}
+		cursor = page.NextCursor
+		nextCursor = cursor
+	}
+	// 仓储按时间倒序返回；从最旧一页开始逐页倒序拼接，得到正序上下文。
+	history := make([]Message, 0, fetched)
+	for i := len(pages) - 1; i >= 0; i-- {
+		for j := len(pages[i].Items) - 1; j >= 0; j-- {
+			history = append(history, pages[i].Items[j])
+		}
 	}
 	if w.hotMessages != nil {
 		if err := w.hotMessages.Save(ctx, run.UserID, run.SessionID, history); err != nil {
@@ -1586,7 +1924,7 @@ func (w *ExecutionWorker) loadHistory(ctx context.Context, run Run) ([]Message, 
 		}
 	}
 	if run.TriggerMessageID != nil && !historyContainsMessage(history, *run.TriggerMessageID) {
-		recovered, recoverErr := w.loadHistoryAtTrigger(ctx, run, history, page.NextCursor)
+		recovered, recoverErr := w.loadHistoryAtTrigger(ctx, run, history, nextCursor)
 		return recovered, degraded, recoverErr
 	}
 	return history, degraded, nil
@@ -1855,13 +2193,15 @@ func (w *ExecutionWorker) persistRunnerMessageRecord(ctx context.Context, run Ru
 	toolCallID, _ := payload["tool_call_id"].(string)
 	name, _ := payload["name"].(string)
 	toolCalls := payloadToolCalls(payload["tool_calls"])
-	messageID := deterministicMessageID(run.ID, index)
+	messageID := deterministicRunMessageID(run, index)
+	explicitMessageID := false
 	if rawID, _ := payload["message_id"].(string); rawID != "" {
 		parsed, err := uuid.Parse(rawID)
 		if err != nil {
 			return Message{}, fmt.Errorf("message event has an invalid message_id: %w", err)
 		}
 		messageID = parsed
+		explicitMessageID = true
 	}
 	message := Message{
 		ID: messageID, SessionID: run.SessionID, UserID: run.UserID,
@@ -1876,6 +2216,12 @@ func (w *ExecutionWorker) persistRunnerMessageRecord(ctx context.Context, run Ru
 	stored, err := w.sessions.AppendMessageIdempotent(context.WithoutCancel(ctx), message, event)
 	if err != nil {
 		return Message{}, err
+	}
+	// 隐式 ID 命中已有消息但内容不一致，说明 Run 级序号发生碰撞；
+	// 必须显式失败而不是静默保留旧内容。显式 message_id 由调用方定义幂等语义，保持原样。
+	if !explicitMessageID && stored.ID == message.ID && (stored.Role != message.Role || stored.Content != message.Content ||
+		stored.ToolCallID != message.ToolCallID || stored.ToolName != message.ToolName) {
+		return Message{}, fmt.Errorf("message %s already exists with different content", message.ID)
 	}
 	// 使用数据库落盘后的消息回放缓存，避免零值 CreatedAt 破坏触发边界的时间裁剪。
 	w.appendHotMessage(context.WithoutCancel(ctx), run, stored)
@@ -1894,8 +2240,20 @@ func (w *ExecutionWorker) appendHotMessage(ctx context.Context, run Run, message
 }
 
 // deterministicMessageID 生成 Run 内确定性的消息 ID，支持 Worker 重试幂等写入。
-func deterministicMessageID(runID uuid.UUID, index int) uuid.UUID {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("run:%s:message:%d", runID, index)))
+func deterministicMessageID(namespace uuid.UUID, index int) uuid.UUID {
+	return deterministicMessageIDForAttempt(namespace, 0, index)
+}
+
+// deterministicMessageIDForAttempt 在确定性消息 ID 中加入 Attempt 维度。
+// ReAct 上下文会按 Token 预算裁剪，但裁剪后的 prompt 长度在重试时可能回退，
+// 仅用 index 会造成跨 Attempt 的 ID 复用并被幂等写入静默保留旧内容。
+func deterministicMessageIDForAttempt(namespace uuid.UUID, attempt, index int) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("run:%s:attempt:%d:message:%d", namespace, attempt, index)))
+}
+
+// deterministicRunMessageID 返回当前 Run 当前 Attempt 的消息 ID。
+func deterministicRunMessageID(run Run, index int) uuid.UUID {
+	return deterministicMessageIDForAttempt(run.ID, run.AttemptNo, index)
 }
 
 // payloadIndex 兼容事件载荷在进程内 int 与 JSON 反序列化后的 float64。
@@ -1932,8 +2290,18 @@ func payloadToolCalls(value any) []map[string]any {
 	return calls
 }
 
+// approvalWaitExpired 判断人工审批等待是否超过独立超时。
+// 等待起点取 PauseRun 写入的 updated_at：审批等待期间 Run 不再更新，因此该时间即暂停时刻。
+func (w *ExecutionWorker) approvalWaitExpired(run Run) bool {
+	if run.UpdatedAt.IsZero() {
+		return false
+	}
+	return !run.UpdatedAt.Add(w.config.ApprovalTimeout).After(w.clock())
+}
+
 // failRun 在栅栏有效时把 Run 推进到失败终态，并追加 run.failed 事件。
-func (w *ExecutionWorker) failRun(ctx context.Context, run Run, fence RunFence, code, message string) {
+// 返回错误表示终态未确认写入，调用方必须保留任务重试，不能直接完成任务。
+func (w *ExecutionWorker) failRun(ctx context.Context, run Run, fence RunFence, code, message string) error {
 	message = truncateUTF8Bytes(message, 512)
 	// 失败事件与失败终态同事务提交，避免出现只有事件或只有状态的半成品。
 	if _, err := w.runs.FinishRunWithEvent(ctx, run.UserID, run.ID, RunRunning, RunFailed, map[string]any{
@@ -1942,8 +2310,61 @@ func (w *ExecutionWorker) failRun(ctx context.Context, run Run, fence RunFence, 
 		RunID: run.ID, UserID: run.UserID, EventType: "run.failed",
 		Payload: map[string]any{"code": code, "message": message},
 	}, fence, w.clock()); err != nil {
+		// 并发下终态可能已由其他路径写入：确认后视为成功，避免无谓重试。
+		if errors.Is(err, ErrResourceConflict) {
+			if current, getErr := w.runs.GetRun(ctx, run.UserID, run.ID); getErr == nil && RunSettled(current.Status) {
+				return nil
+			}
+		}
 		w.logger.Error("mark run failed", "run_id", run.ID, "error", err)
-		return
+		return err
+	}
+	return nil
+}
+
+// expireWaitingApprovalRun 回收审批等待超过独立超时的任务：
+// 先拒绝仍未决策的审批，再把 Run 落为失败终态并完成任务，避免会话与任务队列被永久占用。
+func (w *ExecutionWorker) expireWaitingApprovalRun(ctx context.Context, job Job, run Run) {
+	// 此时执行上下文可能已随截止时间取消，回收动作必须脱离取消信号落库。
+	writeContext := context.WithoutCancel(ctx)
+	if w.approvals != nil {
+		approvals, err := w.approvals.ListApprovals(writeContext, run.UserID, run.ID)
+		if err != nil {
+			w.logger.Warn("list approvals for expired run failed", "run_id", run.ID, "error", err)
+		}
+		for _, approval := range approvals {
+			if approval.Status != ApprovalPending {
+				continue
+			}
+			// 系统以 Run 属主身份拒绝，避免审批中心继续对已超时的 Run 决策。
+			if _, err := w.approvals.DecideApproval(writeContext, run.UserID, approval.ID, ApprovalDecisionDeny, run.UserID, w.clock()); err != nil && !errors.Is(err, ErrResourceConflict) {
+				w.logger.Warn("deny approval for expired run failed", "run_id", run.ID, "approval_id", approval.ID, "error", err)
+			}
+		}
+	}
+	code, message := "approval_timeout", "approval wait exceeded the configured timeout"
+	_, err := w.runs.TransitionRun(writeContext, run.UserID, run.ID, RunWaitingApproval, RunFailed, map[string]any{
+		"error_code": code, "error_message": message, "finished_at": w.clock(),
+	})
+	switch {
+	case err == nil:
+		if _, err := w.runs.AppendEvent(writeContext, RunEvent{
+			RunID: run.ID, UserID: run.UserID, EventType: "run.failed",
+			Payload: map[string]any{"code": code, "message": message},
+		}); err != nil {
+			w.logger.Warn("append expired run failed event failed", "run_id", run.ID, "error", err)
+		}
+		if err := w.jobs.Complete(writeContext, job.ID, w.config.WorkerID, job.FencingToken); err != nil {
+			w.logger.Warn("complete expired approval job failed", "job_id", job.ID, "error", err)
+		}
+	case errors.Is(err, ErrResourceConflict):
+		// 并发下审批可能已把 Run 恢复为 running：此时任务不能完成，
+		// 否则 running 的 Run 会失去唯一的执行任务并永久停摆。
+		w.releaseJob(writeContext, job, w.config.PollInterval, "run left waiting_approval")
+	default:
+		// 终态写入瞬时失败：退回任务等待重试，不能完成任务后让 Run 永久停在 waiting_approval。
+		w.logger.Error("mark expired approval run failed", "run_id", run.ID, "error", err)
+		w.retryJob(writeContext, job, w.clock().Add(backoffDelay(job.Attempts)), "expire approval run: "+err.Error())
 	}
 }
 
@@ -2176,6 +2597,12 @@ func (o *runAttemptObserver) AttemptFinished(ctx context.Context, record model.A
 	if err != nil {
 		return err
 	}
+	// 指标只使用模式与状态标签，不包含用户、会话或 Run 维度，避免基数爆炸。
+	mode := string(o.run.Mode)
+	observability.Default().IncCounter("agent_llm_tokens_total", map[string]string{"agent_mode": mode, "type": "input"}, float64(record.InputTokens))
+	observability.Default().IncCounter("agent_llm_tokens_total", map[string]string{"agent_mode": mode, "type": "output"}, float64(record.OutputTokens))
+	observability.Default().ObserveDuration("agent_llm_request_duration_seconds",
+		map[string]string{"agent_mode": mode, "status": string(status)}, record.Duration.Seconds())
 	delete(o.callIDs, record.AttemptNo)
 	if o.worker.steps != nil {
 		if stepID, exists := o.stepIDs[record.AttemptNo]; exists {
@@ -2283,14 +2710,20 @@ func (o *runAttemptObserver) ModelSwitched(ctx context.Context, record model.Swi
 
 // prepareMCPTools 加载已发布 Agent 绑定的 MCP 工具。
 // 审批仓储可用时保留中高风险工具（执行前必须人工批准）；不可用时仅保留低风险工具，失败关闭。
-func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Registry {
+// 任何工具发现降级都会写入 tool.discovery.degraded 事件，避免模型在静默缺失工具时给出错误结论。
+func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run, fence RunFence) (react.Registry, error) {
 	if w.mcps == nil {
-		return emptyToolRegistry{}
+		return emptyToolRegistry{}, nil
 	}
 	entries := snapshotMCPs(run.ConfigSnapshot)
 	if len(entries) == 0 {
-		return emptyToolRegistry{}
+		return emptyToolRegistry{}, nil
 	}
+	degradations := make([]mcpDegradation, 0)
+	defer func() {
+		// 降级事件写入失败只记录告警，不阻断执行；工具集本身仍按失败关闭处理。
+		w.reportMCPDegradation(ctx, run, fence, degradations)
+	}()
 	servers := make([]mcp.Server, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Status != "enabled" {
@@ -2298,10 +2731,16 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 		}
 		mcpID, err := uuid.Parse(entry.ID)
 		if err != nil {
+			degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: "invalid_server_id"})
 			continue
 		}
 		live, credential, err := w.mcps.GetMCPCredential(ctx, mcpID)
-		if err != nil || live.Status != "enabled" {
+		if err != nil {
+			degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: sanitizeExecutionError(err)})
+			continue
+		}
+		if live.Status != "enabled" {
+			degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: "server_disabled"})
 			continue
 		}
 		// 风险等级属于平台安全控制，必须取实时目录值而不是发布快照；
@@ -2315,6 +2754,7 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 		}
 		if riskLevel != "low" && w.approvals == nil {
 			w.logger.Info("skip MCP server: approval repository unavailable", "mcp", entry.Name, "risk", riskLevel)
+			degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: "approval_repository_unavailable"})
 			continue
 		}
 		endpoint := entry.Endpoint
@@ -2326,6 +2766,7 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 			plaintext, err := w.opener.Open(credential.KeyVersion, credential.Encrypted)
 			if err != nil {
 				w.logger.Warn("decrypt MCP credential failed", "mcp", live.Name, "error", err)
+				degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: "credential_decrypt_failed"})
 				continue
 			}
 			secret = string(plaintext)
@@ -2358,6 +2799,7 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 			cancelDiscovery()
 			if cacheErr != nil {
 				w.logger.Warn("discover MCP tools failed", "mcp", live.Name, "error", cacheErr)
+				degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: sanitizeExecutionError(cacheErr)})
 				continue
 			}
 			client, tools, toolsKnown = cachedClient, cachedTools, true
@@ -2366,6 +2808,7 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 			client, clientErr = w.mcpClient(endpoint, headers, clientTimeout, w.config.MCPAllowPrivateNetwork)
 			if clientErr != nil {
 				w.logger.Warn("invalid MCP endpoint", "mcp", live.Name, "error", clientErr)
+				degradations = append(degradations, mcpDegradation{Name: entry.Name, Reason: sanitizeExecutionError(clientErr)})
 				continue
 			}
 		}
@@ -2379,16 +2822,46 @@ func (w *ExecutionWorker) prepareMCPTools(ctx context.Context, run Run) react.Re
 		})
 	}
 	if len(servers) == 0 {
-		return emptyToolRegistry{}
+		return emptyToolRegistry{}, nil
 	}
 	registry := mcp.NewRegistry(servers)
 	prepareContext, cancel := context.WithTimeout(ctx, w.config.MCPTimeout)
 	defer cancel()
 	if err := registry.Prepare(prepareContext); err != nil {
 		w.logger.Warn("prepare MCP tools failed", "run_id", run.ID, "error", err)
-		return emptyToolRegistry{}
+		degradations = append(degradations, mcpDegradation{Name: "", Reason: sanitizeExecutionError(err)})
+		return emptyToolRegistry{}, nil
 	}
-	return registry
+	return registry, nil
+}
+
+// mcpDegradation 记录单个 MCP 服务的工具发现降级原因。
+type mcpDegradation struct {
+	Name   string
+	Reason string
+}
+
+// reportMCPDegradation 把工具发现降级写入 Run 事件，让用户与执行树看到工具缺失而不是静默降级。
+func (w *ExecutionWorker) reportMCPDegradation(ctx context.Context, run Run, fence RunFence, degradations []mcpDegradation) {
+	if len(degradations) == 0 || w.runs == nil {
+		return
+	}
+	servers := make([]map[string]any, 0, len(degradations))
+	for _, item := range degradations {
+		servers = append(servers, map[string]any{"name": item.Name, "reason": item.Reason})
+	}
+	if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
+		RunID: run.ID, UserID: run.UserID, EventType: "tool.discovery.degraded",
+		Payload: map[string]any{
+			"servers": servers,
+			"message": "部分 MCP 工具发现失败或不可用，本轮执行将在缺少这些工具的情况下继续",
+		},
+	}, fence); err != nil {
+		// 事件写入失败不阻断执行，但必须可观测：静默丢失会让执行树显示工具齐全。
+		observability.Default().IncCounter("agent_event_append_failures_total",
+			map[string]string{"event_type": "tool.discovery.degraded"}, 1)
+		w.logger.Warn("append MCP discovery degradation event failed", "run_id", run.ID, "error", err)
+	}
 }
 
 // runnerRegistry 为 Runner 包装执行观测与审批门禁。
@@ -2432,6 +2905,26 @@ func (w *ExecutionWorker) releaseJob(ctx context.Context, job Job, delay time.Du
 	}
 }
 
+// emitApprovalRequired 在审批门禁拦截时广播 tool.approval.required 事件。
+// 前端执行树与审批中心依赖该事件提示等待人工审批；Eino 迁移后事件一度丢失，
+// 这里在统一的错误处理点按栅栏补发，覆盖 observedTool 与 approvalTool 两条链路。
+// 事件仅为通知，审批记录才是事实来源，写失败不影响暂停流程。
+func (w *ExecutionWorker) emitApprovalRequired(ctx context.Context, run Run, fence RunFence, executionErr error) {
+	var approvalErr *react.ApprovalRequiredError
+	if !errors.As(executionErr, &approvalErr) || w.runs == nil {
+		return
+	}
+	if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
+		RunID: run.ID, UserID: run.UserID, EventType: "tool.approval.required",
+		Payload: map[string]any{
+			"tool": approvalErr.ToolName, "tool_call_id": approvalErr.ToolCallID,
+			"approval_id": approvalErr.ApprovalID, "risk_level": approvalErr.RiskLevel,
+		},
+	}, fence); err != nil {
+		w.logger.Warn("append approval required event failed", "run_id", run.ID, "error", err)
+	}
+}
+
 // pauseForApproval 把 Run 推进到 waiting_approval，并在审批已全部决策时立即恢复。
 // 决策与暂停存在竞态：若暂停后发现没有待决策审批，立即恢复可避免 Run 永久卡住。
 func (w *ExecutionWorker) pauseForApproval(ctx context.Context, run Run, fence RunFence) {
@@ -2462,17 +2955,42 @@ func (w *ExecutionWorker) pauseForApproval(ctx context.Context, run Run, fence R
 	}
 }
 
-// reconcileUnknownApproval 把存在未知副作用的 Run 推进到人工对账状态。
-func (w *ExecutionWorker) reconcileUnknownApproval(ctx context.Context, run Run, fence RunFence, cause error) {
+// resumeDecidedApprovalRun 在审批已全部决策但 Run 仍停在 waiting_approval 时恢复执行。
+// 返回 true 表示 Run 已推进回 running，调用方应立即认领而不是继续等待。
+func (w *ExecutionWorker) resumeDecidedApprovalRun(ctx context.Context, run Run) (bool, error) {
+	if w.approvals == nil {
+		return false, nil
+	}
+	pending, err := w.approvals.CountPendingApprovals(ctx, run.UserID, run.ID)
+	if err != nil {
+		return false, err
+	}
+	if pending > 0 {
+		return false, nil
+	}
+	if _, err := w.runs.ResumeRun(ctx, run.UserID, run.ID, w.clock()); err != nil {
+		// 冲突表示其他实例或决策请求已经恢复，交给认领流程判定即可。
+		if errors.Is(err, ErrResourceConflict) {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// reconcileRun 把存在未知副作用的 Run 推进到人工对账状态。
+// 返回错误时调用方不得完成任务：否则 Run 会永久停在 running 且没有可执行任务。
+func (w *ExecutionWorker) reconcileRun(ctx context.Context, run Run, fence RunFence, code string, cause error) error {
 	message := "工具副作用结果未知，需人工对账"
 	if cause != nil {
 		message = sanitizeExecutionError(cause)
 	}
 	if _, err := w.runs.MarkRunReconciliationRequired(context.WithoutCancel(ctx), run.UserID, run.ID, fence,
-		"tool_execution_unknown", message, w.clock()); err != nil {
-		w.logger.Error("mark run reconciliation required failed", "run_id", run.ID, "error", err)
-		return
+		code, message, w.clock()); err != nil {
+		w.logger.Error("mark run reconciliation required failed", "run_id", run.ID, "code", code, "error", err)
+		return err
 	}
+	return nil
 }
 
 // resumeApprovals 在 ReAct 之前处理 Run 的审批事实：
@@ -2587,8 +3105,13 @@ func (w *ExecutionWorker) executeApprovedTool(ctx context.Context, run Run, fenc
 func (w *ExecutionWorker) deliverApprovalResult(ctx context.Context, run Run, fence RunFence, approval ToolApproval) error {
 	writeContext := context.WithoutCancel(ctx)
 	content := approvalDeliveryContent(approval)
+	// Supervisor 子任务发起的审批必须回填到子会话，否则模型无法在续跑时看到审批结果。
+	sessionID := run.SessionID
+	if approval.SessionID != uuid.Nil {
+		sessionID = approval.SessionID
+	}
 	message := Message{
-		ID: deterministicApprovalMessageID(run.ID, approval.ID), SessionID: run.SessionID, UserID: run.UserID,
+		ID: deterministicApprovalMessageID(run.ID, approval.ID), SessionID: sessionID, UserID: run.UserID,
 		Role: MessageTool, Content: content, ToolCallID: approval.ToolCallID, ToolName: approval.ToolName,
 		RunID: &run.ID,
 	}
@@ -2876,7 +3399,7 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		IdempotencyKey: stepIdempotencyKey, ParentStepID: parentStepFromContext(ctx), StartedAt: &startedAt,
 	})
 	if err != nil {
-		return nil, err
+		return nil, react.NewInfrastructureError("start_step", err)
 	}
 	argsText, truncated := truncatePayloadText(string(arguments), t.worker.config.MaxPayloadBytes)
 	_, payloadErr := t.worker.steps.SavePayload(writeContext, ExecutionPayload{
@@ -2887,7 +3410,7 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 			Status: StepFailed, ErrorCode: "payload_capture_failed", FinishedAt: t.worker.clock(),
 		})
-		return nil, payloadErr
+		return nil, react.NewInfrastructureError("save_tool_input", payloadErr)
 	}
 	// 中高风险工具在步骤与脱敏入参落库后创建审批，绝不直接执行。
 	if approvalRequired(t.inner.RiskLevel()) {
@@ -2915,7 +3438,7 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 			toolName = toolCall.Name
 		}
 		approval, err := t.worker.approvals.CreateApproval(writeContext, ToolApproval{
-			RunID: t.run.ID, StepID: &step.ID, UserID: t.run.UserID,
+			RunID: t.run.ID, StepID: &step.ID, SessionID: resolveApprovalSession(ctx, t.run), UserID: t.run.UserID,
 			ToolCallID: toolCall.ID, ToolName: toolName, Arguments: arguments,
 			RiskLevel: t.inner.RiskLevel(), Status: ApprovalPending,
 			IdempotencyKey: stepIdempotencyKey,
@@ -2924,19 +3447,36 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 				Status: StepFailed, ErrorCode: "approval_persist_failed", FinishedAt: t.worker.clock(),
 			})
-			return nil, err
+			return nil, react.NewInfrastructureError("create_approval", err)
 		}
 		if _, err := t.worker.steps.MarkStepWaitingApproval(writeContext, t.run.UserID, step.ID); err != nil {
 			// 步骤状态写入失败按基础设施故障处理，重试后由审批记录驱动暂停。
-			return nil, err
+			return nil, react.NewInfrastructureError("mark_step_waiting_approval", err)
 		}
 		return nil, &react.ApprovalRequiredError{
 			ApprovalID: approval.ID.String(), ToolCallID: toolCall.ID,
 			ToolName: toolName, RiskLevel: t.inner.RiskLevel(),
 		}
 	}
+	invokeStart := time.Now()
 	output, invokeErr := t.inner.Invoke(ctx, arguments)
+	// 工具耗时只按模式/工具/状态聚合，避免引入用户或 Run 维度。
+	toolMode := string(t.run.Mode)
 	if invokeErr != nil {
+		observability.Default().ObserveDuration("agent_tool_call_duration_seconds",
+			map[string]string{"agent_mode": toolMode, "tool": spec.Name, "status": "failed"}, time.Since(invokeStart).Seconds())
+	} else {
+		observability.Default().ObserveDuration("agent_tool_call_duration_seconds",
+			map[string]string{"agent_mode": toolMode, "tool": spec.Name, "status": "succeeded"}, time.Since(invokeStart).Seconds())
+	}
+	if invokeErr != nil {
+		// 父上下文取消与 MCP 传输故障属于基础设施问题，必须上抛而不是回填模型。
+		if infraErr := toolInfrastructureError(ctx, invokeErr); infraErr != nil {
+			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
+				Status: StepFailed, ErrorCode: "tool_infrastructure_failed", FinishedAt: t.worker.clock(),
+			})
+			return nil, infraErr
+		}
 		errorPayload := ExecutionPayload{
 			RunID: t.run.ID, UserID: t.run.UserID, StepID: &step.ID, Type: PayloadToolError,
 			CaptureMode: CaptureMetadataOnly, ContentJSON: map[string]any{"error": sanitizeExecutionError(invokeErr)},
@@ -2965,14 +3505,61 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 			Status: StepReconciliationRequired, ErrorCode: "tool_result_persist_failed", FinishedAt: t.worker.clock(),
 		})
-		return nil, fmt.Errorf("%w: %v", ErrToolResultPersistence, err)
+		return nil, fmt.Errorf("%w: %w", ErrToolResultPersistence,
+			react.NewInfrastructureError("save_tool_output", err))
 	}
 	if _, err := t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 		Status: StepCompleted, FinishedAt: t.worker.clock(),
 	}); err != nil {
-		return nil, err
+		return nil, react.NewInfrastructureError("finish_step", err)
 	}
 	return output, nil
+}
+
+// toolInfrastructureError 判断工具调用错误是否属于基础设施故障。
+// 父上下文取消与 MCP 传输/会话故障不能回填模型，否则模型会在错误状态下继续执行。
+func toolInfrastructureError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, react.ErrToolInfrastructure) || errors.Is(err, react.ErrApprovalRequired) {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		return react.NewInfrastructureError("tool_context", ctx.Err())
+	}
+	switch {
+	case errors.Is(err, mcp.ErrTransport), errors.Is(err, mcp.ErrSessionExpired),
+		errors.Is(err, mcp.ErrRPC), errors.Is(err, mcp.ErrInvalidEndpoint):
+		return react.NewInfrastructureError("mcp_transport", err)
+	}
+	return nil
+}
+
+// approvalSessionKey 在上下文中携带发起工具调用的会话。
+// Supervisor 子任务需要把审批结果回填到子会话，而不是主 Run 会话。
+type approvalSessionKey struct{}
+
+// withApprovalSession 在上下文中标记当前工具调用所属会话。
+func withApprovalSession(ctx context.Context, sessionID uuid.UUID) context.Context {
+	if sessionID == uuid.Nil {
+		return ctx
+	}
+	return context.WithValue(ctx, approvalSessionKey{}, sessionID)
+}
+
+// approvalSessionFrom 读取上下文中的审批归属会话。
+func approvalSessionFrom(ctx context.Context) uuid.UUID {
+	sessionID, _ := ctx.Value(approvalSessionKey{}).(uuid.UUID)
+	return sessionID
+}
+
+// resolveApprovalSession 返回审批应归属的会话，缺省回退到主 Run 会话。
+func resolveApprovalSession(ctx context.Context, run Run) uuid.UUID {
+	if sessionID := approvalSessionFrom(ctx); sessionID != uuid.Nil {
+		return sessionID
+	}
+	return run.SessionID
 }
 
 // approvalRegistry 在没有执行步骤仓储时提供最小审批门禁。
@@ -3020,7 +3607,7 @@ func (t approvalTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 		return nil, fmt.Errorf("%w: approval repository is unavailable", react.ErrApprovalRequired)
 	}
 	approval, err := t.worker.approvals.CreateApproval(ctx, ToolApproval{
-		RunID: t.run.ID, UserID: t.run.UserID, ToolCallID: call.ID, ToolName: call.Name,
+		RunID: t.run.ID, SessionID: resolveApprovalSession(ctx, t.run), UserID: t.run.UserID, ToolCallID: call.ID, ToolName: call.Name,
 		Arguments: arguments, RiskLevel: t.inner.RiskLevel(), Status: ApprovalPending,
 		IdempotencyKey: approvalIdempotencyKey(t.run.ID, call.ID),
 	})

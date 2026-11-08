@@ -36,7 +36,48 @@ var (
 	ErrToolResultTooLarge = errors.New("tool result too large")
 	// ErrApprovalRequired 工具调用被人工审批门禁拦截，Run 需要暂停等待决策。
 	ErrApprovalRequired = errors.New("react tool approval required")
+	// ErrToolInfrastructure 工具执行期间发生基础设施故障（步骤落库、审批落库、结果持久化等）。
+	// 这类错误不能转换成模型可纠正的观察结果，必须原样上抛给 Worker 决定重试或人工对账。
+	ErrToolInfrastructure = errors.New("tool infrastructure failure")
 )
+
+// InfrastructureError 包装工具执行期的基础设施故障，保留底层错误链供上层分类。
+type InfrastructureError struct {
+	// Op 故障发生的操作，如 start_step、save_payload。
+	Op string
+	// Err 底层基础设施错误。
+	Err error
+}
+
+// Error 实现 error 接口。
+func (e *InfrastructureError) Error() string {
+	if e == nil {
+		return ErrToolInfrastructure.Error()
+	}
+	if e.Op == "" {
+		return fmt.Sprintf("%s: %v", ErrToolInfrastructure.Error(), e.Err)
+	}
+	return fmt.Sprintf("%s: %s: %v", ErrToolInfrastructure.Error(), e.Op, e.Err)
+}
+
+// Unwrap 保留底层错误链，便于 errors.Is/As 继续匹配具体故障。
+func (e *InfrastructureError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// Is 支持 errors.Is(err, ErrToolInfrastructure) 判定。
+func (e *InfrastructureError) Is(target error) bool { return target == ErrToolInfrastructure }
+
+// NewInfrastructureError 构造工具基础设施故障包装；err 为空时返回 nil。
+func NewInfrastructureError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &InfrastructureError{Op: op, Err: err}
+}
 
 // ApprovalRequiredError 描述一次需要人工审批的工具调用事实。
 // 上层据此持久化审批记录并把 Run 推进到 waiting_approval。

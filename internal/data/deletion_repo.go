@@ -285,33 +285,52 @@ func NewDeletionExecutor(db *gorm.DB, hot biz.HotMessageStore) *DeletionExecutor
 	return &DeletionExecutor{db: db, hot: hot}
 }
 
-// DeleteSession 清理会话、消息、Run、摘要、事实、向量、外部绑定、关联任务与缓存。
+// DeleteSession 清理会话及其 Supervisor 子会话的消息、Run、摘要、事实、向量、外部绑定、关联任务与缓存。
 func (e *DeletionExecutor) DeleteSession(ctx context.Context, userID, sessionID uuid.UUID) error {
 	if userID == uuid.Nil || sessionID == uuid.Nil {
 		return fmt.Errorf("%w: user and session ids are required", biz.ErrInvalidConfig)
 	}
+	var sessionIDs []uuid.UUID
 	err := WithScope(ctx, e.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		// 先清理指向该会话或其 Run 的待处理任务，避免删除后任务继续执行。
-		if err := tx.Exec(`
+		// 子会话通过 parent_session_id 挂载在主会话下，且外键是 ON DELETE SET NULL。
+		// 如果不递归删除，删除父会话后子会话会变成孤儿并重新出现在会话列表中。
+		if err := tx.Raw(`
+WITH RECURSIVE subtree AS (
+  SELECT id FROM sessions WHERE user_id = ? AND id = ?
+  UNION ALL
+  SELECT child.id FROM sessions child JOIN subtree parent ON child.parent_session_id = parent.id
+  WHERE child.user_id = ?
+)
+SELECT id FROM subtree`, userID, sessionID, userID).Scan(&sessionIDs).Error; err != nil {
+			return err
+		}
+		// 会话不存在时保持原有幂等语义：按传入 ID 执行删除（影响 0 行）。
+		if len(sessionIDs) == 0 {
+			sessionIDs = []uuid.UUID{sessionID}
+		}
+		for _, targetID := range sessionIDs {
+			// 先清理指向该会话或其 Run 的待处理任务，避免删除后任务继续执行。
+			if err := tx.Exec(`
 DELETE FROM jobs WHERE user_id = ? AND (
   payload->>'session_id' = ? OR
   payload->>'run_id' IN (SELECT id::text FROM agent_runs WHERE user_id = ? AND session_id = ?)
-)`, userID, sessionID.String(), userID, sessionID).Error; err != nil {
-			return err
-		}
-		statements := []string{
-			"DELETE FROM external_conversation_bindings WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM memory_vectors WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM memory_facts WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM session_summaries WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM messages WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM session_members WHERE user_id = ? AND session_id = ?",
-			"DELETE FROM sessions WHERE user_id = ? AND id = ?",
-		}
-		for _, statement := range statements {
-			if err := tx.Exec(statement, userID, sessionID).Error; err != nil {
+)`, userID, targetID.String(), userID, targetID).Error; err != nil {
 				return err
+			}
+			statements := []string{
+				"DELETE FROM external_conversation_bindings WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM memory_vectors WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM memory_facts WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM session_summaries WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM messages WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM session_members WHERE user_id = ? AND session_id = ?",
+				"DELETE FROM sessions WHERE user_id = ? AND id = ?",
+			}
+			for _, statement := range statements {
+				if err := tx.Exec(statement, userID, targetID).Error; err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -321,8 +340,14 @@ DELETE FROM jobs WHERE user_id = ? AND (
 	}
 	// 缓存删除失败时返回错误重试，避免已删除数据继续从 Redis 热窗口被组装进上下文。
 	if e.hot != nil {
-		if err := e.hot.Invalidate(ctx, userID, sessionID); err != nil {
-			return fmt.Errorf("invalidate session cache: %w", err)
+		var failures []string
+		for _, targetID := range sessionIDs {
+			if err := e.hot.Invalidate(ctx, userID, targetID); err != nil {
+				failures = append(failures, targetID.String())
+			}
+		}
+		if len(failures) > 0 {
+			return fmt.Errorf("invalidate %d session caches: %s", len(failures), strings.Join(failures, ","))
 		}
 	}
 	return nil
@@ -410,13 +435,18 @@ func (e *DeletionExecutor) DeleteAccount(ctx context.Context, userID uuid.UUID) 
 			"DELETE FROM sessions WHERE user_id = ?",
 			"DELETE FROM agent_mcps WHERE user_id = ?",
 			"DELETE FROM agent_skills WHERE user_id = ?",
+			// Agent 维度预算按 scope_id 关联用户 Agent，必须在删除 agents 之前清理，否则成为孤儿计数。
+			"DELETE FROM usage_counters WHERE scope = 'user' AND scope_id = ?",
+			"DELETE FROM usage_counters WHERE scope = 'agent' AND scope_id IN (SELECT id FROM agents WHERE user_id = ?)",
 			"DELETE FROM agents WHERE user_id = ?",
 			"DELETE FROM idempotency_keys WHERE user_id = ?",
 			"DELETE FROM refresh_tokens WHERE user_id = ?",
+			// 事件在身份解析前被忽略时不会绑定 user_id；按发言人 open_id 关联清理，
+			// 已加密的载荷无法匹配时不强删，交由保留期清理兜底。
+			"DELETE FROM feishu_event_receipts r USING user_identities i WHERE r.user_id IS NULL AND i.user_id = ? AND i.provider = 'feishu' AND i.external_subject <> '' AND r.payload_redacted::text LIKE '%' || i.external_subject || '%'",
 			"DELETE FROM user_identities WHERE user_id = ?",
 			"DELETE FROM password_reset_tokens WHERE user_id = ?",
 			"DELETE FROM feishu_event_receipts WHERE user_id = ?",
-			"DELETE FROM usage_counters WHERE scope = 'user' AND scope_id = ?",
 		}
 		for _, statement := range statements {
 			if err := tx.Exec(statement, userID).Error; err != nil {

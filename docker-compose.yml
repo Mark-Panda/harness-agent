@@ -1,15 +1,16 @@
 x-app-environment: &app-environment
-  APP_ENV: dev
-  DATABASE_URL: postgres://harness_app:harness@postgres:5432/harness?sslmode=disable
-  AUTH_DATABASE_URL: postgres://harness_auth:harness@postgres:5432/harness?sslmode=disable
+  # 本地默认 dev；部署到共享环境时必须显式覆盖 APP_ENV 与全部密钥。
+  APP_ENV: ${APP_ENV:-dev}
+  DATABASE_URL: postgres://harness_app:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
+  AUTH_DATABASE_URL: postgres://harness_auth:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
   REDIS_ADDR: redis:6379
-  REDIS_PASSWORD: harness
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-harness}
   JWT_SIGNING_KEY_ID: dev
-  JWT_SIGNING_KEY_SECRET: dev-only-jwt-secret-01234567890123456789
-  REFRESH_TOKEN_PEPPER: dev-only-refresh-pepper-0123456789012345
-  AUDIT_PSEUDONYM_KEY: dev-only-audit-key-01234567890123456789
+  JWT_SIGNING_KEY_SECRET: ${JWT_SIGNING_KEY_SECRET:-dev-only-jwt-secret-01234567890123456789}
+  REFRESH_TOKEN_PEPPER: ${REFRESH_TOKEN_PEPPER:-dev-only-refresh-pepper-0123456789012345}
+  AUDIT_PSEUDONYM_KEY: ${AUDIT_PSEUDONYM_KEY:-dev-only-audit-key-01234567890123456789}
   CREDENTIAL_ENCRYPTION_KEY_ID: dev
-  CREDENTIAL_ENCRYPTION_KEY_SECRET: dev-only-credential-key-01234567
+  CREDENTIAL_ENCRYPTION_KEY_SECRET: ${CREDENTIAL_ENCRYPTION_KEY_SECRET:-dev-only-credential-key-01234567}
   # 本地开发允许访问公司内网 MCP（例如 contextforge）；生产按实际网络策略显式开启。
   MCP_ALLOW_PRIVATE_ENDPOINTS: "true"
   # 飞书事件接入；长连接模式只需 FEISHU_ENABLED=true、FEISHU_EVENT_MODE=long_connection。
@@ -27,17 +28,17 @@ x-app-environment: &app-environment
   FEISHU_DEFAULT_AGENT_VERSION: ${FEISHU_DEFAULT_AGENT_VERSION:-}
 
 x-migrate-environment: &migrate-environment
-  APP_ENV: dev
-  DATABASE_URL: postgres://harness:harness@postgres:5432/harness?sslmode=disable
-  AUTH_DATABASE_URL: postgres://harness_auth:harness@postgres:5432/harness?sslmode=disable
+  APP_ENV: ${APP_ENV:-dev}
+  DATABASE_URL: postgres://harness:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
+  AUTH_DATABASE_URL: postgres://harness_auth:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
   REDIS_ADDR: redis:6379
-  REDIS_PASSWORD: harness
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-harness}
   JWT_SIGNING_KEY_ID: dev
-  JWT_SIGNING_KEY_SECRET: dev-only-jwt-secret-01234567890123456789
-  REFRESH_TOKEN_PEPPER: dev-only-refresh-pepper-0123456789012345
-  AUDIT_PSEUDONYM_KEY: dev-only-audit-key-01234567890123456789
+  JWT_SIGNING_KEY_SECRET: ${JWT_SIGNING_KEY_SECRET:-dev-only-jwt-secret-01234567890123456789}
+  REFRESH_TOKEN_PEPPER: ${REFRESH_TOKEN_PEPPER:-dev-only-refresh-pepper-0123456789012345}
+  AUDIT_PSEUDONYM_KEY: ${AUDIT_PSEUDONYM_KEY:-dev-only-audit-key-01234567890123456789}
   CREDENTIAL_ENCRYPTION_KEY_ID: dev
-  CREDENTIAL_ENCRYPTION_KEY_SECRET: dev-only-credential-key-01234567
+  CREDENTIAL_ENCRYPTION_KEY_SECRET: ${CREDENTIAL_ENCRYPTION_KEY_SECRET:-dev-only-credential-key-01234567}
 
 services:
   postgres:
@@ -45,9 +46,10 @@ services:
     environment:
       POSTGRES_DB: harness
       POSTGRES_USER: harness
-      POSTGRES_PASSWORD: harness
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-harness}
     ports:
-      - "5432:5432"
+      # 只监听回环地址，避免本地数据库端口暴露到局域网。
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
       - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -59,13 +61,13 @@ services:
 
   redis:
     image: redis:8.2.3-alpine
-    command: ["redis-server", "--requirepass", "harness", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-harness}", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "harness", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-harness}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -85,8 +87,9 @@ services:
       context: .
     environment: *app-environment
     ports:
-      - "8080:8080"
-      - "9190:9090"
+      # 只监听回环地址；对外暴露应由反向代理统一处理 TLS 与访问控制。
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9190:9090"
     depends_on:
       postgres:
         condition: service_healthy

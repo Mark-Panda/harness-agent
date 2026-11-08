@@ -242,6 +242,24 @@ func NewRouter(candidates []Candidate, health HealthStore, config RouterConfig, 
 	return router, nil
 }
 
+// MinContextWindow 返回候选集中声明的最小上下文窗口；全部未声明时返回 0。
+func (r *Router) MinContextWindow() int64 {
+	if r == nil {
+		return 0
+	}
+	var minimum int64
+	for _, candidate := range r.candidates {
+		window := candidate.Ref.ContextWindowTokens
+		if window <= 0 {
+			continue
+		}
+		if minimum == 0 || window < minimum {
+			minimum = window
+		}
+	}
+	return minimum
+}
+
 // Complete 执行一次带重试与受控切换的非流式模型调用。
 func (r *Router) Complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec) (react.Completion, error) {
 	return r.complete(ctx, messages, tools, nil)

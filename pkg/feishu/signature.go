@@ -118,10 +118,14 @@ func Signature(timestamp, nonce, encryptKey string, body []byte) string {
 }
 
 // VerifyToken 校验明文事件的 Verification Token，防止伪造 URL 验证请求。
-// 未配置 Token 时返回 nil，便于本地未启用集成的测试环境。
+// 未配置 Token 时只有已配置加密密钥（签名已完成鉴权）才放行；
+// 两者都缺失意味着回调完全没有可验证的凭据，必须拒绝而不是 fail-open。
 func (v *Verifier) VerifyToken(token string) error {
 	if v.token == "" {
-		return nil
+		if len(v.keys) > 0 {
+			return nil
+		}
+		return fmt.Errorf("%w: no verification token or encrypt key configured", ErrSignatureInvalid)
 	}
 	if subtle.ConstantTimeCompare([]byte(v.token), []byte(token)) != 1 {
 		return fmt.Errorf("%w: verification token mismatch", ErrSignatureInvalid)

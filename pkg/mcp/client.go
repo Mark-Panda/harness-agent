@@ -220,11 +220,35 @@ func safeDialContextWithPolicy(timeout time.Duration, allowPrivate bool) func(ct
 	}
 }
 
+// mcpBlockedNetworks 是云厂商元数据与非公有可路由网段。
+// net.IP.IsPrivate 只覆盖 RFC1918/ULA，不覆盖 CGNAT(100.64/10，含阿里云 100.100.100.200)、
+// IETF 协议分配段 192.0.0.0/24 与 AWS IPv6 元数据地址，必须显式拒绝。
+var mcpBlockedNetworks = func() []*net.IPNet {
+	cidrs := []string{
+		"100.64.0.0/10",
+		"192.0.0.0/24",
+		"198.18.0.0/15",
+		"fd00:ec2::/32",
+	}
+	networks := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		if _, network, err := net.ParseCIDR(cidr); err == nil {
+			networks = append(networks, network)
+		}
+	}
+	return networks
+}()
+
 // allowedMCPIP 判断地址是否允许连接；allowPrivate 只放开 RFC1918，不放开回环与元数据网段。
 func allowedMCPIP(ip net.IP, allowPrivate bool) bool {
 	if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() {
 		return false
+	}
+	for _, network := range mcpBlockedNetworks {
+		if network.Contains(ip) {
+			return false
+		}
 	}
 	if ip.IsPrivate() {
 		return allowPrivate
@@ -237,6 +261,11 @@ func isPublicIP(ip net.IP) bool {
 	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return false
+	}
+	for _, network := range mcpBlockedNetworks {
+		if network.Contains(ip) {
+			return false
+		}
 	}
 	return true
 }

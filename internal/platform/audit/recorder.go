@@ -139,15 +139,132 @@ func (r *Recorder) VerifyPartition(ctx context.Context, partition string) error 
 		return fmt.Errorf("read audit chain: %w", err)
 	}
 	for index, event := range events {
-		if event.PartitionSeq != int64(index+1) {
-			return fmt.Errorf("audit sequence gap at %d", event.PartitionSeq)
-		}
-		if index > 0 && !bytes.Equal(event.PrevEventHash, events[index-1].EventHash) {
-			return fmt.Errorf("audit previous hash mismatch at %d", event.PartitionSeq)
+		if index == 0 {
+			// 保留期清理会删除链首，此时起点必须由签名边界检查点锚定。
+			if err := r.verifyChainStart(ctx, event); err != nil {
+				return err
+			}
+		} else {
+			if event.PartitionSeq != events[index-1].PartitionSeq+1 {
+				return fmt.Errorf("audit sequence gap at %d", event.PartitionSeq)
+			}
+			if !bytes.Equal(event.PrevEventHash, events[index-1].EventHash) {
+				return fmt.Errorf("audit previous hash mismatch at %d", event.PartitionSeq)
+			}
 		}
 		if !bytes.Equal(event.EventHash, hashEvent(event)) {
 			return fmt.Errorf("audit event hash mismatch at %d: stored=%x computed=%x metadata=%s occurred=%s", event.PartitionSeq, event.EventHash, hashEvent(event), event.Metadata, event.OccurredAt)
 		}
+	}
+	return nil
+}
+
+// verifyChainStart 校验保留链的首个事件：序号为 1 时天然是链首，
+// 否则要求存在 seq-1 的边界检查点，且其签名与哈希都与首个事件的 PrevEventHash 对齐。
+func (r *Recorder) verifyChainStart(ctx context.Context, event auditLogModel) error {
+	if event.PartitionSeq == 1 {
+		return nil
+	}
+	var anchor auditCheckpointModel
+	err := r.db.WithContext(ctx).Where("partition_id = ? AND partition_seq = ?", event.PartitionID, event.PartitionSeq-1).
+		First(&anchor).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("audit sequence gap at %d", event.PartitionSeq)
+	}
+	if err != nil {
+		return fmt.Errorf("read audit chain anchor: %w", err)
+	}
+	if !bytes.Equal(anchor.EventHash, event.PrevEventHash) {
+		return fmt.Errorf("audit chain anchor mismatch at %d", event.PartitionSeq)
+	}
+	if !hmac.Equal(anchor.Signature, r.checkpointSignature(anchor.PartitionID, anchor.PartitionSeq, anchor.EventHash)) {
+		return fmt.Errorf("audit chain anchor signature mismatch at %d", event.PartitionSeq)
+	}
+	return nil
+}
+
+// PurgeBefore 在调用方事务内删除 cutoff 之前的审计事件与检查点，并保持剩余链可验证。
+// 部分过期的分区会先写入 seq = 首条保留事件序号-1 的签名边界检查点，
+// 因此 VerifyPartition 可以从该锚点继续校验，而不是因为链首被删而误报 gap。
+func (r *Recorder) PurgeBefore(ctx context.Context, tx *gorm.DB, cutoff time.Time) (int64, int64, error) {
+	if tx == nil {
+		return 0, 0, errors.New("audit purge requires a transaction")
+	}
+	var partitions []string
+	if err := tx.WithContext(ctx).Table("audit_logs").Where("occurred_at < ?", cutoff).
+		Distinct("partition_id").Pluck("partition_id", &partitions).Error; err != nil {
+		return 0, 0, fmt.Errorf("list expired audit partitions: %w", err)
+	}
+	var logsDeleted, checkpointsDeleted int64
+	for _, partition := range partitions {
+		// 与 Record 使用同一分区事务锁：避免清理计算保留边界时又有新事件追加，
+		// 导致边界检查点序号或链哈希与库内数据不一致。
+		if err := tx.WithContext(ctx).Exec("SELECT pg_advisory_xact_lock(hashtext(?))", partition).Error; err != nil {
+			return 0, 0, fmt.Errorf("lock audit partition for purge: %w", err)
+		}
+		var first struct {
+			PartitionSeq  int64
+			PrevEventHash []byte
+		}
+		if err := tx.WithContext(ctx).Table("audit_logs").
+			Select("partition_seq", "prev_event_hash").
+			Where("partition_id = ? AND occurred_at >= ?", partition, cutoff).
+			Order("partition_seq").Limit(1).Scan(&first).Error; err != nil {
+			return 0, 0, fmt.Errorf("read audit retention boundary: %w", err)
+		}
+		if first.PartitionSeq == 0 {
+			// 整个分区过期：事件与检查点都可整体清除。
+			result := tx.Exec("DELETE FROM audit_logs WHERE partition_id = ? AND occurred_at < ?", partition, cutoff)
+			if result.Error != nil {
+				return 0, 0, result.Error
+			}
+			logsDeleted += result.RowsAffected
+			result = tx.Exec("DELETE FROM audit_checkpoints WHERE partition_id = ?", partition)
+			if result.Error != nil {
+				return 0, 0, result.Error
+			}
+			checkpointsDeleted += result.RowsAffected
+			continue
+		}
+		if first.PartitionSeq > 1 {
+			// 只删除边界之前的检查点；边界检查点稍后补齐，即使它本身已早于保留期也必须保留。
+			result := tx.Exec("DELETE FROM audit_checkpoints WHERE partition_id = ? AND partition_seq < ?",
+				partition, first.PartitionSeq-1)
+			if result.Error != nil {
+				return 0, 0, result.Error
+			}
+			checkpointsDeleted += result.RowsAffected
+			if err := r.ensureRetentionAnchor(ctx, tx, partition, first.PartitionSeq-1, first.PrevEventHash); err != nil {
+				return 0, 0, err
+			}
+		}
+		// 按序号删除保证剩余事件始终是连续后缀；只按 occurred_at 删除会在时钟回拨时留下空洞。
+		result := tx.Exec("DELETE FROM audit_logs WHERE partition_id = ? AND partition_seq < ?", partition, first.PartitionSeq)
+		if result.Error != nil {
+			return 0, 0, result.Error
+		}
+		logsDeleted += result.RowsAffected
+	}
+	return logsDeleted, checkpointsDeleted, nil
+}
+
+// ensureRetentionAnchor 写入保留期边界检查点；已存在同序号检查点时保持不变。
+func (r *Recorder) ensureRetentionAnchor(ctx context.Context, tx *gorm.DB, partition string, seq int64, eventHash []byte) error {
+	var existing auditCheckpointModel
+	err := tx.WithContext(ctx).Where("partition_id = ? AND partition_seq = ?", partition, seq).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("read audit retention anchor: %w", err)
+	}
+	anchor := auditCheckpointModel{
+		PartitionID: partition, PartitionSeq: seq, EventHash: append([]byte(nil), eventHash...),
+		SignatureVersion: 1, CreatedAt: r.clock.Now().UTC(),
+	}
+	anchor.Signature = r.checkpointSignature(anchor.PartitionID, anchor.PartitionSeq, anchor.EventHash)
+	if err := tx.Create(&anchor).Error; err != nil {
+		return fmt.Errorf("write audit retention anchor: %w", err)
 	}
 	return nil
 }

@@ -2,7 +2,9 @@ package biz
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,9 @@ type FeishuEventWorkerConfig struct {
 	DefaultAgentID *uuid.UUID
 	// DefaultAgentVersion 默认 Agent 版本。
 	DefaultAgentVersion *int
+	// DefaultAgentOwnerID 默认助手所属用户；默认应用只服务该用户，
+	// 与已登记机器人的“只服务属主”策略保持一致。
+	DefaultAgentOwnerID *uuid.UUID
 	// Mode 默认编排模式。
 	Mode AgentMode
 	// BotOpenID 机器人 open_id，用于精确判断是否被 @。
@@ -165,7 +170,16 @@ func (w *FeishuEventWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止消费协程：记录堆栈后继续处理下一个任务。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("feishu event worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim feishu event job failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -190,11 +204,30 @@ func (w *FeishuEventWorker) handle(ctx context.Context, job Job) {
 	finishJob := beginJob()
 	jobOutcome := "success"
 	defer func() { finishJob(jobOutcome) }()
+	// 单次 panic 不得终止进程：把任务退回重试（耗尽预算后进入死信），避免事件停留在租约中。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			jobOutcome = "failure"
+			w.logger.Error("feishu event handling panicked", "job_id", job.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			retryAt := w.clock().Add(w.config.PollInterval)
+			if err := w.jobs.Fail(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken,
+				retryAt, "feishu event handling panicked", w.clock()); err != nil {
+				w.logger.Warn("fail feishu event job after panic failed", "job_id", job.ID, "error", err)
+			}
+		}
+	}()
 	eventID, err := decodeFeishuEventJob(job)
 	if err != nil {
-		w.logger.Error("invalid feishu event job payload", "job_id", job.ID)
+		// 载荷损坏无法定位事件：不能直接完成丢弃，否则事件永久消失；
+		// 交给失败重试并在预算耗尽后进入死信，保留现场供排查。
 		jobOutcome = "failure"
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		w.logger.Error("invalid feishu event job payload", "job_id", job.ID, "error", err)
+		retryAt := w.clock().Add(w.config.PollInterval)
+		if failErr := w.jobs.Fail(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken,
+			retryAt, "invalid feishu event job payload: "+err.Error(), w.clock()); failErr != nil {
+			w.logger.Warn("fail invalid feishu event job failed", "job_id", job.ID, "error", failErr)
+		}
 		return
 	}
 	record, err := w.events.GetEvent(ctx, eventID)
@@ -207,7 +240,12 @@ func (w *FeishuEventWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
-	_ = w.events.MarkEventStatus(ctx, eventID, FeishuEventProcessing, "", w.clock())
+	if err := w.events.MarkEventStatus(ctx, eventID, FeishuEventProcessing, "", w.clock()); err != nil {
+		// 状态未落库时继续处理会在后续写入失败时丢失进度，交给任务重试。
+		jobOutcome = "failure"
+		w.failJob(ctx, job, eventID, err)
+		return
+	}
 
 	outcome, err := w.process(ctx, record)
 	if err != nil {
@@ -216,7 +254,12 @@ func (w *FeishuEventWorker) handle(ctx context.Context, job Job) {
 		return
 	}
 	if outcome != "" {
-		_ = w.events.MarkEventStatus(context.WithoutCancel(ctx), eventID, outcome, "", w.clock())
+		if err := w.events.MarkEventStatus(context.WithoutCancel(ctx), eventID, outcome, "", w.clock()); err != nil {
+			// 终态未落库时任务不能完成，否则事件会停留在 processing 且无法再被去重。
+			jobOutcome = "failure"
+			w.failJob(context.WithoutCancel(ctx), job, eventID, err)
+			return
+		}
 	}
 	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 }
@@ -290,11 +333,10 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if err := w.events.BindUser(ctx, record.EventID, identity.UserID); err != nil {
 		return "", err
 	}
-	// 机器人绑定只服务助手所属用户本人；群聊中的其他成员可以作为发言人使用该机器人，
-	// 但会话、预算与 Agent 归属仍保持在机器人绑定所有者名下。
+	// 机器人绑定只服务助手所属用户本人；群聊中的其他成员不能作为发言人驱动该机器人，
+	// 否则任何群成员都能借道属主的 Agent、工具与预算执行操作。
 	var routeAgentID *uuid.UUID
 	var routeAgentVersion *int
-	routeOwnerID := identity.UserID
 	routeMode := w.config.Mode
 	if routedBot != nil {
 		binding, found, err := w.bots.FindFeishuBotBinding(ctx, routedBot.ID)
@@ -304,20 +346,27 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		if !found {
 			return FeishuEventIgnored, nil
 		}
-		if messageEvent.ChatType != feishu.ChatTypeGroup && binding.UserID != identity.UserID {
+		// 机器人绑定只服务助手所属用户本人：绑定契约明确 UserID 是唯一允许使用该机器人的
+		// 飞书用户，群聊中也不能让其他成员借道驱动属主的 Agent 与工具。
+		if binding.UserID != identity.UserID {
 			return FeishuEventIgnored, nil
 		}
 		// 助手取消发布或归档后绑定会被解除；此处兜底避免旧绑定继续执行。
 		if binding.AgentStatus != AgentPublished {
 			return FeishuEventIgnored, nil
 		}
-		routeOwnerID = binding.UserID
 		agentID, agentVersion := binding.AgentID, binding.AgentVersion
 		routeAgentID, routeAgentVersion = &agentID, &agentVersion
 		routeMode = binding.AgentMode
 	} else {
 		if w.config.DefaultAgentID == nil || w.config.DefaultAgentVersion == nil {
 			// 未登记机器人且未配置默认助手时直接忽略，避免事件无限重试进入死信。
+			return FeishuEventIgnored, nil
+		}
+		// 默认应用与已登记机器人使用同一策略：只服务默认助手的属主。
+		// 否则会以发言人身份套用属主的 Agent，Run 快照按 user_id 校验必然失败，
+		// 且一旦放开就等于允许任意飞书用户借道属主的 Agent、工具与预算。
+		if w.config.DefaultAgentOwnerID == nil || *w.config.DefaultAgentOwnerID != identity.UserID {
 			return FeishuEventIgnored, nil
 		}
 		routeAgentID, routeAgentVersion = w.config.DefaultAgentID, w.config.DefaultAgentVersion
@@ -335,10 +384,17 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		return "", err
 	}
 	if !found {
-		binding, err = w.createConversation(ctx, routeOwnerID, conversationAppID, record.TenantKey, routeAgentID, messageEvent, threadID, rootMessageID)
+		binding, err = w.createConversation(ctx, identity.UserID, conversationAppID, record.TenantKey, routeAgentID, messageEvent, threadID, rootMessageID)
 		if err != nil {
 			return "", err
 		}
+	}
+	// 会话归属校验：话题会话的所有者是首次绑定的用户，默认应用（未登记机器人）同样适用。
+	// 群聊中其他成员不得以会话所有者身份驱动 Agent、工具与预算。
+	if messageEvent.ChatType == feishu.ChatTypeGroup && binding.UserID != identity.UserID {
+		w.logger.Warn("feishu group sender is not conversation owner",
+			"session_id", binding.SessionID, "chat_id", messageEvent.ChatID)
+		return FeishuEventIgnored, nil
 	}
 	// closed/archived 绑定不再触发自动回复，需通过显式恢复接口重新启用；
 	// unbound 绑定不会出现在查询结果中，同一话题的下一轮 @ 会创建全新 Session。

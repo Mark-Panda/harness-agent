@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 )
 
 // 模型调用错误分类，供上层决定重试或故障切换。
@@ -283,6 +285,11 @@ func EstimateRequestTokens(messages []ChatMessage, tools []ToolDefinition) int64
 		total += 4 + EstimateTextTokens(tool.Name) + EstimateTextTokens(tool.Description) + EstimateTextTokens(parameters)
 	}
 	return total
+}
+
+// EstimateToolTokens 估算工具定义占用的输入 Token，用于从 Prompt 预算中扣除。
+func EstimateToolTokens(tools []react.ToolSpec) int64 {
+	return EstimateRequestTokens(nil, toToolDefinitions(tools))
 }
 
 // Chat 执行一次非流式调用；调用前校验上下文与能力，错误按可重试性分类且不泄露凭证。

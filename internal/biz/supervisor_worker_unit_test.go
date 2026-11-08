@@ -70,6 +70,19 @@ func (r *memorySupervisorRepo) StartTask(_ context.Context, userID, taskID uuid.
 	r.tasks[taskID] = task
 	return task, nil
 }
+func (r *memorySupervisorRepo) RetryTask(_ context.Context, userID, taskID uuid.UUID, _ time.Time) (SupervisorTask, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	task, ok := r.tasks[taskID]
+	if !ok || task.UserID != userID || task.Status != SupervisorTaskRunning || task.Attempts >= task.MaxAttempts {
+		return SupervisorTask{}, ErrResourceConflict
+	}
+	task.Status = SupervisorTaskPending
+	task.StartedAt = nil
+	task.FinishedAt = nil
+	r.tasks[taskID] = task
+	return task, nil
+}
 func (r *memorySupervisorRepo) FinishTask(_ context.Context, userID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, code, message string, now time.Time) (SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -132,6 +145,22 @@ func (s *memorySupervisorSessions) AppendMessageIdempotent(_ context.Context, me
 	}
 	s.messages = append(s.messages, message)
 	return message, nil
+}
+func (s *memorySupervisorSessions) ListMessages(_ context.Context, userID, sessionID uuid.UUID, limit int, _ string) (Page[Message], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]Message, 0)
+	for _, message := range s.messages {
+		if message.UserID == userID && message.SessionID == sessionID {
+			items = append(items, message)
+		}
+	}
+	// 与生产实现保持一致：按时间倒序返回。
+	sort.Slice(items, func(i, j int) bool { return items[i].ID.String() > items[j].ID.String() })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return Page[Message]{Items: items}, nil
 }
 
 // supervisorFixture 构造 Supervisor Worker 与模型服务器。
@@ -512,5 +541,47 @@ func TestSupervisorPlannerSystemListsExactTools(t *testing.T) {
 	}
 	if empty := supervisorPlannerSystem(nil); !strings.Contains(empty, "tools 必须为空数组") {
 		t.Fatalf("empty registry instruction = %s", empty)
+	}
+}
+
+// failingFinishSupervisorRepo 模拟子任务结果写库失败的仓储。
+type failingFinishSupervisorRepo struct{ *memorySupervisorRepo }
+
+func (r *failingFinishSupervisorRepo) FinishTask(_ context.Context, _, _ uuid.UUID, _ SupervisorTaskStatus, _ map[string]any, _, _ string, _ time.Time) (SupervisorTask, error) {
+	return SupervisorTask{}, errors.New("database unavailable")
+}
+
+// TestExecuteSupervisorSettlementFailureRequiresReconciliation 验证子任务结算失败时不得继续汇总。
+func TestExecuteSupervisorSettlementFailureRequiresReconciliation(t *testing.T) {
+	repo := &failingFinishSupervisorRepo{memorySupervisorRepo: newMemorySupervisorRepo()}
+	worker, err := NewExecutionWorker(ExecutionWorkerDependencies{
+		Jobs: stubJobQueue{}, Runs: stubRunRepository{}, Sessions: &memorySupervisorSessions{},
+		Providers: stubProviders{}, Opener: stubOpener{}, Attempts: noopAttemptRepository{},
+		SupervisorTasks: repo,
+	}, WorkerConfig{
+		WorkerID: "supervisor-worker", Lease: time.Minute, MCPTimeout: time.Second, SupervisorMaxWorkers: 4,
+		Routing: model.RouterConfig{MinContextTokens: 1, MaxAttemptsPerModel: 1, MaxAttemptsPerRun: 6, MaxSwitchesPerRun: 1, MaxOutputTokens: 64, RequestTimeout: 5 * time.Second, BackoffBase: time.Millisecond, MaxBackoff: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), "请输出 Worker 委派 JSON") {
+			supervisorReply(t, w, `{"workers":[{"name":"A","task":"任务A","tools":[]}]}`, http.StatusOK)
+			return
+		}
+		supervisorReply(t, w, "Worker 结果", http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	candidates := []model.Candidate{{
+		Priority: 1, BaseURL: server.URL, APIKey: "test-key",
+		Ref: model.ModelRef{ProviderID: uuid.NewString(), ModelID: uuid.NewString(), RemoteModelName: "test", ContextWindowTokens: 1_000_000, MaxOutputTokens: 64},
+	}}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	_, err = worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates,
+		nil, []react.Message{{Role: react.RoleUser, Content: "请处理任务"}}, emptyToolRegistry{})
+	if !errors.Is(err, ErrSupervisorTaskSettlement) {
+		t.Fatalf("executeSupervisor() error = %v, want ErrSupervisorTaskSettlement", err)
 	}
 }

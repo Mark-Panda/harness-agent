@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,14 +50,23 @@ type feishuEventReceiptModel struct {
 // TableName 指定事件回执表名。
 func (feishuEventReceiptModel) TableName() string { return "feishu_event_receipts" }
 
-// FeishuEventRepository 是飞书事件回执的 GORM 实现。
-type FeishuEventRepository struct {
-	db *gorm.DB
+// PayloadProtector 为事件回执载荷提供静态加密，避免消息正文以明文落库。
+type PayloadProtector interface {
+	// Seal 加密明文并返回密文与密钥版本。
+	Seal(plaintext []byte) (ciphertext []byte, keyVersion string, err error)
+	// Open 按密钥版本解密。
+	Open(keyVersion string, ciphertext []byte) ([]byte, error)
 }
 
-// NewFeishuEventRepository 构造事件回执仓库。
-func NewFeishuEventRepository(db *gorm.DB) *FeishuEventRepository {
-	return &FeishuEventRepository{db: db}
+// FeishuEventRepository 是飞书事件回执的 GORM 实现。
+type FeishuEventRepository struct {
+	db        *gorm.DB
+	protector PayloadProtector
+}
+
+// NewFeishuEventRepository 构造事件回执仓库；protector 为空时按明文保存（仅限测试）。
+func NewFeishuEventRepository(db *gorm.DB, protector PayloadProtector) *FeishuEventRepository {
+	return &FeishuEventRepository{db: db, protector: protector}
 }
 
 // RecordEvent 幂等写入事件回执；同一 event_id 重复投递返回 false。
@@ -67,6 +77,18 @@ func (r *FeishuEventRepository) RecordEvent(ctx context.Context, event biz.Feish
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
 		return false, err
+	}
+	if r.protector != nil {
+		ciphertext, keyVersion, sealErr := r.protector.Seal(payload)
+		if sealErr != nil {
+			return false, fmt.Errorf("seal feishu event payload: %w", sealErr)
+		}
+		payload, err = json.Marshal(map[string]string{
+			"encrypted": base64.StdEncoding.EncodeToString(ciphertext), "key_version": keyVersion,
+		})
+		if err != nil {
+			return false, err
+		}
 	}
 	record := feishuEventReceiptModel{
 		ID: uuid.New(), EventID: event.EventID, EventType: event.EventType, TenantKey: event.TenantKey,
@@ -97,8 +119,27 @@ func (r *FeishuEventRepository) GetEvent(ctx context.Context, eventID string) (b
 	if err != nil {
 		return biz.FeishuEventRecord{}, catalogError("get feishu event", err)
 	}
+	payloadJSON := []byte(record.PayloadRedacted)
+	var envelope struct {
+		Encrypted  string `json:"encrypted"`
+		KeyVersion string `json:"key_version"`
+	}
+	if json.Unmarshal(payloadJSON, &envelope) == nil && envelope.Encrypted != "" {
+		if r.protector == nil {
+			return biz.FeishuEventRecord{}, fmt.Errorf("%w: feishu event payload is encrypted but no protector is configured", biz.ErrInvalidConfig)
+		}
+		ciphertext, decodeErr := base64.StdEncoding.DecodeString(envelope.Encrypted)
+		if decodeErr != nil {
+			return biz.FeishuEventRecord{}, fmt.Errorf("decode feishu event payload: %w", decodeErr)
+		}
+		plaintext, openErr := r.protector.Open(envelope.KeyVersion, ciphertext)
+		if openErr != nil {
+			return biz.FeishuEventRecord{}, fmt.Errorf("open feishu event payload: %w", openErr)
+		}
+		payloadJSON = plaintext
+	}
 	var payload map[string]any
-	if err := json.Unmarshal(record.PayloadRedacted, &payload); err != nil {
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
 		return biz.FeishuEventRecord{}, err
 	}
 	return biz.FeishuEventRecord{

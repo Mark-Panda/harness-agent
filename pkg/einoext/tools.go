@@ -40,8 +40,9 @@ func (t *Tool) Info(context.Context) (*schemaToolInfo, error) {
 	return SpecToToolInfo(t.inner.Spec())
 }
 
-// InvokableRun 执行工具并把错误转换为模型可纠正的观察结果。
-// 审批门禁错误必须原样上抛，由 Worker 暂停 Run 等待人工决策。
+// InvokableRun 执行工具并把业务错误转换为模型可纠正的观察结果。
+// 审批门禁与基础设施故障必须原样上抛：前者由 Worker 暂停 Run 等待人工决策，
+// 后者决定重试或人工对账，转成观察结果会让模型继续执行并丢失故障语义。
 func (t *Tool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
 	spec := t.inner.Spec()
 	callID := compose.GetToolCallID(ctx)
@@ -52,15 +53,25 @@ func (t *Tool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...to
 			"tool": spec.Name, "tool_call_id": callID, "risk_level": t.inner.RiskLevel(),
 		})
 	}
-	if guard := LoopGuardFromContext(ctx); guard != nil && guard.Repeated(spec.Name, argumentsInJSON) {
-		content := `{"error":"repeated_tool_call","hint":"与紧邻的上一次调用参数完全相同，工具未重复执行；请总结已有结果、补充缺失信息或改用其他参数或工具。"}`
-		t.finish(ctx, spec.Name, callID, "repeated", content, "")
-		return content, nil
+	if guard := LoopGuardFromContext(ctx); guard != nil {
+		content, loopErr := guard.checkToolCall(ctx, spec.Name, argumentsInJSON)
+		if loopErr != nil {
+			return "", loopErr
+		}
+		if content != "" {
+			t.finish(ctx, spec.Name, callID, "repeated", content, "")
+			return content, nil
+		}
 	}
 	output, err := t.inner.Invoke(ctx, json.RawMessage(argumentsInJSON))
 	if err != nil {
-		if errors.Is(err, react.ErrApprovalRequired) {
+		// 审批门禁与基础设施故障不属于模型可纠正的业务错误。
+		if errors.Is(err, react.ErrApprovalRequired) || errors.Is(err, react.ErrToolInfrastructure) {
 			return "", err
+		}
+		// 父上下文已取消/超时：终止 Run，而不是让模型基于残缺结果继续推理。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
 		}
 		status := "failed"
 		var invalidArguments *react.InvalidArgumentsError

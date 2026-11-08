@@ -27,6 +27,20 @@ func (t testTool) Invoke(_ context.Context, arguments json.RawMessage) (json.Raw
 
 type testRegistry struct{ tools map[string]react.Tool }
 
+// TestErrorTextRedactsSecrets 验证执行事件中的错误文本不会回显凭证。
+func TestErrorTextRedactsSecrets(t *testing.T) {
+	raw := errors.New(`call https://user:pass@example.com failed: Authorization: Bearer sk-secret api_key=abc123 &access_token=xyz`)
+	text := errorText(raw)
+	for _, leaked := range []string{"sk-secret", "abc123", "xyz", "user:pass"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("error text leaked %q: %s", leaked, text)
+		}
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Fatalf("error text not redacted: %s", text)
+	}
+}
+
 func (r testRegistry) Lookup(name string) (react.Tool, bool) {
 	tool, ok := r.tools[name]
 	return tool, ok

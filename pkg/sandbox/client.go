@@ -94,10 +94,19 @@ func NewClient(config Config) (*Client, error) {
 	if config.MaxResponseBytes <= 0 {
 		config.MaxResponseBytes = 1024 * 1024
 	}
+	// 复用默认 Transport 的连接池参数，但显式禁用环境代理与重定向：
+	// 环境代理会把携带 Bearer 的内部请求转发到不可信出口，重定向则可能把令牌带到其他主机。
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	return &Client{
 		endpoint: endpoint, token: config.Token, timeout: config.Timeout,
 		maxResponseBytes: config.MaxResponseBytes,
-		httpClient:       &http.Client{Timeout: config.Timeout},
+		httpClient: &http.Client{
+			Timeout:   config.Timeout,
+			Transport: transport,
+			// 不跟随 3xx：返回原始响应，由状态码校验拒绝。
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}, nil
 }
 

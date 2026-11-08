@@ -103,7 +103,8 @@ func TestPurgeExpiredRetention(t *testing.T) {
 	executionCutoff := time.Now().UTC().Add(-90 * 24 * time.Hour)
 	auditCutoff := time.Now().UTC().Add(-365 * 24 * time.Hour)
 	feishuCutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
-	dryRun, err := PurgeExpired(ctx, adminDB, executionCutoff, auditCutoff, feishuCutoff, false)
+	auditKey := []byte("01234567890123456789012345678901")
+	dryRun, err := PurgeExpired(ctx, adminDB, auditKey, executionCutoff, auditCutoff, feishuCutoff, false)
 	if err != nil {
 		t.Fatalf("dry-run purge: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestPurgeExpiredRetention(t *testing.T) {
 		t.Fatalf("dry-run deleted feishu receipt: count=%d err=%v", count, err)
 	}
 
-	applied, err := PurgeExpired(ctx, adminDB, executionCutoff, auditCutoff, feishuCutoff, true)
+	applied, err := PurgeExpired(ctx, adminDB, auditKey, executionCutoff, auditCutoff, feishuCutoff, true)
 	if err != nil {
 		t.Fatalf("apply purge: %v", err)
 	}

@@ -66,6 +66,9 @@ type ServerConfig struct {
 	APIRateLimit APIRateLimitConfig `yaml:"api_rate_limit"`
 	// TrustedProxies 是可信反向代理的 CIDR 列表；为空时只使用直连地址，忽略转发头。
 	TrustedProxies []string `yaml:"trusted_proxies"`
+	// MetricsToken 是 /metrics 的 Bearer 访问令牌；为空时保持匿名只读，
+	// 由部署侧网络策略限制来源。配置后必须携带 Authorization: Bearer <token>。
+	MetricsToken string `yaml:"metrics_token"`
 }
 
 // APIRateLimitConfig 是 API 多维限流配置，0 表示关闭该维度。
@@ -576,6 +579,10 @@ func (c Config) Validate() error {
 	if c.Server.HTTP.Timeout.Duration <= 0 || c.Server.ShutdownTimeout.Duration <= 0 {
 		return fmt.Errorf("server timeouts must be positive")
 	}
+	// 纯空白令牌会让 /metrics 意外保持匿名，必须在启动时拒绝。
+	if c.Server.MetricsToken != "" && strings.TrimSpace(c.Server.MetricsToken) == "" {
+		return fmt.Errorf("server.metrics_token must not be blank")
+	}
 	if c.Server.HTTP.TLS.Enabled {
 		if strings.TrimSpace(c.Server.HTTP.TLS.CertFile) == "" || strings.TrimSpace(c.Server.HTTP.TLS.KeyFile) == "" {
 			return fmt.Errorf("server.http.tls.cert_file and key_file are required when TLS is enabled")
@@ -666,6 +673,10 @@ func (c Config) Validate() error {
 	memory := c.Agent.Memory
 	if memory.HotWindowMessages < 0 || memory.HotWindowTTL.Duration < 0 {
 		return fmt.Errorf("agent.memory hot window size and ttl must not be negative")
+	}
+	// 热窗口仓库最大保留 500 条；配置更大时会被静默裁剪，必须启动即拒绝。
+	if memory.HotWindowMessages > 500 {
+		return fmt.Errorf("agent.memory.hot_window_messages must not exceed 500")
 	}
 	summary := memory.Summary
 	if summary.Enabled {
@@ -813,6 +824,10 @@ func (c Config) Validate() error {
 		if !c.Audit.SynchronousCriticalWrites || !c.Audit.HashChainEnabled {
 			return fmt.Errorf("production synchronous audit writes and hash chain are required")
 		}
+		// 生产环境禁止沙箱明文回退：Bearer 令牌与工具参数不能走未加密链路。
+		if c.Agent.Sandbox.AllowInsecure {
+			return fmt.Errorf("agent.sandbox.allow_insecure must be disabled in production")
+		}
 	}
 	if err := c.validateCredentials(); err != nil {
 		return err
@@ -919,10 +934,6 @@ func (c Config) validateFeishu() error {
 	}
 	if reply.MaxConcurrentPerChat <= 0 || reply.MaxConcurrentPerUser <= 0 {
 		return fmt.Errorf("feishu.reply concurrency limits must be positive")
-	}
-	// Webhook 模式在生产环境必须启用事件签名与时间窗校验，禁止明文回调。
-	if c.Environment == "production" && eventMode == FeishuEventModeWebhook && (validKeys == 0 || feishu.EventWindow.Duration <= 0) {
-		return fmt.Errorf("production feishu callback signature and replay window are required")
 	}
 	return nil
 }

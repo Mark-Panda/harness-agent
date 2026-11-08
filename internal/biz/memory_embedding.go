@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -345,7 +346,16 @@ func (w *MemoryEmbedWorker) loop(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		if _, err := w.ProcessOne(ctx); err != nil && ctx.Err() == nil {
+		if _, err := func() (bool, error) {
+			// 单次迭代 panic 不得终止向量化协程：记录堆栈后继续处理下一个任务。
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					w.logger.Error("memory embed worker iteration panicked",
+						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+				}
+			}()
+			return w.ProcessOne(ctx)
+		}(); err != nil && ctx.Err() == nil {
 			w.logger.Warn("claim memory embed job failed", "error", err)
 		}
 		timer.Reset(w.config.PollInterval)
@@ -367,6 +377,14 @@ func (w *MemoryEmbedWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 解析任务、读取来源消息并按索引版本批量写入向量。
 func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
+	// 单次 panic 不得终止进程：记录堆栈并把任务退回重试，避免任务停留在租约中。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("memory embed job panicked", "job_id", job.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			w.failJob(context.WithoutCancel(ctx), job, fmt.Errorf("memory embed panicked: %v", recovered))
+		}
+	}()
 	task, err := decodeMemoryTask(job)
 	if err != nil {
 		w.logger.Error("invalid memory embed job payload", "job_id", job.ID, "error", err)

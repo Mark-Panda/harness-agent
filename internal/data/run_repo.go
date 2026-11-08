@@ -387,10 +387,16 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 			return err
 		}
 		var active int64
-		// 只有“仍在续租的 running”或“等待审批”才占用会话；租约已过期的 running 视为
-		// 已放弃执行（例如计划暂停后 Worker 退出），不能继续阻塞同会话的新消息。
+		// 只有“仍在续租（或刚恢复、尚未续租）的 running”或“等待审批的 waiting_approval”才占用会话。
+		// 审批等待不消耗执行时长预算，因此不能用 deadline_at 判断；待审批全部决策后 Run
+		// 会被决策请求或 Worker 的自动恢复推进回 running，并由独立审批超时回收长期无人处理
+		// 的审批。这里必须无条件占用会话：决策与恢复是两次独立写，若在窗口内放行新 Run，
+		// 会出现后发消息先执行、恢复后的旧 Run 再插入的顺序倒置。
+		// ResumeRun 会清空租约，使 running 短暂处于 lease_expires_at IS NULL，这段恢复窗口
+		// 同样必须占用会话，否则后发 Run 会抢在旧 Run 恢复前执行。
+		// 租约已过期的 running 也不能继续阻塞同会话的新消息。
 		if err := tx.Model(&runModel{}).
-			Where("user_id = ? AND session_id = ? AND id <> ? AND (status = ? OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at > ?))",
+			Where("user_id = ? AND session_id = ? AND id <> ? AND (status = ? OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at > ?)))",
 				userID, record.SessionID, runID, string(biz.RunWaitingApproval), string(biz.RunRunning), now).
 			Count(&active).Error; err != nil {
 			return err
@@ -735,13 +741,26 @@ func appendRunEvent(tx *gorm.DB, event biz.RunEvent) (runEventModel, error) {
 
 // ListEvents 按 seq 升序读取 afterSeq 之后的事件，limit 上限 200。
 func (r *RunRepository) ListEvents(ctx context.Context, userID, runID uuid.UUID, afterSeq int64, limit int) ([]biz.RunEvent, error) {
+	return r.listEvents(ctx, userID, runID, afterSeq, limit, nil)
+}
+
+// ListEventsByTypes 按事件类型过滤读取，避免恢复路径加载海量流式增量事件。
+func (r *RunRepository) ListEventsByTypes(ctx context.Context, userID, runID uuid.UUID, afterSeq int64, limit int, eventTypes []string) ([]biz.RunEvent, error) {
+	return r.listEvents(ctx, userID, runID, afterSeq, limit, eventTypes)
+}
+
+// listEvents 是事件查询的共享实现；eventTypes 为空表示不过滤。
+func (r *RunRepository) listEvents(ctx context.Context, userID, runID uuid.UUID, afterSeq int64, limit int, eventTypes []string) ([]biz.RunEvent, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 200
 	}
 	var records []runEventModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.Where("user_id = ? AND run_id = ? AND seq > ?", userID, runID, afterSeq).
-			Order("seq").Limit(limit).Find(&records).Error
+		query := tx.Where("user_id = ? AND run_id = ? AND seq > ?", userID, runID, afterSeq)
+		if len(eventTypes) > 0 {
+			query = query.Where("event_type IN ?", eventTypes)
+		}
+		return query.Order("seq").Limit(limit).Find(&records).Error
 	})
 	if err != nil {
 		return nil, catalogError("list run events", err)

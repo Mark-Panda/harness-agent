@@ -23,6 +23,13 @@ type PlanLimits struct {
 	MaxArgumentsBytes int
 }
 
+// planStepMaxModelCalls 是单个计划步骤允许的最大模型调用次数（含工具轮次）。
+// 计划执行复用同一个 Router，attempt 预算必须按该上限放大。
+const planStepMaxModelCalls = 8
+
+// planPlannerMaxModelCalls 是规划阶段允许的模型调用次数（含一次工具名修正）。
+const planPlannerMaxModelCalls = 2
+
 // DefaultPlanLimits 返回生产默认限制：50 步、依赖深度 5。
 func DefaultPlanLimits() PlanLimits {
 	return PlanLimits{

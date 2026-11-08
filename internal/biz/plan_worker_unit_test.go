@@ -461,7 +461,7 @@ func TestExecutePlanSuccess(t *testing.T) {
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
 	messages := []react.Message{{Role: react.RoleSystem, Content: "system"}, {Role: react.RoleUser, Content: "整理数据"}}
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{})
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{})
 	if err != nil {
 		plan, _ := plans.GetPlanByRun(context.Background(), run.UserID, run.ID)
 		t.Logf("plan after failure: %#v", plan)
@@ -481,7 +481,7 @@ func TestExecutePlanInvalidPlannerOutput(t *testing.T) {
 		writeCompletion(t, w, "不是 JSON", http.StatusOK)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanInvalid) {
 		t.Fatalf("invalid planner error = %v", err)
 	}
@@ -500,7 +500,7 @@ func TestExecutePlanPaused(t *testing.T) {
 		Status: PlanPaused, Goal: "g", MaxSteps: 50,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepPending, MaxAttempts: 2}},
 	})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanPaused) {
 		t.Fatalf("paused plan error = %v", err)
 	}
@@ -516,7 +516,7 @@ func TestExecutePlanModelStepFailure(t *testing.T) {
 		writeCompletion(t, w, "失败", http.StatusInternalServerError)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
-	_, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	_, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{})
 	if !errors.Is(err, ErrPlanFailed) {
 		t.Fatalf("step failure error = %v", err)
@@ -534,7 +534,7 @@ func TestExecutePlanDeadlineExceeded(t *testing.T) {
 		Status: PlanExecuting, Goal: "g", MaxSteps: 50, Revision: 0, DeadlineAt: &deadline,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepPending, MaxAttempts: 2}},
 	})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanFailed) {
 		t.Fatalf("deadline error = %v", err)
 	}
@@ -851,7 +851,7 @@ func TestPlanStepMessageIDsUseStepNamespace(t *testing.T) {
 	firstStep, secondStep := uuid.New(), uuid.New()
 	ids := make([]string, 0, 2)
 	for _, stepID := range []uuid.UUID{firstStep, secondStep} {
-		scopePlanStepMessageEvents(stepID, func(event react.StepEvent) {
+		scopePlanStepMessageEvents(stepID, 0, func(event react.StepEvent) {
 			ids = append(ids, event.Payload["message_id"].(string))
 		})(react.StepEvent{Type: "message.created", Payload: map[string]any{"index": 4, "role": "assistant", "content": "结果"}})
 	}
@@ -884,11 +884,11 @@ func TestPlanCompletedAndCancelledEntry(t *testing.T) {
 	completedPlan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
 		Status: PlanCompleted, Goal: "g", MaxSteps: 50, Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}}}
 	plans.seedPlan(completedPlan)
-	if result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); err != nil || !strings.Contains(result.Content, "结果") {
+	if result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); err != nil || !strings.Contains(result.Content, "结果") {
 		t.Fatalf("completed plan result = %#v, %v", result, err)
 	}
 	plans.seedPlan(Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 2, Status: PlanCancelled, MaxSteps: 50})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); !errors.Is(err, ErrPlanCancelled) {
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); !errors.Is(err, ErrPlanCancelled) {
 		t.Fatalf("cancelled plan error = %v", err)
 	}
 }
@@ -984,7 +984,7 @@ func TestExecutePlanFailedAndRecoverModelStep(t *testing.T) {
 	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
 	plans.seedPlan(Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
 		Status: PlanFailed, ErrorMessage: "previous failure", MaxSteps: 50})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); !errors.Is(err, ErrPlanFailed) {
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); !errors.Is(err, ErrPlanFailed) {
 		t.Fatalf("failed plan error = %v", err)
 	}
 	modelStep := PlanStep{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepRunning, MaxAttempts: 2}

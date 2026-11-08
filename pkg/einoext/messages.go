@@ -47,10 +47,14 @@ func ToSchemaMessages(messages []react.Message) []*schema.Message {
 // ToSchemaMessage 转换单条执行层消息。
 func ToSchemaMessage(message react.Message) *schema.Message {
 	converted := &schema.Message{
-		Role:       schema.RoleType(message.Role),
-		Content:    message.Content,
-		ToolCallID: message.ToolCallID,
-		ToolName:   message.Name,
+		Role:    schema.RoleType(message.Role),
+		Content: message.Content,
+	}
+	// ToolCallID 与 ToolName 仅对 tool 角色有意义；其他角色透传 Name 会让
+	// Eino 将其误当作工具结果消息，这里只在 tool 角色下设置。
+	if message.Role == react.RoleTool {
+		converted.ToolCallID = message.ToolCallID
+		converted.ToolName = message.Name
 	}
 	for index, call := range message.ToolCalls {
 		position := index

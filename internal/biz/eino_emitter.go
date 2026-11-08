@@ -14,6 +14,7 @@ import (
 type einoWorkerEmitter struct {
 	sink                react.EventSink
 	runID               uuid.UUID
+	attemptNo           int
 	initialMessageIndex int
 	messageIndex        atomic.Int64
 	stepIndex           atomic.Int64
@@ -34,7 +35,7 @@ func (e *einoWorkerEmitter) NextMessageIndex() int {
 	index := e.initialMessageIndex + int(e.messageIndex.Add(1)) - 1
 	if e.runID != uuid.Nil {
 		e.lastMu.Lock()
-		e.lastMessageID = deterministicMessageID(e.runID, index).String()
+		e.lastMessageID = deterministicMessageIDForAttempt(e.runID, e.attemptNo, index).String()
 		e.lastMu.Unlock()
 	}
 	return index

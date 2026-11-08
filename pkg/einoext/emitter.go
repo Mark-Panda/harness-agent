@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sync"
+
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 )
 
 // Emitter 将 Eino 模型/工具执行事实转换为现有 RunEvent。
@@ -73,38 +76,53 @@ type ToolCall struct {
 	Arguments string
 }
 
-// LoopGuard 记录连续相同工具调用，防止模型原地循环。
+// LoopGuard 记录本次 Run 内相同工具调用的累计次数，防止模型原地循环。
+// 采用按调用指纹计数的滑动语义：A/B 交替重复同样会被识别，而不仅限于连续相同调用。
 type LoopGuard struct {
-	mu          sync.Mutex
-	lastHash    string
-	consecutive int
-	threshold   int
+	mu        sync.Mutex
+	counts    map[string]int
+	threshold int
 }
+
+// repeatedToolCallContent 是首次达到重复阈值时回填模型的纠偏提示。
+const repeatedToolCallContent = `{"error":"repeated_tool_call","hint":"相同工具调用已重复多次，工具未再执行；请总结已有结果、补充缺失信息或改用其他参数或工具。"}`
 
 // NewLoopGuard 构造工具循环守卫。
 func NewLoopGuard(threshold int) *LoopGuard {
 	if threshold <= 0 {
 		threshold = 3
 	}
-	return &LoopGuard{threshold: threshold}
+	return &LoopGuard{counts: make(map[string]int), threshold: threshold}
 }
 
-// Repeated 判断工具调用是否达到重复阈值。
-func (g *LoopGuard) Repeated(name, arguments string) bool {
+// checkToolCall 统计工具调用指纹并决定是否放行。
+// 首次达到阈值返回纠偏提示，给模型一次自我修正机会；再次重复则返回 ErrToolLoop 终止 Run。
+func (g *LoopGuard) checkToolCall(_ context.Context, name, arguments string) (string, error) {
 	if g == nil {
-		return false
+		return "", nil
 	}
 	sum := sha256.Sum256([]byte(name + "\x00" + arguments))
 	hash := hex.EncodeToString(sum[:])
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	if hash == g.lastHash {
-		g.consecutive++
-	} else {
-		g.lastHash = hash
-		g.consecutive = 1
+	if g.counts == nil {
+		g.counts = make(map[string]int)
 	}
-	return g.consecutive >= g.threshold
+	g.counts[hash]++
+	count := g.counts[hash]
+	g.mu.Unlock()
+	if count < g.threshold {
+		return "", nil
+	}
+	if count == g.threshold {
+		return repeatedToolCallContent, nil
+	}
+	return "", fmt.Errorf("%w: %s repeated %d times", react.ErrToolLoop, name, count)
+}
+
+// Repeated 判断工具调用是否达到重复阈值；保留给不关心终止语义的调用方。
+func (g *LoopGuard) Repeated(name, arguments string) bool {
+	content, err := g.checkToolCall(context.Background(), name, arguments)
+	return err != nil || content != ""
 }
 
 type loopGuardContextKey struct{}

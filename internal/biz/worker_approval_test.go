@@ -464,3 +464,57 @@ func TestWorkerFailsRunWhenBudgetExhausted(t *testing.T) {
 		t.Fatalf("ProcessOne() = %t, %v", processed, err)
 	}
 }
+
+// TestWorkerResumesDecidedApprovalRun 验证审批已全部决策但 Run 仍停在 waiting_approval 时自动恢复。
+func TestWorkerResumesDecidedApprovalRun(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
+	providerID, modelID := uuid.NewString(), uuid.NewString()
+	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+
+	job := jobFixture(userID, runID)
+	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+	run := runFixture(userID, runID, sessionID, snapshotFixture("https://models.example.com", providerID, modelID))
+	run.Status = biz.RunWaitingApproval
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
+	approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(0, nil)
+	runs.EXPECT().ResumeRun(gomock.Any(), userID, runID, gomock.Any()).Return(run, nil)
+	// 恢复后立即尝试认领；此处让会话仍被占用，验证不会重复等待审批轮询。
+	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(biz.Run{}, biz.RunFence{}, biz.ErrSessionRunActive)
+	jobs.EXPECT().Release(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any()).Return(nil)
+
+	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOne() = %t, %v", processed, err)
+	}
+}
+
+// TestWorkerRetriesWhenReconciliationWriteFails 验证对账状态写库失败时任务退回重试而非完成。
+func TestWorkerRetriesWhenReconciliationWriteFails(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
+	providerID, modelID := uuid.NewString(), uuid.NewString()
+	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+
+	job := jobFixture(userID, runID)
+	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
+	run := runFixture(userID, runID, sessionID, snapshotFixture("https://models.example.com", providerID, modelID))
+	run.Status = biz.RunRunning
+	fence := biz.RunFence{Owner: "worker-1", Token: 9}
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
+	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(run, fence, nil)
+	stepID := uuid.New()
+	approvals.EXPECT().ListApprovals(gomock.Any(), userID, runID).Return([]biz.ToolApproval{{
+		ID: uuid.New(), RunID: runID, UserID: userID, StepID: &stepID,
+		ToolCallID: "call-1", ToolName: "mcp_admin_delete", RiskLevel: "high",
+		Status: biz.ApprovalExecuting, IdempotencyKey: "idem-1",
+	}}, nil)
+	runs.EXPECT().MarkRunReconciliationRequired(gomock.Any(), userID, runID, fence, "tool_execution_unknown", gomock.Any(), gomock.Any()).Return(
+		biz.Run{}, context.DeadlineExceeded,
+	)
+	// 对账未落库时不得完成任务：否则 Run 永久停在 running 且无人再执行。
+	jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
+		t.Fatalf("ProcessOne() = %t, %v", processed, err)
+	}
+}

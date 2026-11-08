@@ -15,7 +15,7 @@
 | 接口 | 方法 | 匿名 | user | admin | 隔离规则 |
 | --- | --- | --- | --- | --- | --- |
 | `/health/live`、`/health/ready`、`/api/v1/health` | GET | 允许 | 允许 | 允许 | 不返回用户数据 |
-| `/metrics` | GET | 允许 | 允许 | 允许 | 标签禁止 user/session/run；生产应限制网络访问 |
+| `/metrics` | GET | 允许 | 允许 | 允许 | 标签禁止 user/session/run；配置 `server.metrics_token` 后要求 `Authorization: Bearer`，未配置时生产应限制网络访问 |
 | `/api/v1/sse/probe` | GET | 允许 | 允许 | 允许 | 仅心跳，不读取业务数据 |
 | `/api/v1/auth/register`、`login`、`refresh`、`csrf` | POST/GET | 允许 | 允许 | 允许 | 登录限流；注册受 `registration_enabled` 控制；刷新并发重放；Cookie 模式强制 CSRF |
 | `/api/v1/auth/password`、`/api/v1/auth/password/reset` | POST | 仅 reset 允许 | 允许 | 允许 | 改密校验当前密码；重置令牌一次性、15 分钟过期；成功后全端失效 |

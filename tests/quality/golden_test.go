@@ -97,12 +97,16 @@ func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedSta
 
 		hasToolResult := false
 		stepLimit := false
+		loopedToolCall := false
 		for _, message := range body.Messages {
 			if message.Role == "tool" {
 				hasToolResult = true
 			}
 			if strings.Contains(message.Content, "已达到工具调用步数上限") {
 				stepLimit = true
+			}
+			if strings.Contains(message.Content, "repeated_tool_call") {
+				loopedToolCall = true
 			}
 		}
 
@@ -122,7 +126,8 @@ func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedSta
 				toolCalls = scriptedToolCalls(scenario)
 			}
 		case "tool_loop":
-			if stepLimit {
+			// 收到重复调用提示或步数上限收尾指令后停止调用工具并给出结论。
+			if stepLimit || loopedToolCall {
 				content = "工具调用达到上限，已停止重复调用。"
 			} else {
 				toolCalls = scriptedToolCalls(scenario)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,6 +69,33 @@ const stepLimitInstruction = "已达到工具调用步数上限。请不要再�
 // continuationInstruction 要求模型在输出被长度截断后从中断处继续，不要重复已有内容。
 const continuationInstruction = "上一条回答因输出长度限制被截断。请从中断处继续，不要重复已经输出的内容，也不要调用工具。"
 
+// streamSender 统一处理 StreamWriter 写入错误：
+// 一旦读取端关闭就停止后续发送，避免向已关闭的流重复写入并放大事件。
+type streamSender struct {
+	writer *schema.StreamWriter[*schema.Message]
+	err    error
+}
+
+// send 写入一帧；Send 返回 closed=true 表示读取端已关闭，后续写入全部跳过。
+func (s *streamSender) send(message *schema.Message, err error) bool {
+	if s == nil || s.writer == nil || s.err != nil {
+		return false
+	}
+	if s.writer.Send(message, err) {
+		s.err = errors.New("stream reader closed")
+		return false
+	}
+	return true
+}
+
+// Err 返回首次写入错误。
+func (s *streamSender) Err() error {
+	if s == nil {
+		return nil
+	}
+	return s.err
+}
+
 // Generate 执行一次非流式模型调用并记录 Attempt 用量与消息事件。
 func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...einomodel.Option) (*schema.Message, error) {
 	if m.stepLimitReached() {
@@ -75,20 +103,26 @@ func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...
 	}
 	step := m.beginStep(ctx)
 	completion, err := m.router.Complete(ctx, ToReactMessages(input), m.specs)
-	m.finishStep(ctx, step, completion, err)
+	// 每次实际模型调用都立即计入用量，错误与截断路径也不会漏记 Token。
+	m.recordUsage(completion)
 	if err != nil {
+		m.finishStep(ctx, step, completion, err)
 		return nil, err
 	}
 	if reasonErr := completionError(completion); reasonErr != nil {
+		m.finishStep(ctx, step, completion, reasonErr)
 		return nil, reasonErr
 	}
 	// 输出被长度截断时先请求一次续写，避免把半截答案直接返回用户。
 	if isLengthFinish(completion) && len(completion.ToolCalls) == 0 {
 		completion, err = m.continueCompletion(ctx, ToReactMessages(input), completion)
 		if err != nil {
+			m.finishStep(ctx, step, completion, err)
 			return nil, err
 		}
 	}
+	// 步骤完成事件在续写合并后发出，Token 口径包含两次真实调用。
+	m.finishStep(ctx, step, completion, nil)
 	m.setLastContent(completion.Content)
 	if budgetErr := m.emitAssistant(ctx, completion); budgetErr != nil {
 		return nil, budgetErr
@@ -106,47 +140,54 @@ func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, _ ...ei
 	reader, writer := schema.Pipe[*schema.Message](16)
 	go func() {
 		defer writer.Close()
+		sender := &streamSender{writer: writer}
 		messages := ToReactMessages(input)
-		var content strings.Builder
 		completion, err := m.router.CompleteStream(ctx, messages, m.specs, func(delta string) {
 			if delta == "" {
 				return
 			}
-			content.WriteString(delta)
+			// 客户端已断开或读取端关闭时停止写入，避免无效发送与事件放大。
+			if !sender.send(&schema.Message{Role: schema.Assistant, Content: delta}, nil) {
+				return
+			}
 			if m.emitter != nil {
 				m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": delta})
 			}
-			writer.Send(&schema.Message{Role: schema.Assistant, Content: delta}, nil)
 		})
-		m.finishStep(ctx, step, completion, err)
+		m.recordUsage(completion)
 		if err != nil {
-			writer.Send(nil, err)
+			m.finishStep(ctx, step, completion, err)
+			sender.send(nil, err)
 			return
 		}
 		// 内容审核与工具调用截断必须在执行工具前终止，避免产生非预期副作用。
 		if reasonErr := completionError(completion); reasonErr != nil {
-			writer.Send(nil, reasonErr)
+			m.finishStep(ctx, step, completion, reasonErr)
+			sender.send(nil, reasonErr)
 			return
 		}
 		// 输出被长度截断时续写一次，把两段文本合并成同一条助手消息。
 		if isLengthFinish(completion) && len(completion.ToolCalls) == 0 {
-			continued, contErr := m.continueStream(ctx, messages, step, completion, writer)
+			continued, contErr := m.continueStream(ctx, messages, step, completion, sender)
 			if contErr != nil {
-				writer.Send(nil, contErr)
+				m.finishStep(ctx, step, continued, contErr)
+				sender.send(nil, contErr)
 				return
 			}
 			completion = continued
 		}
+		// 步骤事件在续写合并后发出，Token 口径与真实调用一致。
+		m.finishStep(ctx, step, completion, nil)
 		// 预算耗尽必须在发送工具调用帧之前终止，避免 Eino 继续执行工具产生副作用。
 		m.setLastContent(completion.Content)
 		if budgetErr := m.emitAssistant(ctx, completion); budgetErr != nil {
-			writer.Send(nil, budgetErr)
+			sender.send(nil, budgetErr)
 			return
 		}
 		// 最后一帧只携带工具调用与结束原因，正文已通过增量帧发送，避免重复拼接。
 		final := completionToMessage(completion)
 		final.Content = ""
-		writer.Send(final, nil)
+		sender.send(final, nil)
 	}()
 	return reader, nil
 }
@@ -179,6 +220,7 @@ func (m *ChatModel) stepLimitReached() bool {
 func (m *ChatModel) summarize(ctx context.Context, input []*schema.Message) (*schema.Message, error) {
 	step := m.beginFinalStep(ctx)
 	completion, err := m.router.Complete(ctx, m.summaryMessages(input), nil)
+	m.recordUsage(completion)
 	m.finishStep(ctx, step, completion, err)
 	if err != nil {
 		return nil, fmt.Errorf("%w: final summary failed: %v", react.ErrStepLimit, err)
@@ -202,39 +244,41 @@ func (m *ChatModel) summarizeStream(ctx context.Context, input []*schema.Message
 	reader, writer := schema.Pipe[*schema.Message](16)
 	go func() {
 		defer writer.Close()
+		sender := &streamSender{writer: writer}
 		step := m.beginFinalStep(ctx)
-		var content strings.Builder
 		completion, err := m.router.CompleteStream(ctx, m.summaryMessages(input), nil, func(delta string) {
 			if delta == "" {
 				return
 			}
-			content.WriteString(delta)
+			if !sender.send(&schema.Message{Role: schema.Assistant, Content: delta}, nil) {
+				return
+			}
 			if m.emitter != nil {
 				m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": delta, "final": true})
 			}
-			writer.Send(&schema.Message{Role: schema.Assistant, Content: delta}, nil)
 		})
+		m.recordUsage(completion)
 		m.finishStep(ctx, step, completion, err)
 		if err != nil {
-			writer.Send(nil, fmt.Errorf("%w: final summary failed: %v", react.ErrStepLimit, err))
+			sender.send(nil, fmt.Errorf("%w: final summary failed: %v", react.ErrStepLimit, err))
 			return
 		}
 		if reasonErr := completionError(completion); reasonErr != nil {
-			writer.Send(nil, reasonErr)
+			sender.send(nil, reasonErr)
 			return
 		}
 		if isLengthFinish(completion) {
-			writer.Send(nil, fmt.Errorf("%w: final summary truncated", react.ErrStepLimit))
+			sender.send(nil, fmt.Errorf("%w: final summary truncated", react.ErrStepLimit))
 			return
 		}
 		m.setLastContent(completion.Content)
 		if budgetErr := m.emitAssistant(ctx, completion); budgetErr != nil {
-			writer.Send(nil, budgetErr)
+			sender.send(nil, budgetErr)
 			return
 		}
 		final := completionToMessage(completion)
 		final.Content = ""
-		writer.Send(final, nil)
+		sender.send(final, nil)
 	}()
 	return reader
 }
@@ -261,6 +305,7 @@ func (m *ChatModel) continueCompletion(ctx context.Context, messages []react.Mes
 		return partial, err
 	}
 	continued, err := m.router.Complete(ctx, m.continuationMessages(messages, partial), nil)
+	m.recordUsage(continued)
 	if err != nil {
 		return partial, fmt.Errorf("%w: continuation failed: %v", react.ErrStepLimit, err)
 	}
@@ -268,7 +313,7 @@ func (m *ChatModel) continueCompletion(ctx context.Context, messages []react.Mes
 }
 
 // continueStream 以流式方式续写截断答案，增量直接写入同一个 StreamReader。
-func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message, step int, partial react.Completion, writer *schema.StreamWriter[*schema.Message]) (react.Completion, error) {
+func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message, step int, partial react.Completion, sender *streamSender) (react.Completion, error) {
 	if err := m.continuationAllowed(partial); err != nil {
 		return partial, err
 	}
@@ -279,13 +324,20 @@ func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message
 		if delta == "" {
 			return
 		}
+		if !sender.send(&schema.Message{Role: schema.Assistant, Content: delta}, nil) {
+			return
+		}
 		if m.emitter != nil {
 			m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": delta, "continuation": true})
 		}
-		writer.Send(&schema.Message{Role: schema.Assistant, Content: delta}, nil)
 	})
+	m.recordUsage(continued)
 	if err != nil {
 		return partial, fmt.Errorf("%w: continuation failed: %v", react.ErrStepLimit, err)
+	}
+	// 读取端已关闭时不再合并续写结果，避免把未送达的文本计入最终答案。
+	if sendErr := sender.Err(); sendErr != nil {
+		return partial, sendErr
 	}
 	return m.mergeContinuation(partial, continued)
 }
@@ -295,7 +347,8 @@ func (m *ChatModel) continuationAllowed(partial react.Completion) error {
 	if strings.TrimSpace(partial.Content) == "" {
 		return fmt.Errorf("%w: output truncated", react.ErrStepLimit)
 	}
-	if m.maxCalls > 0 && int(m.state.calls.Load())+1 >= m.maxCalls {
+	// 当前调用已计入 calls，续写是第 calls+1 次真实调用。
+	if m.maxCalls > 0 && int(m.state.calls.Load())+1 > m.maxCalls {
 		return fmt.Errorf("%w: continuation would exceed step limit", react.ErrStepLimit)
 	}
 	return nil
@@ -312,12 +365,11 @@ func (m *ChatModel) continuationMessages(messages []react.Message, partial react
 	return result
 }
 
-// mergeContinuation 合并续写结果与用量；第二次调用同样计入步数。
+// mergeContinuation 合并续写结果与用量；调用次数已在 recordUsage 中按真实调用累计。
 func (m *ChatModel) mergeContinuation(partial, continued react.Completion) (react.Completion, error) {
 	if len(continued.ToolCalls) > 0 {
 		return partial, fmt.Errorf("%w: continuation returned tool calls", react.ErrIncompleteToolCall)
 	}
-	m.state.calls.Add(1)
 	partial.Content += continued.Content
 	partial.Usage.InputTokens += continued.Usage.InputTokens
 	partial.Usage.OutputTokens += continued.Usage.OutputTokens
@@ -366,15 +418,21 @@ func (m *ChatModel) finishStep(ctx context.Context, step int, completion react.C
 	})
 }
 
-// emitAssistant 累计用量、检查 Token/费用预算并发出助手消息事件。
-// 预算超限时返回错误，调用方必须在执行下一轮工具调用前终止。
-func (m *ChatModel) emitAssistant(ctx context.Context, completion react.Completion) error {
-	if m.state != nil {
-		m.state.calls.Add(1)
-		m.state.inputTokens.Add(int64(completion.Usage.InputTokens))
-		m.state.outputTokens.Add(int64(completion.Usage.OutputTokens))
-		addCost(m.state, completion.EstimatedCost)
+// recordUsage 在每次真实模型调用返回后立即累计调用次数、Token 与费用。
+// 与 emitAssistant 解耦，确保错误、审核拦截与截断续写路径都不会漏记用量。
+func (m *ChatModel) recordUsage(completion react.Completion) {
+	if m == nil || m.state == nil {
+		return
 	}
+	m.state.calls.Add(1)
+	m.state.inputTokens.Add(int64(completion.Usage.InputTokens))
+	m.state.outputTokens.Add(int64(completion.Usage.OutputTokens))
+	addCost(m.state, completion.EstimatedCost)
+}
+
+// emitAssistant 检查 Token/费用预算并发出一条助手消息事件。
+// 用量已在 recordUsage 中按真实调用累计，这里不再重复计数。
+func (m *ChatModel) emitAssistant(ctx context.Context, completion react.Completion) error {
 	if m.budgetExceeded() {
 		inputTokens, outputTokens, cost := m.state.inputTokens.Load(), m.state.outputTokens.Load(), math.Float64frombits(m.state.costBits.Load())
 		return fmt.Errorf("%w: tokens=%d cost=%.4f", react.ErrBudgetExceeded, inputTokens+outputTokens, cost)
@@ -441,11 +499,26 @@ func completionError(completion react.Completion) error {
 	return nil
 }
 
+// errorSecretPatterns 用于在执行事件中脱敏凭证，避免供应商错误回显密钥。
+var errorSecretPatterns = []struct {
+	pattern     *regexp.Regexp
+	replacement string
+}{
+	{regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+`), `Bearer [REDACTED]`},
+	{regexp.MustCompile(`(?i)\b(api[_-]?key|access[_-]?token|token|secret|password)\b\s*[:=]\s*[^\s,;&]+`), `${1}=[REDACTED]`},
+	{regexp.MustCompile(`(?i)([?&](?:key|api_key|access_token)=)[^&\s]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(https?://)[^/\s:@]+:[^/\s@]+@`), `${1}[REDACTED]@`},
+}
+
 func errorText(err error) string {
 	if err == nil {
 		return ""
 	}
 	text := err.Error()
+	for _, rule := range errorSecretPatterns {
+		text = rule.pattern.ReplaceAllString(text, rule.replacement)
+	}
 	if len(text) > 256 {
 		text = truncateUTF8(text, 256)
 	}

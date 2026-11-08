@@ -496,3 +496,41 @@ func TestSummaryWorkerRejectsInvalidPayload(t *testing.T) {
 		t.Fatalf("completed=%d generation=%d", jobs.completed, generator.calls)
 	}
 }
+
+// TestSummaryWorkerRetriesOnSessionLookupFailure 验证会话查询瞬时失败时退避重试而不是丢弃摘要。
+func TestSummaryWorkerRetriesOnSessionLookupFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	message := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Now().UTC()}
+	task := biz.SummaryTask{
+		UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: 0,
+		SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+		EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
+	}
+	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+	jobs := &fakeSummaryJobs{job: job}
+	sessions := mocks.NewMockSessionRepository(ctrl)
+	sessions.EXPECT().GetSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Session{}, context.DeadlineExceeded)
+	worker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
+		Jobs: jobs, Sessions: sessions, Messages: &fakeSummaryReader{},
+		Summaries: &fakeSummaryRepository{applied: true}, Generator: &fakeSummaryGenerator{},
+	}, biz.SummaryWorkerConfig{WorkerID: "summary-test", Heartbeat: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.failed != 1 || jobs.completed != 0 {
+		t.Fatalf("transient session error: completed=%d failed=%d", jobs.completed, jobs.failed)
+	}
+
+	// 会话确实不存在时结束任务，避免死信堆积。
+	jobs.claimed, jobs.failed, jobs.completed = false, 0, 0
+	sessions.EXPECT().GetSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Session{}, biz.ErrResourceNotFound)
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.completed != 1 || jobs.failed != 0 {
+		t.Fatalf("missing session: completed=%d failed=%d", jobs.completed, jobs.failed)
+	}
+}

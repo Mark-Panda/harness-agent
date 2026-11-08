@@ -215,7 +215,8 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 		cancelQuery()
 		if listErr != nil {
 			// 流已开始，只能以 run.failed 风格结束，避免写入非法 JSON 错误体。
-			writeSSE(w, after+1, "run.failed", map[string]any{"reason": "event_read_failed"})
+			// 合成事件不是真实事件流成员，seq 传 0 不写 id，防止污染客户端 Last-Event-ID 游标。
+			writeSSE(w, 0, "run.failed", map[string]any{"reason": "event_read_failed"})
 			flusher.Flush()
 			return
 		}

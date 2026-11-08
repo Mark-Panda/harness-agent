@@ -38,14 +38,16 @@ type planGraphState struct {
 
 // executePlanEino 使用 Eino Graph 编排 Plan 模式的推进循环。
 // 计划持久化、审批恢复、预算与事件语义与原 executePlan 完全一致，图只负责节点流转。
-func (w *ExecutionWorker) executePlanEino(ctx context.Context, run Run, fence RunFence, router *model.Router, messages []react.Message, tools react.Registry) (react.Result, error) {
+func (w *ExecutionWorker) executePlanEino(ctx context.Context, run Run, fence RunFence, router *model.Router, messages []react.Message, tools react.Registry) (react.Result, bool, error) {
 	if w.plans == nil {
-		return react.Result{}, fmt.Errorf("%w: plan repository is not configured", ErrPlanInvalid)
+		return react.Result{}, false, fmt.Errorf("%w: plan repository is not configured", ErrPlanInvalid)
 	}
 	planFence := PlanFence{Owner: w.config.WorkerID, Token: fence.Token}
-	graph, err := w.buildPlanGraph(run, fence, planFence, router, messages, tools)
+	// 用图外变量记录推流状态：节点返回错误时 Eino 不会回传状态，必须独立于图状态保留该事实。
+	var streamed bool
+	graph, err := w.buildPlanGraph(run, fence, planFence, router, messages, tools, &streamed)
 	if err != nil {
-		return react.Result{}, err
+		return react.Result{}, streamed, err
 	}
 	// 单次计划最多执行 MaxSteps+9 轮，每轮固定经过 guard/approvals/select/step 四个节点，
 	// 额外预留重规划与汇总节点；轮次超限由图内 guard 返回业务错误，而不是依赖 Eino 的通用步数错误。
@@ -54,22 +56,22 @@ func (w *ExecutionWorker) executePlanEino(ctx context.Context, run Run, fence Ru
 		compose.WithMaxRunSteps((DefaultPlanLimits().MaxSteps+10)*6+16),
 	)
 	if err != nil {
-		return react.Result{}, fmt.Errorf("compile plan graph: %w", err)
+		return react.Result{}, streamed, fmt.Errorf("compile plan graph: %w", err)
 	}
 	state, err := runnable.Invoke(ctx, &planGraphState{})
 	if err != nil {
-		return react.Result{}, err
+		return react.Result{}, streamed, err
 	}
 	if state == nil {
-		return react.Result{}, fmt.Errorf("%w: plan graph produced no state", ErrPlanInvalid)
+		return react.Result{}, streamed, fmt.Errorf("%w: plan graph produced no state", ErrPlanInvalid)
 	}
-	return state.Result, nil
+	return state.Result, streamed, nil
 }
 
 // buildPlanGraph 构造 Plan 执行图：加载 → 恢复 → 守卫 → 审批 → 选步 → 执行/重规划 → 汇总。
 func (w *ExecutionWorker) buildPlanGraph(
 	run Run, fence RunFence, planFence PlanFence,
-	router *model.Router, messages []react.Message, tools react.Registry,
+	router *model.Router, messages []react.Message, tools react.Registry, streamed *bool,
 ) (*compose.Graph[*planGraphState, *planGraphState], error) {
 	graph := compose.NewGraph[*planGraphState, *planGraphState]()
 
@@ -178,7 +180,12 @@ func (w *ExecutionWorker) buildPlanGraph(
 	})
 
 	modelStep := compose.InvokableLambda(func(ctx context.Context, state *planGraphState) (*planGraphState, error) {
-		if err := w.executePlanModelStep(ctx, run, planFence, router, messages, tools, state.Plan, state.Step); err != nil {
+		stepStreamed, err := w.executePlanModelStep(ctx, run, planFence, router, messages, tools, state.Plan, state.Step)
+		// 即使步骤失败，已推送的增量也必须记住，避免上层把同一回答再推一遍。
+		if stepStreamed {
+			*streamed = true
+		}
+		if err != nil {
 			return nil, err
 		}
 		return state, nil

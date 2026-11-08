@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/platform/config"
+	"github.com/Mark-Panda/harness-agent/internal/platform/observability"
 	"github.com/Mark-Panda/harness-agent/internal/service"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	kratoshttp "github.com/go-kratos/kratos/v3/transport/http"
@@ -58,22 +60,22 @@ func NewHTTPServerWithLimits(cfg config.ServerConfig, assets fs.FS, authService 
 		return nil, err
 	}
 	srv := kratoshttp.NewServer(options...)
-	srv.HandlePrefix("/", newHandler(assets, authService, limiter, authCookiePolicy{Secure: cfg.CookieSecure}, apiLimits, ipResolver, platform...))
+	srv.HandlePrefix("/", newHandler(assets, authService, limiter, authCookiePolicy{Secure: cfg.CookieSecure}, apiLimits, ipResolver, cfg.MetricsToken, platform...))
 	return srv, nil
 }
 
 func NewHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimiter, platform ...*service.PlatformService) http.Handler {
-	return newHandler(assets, authService, limiter, authCookiePolicy{}, APILimiters{}, nil, platform...)
+	return newHandler(assets, authService, limiter, authCookiePolicy{}, APILimiters{}, nil, "", platform...)
 }
 
 // NewHandlerWithLimits 构造带多维限流的测试/嵌入 Handler。
 func NewHandlerWithLimits(assets fs.FS, authService AuthApplication, limiter AuthRateLimiter, apiLimits APILimiters, platform ...*service.PlatformService) http.Handler {
-	return newHandler(assets, authService, limiter, authCookiePolicy{}, apiLimits, nil, platform...)
+	return newHandler(assets, authService, limiter, authCookiePolicy{}, apiLimits, nil, "", platform...)
 }
 
 // newHandler 装配完整 HTTP 路由；cookies 控制鉴权 Cookie 的安全属性，
-// ipResolver 决定限流与审计使用的客户端 IP。
-func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimiter, cookies authCookiePolicy, apiLimits APILimiters, ipResolver *clientIPResolver, platform ...*service.PlatformService) http.Handler {
+// ipResolver 决定限流与审计使用的客户端 IP，metricsToken 为空表示 /metrics 匿名只读。
+func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimiter, cookies authCookiePolicy, apiLimits APILimiters, ipResolver *clientIPResolver, metricsToken string, platform ...*service.PlatformService) http.Handler {
 	authHandler := &authHTTPHandler{service: authService, limiter: limiter, userLimiter: apiLimits.User, ipResolver: ipResolver, cookies: cookies}
 	mux := http.NewServeMux()
 	if len(platform) > 0 && platform[0] != nil {
@@ -100,6 +102,7 @@ func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimit
 	}
 	mux.HandleFunc("GET /health/live", healthHandler("alive"))
 	mux.HandleFunc("GET /health/ready", readinessHandler)
+	mux.HandleFunc("GET /metrics", metricsHandler(metricsToken))
 	mux.HandleFunc("GET /api/v1/health", healthHandler("ok"))
 	mux.HandleFunc("GET /api/v1/sse/probe", sseProbeHandler)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) {
@@ -107,8 +110,9 @@ func newHandler(assets fs.FS, authService AuthApplication, limiter AuthRateLimit
 	})
 	mux.Handle("/", spaHandler(assets))
 	apiHandler := apiRateLimitMiddleware(apiLimits, ipResolver, mux)
-	// 请求关联中间件为每个请求建立或复用 request_id，并回写响应头。
-	return securityHeaders(cookies.Secure, logging.RequestIDMiddleware(apiHandler))
+	// 追踪中间件建立或复用 traceparent，并在响应头回写 X-Trace-Id；
+	// request_id 仍由日志中间件独立生成，两者共同贯穿 HTTP 与后台任务。
+	return securityHeaders(cookies.Secure, observability.TracingMiddleware(logging.RequestIDMiddleware(apiHandler)))
 }
 
 // apiRateLimitMiddleware 对 /api/v1 请求执行全局与来源 IP 维度限流；
@@ -144,6 +148,28 @@ func allowAPIRate(w http.ResponseWriter, r *http.Request, limiter AuthRateLimite
 		return false
 	}
 	return true
+}
+
+// metricsHandler 以可选 Bearer 令牌保护指标端点。
+// 未配置令牌时保持匿名只读，由部署侧网络策略限制来源；
+// 配置后必须携带 Authorization: Bearer <token>，避免容量与调用信息对外泄露。
+func metricsHandler(token string) http.HandlerFunc {
+	handler := observability.Default().MetricsHandler
+	if token == "" {
+		return handler
+	}
+	expected := []byte(token)
+	return func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, prefix) ||
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(authorization, prefix)), expected) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		handler(w, r)
+	}
 }
 
 // securityHeaders 为所有响应添加浏览器安全头；启用 Secure Cookie 时视为 HTTPS 部署并附加 HSTS。

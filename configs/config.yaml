@@ -36,6 +36,8 @@ server:
   trusted_proxies: []
   # 刷新令牌与 CSRF Cookie 是否带 Secure 标记；本地 HTTP 开发可关闭，生产必须开启。
   cookie_secure: false
+  # /metrics 的 Bearer 访问令牌；为空时匿名只读，由网络策略限制来源。
+  # metrics_token: ${METRICS_TOKEN}
 
 data:
   postgres:

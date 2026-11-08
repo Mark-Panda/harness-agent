@@ -92,3 +92,37 @@ func TestNewHTTPServerRejectsInvalidTLSFiles(t *testing.T) {
 		t.Fatal("invalid TLS certificate must fail server construction")
 	}
 }
+
+// TestMetricsEndpointRequiresBearerToken 验证配置令牌后 /metrics 强制 Bearer 鉴权。
+func TestMetricsEndpointRequiresBearerToken(t *testing.T) {
+	handler := newHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, nil, nil, authCookiePolicy{}, APILimiters{}, nil, "metrics-secret")
+	for _, testCase := range []struct {
+		name          string
+		authorization string
+		want          int
+	}{
+		{name: "missing", want: http.StatusUnauthorized},
+		{name: "wrong scheme", authorization: "Basic metrics-secret", want: http.StatusUnauthorized},
+		{name: "wrong token", authorization: "Bearer other", want: http.StatusUnauthorized},
+		{name: "valid", authorization: "Bearer metrics-secret", want: http.StatusOK},
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		if testCase.authorization != "" {
+			request.Header.Set("Authorization", testCase.authorization)
+		}
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != testCase.want {
+			t.Fatalf("%s: status = %d, want %d", testCase.name, recorder.Code, testCase.want)
+		}
+	}
+}
+
+// TestMetricsEndpointAnonymousWithoutToken 验证未配置令牌时保持匿名只读。
+func TestMetricsEndpointAnonymousWithoutToken(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	testHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if recorder.Code != http.StatusOK || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("status = %d, content type = %q", recorder.Code, recorder.Header().Get("Content-Type"))
+	}
+}

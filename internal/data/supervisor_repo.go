@@ -134,6 +134,24 @@ RETURNING *`, now.UTC(), now.UTC(), taskID, userID).Scan(&record).Error
 	return toBizSupervisorTask(record)
 }
 
+// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于审批恢复与瞬时故障重试。
+func (r *SupervisorTaskRepository) RetryTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+	var record supervisorTaskModel
+	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Raw(`
+UPDATE supervisor_tasks
+SET status = 'pending', started_at = NULL, finished_at = NULL, error_code = '', error_message = '', updated_at = ?
+WHERE id = ? AND user_id = ? AND status = 'running' AND attempts < max_attempts
+RETURNING *`, now.UTC(), taskID, userID).Scan(&record).Error
+	}); err != nil {
+		return biz.SupervisorTask{}, catalogError("retry supervisor task", err)
+	}
+	if record.ID == uuid.Nil {
+		return biz.SupervisorTask{}, fmt.Errorf("%w: task is not retryable", biz.ErrResourceConflict)
+	}
+	return toBizSupervisorTask(record)
+}
+
 // FinishTask 以 running 状态为前置条件推进终态，迟到结果被拒绝。
 func (r *SupervisorTaskRepository) FinishTask(ctx context.Context, userID, taskID uuid.UUID, status biz.SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time) (biz.SupervisorTask, error) {
 	if !biz.SupervisorTaskTerminal(status) {

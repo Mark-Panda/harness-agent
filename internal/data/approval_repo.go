@@ -22,6 +22,8 @@ type toolApprovalModel struct {
 	RunID uuid.UUID `gorm:"type:uuid"`
 	// StepID 请求审批的工具步骤。
 	StepID *uuid.UUID `gorm:"type:uuid"`
+	// SessionID 发起工具调用的会话，零值表示主会话。
+	SessionID *uuid.UUID `gorm:"type:uuid"`
 	// UserID 所属用户，RLS 隔离键。
 	UserID uuid.UUID `gorm:"type:uuid"`
 	// ToolCallID 模型产生的工具调用 ID。
@@ -90,8 +92,13 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 		result = datatypes.JSON(approval.ResultJSON)
 	}
 	now := time.Now().UTC()
+	var sessionID *uuid.UUID
+	if approval.SessionID != uuid.Nil {
+		value := approval.SessionID
+		sessionID = &value
+	}
 	record := toolApprovalModel{
-		ID: approval.ID, RunID: approval.RunID, StepID: approval.StepID, UserID: approval.UserID,
+		ID: approval.ID, RunID: approval.RunID, StepID: approval.StepID, SessionID: sessionID, UserID: approval.UserID,
 		ToolCallID: approval.ToolCallID, ToolName: approval.ToolName, Arguments: datatypes.JSON(arguments),
 		RiskLevel: approval.RiskLevel, Status: string(approval.Status), IdempotencyKey: approval.IdempotencyKey,
 		ResultJSON: result, ErrorCode: approval.ErrorCode, ErrorMessage: approval.ErrorMessage,
@@ -112,8 +119,18 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return tx.First(&stored, "user_id = ? AND run_id = ? AND tool_call_id = ?",
-				approval.UserID, approval.RunID, approval.ToolCallID).Error
+			if err := tx.First(&stored, "user_id = ? AND run_id = ? AND tool_call_id = ?",
+				approval.UserID, approval.RunID, approval.ToolCallID).Error; err != nil {
+				return err
+			}
+			// provider 可能复用 tool_call_id（本地/兼容网关常见，空 ID 也会复用）：
+			// 参数不同却复用旧审批会执行错误参数，必须显式冲突，禁止静默复用。
+			if canonicalApprovalArguments(json.RawMessage(stored.Arguments)) != canonicalApprovalArguments(arguments) {
+				return fmt.Errorf("%w: approval tool call %q reused with different arguments",
+					biz.ErrResourceConflict, approval.ToolCallID)
+			}
+			// 冲突命中的是旧记录，必须返回库中的既有审批而不是本次插入值。
+			return nil
 		}
 		stored = record
 		return nil
@@ -326,6 +343,19 @@ func normalizeApprovalJSON(raw json.RawMessage) json.RawMessage {
 	}
 }
 
+// canonicalApprovalArguments 返回与键序/空白无关的参数表示，用于判断同一 tool_call_id 的参数是否真的相同。
+func canonicalApprovalArguments(raw json.RawMessage) string {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return string(raw)
+	}
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return string(raw)
+	}
+	return string(normalized)
+}
+
 // toBizApproval 将数据库行转换为领域审批。
 func toBizApproval(record toolApprovalModel) (biz.ToolApproval, error) {
 	approval := biz.ToolApproval{
@@ -335,6 +365,9 @@ func toBizApproval(record toolApprovalModel) (biz.ToolApproval, error) {
 		ResultJSON: json.RawMessage(record.ResultJSON), ErrorCode: record.ErrorCode, ErrorMessage: record.ErrorMessage,
 		DecidedBy: record.DecidedBy, DecidedAt: record.DecidedAt, DeliveredAt: record.DeliveredAt,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+	}
+	if record.SessionID != nil {
+		approval.SessionID = *record.SessionID
 	}
 	return approval, nil
 }

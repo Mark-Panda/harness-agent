@@ -301,7 +301,7 @@ func responseCookie(t *testing.T, recorder *httptest.ResponseRecorder, name stri
 }
 
 func TestLoginUsesSecureCookieTransport(t *testing.T) {
-	handler := newHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{result: cookieAuthFixture()}, nil, authCookiePolicy{Secure: true}, APILimiters{}, nil)
+	handler := newHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{result: cookieAuthFixture()}, nil, authCookiePolicy{Secure: true}, APILimiters{}, nil, "")
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"alice","password":"correct horse battery"}`))
 	handler.ServeHTTP(recorder, request)

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // jobModel 对应 jobs 表：持久化异步任务与租约状态。
@@ -83,7 +84,19 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
+		// dedupe_key 上是部分唯一索引，ON CONFLICT 不指定列才能匹配到该索引。
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 0 {
+			return nil
+		}
+		// 已有同 Run 的 pending 任务：重复入队通常发生在“审批决策/恢复需要立即唤醒”场景。
+		// 若旧任务被退避到了更晚的 available_at，直接返回会推迟唤醒；这里只在提前时前移。
+		return tx.Model(&jobModel{}).
+			Where("dedupe_key = ? AND status = ? AND available_at > ?", dedupe, "pending", availableAt).
+			Updates(map[string]any{"available_at": availableAt, "updated_at": time.Now().UTC()}).Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
 		// Worker 重启或客户端重试可能重复入队，幂等键保证只有一个任务。

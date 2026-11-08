@@ -520,6 +520,7 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 		Clock:       func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, biz.FeishuEventWorkerConfig{
 		WorkerID: "worker-1", DefaultAgentID: &agentID, DefaultAgentVersion: &version,
+		DefaultAgentOwnerID: &userID,
 	})
 	if err != nil {
 		t.Fatalf("new worker: %v", err)
@@ -563,7 +564,8 @@ func TestFeishuEventWorkerGroupPolicies(t *testing.T) {
 			Sessions: &feishuSessionsStub{conversation: conversations}, Messages: messages, Runs: runs, Outbound: &feishuOutboundStub{},
 		}, biz.FeishuEventWorkerConfig{
 			WorkerID: "worker-1", DefaultAgentID: &agentID, DefaultAgentVersion: &version,
-			BotOpenID: "ou_bot", RequireTopic: true,
+			DefaultAgentOwnerID: &userID,
+			BotOpenID:           "ou_bot", RequireTopic: true,
 		})
 		if err != nil {
 			t.Fatalf("new worker: %v", err)
@@ -587,7 +589,7 @@ func TestFeishuEventWorkerGroupPolicies(t *testing.T) {
 	}
 }
 
-// TestFeishuEventWorkerSpeakerFactOwnership 验证群聊话题只提取发言人事实并写入发言人私有记忆。
+// TestFeishuEventWorkerSpeakerFactOwnership 验证群聊话题仅属主可驱动，且事实归属发言人本人。
 func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 	ownerID, speakerID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	// 群聊话题：消息归属会话所有者，事实提取身份切换为发言人本人。
@@ -600,12 +602,24 @@ func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 	}
 	groupFixture := newFeishuWorkerFixture(t, groupRecord, feishuJob("evt-speaker-group", 1, 3),
 		biz.FeishuEventWorkerConfig{BotOpenID: "ou_bot"})
-	groupFixture.identities.userID = speakerID
 	groupFixture.conversations.found = true
 	groupFixture.conversations.binding = biz.FeishuConversationBinding{
 		UserID: ownerID, SessionID: sessionID, ThreadID: "omt_parent", Status: biz.FeishuBindingActive,
 	}
 	groupFixture.conversations.session = biz.Session{ID: sessionID, UserID: ownerID, Status: biz.SessionActive}
+	// 非属主群成员发言必须忽略，禁止以会话所有者身份驱动 Agent、工具与预算。
+	groupFixture.identities.userID = speakerID
+	if _, err := groupFixture.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("non-owner group process: %v", err)
+	}
+	if groupFixture.events.statuses["evt-speaker-group"] != biz.FeishuEventIgnored {
+		t.Fatalf("non-owner group status = %q", groupFixture.events.statuses["evt-speaker-group"])
+	}
+	if groupFixture.facts.speakerCalls != 0 || groupFixture.runs.calls != 0 {
+		t.Fatalf("non-owner group facts=%d runs=%d", groupFixture.facts.speakerCalls, groupFixture.runs.calls)
+	}
+	// 属主本人发言时正常推进，事实提取仍归属发言人（即属主）。
+	groupFixture.identities.userID = ownerID
 	if _, err := groupFixture.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("group process: %v", err)
 	}
@@ -613,7 +627,7 @@ func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 		t.Fatalf("speaker fact calls = %d", groupFixture.facts.speakerCalls)
 	}
 	if groupFixture.facts.ownerUserID != ownerID || groupFixture.facts.sessionID != sessionID ||
-		groupFixture.facts.factOwnerID != speakerID || groupFixture.facts.speakerOpenID != "ou_user" {
+		groupFixture.facts.factOwnerID != ownerID || groupFixture.facts.speakerOpenID != "ou_user" {
 		t.Fatalf("speaker fact input = %+v", groupFixture.facts)
 	}
 	if groupFixture.runs.calls != 1 {
@@ -913,6 +927,10 @@ func newFeishuWorkerFixture(t *testing.T, record biz.FeishuEventRecord, job biz.
 	if config.DefaultAgentVersion == nil {
 		config.DefaultAgentVersion = &version
 	}
+	// 默认应用只服务默认助手属主；指向桩身份字段，测试中途切换发言人时属主同步变化。
+	if config.DefaultAgentOwnerID == nil {
+		config.DefaultAgentOwnerID = &fixture.identities.userID
+	}
 	fixture.buildWithConfig(t, config)
 	return fixture
 }
@@ -1108,14 +1126,14 @@ func TestFeishuEventWorkerTerminalAndIgnoredBranches(t *testing.T) {
 	if terminal.jobs.completed != 1 || len(terminal.events.statuses) != 0 {
 		t.Fatalf("terminal completed=%d statuses=%v", terminal.jobs.completed, terminal.events.statuses)
 	}
-	// 缺少 event_id 的非法载荷直接完成，避免永久重试。
+	// 缺少 event_id 的非法载荷不能静默丢弃：进入失败重试，预算耗尽后由队列转入死信。
 	invalid := newFeishuWorkerFixture(t, biz.FeishuEventRecord{EventID: "evt-2"},
 		biz.Job{ID: uuid.New(), Payload: map[string]any{}}, biz.FeishuEventWorkerConfig{})
 	if _, err := invalid.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("invalid payload process: %v", err)
 	}
-	if invalid.jobs.completed != 1 {
-		t.Fatalf("invalid payload completed=%d", invalid.jobs.completed)
+	if invalid.jobs.completed != 0 || invalid.jobs.failed != 1 {
+		t.Fatalf("invalid payload completed=%d failed=%d", invalid.jobs.completed, invalid.jobs.failed)
 	}
 	emptyBody := &feishuEventStoreStub{event: biz.FeishuEventRecord{EventID: "evt-empty", Payload: map[string]any{}}}
 	emptyFixture := newFeishuWorkerFixture(t, emptyBody.event, feishuJob("evt-empty", 1, 3), biz.FeishuEventWorkerConfig{})
@@ -1432,12 +1450,21 @@ func TestFeishuReplyWorkerRunStatesAndLookupFailure(t *testing.T) {
 	}
 	// Run 已被删除时直接结束外发，避免永久重试。
 	missing := newFeishuReplyFixture(t, base, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
-	missing.runs.err = errors.New("run deleted")
+	missing.runs.err = biz.ErrResourceNotFound
 	if _, err := missing.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("missing run process: %v", err)
 	}
 	if missing.outbound.completed != 1 || missing.sender.cardCalls != 0 {
 		t.Fatalf("missing completed=%d cards=%d", missing.outbound.completed, missing.sender.cardCalls)
+	}
+	// 瞬时读取失败必须进入重试，不能把外发记录直接完成掉导致用户收不到答复。
+	unavailable := newFeishuReplyFixture(t, base, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
+	unavailable.runs.err = errors.New("database unavailable")
+	if _, err := unavailable.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("unavailable run process: %v", err)
+	}
+	if unavailable.outbound.failed != 1 || unavailable.outbound.completed != 0 {
+		t.Fatalf("unavailable failed=%d completed=%d", unavailable.outbound.failed, unavailable.outbound.completed)
 	}
 	cases := []struct {
 		name   string

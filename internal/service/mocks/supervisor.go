@@ -102,6 +102,21 @@ func (mr *MockSupervisorTaskRepositoryMockRecorder) ListTasks(ctx, userID, paren
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).ListTasks), ctx, userID, parentRunID)
 }
 
+// RetryTask mocks base method.
+func (m *MockSupervisorTaskRepository) RetryTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RetryTask", ctx, userID, taskID, now)
+	ret0, _ := ret[0].(biz.SupervisorTask)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RetryTask indicates an expected call of RetryTask.
+func (mr *MockSupervisorTaskRepositoryMockRecorder) RetryTask(ctx, userID, taskID, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RetryTask", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).RetryTask), ctx, userID, taskID, now)
+}
+
 // StartTask mocks base method.
 func (m *MockSupervisorTaskRepository) StartTask(ctx context.Context, userID, taskID uuid.UUID, now time.Time) (biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()

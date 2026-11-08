@@ -3,7 +3,10 @@ package data
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -39,11 +42,11 @@ func OpenPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 		Logger:         newQueryLogger(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("open postgres: %w", err)
+		return nil, fmt.Errorf("open postgres: %v", redactDSNError(err, dsn))
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
-		return nil, fmt.Errorf("get postgres connection pool: %w", err)
+		return nil, fmt.Errorf("get postgres connection pool: %v", redactDSNError(err, dsn))
 	}
 	// 连接池设置上限，避免单实例耗尽数据库连接。
 	sqlDB.SetMaxOpenConns(maxOpenConns)
@@ -54,9 +57,24 @@ func OpenPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 	defer cancel()
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+		return nil, fmt.Errorf("ping postgres: %v", redactDSNError(err, dsn))
 	}
 	return db, nil
+}
+
+// redactDSNError 移除错误文本中出现的 DSN 密码，避免启动日志泄露凭据。
+func redactDSNError(err error, dsn string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	if parsed, parseErr := url.Parse(dsn); parseErr == nil && parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok && password != "" {
+			message = strings.ReplaceAll(message, password, "***")
+			message = strings.ReplaceAll(message, url.QueryEscape(password), "***")
+		}
+	}
+	return errors.New(message)
 }
 
 // WithScope 在单个事务内设置 RLS 会话变量后执行 fn，事务结束自动清理作用域。

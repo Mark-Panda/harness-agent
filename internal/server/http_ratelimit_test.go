@@ -202,7 +202,7 @@ func TestAPIRateLimitUsesTrustedProxyIP(t *testing.T) {
 		t.Fatalf("resolver: %v", err)
 	}
 	ipLimiter := &recordingLimiter{allowed: true}
-	handler := newHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{}, nil, authCookiePolicy{}, APILimiters{IP: ipLimiter}, resolver)
+	handler := newHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{}, nil, authCookiePolicy{}, APILimiters{IP: ipLimiter}, resolver, "")
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
 	request.RemoteAddr = "10.0.0.5:4321"
 	request.Header.Set("X-Forwarded-For", "203.0.113.9")

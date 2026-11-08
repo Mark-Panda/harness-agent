@@ -36,7 +36,7 @@ func TestExecutePlanEinoSuccess(t *testing.T) {
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
 	messages := []react.Message{{Role: react.RoleSystem, Content: "system"}, {Role: react.RoleUser, Content: "整理数据"}}
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{})
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{})
 	if err != nil {
 		plan, _ := plans.GetPlanByRun(context.Background(), run.UserID, run.ID)
 		t.Logf("plan after failure: %#v", plan)
@@ -80,7 +80,7 @@ func TestExecutePlanEinoToolStep(t *testing.T) {
 	}
 	plan.Steps[0].PlanID = plan.ID
 	plans.seedPlan(plan)
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}},
 		fakePlanRegistry{tool: fakePlanTool{risk: "low", output: `{"ok":true}`}})
 	if err != nil {
@@ -110,7 +110,7 @@ func TestExecutePlanEinoCompletedPlanRecovery(t *testing.T) {
 		Status: PlanCompleted, Goal: "g", MaxSteps: 50,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}},
 	})
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +131,7 @@ func TestExecutePlanEinoPaused(t *testing.T) {
 		Status: PlanPaused, Goal: "g", MaxSteps: 50,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepPending, MaxAttempts: 2}},
 	})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanPaused) {
 		t.Fatalf("paused plan error = %v", err)
 	}
@@ -163,7 +163,7 @@ func TestExecutePlanEinoApprovalPauseAndResume(t *testing.T) {
 	plans.seedPlan(plan)
 	registry := fakePlanRegistry{tool: fakePlanTool{risk: "high", output: `{"ok":true}`}}
 
-	_, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	_, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, registry)
 	if !errors.Is(err, ErrApprovalPending) {
 		t.Fatalf("approval pause error = %v", err)
@@ -181,7 +181,7 @@ func TestExecutePlanEinoApprovalPauseAndResume(t *testing.T) {
 
 	approvals.items[0].Status = ApprovalExecuted
 	approvals.items[0].ResultJSON = json.RawMessage(`{"approved":true}`)
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, registry)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +221,7 @@ func TestExecutePlanEinoReplan(t *testing.T) {
 		}
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
-	result, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{})
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestExecutePlanEinoBudgetGuard(t *testing.T) {
 		Status: PlanExecuting, Goal: "g", MaxSteps: 50, TotalInputTokens: 100,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepPending, MaxAttempts: 2}},
 	})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanFailed) {
 		t.Fatalf("budget error = %v", err)
 	}
@@ -275,7 +275,7 @@ func TestExecutePlanEinoDeadlineGuard(t *testing.T) {
 		Status: PlanExecuting, Goal: "g", MaxSteps: 50, DeadlineAt: &deadline,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepPending, MaxAttempts: 2}},
 	})
-	if _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
 		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanFailed) {
 		t.Fatalf("deadline error = %v", err)
 	}

@@ -10,7 +10,13 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// idempotencyInProgressTimeout 是 in_progress 记录被视为僵死的最短时长。
+// 处理进程崩溃或请求超时后键会停留在 in_progress；超过该时长允许同键重新占位，
+// 避免客户端被永久拒绝，同时给正常慢请求留出足够窗口。
+const idempotencyInProgressTimeout = 5 * time.Minute
 
 // idempotencyKeyModel 对应 idempotency_keys 表：写接口幂等记录。
 type idempotencyKeyModel struct {
@@ -54,7 +60,9 @@ func (r *IdempotencyRepository) Begin(ctx context.Context, userID uuid.UUID, key
 	var outcome biz.IdempotencyOutcome
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		var record idempotencyKeyModel
-		err := tx.First(&record, "user_id = ? AND key = ?", userID, key).Error
+		// 加行锁串行化同键并发请求：避免两个请求同时看到 in_progress 或过期行后都继续执行。
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&record, "user_id = ? AND key = ?", userID, key).Error
+		now := time.Now().UTC()
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			record = idempotencyKeyModel{
 				ID: uuid.New(), UserID: userID, Key: key, RequestHash: requestHash,
@@ -67,6 +75,14 @@ func (r *IdempotencyRepository) Begin(ctx context.Context, userID uuid.UUID, key
 		}
 		if err != nil {
 			return err
+		}
+		// 过期记录不能回放：它可能对应早已变化的资源状态，且会阻止新请求占位。
+		// 复用同一行重置为新的处理中记录，保持 (user_id, key) 唯一约束不变。
+		if !record.ExpiresAt.After(now) {
+			return tx.Model(&idempotencyKeyModel{}).Where("id = ?", record.ID).Updates(map[string]any{
+				"request_hash": requestHash, "status": "in_progress", "response_json": nil,
+				"resource_type": resourceType, "resource_id": "", "expires_at": expiresAt, "created_at": now,
+			}).Error
 		}
 		// 同键不同请求体必须拒绝，避免把 A 请求的结果回放给 B 请求。
 		if !bytes.Equal(record.RequestHash, requestHash) {
@@ -83,7 +99,17 @@ func (r *IdempotencyRepository) Begin(ctx context.Context, userID uuid.UUID, key
 		case "failed":
 			// 失败记录允许同键重试：重置为处理中并刷新过期时间。
 			return tx.Model(&idempotencyKeyModel{}).Where("user_id = ? AND key = ?", userID, key).
-				Updates(map[string]any{"status": "in_progress", "response_json": nil, "expires_at": expiresAt}).Error
+				Updates(map[string]any{"status": "in_progress", "response_json": nil, "expires_at": expiresAt, "created_at": now}).Error
+		case "in_progress":
+			if now.Sub(record.CreatedAt) <= idempotencyInProgressTimeout {
+				return biz.ErrIdempotencyConflict
+			}
+			// 僵死的处理中记录（例如进程崩溃）允许同键重新占位，并重置处理计时。
+			return tx.Model(&idempotencyKeyModel{}).Where("id = ? AND status = ?", record.ID, "in_progress").
+				Updates(map[string]any{
+					"request_hash": requestHash, "response_json": nil, "resource_type": resourceType,
+					"resource_id": "", "expires_at": expiresAt, "created_at": now,
+				}).Error
 		default:
 			return biz.ErrIdempotencyConflict
 		}
