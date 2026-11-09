@@ -8,6 +8,9 @@ COPY web/ ./
 RUN npm run build
 
 FROM golang:1.26.10-alpine AS server-builder
+# 构建期模块代理可通过 --build-arg 覆盖，默认使用国内镜像避免 proxy.golang.org 不可达。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
