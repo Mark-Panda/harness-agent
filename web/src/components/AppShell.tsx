@@ -1,17 +1,19 @@
-// 应用外壳：顶栏导航、平台设置入口、使用指南与账户操作。
-import { useState } from "react";
+// 应用外壳：工作区侧栏、移动导航、平台设置和账户操作。
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Link, NavLink, Navigate, Outlet } from "react-router-dom";
+import { Link, Navigate, Outlet, useLocation, useNavigationType } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { HelpSheet } from "./HelpSheet";
+import { Icon } from "./Icon";
+import type { IconName } from "./Icon";
 import { Badge, Button, ConfirmDialog, DropdownMenu, EmptyState, MenuItem, cn } from "./ui";
 
-const workItems = [
-  { to: "/", label: "工作台", detail: "从哪里开始" },
-  { to: "/sessions", label: "对话", detail: "和助手聊天" },
-  { to: "/agents", label: "助手", detail: "创建与发布" },
-  { to: "/memory", label: "记忆", detail: "知识图谱" },
-  { to: "/audit", label: "运行记录", detail: "每一步做了什么" },
+const workItems: Array<{ to: string; label: string; icon: IconName }> = [
+  { to: "/", label: "工作台", icon: "dashboard" },
+  { to: "/sessions", label: "对话", icon: "chat" },
+  { to: "/agents", label: "助手", icon: "agent" },
+  { to: "/memory", label: "记忆", icon: "memory" },
+  { to: "/audit", label: "运行记录", icon: "activity" },
 ];
 
 // 管理入口按配置顺序分组，避免八项平铺后找不到先后关系。
@@ -41,81 +43,169 @@ const adminGroups = [
   },
 ];
 
-function TopNavItem({ to, label, detail }: { to: string; label: string; detail: string }) {
+function WorkspaceNav({ activePath, onNavigate, onHelp, onClose }: {
+  activePath?: string;
+  onNavigate?: () => void;
+  onHelp: () => void;
+  onClose?: () => void;
+}) {
   return (
-    <NavLink
-      to={to}
-      end={to === "/"}
-      className={({ isActive }) =>
-        cn(
-          "group flex flex-col gap-0.5 border-b-2 px-1 py-1 transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
-          isActive ? "border-accent text-accent" : "border-transparent text-ink-soft hover:border-line-strong hover:text-ink",
-        )
-      }
-    >
-      <span className="text-sm font-medium tracking-wide">{label}</span>
-      <span className="hidden text-[10px] text-muted sm:block">{detail}</span>
-    </NavLink>
+    <div className="flex min-h-full flex-col px-3 py-4">
+      <div className="flex items-center justify-between gap-2 px-2">
+        <Link to="/" onClick={onNavigate} className="flex min-w-0 items-center gap-3 rounded-lg">
+          <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-accent text-accent-ink">
+            <Icon name="logo" className="size-6" />
+          </span>
+          <span className="min-w-0">
+            <span className="block text-base font-semibold leading-tight tracking-tight">Harness</span>
+            <span className="block text-xs text-muted">智能体工作区</span>
+          </span>
+        </Link>
+        {onClose ? <Button size="sm" variant="ghost" aria-label="关闭导航" onClick={onClose}><Icon name="close" /></Button> : null}
+      </div>
+
+      <Link to="/sessions?new=1" onClick={onNavigate} className="mx-1 mt-7 flex min-h-10 items-center gap-2 rounded-lg border border-accent/25 bg-accent-soft/55 px-3 text-sm font-semibold text-accent transition-colors hover:border-accent/50 hover:bg-accent-soft">
+        <Icon name="plus" />
+        新建对话
+      </Link>
+
+      <nav aria-label="主导航" className="mt-7 flex flex-col gap-1">
+        {workItems.map(({ to, label, icon }) => (
+          <Link
+            key={to}
+            to={to}
+            aria-current={activePath === to ? "page" : undefined}
+            onClick={onNavigate}
+            className={cn(
+              "relative flex min-h-11 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors",
+              activePath === to ? "bg-accent-soft text-accent" : "text-ink-soft hover:bg-paper-deep hover:text-ink",
+            )}
+          >
+            <Icon name={icon} />
+            {label}
+          </Link>
+        ))}
+      </nav>
+
+      <div className="mt-auto pt-6">
+        <div className="border-t border-line pt-3">
+          <Button size="sm" variant="ghost" onClick={onHelp} className="w-full justify-start text-sm">
+            <Icon name="help" />
+            使用指南
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 
 export function AppShell() {
   const { user, logout, logoutAll } = useAuth();
+  const { pathname, search } = useLocation();
+  const navigationType = useNavigationType();
+  const lastPath = useRef(pathname);
+  const mainRef = useRef<HTMLElement>(null);
   const [confirmLogoutAll, setConfirmLogoutAll] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const navigationRef = useRef<HTMLDialogElement>(null);
+  const sectionPath = pathname.startsWith("/runs/") ? "/audit" : pathname;
+  const navItem = workItems.find(({ to }) => sectionPath === to || sectionPath.startsWith(to + "/"));
+  const adminItem = adminGroups.flatMap((group) => group.items).find(({ to }) => pathname === to);
+  const currentLabel = navItem?.label ?? adminItem?.label ?? "工作区";
+
+  useLayoutEffect(() => {
+    const changed = lastPath.current !== pathname;
+    lastPath.current = pathname;
+    if (!changed || navigationType === "POP") return;
+    window.scrollTo({ top: 0, behavior: "instant" });
+    const main = mainRef.current;
+    if (!document.querySelector("dialog:modal") && !main?.contains(document.activeElement)) {
+      main?.focus({ preventScroll: true });
+    }
+  }, [pathname, navigationType]);
+
+  useEffect(() => {
+    if (navigationRef.current?.open) navigationRef.current.close();
+  }, [pathname, search]);
+
+  useEffect(() => {
+    const desktop = window.matchMedia?.("(min-width: 1024px)");
+    if (!desktop) return;
+    const closeOnDesktop = () => {
+      if (desktop.matches && navigationRef.current?.open) {
+        navigationRef.current?.close();
+      }
+    };
+    desktop.addEventListener("change", closeOnDesktop);
+    return () => desktop.removeEventListener("change", closeOnDesktop);
+  }, []);
+
+  const closeNav = () => navigationRef.current?.close();
+  const openHelp = () => {
+    closeNav();
+    setHelpOpen(true);
+  };
 
   return (
-    <div className="min-h-screen text-ink">
+    <div className="min-h-screen text-ink lg:grid lg:grid-cols-[228px_minmax(0,1fr)]">
       <a
         href="#main-content"
-        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded focus:bg-ink focus:px-3 focus:py-2 focus:text-paper-raised"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-accent focus:px-3 focus:py-2 focus:text-accent-ink"
       >
         跳到主内容
       </a>
 
-      <header className="sticky top-0 z-30 border-b border-line bg-paper/90 backdrop-blur-sm">
-        <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center gap-x-8 gap-y-3 px-4 py-3 sm:px-6 lg:px-8">
-          <Link to="/" className="flex items-baseline gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">
-            <span className="font-display text-xl tracking-[0.16em] text-ink">HARNESS</span>
-            <span className="text-[11px] tracking-[0.22em] text-accent">智能体工坊</span>
-          </Link>
+      <aside className="sticky top-0 hidden h-dvh overflow-y-auto border-r border-line bg-paper-raised lg:block">
+        <WorkspaceNav activePath={navItem?.to} onHelp={openHelp} />
+      </aside>
+      <dialog
+        ref={navigationRef}
+        aria-label="工作区导航"
+        className="fixed inset-y-0 left-0 m-0 h-dvh max-h-none w-[min(18rem,85vw)] max-w-none overflow-y-auto border-r border-line bg-paper-raised text-ink"
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            closeNav();
+          }
+        }}
+      >
+        <WorkspaceNav activePath={navItem?.to} onNavigate={closeNav} onClose={closeNav} onHelp={openHelp} />
+      </dialog>
 
-          <nav aria-label="主导航" className="flex flex-wrap items-center gap-5">
-            {workItems.map((item) => (
-              <TopNavItem key={item.to} {...item} />
-            ))}
-          </nav>
-
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button size="sm" variant="secondary" onClick={() => setHelpOpen(true)}>
-              使用指南
-            </Button>
+      <div className="min-w-0">
+        <header className="sticky top-0 z-30 flex min-h-16 items-center gap-2 border-b border-line bg-paper/95 px-3 backdrop-blur-sm sm:gap-4 sm:px-6 lg:px-8">
+          <Button size="sm" variant="ghost" className="size-10 shrink-0 p-0 lg:hidden" aria-label="打开导航" aria-haspopup="dialog" onClick={() => navigationRef.current?.showModal()}>
+            <Icon name="menu" />
+          </Button>
+          <div className="flex min-w-0 items-center gap-2 text-sm">
+            <span className="hidden text-muted sm:inline">工作区</span>
+            <Icon name="chevron" className="hidden size-3.5 shrink-0 text-muted sm:block" />
+            <span className="truncate font-medium">{currentLabel}</span>
+          </div>
+          <div className="ml-auto flex shrink-0 items-center gap-1 sm:gap-2">
             {user?.role === "admin" ? (
               <DropdownMenu
                 label="平台设置菜单"
+                triggerLabel="平台设置"
                 indicator
                 panelClassName="w-80"
-                triggerClassName="px-3 text-ink-soft hover:bg-paper-deep hover:text-ink"
-                trigger={<span>平台设置</span>}
+                triggerClassName={cn("px-2.5 text-ink-soft hover:bg-paper-deep hover:text-ink", adminItem && "bg-paper-deep text-ink")}
+                trigger={<><Icon name="settings" /><span className="hidden sm:inline">平台设置</span></>}
               >
-                <p className="px-2 pb-2 text-[11px] leading-5 text-muted">
-                  按顺序配置：先完成「模型接入」，助手才能选到模型。
-                </p>
                 {adminGroups.map((group, index) => (
                   <div
                     key={group.title}
                     role="group"
                     aria-label={group.title}
-                    className={cn("py-1", index > 0 && "mt-1 border-t border-line pt-2")}
+                    className={cn("px-0.5 py-1", index > 0 && "mt-1 border-t border-line pt-2")}
                   >
-                    <p aria-hidden className="px-2 pb-1 text-[11px] font-semibold tracking-[0.14em] text-muted">
+                    <p aria-hidden className="px-2.5 pb-1 text-xs font-medium text-muted">
                       {group.title}
                     </p>
                     <div className="flex flex-col gap-0.5">
                       {group.items.map((item) => (
                         <MenuItem key={item.to} to={item.to}>
-                          <span className="block font-medium text-ink">{item.label}</span>
+                          <span className="block font-medium">{item.label}</span>
                           <span className="block text-[11px] text-muted">{item.detail}</span>
                         </MenuItem>
                       ))}
@@ -128,13 +218,13 @@ export function AppShell() {
               label="账户菜单"
               indicator
               panelClassName="w-60 p-3"
-              triggerClassName="px-3 text-ink-soft hover:bg-paper-deep hover:text-ink"
+              triggerClassName="min-h-10 px-2 text-ink-soft hover:bg-paper-deep hover:text-ink"
               trigger={
                 <>
-                  <span aria-hidden className="flex size-6 items-center justify-center rounded-full border border-line-strong font-display text-[11px] text-accent">
+                  <span aria-hidden className="grid size-7 place-items-center rounded-full border border-accent/25 bg-accent-soft text-xs text-accent">
                     {(user?.username ?? "?").slice(0, 1).toUpperCase()}
                   </span>
-                  <span className="max-w-28 truncate">{user?.username ?? "账户"}</span>
+                  <span className="sr-only max-w-28 truncate sm:not-sr-only">{user?.username ?? "账户"}</span>
                 </>
               }
             >
@@ -146,19 +236,15 @@ export function AppShell() {
                 <Badge tone={user?.status === "disabled" ? "danger" : "success"}>{user?.status === "disabled" ? "已禁用" : "在线"}</Badge>
               </div>
               <div className="mt-3 flex flex-col gap-0.5 border-t border-line pt-2">
-                <MenuItem onClick={() => void logout()}>注销当前设备</MenuItem>
-                <MenuItem onClick={() => setConfirmLogoutAll(true)}>注销全部设备</MenuItem>
+                <MenuItem icon="logout" onClick={() => void logout()}>注销当前设备</MenuItem>
+                <MenuItem icon="logout" danger onClick={() => setConfirmLogoutAll(true)}>注销全部设备</MenuItem>
               </div>
             </DropdownMenu>
           </div>
-        </div>
-      </header>
+        </header>
 
-      <div className="mx-auto w-full max-w-[1600px] px-4 py-8 sm:px-6 lg:px-8">
-        <main id="main-content" className="min-w-0 pb-16">
-          <div className="page-rise">
-            <Outlet />
-          </div>
+        <main id="main-content" ref={mainRef} tabIndex={-1} className="mx-auto w-full max-w-[1520px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+          <Outlet />
         </main>
       </div>
 

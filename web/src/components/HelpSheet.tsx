@@ -1,5 +1,6 @@
 // 使用指南：用人类语言解释核心概念与首次使用顺序。
-import { Badge, Button, Card, cn } from "./ui";
+import { useEffect, useRef } from "react";
+import { Button, Card } from "./ui";
 
 const flow = [
   { step: "01", title: "接入模型服务", detail: "你在用的模型由哪家公司提供，例如 OpenAI 兼容服务。" },
@@ -21,27 +22,25 @@ const glossary = [
 ];
 
 export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
-  if (!open) {
-    return null;
-  }
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (open && dialog && !dialog.open) dialog.showModal();
+    if (!open && dialog?.open) dialog.close();
+  }, [open]);
+
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-ink/35" role="presentation" onClick={onClose}>
-      <aside
-        role="dialog"
-        aria-modal="true"
-        aria-label="使用指南"
-        className="h-full w-full max-w-xl overflow-y-auto border-l border-line bg-paper px-6 py-6 shadow-[-20px_0_60px_rgb(31_27_21/0.18)]"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            onClose();
-          }
-        }}
-      >
+    <dialog
+      ref={dialogRef}
+      aria-label="使用指南"
+      className="fixed inset-y-0 right-0 left-auto m-0 h-dvh max-h-none w-full max-w-xl border-l border-line bg-paper text-ink shadow-2xl"
+      onClose={onClose}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}
+    >
+      {open ? <div className="min-h-full px-5 py-6 sm:px-6">
         <div className="flex items-start justify-between gap-4 border-b border-line pb-4">
           <div>
-            <p className="text-[11px] font-semibold tracking-[0.18em] text-accent">使用指南</p>
-            <h2 className="mt-1 text-2xl text-ink">先看这里，再动手</h2>
+            <h2 className="text-2xl text-ink">使用指南</h2>
             <p className="mt-2 text-sm leading-6 text-muted">不用记术语。下面按“从零到第一次对话”的顺序解释每个功能。</p>
           </div>
           <Button size="sm" variant="secondary" onClick={onClose}>
@@ -71,7 +70,6 @@ export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => voi
               <div key={item.term} className="rounded-[3px] border border-line bg-paper-raised px-3 py-3">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-ink">{item.term}</span>
-                  <Badge tone="neutral">说明</Badge>
                 </div>
                 <p className="mt-1 text-xs leading-5 text-muted">{item.plain}</p>
               </div>
@@ -86,11 +84,11 @@ export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => voi
             <li>· <span className="font-medium">选模规则</span>：像排班一样安排主选与替补，不必写 JSON。</li>
             <li>· <span className="font-medium">技能与外部工具</span>：决定助手还能做什么；高风险工具会要求审批。</li>
           </ul>
-          <p className={cn("mt-3 text-xs leading-5 text-muted")}>
+          <p className="mt-3 text-xs leading-5 text-muted">
             管理员完成前 3 步后，普通用户就能在“助手”页创建并发布自己的助手。
           </p>
         </Card>
-      </aside>
-    </div>
+      </div> : null}
+    </dialog>
   );
 }

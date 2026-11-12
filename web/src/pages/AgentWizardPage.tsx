@@ -1,10 +1,11 @@
 // 助手创建向导：把“编排”拆成四步人话问答，最后检查并发布。
-import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useBlocker, useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { useRemote } from "../lib/hooks";
+import { Icon } from "../components/Icon";
 import { useToast } from "../components/Toast";
 import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill } from "../lib/types";
 import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
@@ -28,10 +29,14 @@ const modes: Array<{ value: AgentMode; title: string; description: string; badge
   },
 ];
 
-const stepTitles = ["基本情况", "工作方式", "模型与能力", "检查并发布"];
+const stepTitles = ["基本信息", "工作方式", "模型与能力", "检查与发布"];
 
 export default function AgentWizardPage() {
   const { agentId } = useParams();
+  return <AgentWizard key={agentId ?? "new"} agentId={agentId} />;
+}
+
+function AgentWizard({ agentId }: { agentId?: string }) {
   const navigate = useNavigate();
   const toast = useToast();
   const { user } = useAuth();
@@ -54,7 +59,24 @@ export default function AgentWizardPage() {
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"draft" | "publish" | null>(null);
-  const [confirmLeave, setConfirmLeave] = useState(false);
+  const allowNavigation = useRef(false);
+  const [savedDraft, setSavedDraft] = useState<{ id: string; signature: string } | null>(null);
+  const stepHeadingRef = useRef<HTMLHeadingElement>(null);
+  const focusStepRef = useRef(false);
+
+  useEffect(() => {
+    if (focusStepRef.current) {
+      stepHeadingRef.current?.focus();
+      focusStepRef.current = false;
+    }
+  }, [step]);
+
+  const goToStep = (index: number) => {
+    if (index !== step) {
+      focusStepRef.current = true;
+      setStep(index);
+    }
+  };
 
   const publishedPolicies = (policies.data?.items ?? []).filter((policy) => policy.status === "published");
   const activeSkills = (skills.data?.items ?? []).filter((skill) => skill.status === "published");
@@ -78,16 +100,18 @@ export default function AgentWizardPage() {
 
   // 新建时默认选中第一个已发布规则，减少“不知道为什么不能下一步”的困惑。
   useEffect(() => {
-    if (!policyID && publishedPolicies.length > 0) {
+    if (!isEditing && !policyID && publishedPolicies.length > 0) {
       setPolicyID(publishedPolicies[0].id);
     }
-  }, [policyID, publishedPolicies]);
+  }, [isEditing, policyID, publishedPolicies]);
 
   const canLeaveBasics = name.trim().length >= 2;
   const canLeaveModel = selectedPolicy !== null;
   // 有未保存内容时，关闭浏览器和返回列表前都先确认，避免整页填写白费。
   const defaultPolicyID = publishedPolicies[0]?.id ?? "";
+  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...mcpIDs].sort()]);
   const dirty = useMemo(() => {
+    if (savedDraft?.signature === draftSignature) return false;
     if (isEditing && editing.data) {
       const sameIDs = (left: string[], right: string[]) => [...left].sort().join() === [...right].sort().join();
       return name.trim() !== editing.data.name
@@ -103,7 +127,11 @@ export default function AgentWizardPage() {
       || policyID !== defaultPolicyID
       || skillIDs.length > 0
       || mcpIDs.length > 0;
-  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, mcpIDs]);
+  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, mcpIDs, draftSignature, savedDraft]);
+
+  const blocker = useBlocker(({ currentLocation, nextLocation }) =>
+    !allowNavigation.current && dirty && currentLocation.pathname !== nextLocation.pathname,
+  );
 
   useEffect(() => {
     if (!dirty) {
@@ -125,24 +153,26 @@ export default function AgentWizardPage() {
     if (!canLeaveBasics) {
       return false;
     }
-    return index === 1 || canLeaveModel;
+    return index < 3 || canLeaveModel;
   };
 
   const toggle = (values: string[], id: string) => (values.includes(id) ? values.filter((value) => value !== id) : [...values, id]);
 
   const submit = async (publish: boolean) => {
+    if (busy) return;
     if (!canLeaveBasics) {
       setError("请先填写助手名称（至少 2 个字符）。");
-      setStep(0);
+      goToStep(0);
       return;
     }
     if (!selectedPolicy) {
       setError("请先选择一个选模规则。若列表为空，请联系管理员完成平台配置。");
-      setStep(2);
+      goToStep(2);
       return;
     }
     setBusy(publish ? "publish" : "draft");
     setError(null);
+    let draftSaved = false;
     try {
       const body: AgentInput = {
         name: name.trim(),
@@ -153,16 +183,20 @@ export default function AgentWizardPage() {
         skill_ids: skillIDs,
         mcp_ids: mcpIDs,
       };
-      const saved = isEditing && agentId
-        ? await mutate<Agent>(`/api/v1/agents/${agentId}`, "PUT", body, crypto.randomUUID())
+      const draftID = agentId ?? savedDraft?.id;
+      const saved = draftID
+        ? await mutate<Agent>(`/api/v1/agents/${draftID}`, "PUT", body, crypto.randomUUID())
         : await mutate<Agent>("/api/v1/agents", "POST", body, crypto.randomUUID());
       if (publish) {
+        setSavedDraft({ id: saved.id, signature: draftSignature });
+        draftSaved = true;
         await mutate(`/api/v1/agents/${saved.id}/publish`, "POST", undefined, crypto.randomUUID());
       }
       toast.show(publish ? "助手已发布，可以在对话页使用" : "草稿已保存", "success");
+      allowNavigation.current = true;
       navigate("/agents");
     } catch (failure) {
-      setError(describeError(failure));
+      setError(draftSaved ? `草稿已保存，发布失败。${describeError(failure)}` : describeError(failure));
     } finally {
       setBusy(null);
     }
@@ -171,6 +205,9 @@ export default function AgentWizardPage() {
   const loading = (isEditing && editing.loading) || policies.loading || skills.loading || mcps.loading;
   if (loading) {
     return <LoadingState label="正在准备向导…" />;
+  }
+  if (isEditing && editing.error) {
+    return <ErrorBanner message={editing.error} onRetry={editing.reload} />;
   }
   // 已发布版本是冻结快照，直接编辑会破坏已有对话的复现能力。
   if (isEditing && editing.data && editing.data.status !== "draft") {
@@ -188,61 +225,50 @@ export default function AgentWizardPage() {
   }
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="mx-auto flex max-w-5xl flex-col gap-5">
       <PageHeader
-        eyebrow={isEditing ? "编辑助手" : "创建助手"}
-        title={isEditing ? `编辑「${editing.data?.name ?? name}」` : "一步一步创建你的助手"}
-        description="不需要懂“编排”。只要回答四个问题：它是谁、怎么工作、用哪些模型和工具，最后确认发布。"
+        title={isEditing ? `编辑「${editing.data?.name ?? name}」` : "创建助手"}
+        description="配置工作方式、模型和工具，再保存草稿或发布。"
         actions={
-          <button
-            type="button"
-            onClick={() => {
-              if (dirty) {
-                setConfirmLeave(true);
-              } else {
-                navigate("/agents");
-              }
-            }}
-            className="text-sm text-muted underline underline-offset-4 hover:text-accent"
+          <Button
+            variant="ghost"
+            disabled={busy !== null}
+            onClick={() => navigate("/agents")}
           >
-            返回助手列表
-          </button>
+            <Icon name="back" className="size-4" /> 返回助手列表
+          </Button>
         }
       />
 
-      {editing.error ? <ErrorBanner message={editing.error} onRetry={editing.reload} /> : null}
       {policies.error ? <ErrorBanner message={policies.error} onRetry={policies.reload} /> : null}
 
-      <div className="flex flex-col gap-2">
-        <nav aria-label="创建步骤" className="flex flex-wrap gap-2">
-          {stepTitles.map((title, index) => (
-            <button
-              key={title}
-              type="button"
-              aria-current={step === index ? "step" : undefined}
-              onClick={() => setStep(index)}
-              disabled={!canVisitStep(index)}
-              className={cn(
-                "flex items-center gap-2 rounded-[3px] border px-3 py-2 text-xs transition disabled:cursor-not-allowed disabled:opacity-50",
-                step === index ? "border-accent bg-accent-soft/50 text-accent" : "border-line bg-paper-raised text-muted hover:border-line-strong",
-              )}
-            >
-              <span className="font-display text-sm">{String(index + 1).padStart(2, "0")}</span>
-              {title}
-            </button>
-          ))}
-        </nav>
-        {!canVisitStep(stepTitles.length - 1) ? (
-          <p className="text-[11px] leading-5 text-muted">
-            灰色步骤暂不可进入：{!canLeaveBasics ? "先填写助手名称（至少 2 个字符）" : "先选择一套选模规则"}。
-          </p>
-        ) : null}
-      </div>
+      <nav aria-label="创建步骤" className="grid grid-cols-2 gap-2 rounded-xl border border-line bg-paper-raised p-2 sm:grid-cols-4">
+        {stepTitles.map((title, index) => (
+          <button
+            key={title}
+            type="button"
+            aria-current={step === index ? "step" : undefined}
+            onClick={() => goToStep(index)}
+            disabled={busy !== null || !canVisitStep(index)}
+            className={cn(
+              "flex min-h-11 min-w-0 items-center gap-2 rounded-lg px-2 text-left text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              step === index ? "bg-accent-soft text-accent" : "text-muted hover:bg-paper-deep hover:text-ink",
+            )}
+          >
+            <span aria-hidden="true" className={cn("grid size-6 shrink-0 place-items-center rounded-full border text-xs tabular-nums", step === index ? "border-accent/35 bg-accent/10" : "border-line-strong")}>
+              {index + 1}
+            </span>
+            {title}
+          </button>
+        ))}
+      </nav>
 
+      <h2 ref={stepHeadingRef} tabIndex={-1} className="scroll-mt-20 text-lg tracking-tight focus:outline-none">{stepTitles[step]}</h2>
       {error ? <ErrorBanner message={error} /> : null}
 
+      <fieldset disabled={busy !== null} className="min-w-0">
       {step === 0 ? (
-        <Card title="它是谁？" description="名字和描述会出现在对话页，帮助你和同事记住它的用途。">
+        <Card>
           <div className="grid gap-5 md:grid-cols-2">
             <Field label="助手名称" hint="例如：需求整理助手、代码审查搭档。至少 2 个字符。">
               <Input value={name} onChange={(event) => setName(event.target.value)} maxLength={128} autoFocus placeholder="给助手起个名字" />
@@ -262,6 +288,7 @@ export default function AgentWizardPage() {
             {modes.map((item) => (
               <ChoiceCard
                 key={item.value}
+                name="agent-mode"
                 selected={mode === item.value}
                 title={item.title}
                 description={item.description}
@@ -291,6 +318,7 @@ export default function AgentWizardPage() {
                 {publishedPolicies.map((policy) => (
                   <ChoiceCard
                     key={policy.id}
+                    name="agent-policy"
                     selected={policyID === policy.id}
                     title={policy.name}
                     description={`版本 v${policy.version} · ${policy.candidates.length} 个候选模型 · 最低上下文 ${policy.min_context_tokens.toLocaleString("zh-CN")} Token`}
@@ -401,43 +429,36 @@ export default function AgentWizardPage() {
         </Card>
       ) : null}
 
-      <div className="sticky bottom-3 z-20 flex flex-wrap items-center justify-between gap-3 rounded-[4px] border border-line-strong bg-paper-raised/95 px-4 py-3 shadow-[0_10px_30px_rgb(31_27_21/0.10)] backdrop-blur">
-        {step === 0 ? (
-          <p className="text-xs text-muted">填写助手名称后即可继续。</p>
-        ) : (
-          <Button variant="secondary" onClick={() => setStep(step - 1)}>上一步</Button>
-        )}
-        <div className="flex flex-wrap items-center gap-2">
-          {step === 0 ? (
-            <Button disabled={!canLeaveBasics} onClick={() => setStep(1)}>下一步：它是怎么工作的</Button>
+      </fieldset>
+      <div className="sticky bottom-2 z-20 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line-strong bg-paper-raised/95 p-3 shadow-lg backdrop-blur" aria-busy={busy !== null}>
+        {step > 0 ? (
+          <Button variant="ghost" disabled={busy !== null} onClick={() => goToStep(step - 1)}>
+            <Icon name="back" className="size-4" /> 上一步
+          </Button>
+        ) : <p className="text-xs text-muted">{canLeaveBasics ? "第 1 步，共 4 步" : "助手名称至少 2 个字符"}</p>}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {canLeaveBasics && canLeaveModel ? (
+            <Button variant="secondary" loading={busy === "draft"} disabled={busy !== null} onClick={() => void submit(false)}>保存草稿</Button>
           ) : null}
-          {step === 1 ? <Button onClick={() => setStep(2)}>下一步：用哪个模型</Button> : null}
-          {step === 2 ? (
-            <Button disabled={!canLeaveModel} onClick={() => setStep(3)}>下一步：检查并发布</Button>
-          ) : null}
-          {step === 3 ? (
-            <>
-              <Button variant="secondary" loading={busy === "draft"} disabled={busy !== null} onClick={() => void submit(false)}>
-                先保存草稿
-              </Button>
-              <Button loading={busy === "publish"} disabled={busy !== null} onClick={() => void submit(true)}>
-                发布并使用
-              </Button>
-            </>
-          ) : null}
+          {step < 3 ? (
+            <Button disabled={busy !== null || !canVisitStep(step + 1)} onClick={() => goToStep(step + 1)}>
+              下一步 <Icon name="arrow" className="size-4" />
+            </Button>
+          ) : (
+            <Button loading={busy === "publish"} disabled={busy !== null || !canLeaveModel} onClick={() => void submit(true)}>
+              发布助手
+            </Button>
+          )}
         </div>
       </div>
 
       <ConfirmDialog
-        open={confirmLeave}
+        open={blocker.state === "blocked" && busy === null}
         title="放弃未保存的修改？"
         description="当前填写的内容还没有保存，离开后会丢失。"
         confirmLabel="放弃并离开"
-        onCancel={() => setConfirmLeave(false)}
-        onConfirm={() => {
-          setConfirmLeave(false);
-          navigate("/agents");
-        }}
+        onCancel={() => { if (blocker.state === "blocked") blocker.reset(); }}
+        onConfirm={() => { if (blocker.state === "blocked") blocker.proceed(); }}
       />
     </div>
   );

@@ -1,7 +1,7 @@
 // 助手列表：用“我的助手”替代“Agent 编排”，突出创建、发布与开始对话。
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, LoadingState, PageHeader, Select } from "../components/ui";
+import { ActionLink, Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, LoadingState, PageHeader, Select } from "../components/ui";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
@@ -88,12 +88,7 @@ export default function AgentsPage() {
             <Button size="sm" variant="secondary" onClick={toggleArchived}>
               {showArchived ? "只看在用版本" : "显示已归档"}
             </Button>
-            <Link
-              to="/agents/new"
-              className="inline-flex h-10 items-center rounded-[3px] bg-ink px-4 text-sm font-medium tracking-wide text-paper-raised transition hover:bg-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-            >
-              创建助手
-            </Link>
+            <ActionLink to="/agents/new" size="sm">创建助手</ActionLink>
           </div>
         }
       />
@@ -230,12 +225,7 @@ export default function AgentsPage() {
                 ) : (
                   <>
                     {agent.status === "published" ? (
-                      <Link
-                        to={`/sessions?agent=${agent.id}`}
-                        className="inline-flex h-8 items-center rounded-[3px] bg-ink px-3 text-xs text-paper-raised transition hover:bg-accent"
-                      >
-                        用它开始对话
-                      </Link>
+                      <ActionLink to={`/sessions?agent=${agent.id}`} size="sm">用它开始对话</ActionLink>
                     ) : null}
                     <Button
                       size="sm"
@@ -302,12 +292,7 @@ export default function AgentsPage() {
             title="还没有助手"
             description="创建一个助手，选择它的工作方式与模型规则，然后发布。整个过程大约两分钟。"
             action={
-              <Link
-                to="/agents/new"
-                className="inline-flex h-9 items-center rounded-[3px] bg-ink px-4 text-sm text-paper-raised transition hover:bg-accent"
-              >
-                创建第一个助手
-              </Link>
+              <ActionLink to="/agents/new" size="sm">创建第一个助手</ActionLink>
             }
           />
         </Card>

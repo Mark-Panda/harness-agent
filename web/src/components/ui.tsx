@@ -1,8 +1,10 @@
-// 纸墨风格 UI 原语：暖纸底、墨色文字、朱砂强调，统一焦点与可访问语义。
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
-import { useEffect, useId, useRef, useState } from "react";
+// 共用界面组件，统一操作样式、焦点与可访问语义。
+import type { ComponentPropsWithRef, FormEvent, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
+import { cloneElement, isValidElement, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { NavLink } from "react-router-dom";
+import { Link, NavLink } from "react-router-dom";
+import type { LinkProps } from "react-router-dom";
+import { Icon } from "./Icon";
 
 // cn 合并条件类名。
 export function cn(...values: Array<string | false | null | undefined>): string {
@@ -13,54 +15,94 @@ type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 type ButtonSize = "sm" | "md";
 
 const buttonVariants: Record<ButtonVariant, string> = {
-  primary: "bg-ink text-paper-raised hover:bg-accent focus-visible:outline-accent",
-  secondary: "border border-line-strong bg-paper-raised text-ink hover:border-accent hover:text-accent focus-visible:outline-accent",
+  primary: "bg-accent text-accent-ink hover:bg-accent-hover focus-visible:outline-accent",
+  secondary: "border border-line-strong bg-paper-raised text-ink hover:border-accent/65 hover:bg-paper-deep focus-visible:outline-accent",
   ghost: "text-ink-soft hover:bg-paper-deep hover:text-ink focus-visible:outline-accent",
   danger: "border border-rust bg-rust-soft/60 text-rust hover:bg-rust-soft focus-visible:outline-rust",
 };
 
 const buttonSizes: Record<ButtonSize, string> = {
-  sm: "h-8 px-3 text-xs",
-  md: "h-10 px-4 text-sm",
+  sm: "min-h-9 px-3 py-1.5 text-xs max-sm:min-h-10",
+  md: "min-h-11 px-4 py-2 text-sm",
 };
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+const buttonClass = "inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-[background-color,border-color,color,transform] duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 active:scale-[0.98]";
+
+export interface ButtonProps extends ComponentPropsWithRef<"button"> {
   variant?: ButtonVariant;
   size?: ButtonSize;
   loading?: boolean;
 }
 
-export function Button({ variant = "primary", size = "md", loading = false, className, children, disabled, ...rest }: ButtonProps) {
+export function Button({ variant = "primary", size = "md", type = "button", loading = false, className, children, disabled, ...rest }: ButtonProps) {
   return (
     <button
       {...rest}
+      type={type}
+      aria-busy={loading || undefined}
       disabled={disabled || loading}
       className={cn(
-        "inline-flex items-center justify-center gap-2 rounded-[3px] font-medium tracking-wide transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
+        buttonClass,
+        "disabled:cursor-not-allowed disabled:opacity-50",
         buttonVariants[variant],
         buttonSizes[size],
         className,
       )}
     >
-      {loading ? <span aria-hidden className="size-3 animate-pulse rounded-full bg-current" /> : null}
+      {loading ? <span aria-hidden className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-current border-r-transparent" /> : null}
       {children}
     </button>
   );
 }
 
-// Field 统一标签、说明与错误提示；hint 用浅墨色，错误用锈红。
+export function ActionLink({ variant = "primary", size = "md", className, ...rest }: LinkProps & {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+}) {
+  return <Link {...rest} className={cn(buttonClass, buttonVariants[variant], buttonSizes[size], className)} />;
+}
+
+type FieldControl = {
+  id?: string;
+  required?: boolean;
+  "aria-describedby"?: string;
+  "aria-invalid"?: ComponentPropsWithRef<"input">["aria-invalid"];
+};
+
+function validationMessage(event: FormEvent<HTMLDivElement>): string {
+  const input = event.target as HTMLInputElement;
+  const state = input.validity;
+  if (!state) return "";
+  if (state.valueMissing) return "请填写此项。";
+  if (state.typeMismatch && input.type === "url") return "请输入完整的网址，例如 https://example.com。";
+  if (state.tooShort) return `至少需要 ${input.minLength} 个字符。`;
+  if (state.rangeUnderflow) return `请输入大于或等于 ${input.min} 的数值。`;
+  return input.validationMessage;
+}
+
+// Field 关联标签和说明，校验失败后在控件旁显示错误。
 export function Field({ label, hint, error, children }: { label: string; hint?: string; error?: string | null; children: ReactNode }) {
+  const generatedID = useId();
+  const [validationError, setValidationError] = useState("");
+  const control = isValidElement<FieldControl>(children) ? children : null;
+  const id = control?.props.id ?? generatedID;
+  const message = error || validationError || hint;
+  const invalid = Boolean(error || validationError);
+  const messageID = message ? `${generatedID}-hint` : undefined;
+  const description = [control?.props["aria-describedby"], messageID].filter(Boolean).join(" ");
   return (
-    <label className="flex flex-col gap-1.5 text-sm">
-      <span className="font-medium text-ink">{label}</span>
-      {children}
-      {hint && !error ? <span className="text-xs leading-5 text-muted">{hint}</span> : null}
-      {error ? (
-        <span role="alert" className="text-xs leading-5 text-rust">
-          {error}
-        </span>
-      ) : null}
-    </label>
+    <div className="flex min-w-0 flex-col gap-1.5 text-sm" onInvalid={(event) => setValidationError(validationMessage(event))} onChange={() => setValidationError("")}>
+      <label htmlFor={id} className="font-medium text-ink">
+        {label}
+        {control?.props.required ? <span aria-hidden="true" className="ml-1 text-accent">*</span> : null}
+      </label>
+      {control ? cloneElement(control, {
+        id,
+        "aria-describedby": description || undefined,
+        "aria-invalid": invalid || control.props["aria-invalid"],
+      }) : children}
+      {message ? <span id={messageID} role={invalid ? "alert" : undefined} className={cn("text-xs leading-5", invalid ? "text-rust" : "text-muted")}>{message}</span> : null}
+    </div>
   );
 }
 
@@ -79,11 +121,29 @@ export function HelpTip({ children }: { children: ReactNode }) {
   );
 }
 
-const controlClass =
-  "w-full rounded-[3px] border border-line-strong bg-paper-raised px-3 py-2 text-sm text-ink placeholder:text-muted/70 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:opacity-60";
+const controlClass = "form-control min-w-0 w-full rounded-lg px-3 py-2 text-base text-ink sm:text-sm";
 
-export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...rest} className={cn(controlClass, className)} />;
+export function Input({ className, type, disabled, ...rest }: ComponentPropsWithRef<"input">) {
+  const [visible, setVisible] = useState(false);
+  if (type !== "password") {
+    return <input {...rest} type={type} disabled={disabled} className={cn(controlClass, className)} />;
+  }
+  return (
+    <div className="relative min-w-0">
+      <input {...rest} type={visible ? "text" : "password"} disabled={disabled} className={cn(controlClass, "pr-12", className)} />
+      <button
+        type="button"
+        aria-label={visible ? "隐藏密码或密钥" : "显示密码或密钥"}
+        aria-controls={rest.id}
+        title={visible ? "隐藏内容" : "显示内容"}
+        disabled={disabled}
+        className="absolute inset-y-1 right-1 grid w-10 place-items-center rounded-md text-muted transition-colors hover:bg-paper-deep hover:text-ink disabled:opacity-50"
+        onClick={() => setVisible((value) => !value)}
+      >
+        <Icon name={visible ? "eyeOff" : "eye"} />
+      </button>
+    </div>
+  );
 }
 
 export function Textarea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
@@ -91,23 +151,22 @@ export function Textarea({ className, ...rest }: TextareaHTMLAttributes<HTMLText
 }
 
 export function Select({ className, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select {...rest} className={cn(controlClass, className)} />;
+  return <select {...rest} className={cn(controlClass, "form-select", className)} />;
 }
 
 type BadgeTone = "neutral" | "success" | "warning" | "danger" | "info";
 
-// 徽章做成印章：小字号、加字距、硬边框，避免圆角药丸的通用感。
 const badgeTones: Record<BadgeTone, string> = {
   neutral: "border-line-strong bg-paper-deep text-ink-soft",
-  success: "border-jade bg-jade-soft text-jade",
-  warning: "border-ochre bg-ochre-soft text-ochre",
-  danger: "border-rust bg-rust-soft text-rust",
-  info: "border-jade bg-jade-soft text-jade",
+  success: "border-jade/35 bg-jade-soft text-jade",
+  warning: "border-ochre/35 bg-ochre-soft text-ochre",
+  danger: "border-rust/35 bg-rust-soft text-rust",
+  info: "border-jade/35 bg-jade-soft text-jade",
 };
 
 export function Badge({ tone = "neutral", children }: { tone?: BadgeTone; children: ReactNode }) {
   return (
-    <span className={cn("inline-flex items-center rounded-[2px] border px-1.5 py-0.5 text-[11px] font-medium tracking-wide", badgeTones[tone])}>
+    <span className={cn("inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium", badgeTones[tone])}>
       {children}
     </span>
   );
@@ -115,33 +174,32 @@ export function Badge({ tone = "neutral", children }: { tone?: BadgeTone; childr
 
 export function Card({ title, description, actions, children, className }: { title?: string; description?: string; actions?: ReactNode; children: ReactNode; className?: string }) {
   return (
-    <section className={cn("rounded-[4px] border border-line bg-paper-raised shadow-[0_1px_0_rgb(31_27_21/0.04)]", className)}>
+    <section className={cn("min-w-0 rounded-xl border border-line bg-paper-raised", className)}>
       {(title || actions) && (
-        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-line px-5 py-4">
-          <div>
-            {title ? <h2 className="text-lg text-ink">{title}</h2> : null}
+        <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3 sm:px-5">
+          <div className="min-w-0">
+            {title ? <h2 className="break-words text-base text-ink">{title}</h2> : null}
             {description ? <p className="mt-1 max-w-2xl text-xs leading-5 text-muted">{description}</p> : null}
           </div>
           {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
         </header>
       )}
-      <div className="p-5">{children}</div>
+      <div className="p-4 sm:p-5">{children}</div>
     </section>
   );
 }
 
-// PageHeader 用朱砂短线做“栏目引子”，标题使用宋体，强化编辑排版感。
+// PageHeader 统一标题、说明和页面级操作。
 export function PageHeader({ eyebrow, title, description, actions }: { eyebrow?: string; title: string; description?: string; actions?: ReactNode }) {
   return (
-    <div className="flex flex-wrap items-end justify-between gap-4 border-b border-line pb-5">
-      <div>
-        {eyebrow ? (
-          <p className="flex items-center gap-2 text-[11px] font-semibold tracking-[0.18em] text-accent">
-            <span aria-hidden className="h-px w-6 bg-accent" />
+    <div className="flex flex-wrap items-end justify-between gap-4">
+      <div className="min-w-0">
+        {eyebrow && eyebrow !== title ? (
+          <p className="mb-2 text-xs font-medium text-accent">
             {eyebrow}
           </p>
         ) : null}
-        <h1 className="mt-2 text-3xl leading-tight text-ink">{title}</h1>
+        <h1 className="break-words text-2xl leading-tight tracking-tight text-ink sm:text-3xl">{title}</h1>
         {description ? <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">{description}</p> : null}
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
@@ -167,13 +225,9 @@ export function Callout({ tone = "info", title, children }: { tone?: "info" | "w
 
 // ChoiceCard 用于向导中的单选项，整块可点，带标题、解释和可选徽章。
 export function ChoiceCard({
-  selected,
-  title,
-  description,
-  badge,
-  onSelect,
-  disabled,
+  name, selected, title, description, badge, onSelect, disabled,
 }: {
+  name: string;
   selected: boolean;
   title: string;
   description: string;
@@ -181,35 +235,41 @@ export function ChoiceCard({
   onSelect: () => void;
   disabled?: boolean;
 }) {
+  const detailID = useId();
   return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={selected}
-      disabled={disabled}
-      onClick={onSelect}
-      className={cn(
-        "group relative flex w-full flex-col gap-2 rounded-[3px] border p-4 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50",
-        selected
-          ? "border-accent bg-paper-raised shadow-[inset_3px_0_0_var(--color-accent)]"
-          : "border-line bg-paper-raised/70 hover:border-line-strong hover:bg-paper-raised",
-      )}
-    >
-      <span className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-ink">{title}</span>
-        {badge}
-        {selected ? <span className="ml-auto text-[11px] font-medium tracking-wide text-accent">已选择</span> : null}
+    <label className={cn("relative block min-w-0", disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer")}>
+      <input
+        type="radio"
+        name={name}
+        checked={selected}
+        disabled={disabled}
+        aria-label={title}
+        aria-describedby={detailID}
+        onChange={onSelect}
+        className="peer sr-only"
+      />
+      <span className={cn(
+        "flex flex-col gap-2 rounded-xl border px-4 py-3 text-left transition-colors peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-accent",
+        selected ? "border-accent/65 bg-accent-soft/55" : "border-line-strong bg-paper hover:bg-paper-deep",
+      )}>
+        <span className="flex flex-wrap items-center gap-2.5">
+          <span className={cn("grid size-4 shrink-0 place-items-center rounded-full border", selected ? "border-accent" : "border-line-strong")}>
+            {selected ? <span className="size-2 rounded-full bg-accent" /> : null}
+          </span>
+          <span className="font-medium text-ink">{title}</span>
+          {badge}
+        </span>
+        <span id={detailID} className="pl-6 text-sm leading-6 text-muted">{description}</span>
       </span>
-      <span className="text-xs leading-5 text-muted">{description}</span>
-    </button>
+    </label>
   );
 }
 
 export function EmptyState({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
   return (
-    <div className="flex flex-col items-center gap-3 rounded-[3px] border border-dashed border-line-strong bg-paper-raised/60 px-6 py-12 text-center">
-      <span aria-hidden className="flex size-10 items-center justify-center rounded-full border border-line-strong font-display text-lg text-accent">
-        导
+    <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-line bg-paper/65 px-4 py-9 text-center">
+      <span aria-hidden className="flex size-10 items-center justify-center rounded-xl border border-accent/25 bg-accent-soft text-accent">
+        <Icon name="inbox" className="size-5" />
       </span>
       <p className="text-base text-ink">{title}</p>
       {description ? <p className="max-w-md text-xs leading-5 text-muted">{description}</p> : null}
@@ -321,90 +381,61 @@ export function ConfirmDialog({
 }) {
   const titleID = useId();
   const descriptionID = useId();
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const restoreRef = useRef<HTMLElement | null>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const backdropPress = useRef(false);
 
-  // 打开时记住原焦点，关闭后还回去；Tab 在弹窗内循环，避免焦点跑到背景页。
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    restoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!open || !dialog) return;
+    const trigger = document.activeElement;
+    dialog.showModal();
+    cancelRef.current?.focus();
     return () => {
-      restoreRef.current?.focus();
+      dialog.close();
+      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus({ preventScroll: true });
     };
   }, [open]);
 
-  if (!open) {
-    return null;
-  }
-  // 请求进行中禁止关闭弹窗，避免失败原因还没看到就被用户误关。
+  if (!open) return null;
   const requestCancel = () => {
-    if (!busy) {
-      onCancel();
-    }
+    if (!busy) onCancel();
   };
-  const trapFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Tab") {
-      return;
-    }
-    const nodes = Array.from(panelRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])') ?? [])
-      .filter((node) => !node.hasAttribute("disabled"));
-    if (nodes.length === 0) {
-      return;
-    }
-    const first = nodes[0];
-    const last = nodes[nodes.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/35 p-4" role="presentation" onClick={requestCancel}>
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleID}
-        aria-describedby={description ? descriptionID : undefined}
-        className="w-full max-w-md rounded-[4px] border border-line-strong bg-paper-raised p-6 shadow-[0_20px_60px_rgb(31_27_21/0.25)]"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDown={(event) => {
-          trapFocus(event);
-          if (event.key === "Escape") {
-            requestCancel();
-          }
-        }}
-      >
-        <h2 id={titleID} className="text-xl text-ink">
-          {title}
-        </h2>
-        {description ? (
-          <p id={descriptionID} className="mt-2 text-sm leading-6 text-muted">
-            {description}
-          </p>
-        ) : null}
+    <dialog
+      ref={dialogRef}
+      role="alertdialog"
+      aria-labelledby={titleID}
+      aria-describedby={description ? descriptionID : undefined}
+      aria-busy={busy || undefined}
+      className="confirm-dialog fixed inset-0 m-auto max-h-[calc(100dvh-2rem)] w-[calc(100%_-_2rem)] max-w-md rounded-2xl border border-line-strong bg-paper-raised text-ink shadow-2xl"
+      onCancel={(event) => {
+        event.preventDefault();
+        requestCancel();
+      }}
+      onPointerDown={(event) => { backdropPress.current = event.target === event.currentTarget; }}
+      onClick={(event) => {
+        if (backdropPress.current && event.target === event.currentTarget) requestCancel();
+        backdropPress.current = false;
+      }}
+    >
+      <div className="p-5 sm:p-6">
+        <h2 id={titleID} className="text-xl tracking-tight">{title}</h2>
+        {description ? <p id={descriptionID} className="mt-2 text-sm leading-6 text-muted">{description}</p> : null}
         {children ? <div className="mt-4">{children}</div> : null}
-        <div className="mt-6 flex justify-end gap-2">
-          <Button variant="secondary" onClick={requestCancel} disabled={busy} autoFocus>
-            取消
-          </Button>
-          <Button variant={tone === "danger" ? "danger" : "primary"} onClick={onConfirm} loading={busy}>
-            {confirmLabel}
-          </Button>
+        <div className="mt-6 flex flex-wrap justify-end gap-2">
+          <Button ref={cancelRef} variant="secondary" onClick={requestCancel} disabled={busy}>取消</Button>
+          <Button variant={tone === "danger" ? "danger" : "primary"} onClick={onConfirm} loading={busy}>{confirmLabel}</Button>
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }
 
 // menuItems 返回面板内可聚焦的菜单项。
 function menuItems(panel: HTMLDivElement | null): HTMLElement[] {
-  return Array.from(panel?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+  return Array.from(panel?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)') ?? []);
 }
 
 // DropdownMenu 是统一的下拉菜单：点击外部、Escape 或选择菜单项后关闭，方向键在项间移动。
@@ -428,126 +459,107 @@ export function DropdownMenu({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  // focusTarget 记录“用键盘打开菜单”时焦点应该落到第一项还是最后一项。
-  const [focusTarget, setFocusTarget] = useState<"first" | "last" | null>(null);
-  // 面板通过 Portal 渲染到 body，避免被表格滚动容器裁切。
-  const [position, setPosition] = useState<{ top?: number; bottom?: number; left?: number; right?: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const initialFocus = useRef<"first" | "last" | "panel">("panel");
+  const search = useRef({ text: "", time: 0 });
   const panelID = useId();
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    // 等定位完成、面板真正挂载后再把焦点送到菜单项。
-    const frame = window.requestAnimationFrame(() => {
-      if (!focusTarget) {
-        return;
-      }
-      const items = menuItems(panelRef.current);
-      (focusTarget === "last" ? items[items.length - 1] : items[0])?.focus();
-      setFocusTarget(null);
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [open, focusTarget]);
+  const close = (restoreFocus: boolean) => {
+    if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
+    setOpen(false);
+  };
 
-  // 收起时清掉旧坐标，避免再次打开时先在旧位置闪一下。
-  useEffect(() => {
-    if (!open) {
-      setPosition(null);
-    }
-  }, [open]);
-
-  // 跟随触发器定位；下方空间不足时向上展开。
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const trigger = triggerRef.current;
+    if (!open || !panel || !trigger) return;
     const place = () => {
-      const rect = triggerRef.current?.getBoundingClientRect();
-      if (!rect) {
+      const rect = trigger.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0 && (rect.bottom <= 0 || rect.top >= window.innerHeight || rect.right <= 0 || rect.left >= window.innerWidth)) {
+        setOpen(false);
         return;
       }
-      const alignStyle = align === "right"
-        ? { right: Math.max(8, window.innerWidth - rect.right) }
-        : { left: Math.max(8, rect.left) };
-      if (window.innerHeight - rect.bottom < 320 && rect.top > 360) {
-        setPosition({ ...alignStyle, bottom: window.innerHeight - rect.top + 8 });
-      } else {
-        setPosition({ ...alignStyle, top: rect.bottom + 8 });
-      }
+      const gap = 8;
+      const width = panel.offsetWidth;
+      const desiredLeft = align === "right" ? rect.right - width : rect.left;
+      const left = Math.max(gap, Math.min(desiredLeft, window.innerWidth - width - gap));
+      const below = window.innerHeight - rect.bottom - gap * 2;
+      const above = rect.top - gap * 2;
+      const upward = panel.scrollHeight > below && above > below;
+      panel.style.left = `${left}px`;
+      panel.style.top = upward ? "auto" : `${rect.bottom + gap}px`;
+      panel.style.bottom = upward ? `${window.innerHeight - rect.top + gap}px` : "auto";
+      panel.style.maxHeight = `${Math.max(0, upward ? above : below)}px`;
+      panel.style.setProperty("--menu-offset", upward ? "4px" : "-4px");
     };
+
     place();
+    const items = menuItems(panel);
+    const target = initialFocus.current === "first" ? items[0] : initialFocus.current === "last" ? items.at(-1) : panel;
+    if (target && target !== panel) target.focus();
+    else panel.focus({ preventScroll: true });
+    search.current = { text: "", time: 0 };
+
+    const onScroll = (event: Event) => {
+      if (event.target instanceof Node && panel.contains(event.target)) return;
+      place();
+    };
+    const onOutsidePress = (event: PointerEvent) => {
+      if (event.target instanceof Node && !trigger.contains(event.target) && !panel.contains(event.target)) setOpen(false);
+    };
     window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
+    window.addEventListener("scroll", onScroll, true);
+    document.addEventListener("pointerdown", onOutsidePress);
     return () => {
       window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("scroll", onScroll, true);
+      document.removeEventListener("pointerdown", onOutsidePress);
     };
   }, [open, align]);
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (!rootRef.current?.contains(target) && !panelRef.current?.contains(target)) {
-        setOpen(false);
-      }
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-        triggerRef.current?.focus();
-      }
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
-
-  // 触发器上按上下方向键直接打开菜单，并把焦点送到菜单项。
-  const handleTriggerKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
-      return;
-    }
-    event.preventDefault();
-    setFocusTarget(event.key === "ArrowDown" ? "first" : "last");
-    setOpen(true);
-  };
-
   const handlePanelKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    const items = menuItems(panelRef.current);
-    if (items.length === 0) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      close(true);
       return;
     }
+    if (event.key === "Tab") {
+      // 将 Tab 交回触发器所在位置，由浏览器继续原来的顺序。
+      close(true);
+      return;
+    }
+    if (event.nativeEvent.isComposing) return;
+    const items = menuItems(panelRef.current);
+    if (!items.length) return;
     const current = items.indexOf(document.activeElement as HTMLElement);
-    if (event.key === "ArrowDown") {
+    let target: HTMLElement | undefined;
+    switch (event.key) {
+      case "ArrowDown": target = items[(current + 1) % items.length]; break;
+      case "ArrowUp": target = items[current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length]; break;
+      case "Home": target = items[0]; break;
+      case "End": target = items.at(-1); break;
+      default: {
+        if (event.key.length !== 1 || event.key === " " || event.ctrlKey || event.metaKey || event.altKey) return;
+        const now = Date.now();
+        const key = event.key.toLocaleLowerCase();
+        const previous = now - search.current.time < 500 ? search.current.text : "";
+        const query = previous === key ? key : previous + key;
+        search.current = { text: query, time: now };
+        const next = current + 1;
+        const ordered = query.length === 1 ? [...items.slice(next), ...items.slice(0, next)] : items;
+        target = ordered.find((item) => (item.getAttribute("aria-label") ?? item.textContent ?? "").trim().toLocaleLowerCase().startsWith(query));
+      }
+    }
+    if (target) {
       event.preventDefault();
-      items[(current + 1) % items.length]?.focus();
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      items[(current - 1 + items.length) % items.length]?.focus();
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      items[0]?.focus();
-    } else if (event.key === "End") {
-      event.preventDefault();
-      items[items.length - 1]?.focus();
-    } else if (event.key === "Tab") {
-      // Tab 保留浏览器默认顺序，但先把菜单收起。
-      setOpen(false);
+      target.focus();
     }
   };
 
   return (
-    <div ref={rootRef} className="relative">
+    <div className="relative inline-flex">
       <button
         type="button"
         ref={triggerRef}
@@ -555,40 +567,55 @@ export function DropdownMenu({
         aria-expanded={open}
         aria-controls={open ? panelID : undefined}
         aria-label={triggerLabel}
-        onClick={() => setOpen((value) => !value)}
-        onKeyDown={handleTriggerKeyDown}
+        onClick={(event) => {
+          if (open) {
+            close(true);
+          } else {
+            initialFocus.current = event.detail === 0 ? "first" : "panel";
+            setOpen(true);
+          }
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          initialFocus.current = event.key === "ArrowDown" ? "first" : "last";
+          if (open) {
+            const items = menuItems(panelRef.current);
+            (initialFocus.current === "last" ? items.at(-1) : items[0])?.focus();
+          } else {
+            setOpen(true);
+          }
+        }}
         className={cn(
-          "inline-flex h-8 items-center justify-center gap-2 rounded-[3px] text-xs font-medium tracking-wide transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
+          "group inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-transparent text-sm font-medium transition-[background-color,border-color,color,transform] duration-150 active:scale-[0.98] aria-expanded:border-accent/30 aria-expanded:bg-accent-soft aria-expanded:text-accent",
           triggerClassName,
         )}
       >
         {trigger}
-        {indicator ? <span aria-hidden className="text-[10px]">{open ? "▴" : "▾"}</span> : null}
+        {indicator ? <Icon name="chevronDown" className="size-3.5 shrink-0 text-current transition-transform group-aria-expanded:rotate-180" /> : null}
       </button>
-      {open && position
-        ? createPortal(
-            <div
-              id={panelID}
-              ref={panelRef}
-              role="menu"
-              aria-label={label}
-              style={{ position: "fixed", ...position }}
-              className={cn(
-                "z-50 rounded-[3px] border border-line bg-paper-raised p-2 shadow-[0_16px_40px_rgb(31_27_21/0.18)]",
-                panelClassName,
-              )}
-              onClick={(event) => {
-                if ((event.target as HTMLElement).closest('[role="menuitem"]')) {
-                  window.requestAnimationFrame(() => setOpen(false));
-                }
-              }}
-              onKeyDown={handlePanelKeyDown}
-            >
-              {children}
-            </div>,
-            document.body,
-          )
-        : null}
+      {open ? createPortal(
+        <div
+          id={panelID}
+          ref={panelRef}
+          role="menu"
+          tabIndex={-1}
+          aria-label={label}
+          className={cn("menu-panel fixed z-50 max-w-[calc(100vw-1rem)] overflow-y-auto overscroll-contain rounded-xl border border-line-strong bg-paper-raised p-1.5 shadow-xl focus:outline-none", panelClassName)}
+          onClick={(event) => {
+            const item = (event.target as Element).closest<HTMLElement>('[role="menuitem"]');
+            if (item) {
+              const staysOnPage = item.tagName === "BUTTON" || item.getAttribute("aria-current") === "page"
+                || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey;
+              close(staysOnPage);
+            }
+          }}
+          onKeyDown={handlePanelKeyDown}
+        >
+          {children}
+        </div>,
+        document.body,
+      ) : null}
     </div>
   );
 }
@@ -599,6 +626,7 @@ export function MenuItem({
   onClick,
   danger = false,
   disabled = false,
+  icon,
   className,
   children,
 }: {
@@ -606,14 +634,16 @@ export function MenuItem({
   onClick?: () => void;
   danger?: boolean;
   disabled?: boolean;
+  icon?: React.ComponentProps<typeof Icon>["name"];
   className?: string;
   children: ReactNode;
 }) {
   const classes = cn(
-    "block w-full rounded-[2px] px-2 py-2 text-left text-xs transition hover:bg-paper-deep focus-visible:bg-paper-deep focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50",
+    "flex min-h-10 w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors hover:bg-paper-deep focus-visible:bg-paper-deep focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50",
     danger ? "text-rust" : "text-ink",
     className,
   );
+  const content = <>{icon ? <Icon name={icon} className="size-4 shrink-0 text-current" /> : null}<span className="min-w-0 flex-1">{children}</span></>;
   if (to) {
     return (
       <NavLink
@@ -621,15 +651,30 @@ export function MenuItem({
         role="menuitem"
         tabIndex={-1}
         onClick={onClick}
-        className={({ isActive }) => cn(classes, isActive ? "bg-paper-deep" : "")}
+        className={({ isActive }) => cn(classes, isActive && "bg-accent-soft text-accent")}
       >
-        {children}
+        {({ isActive }) => <>{content}{isActive ? <Icon name="check" className="size-4 shrink-0 text-accent" /> : null}</>}
       </NavLink>
     );
   }
   return (
     <button type="button" role="menuitem" tabIndex={-1} disabled={disabled} onClick={onClick} className={classes}>
-      {children}
+      {content}
     </button>
+  );
+}
+
+export function RowMenu({ name, children }: { name: string; children: ReactNode }) {
+  const label = `更多操作：${name}`;
+  return (
+    <DropdownMenu
+      label={label}
+      triggerLabel={label}
+      trigger={<Icon name="more" />}
+      triggerClassName="size-10 text-ink-soft ring-1 ring-line ring-inset hover:bg-paper-deep"
+      panelClassName="w-44"
+    >
+      {children}
+    </DropdownMenu>
   );
 }

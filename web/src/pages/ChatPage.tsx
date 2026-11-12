@@ -2,12 +2,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
+import { Icon } from "../components/Icon";
 import { SafeMarkdown } from "../components/SafeMarkdown";
 import { useToast } from "../components/Toast";
-import { Badge, Button, Card, EmptyState, ErrorBanner, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
+import { ActionLink, Badge, Button, Card, ErrorBanner, LoadingState, PageHeader, cn } from "../components/ui";
 import { downloadAttachment, mutate, requestJSON, streamRunEvents, uploadAttachment } from "../lib/api";
 import { describeError } from "../lib/errors";
-import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/format";
+import { formatDateTime, formatRelative, formatSessionSource, statusLabel, statusTone } from "../lib/format";
 import { useRemote } from "../lib/hooks";
 import type { Agent, Attachment, Message, Page, Run, RunEvent, Session, ToolApproval } from "../lib/types";
 
@@ -28,18 +29,6 @@ function modeLabel(mode: string | undefined): string {
       return "多助手协作";
     default:
       return "边做边想";
-  }
-}
-
-// sourceLabel 把会话来源翻译成用户语言。
-function sourceLabel(source: string | undefined): string {
-  switch (source) {
-    case "feishu":
-      return "飞书";
-    case "api":
-      return "接口";
-    default:
-      return "网页";
   }
 }
 
@@ -173,8 +162,13 @@ export default function ChatPage() {
   const [showJump, setShowJump] = useState(false);
   // messagesExpanded 控制消息区放大阅读，方便查看长工具结果。
   const [messagesExpanded, setMessagesExpanded] = useState(false);
+  const readingRef = useRef<HTMLDialogElement>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.matchMedia?.("(min-width: 1280px)")?.matches ?? false);
+  const inspectorRef = useRef<HTMLElement>(null);
+  const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
+  const transcriptScrollTopRef = useRef(0);
   // stickToBottomRef 记录用户是否停留在底部，避免新内容把正在翻历史的用户拽回去。
   const stickToBottomRef = useRef(true);
 
@@ -679,6 +673,22 @@ export default function ChatPage() {
       ? (activeRun.status === "failed" ? activeRun : null)
       : (latestRun?.status === "failed" ? latestRun : null);
 
+  useEffect(() => {
+    if (messagesExpanded && !readingRef.current?.open) {
+      readingRef.current?.showModal();
+    }
+    const log = messageListRef.current;
+    if (log) {
+      log.scrollTop = stickToBottomRef.current ? log.scrollHeight : transcriptScrollTopRef.current;
+    }
+  }, [messagesExpanded]);
+
+  useEffect(() => {
+    if (inspectorOpen && window.matchMedia?.("(max-width: 1279px)")?.matches) {
+      inspectorRef.current?.focus();
+    }
+  }, [inspectorOpen]);
+
   // 新内容到达时只在用户停留在底部才自动滚动，向上翻阅历史时不打断阅读。
   useEffect(() => {
     const element = messageListRef.current;
@@ -693,26 +703,7 @@ export default function ChatPage() {
     if (persistedMessages.length + liveMessages.length > 0) {
       setShowJump(true);
     }
-  }, [persistedMessages.length, liveMessages.length, runActive, messagesExpanded]);
-
-  // 放大阅读时锁定页面滚动，并支持 Esc 恢复。
-  useEffect(() => {
-    if (!messagesExpanded) {
-      return;
-    }
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setMessagesExpanded(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [messagesExpanded]);
+  }, [persistedMessages.length, liveMessages, runActive]);
 
   // scrollToLatest 主动回到底部，并恢复自动跟随。
   const scrollToLatest = () => {
@@ -731,6 +722,7 @@ export default function ChatPage() {
     if (!element) {
       return;
     }
+    transcriptScrollTopRef.current = element.scrollTop;
     const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
     const nearBottom = distance <= 48;
     stickToBottomRef.current = nearBottom;
@@ -749,68 +741,75 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader
-        eyebrow="对话"
-        title={session.data?.title ?? "加载对话…"}
-        description={session.data ? `${statusLabel(session.data.status)} · 来自${sourceLabel(session.data.source)} · 最近消息 ${formatRelative(session.data.last_message_at)}` : undefined}
-        actions={
-          <Link to="/sessions" className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
-            返回对话列表
-          </Link>
-        }
-      />
+      <div>
+        <ActionLink to="/sessions" variant="ghost" size="sm" className="-ml-2 mb-2">
+          <Icon name="back" className="size-4" /> 返回对话
+        </ActionLink>
+        <PageHeader
+          title={session.data?.title ?? (session.loading ? "加载对话…" : "对话")}
+          description={session.data ? `${statusLabel(session.data.status)} · 来自${formatSessionSource(session.data.source)} · 最近消息 ${formatRelative(session.data.last_message_at)}` : undefined}
+          actions={
+            <Button ref={inspectorToggleRef} variant="secondary" aria-expanded={inspectorOpen} aria-controls="chat-inspector" onClick={() => setInspectorOpen((open) => !open)}>
+              <Icon name="panel" />
+              {inspectorOpen ? "收起运行详情" : "运行详情"}
+            </Button>
+          }
+        />
+      </div>
       {session.error ? <ErrorBanner message={session.error} onRetry={session.reload} /> : null}
       {sendError ? <ErrorBanner message={sendError} /> : null}
       {actionError ? <ErrorBanner message={actionError} /> : null}
       {streamError ? <ErrorBanner message={`事件流中断：${streamError}`} /> : null}
 
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start">
+      <div className={cn("grid gap-4 xl:items-start", inspectorOpen && "xl:grid-cols-[minmax(0,1fr)_minmax(0,320px)]")}>
       <Card
         title={agent?.name ?? "对话"}
-        description={canRun ? `${modeLabel(agent?.mode)} · 消息会自动保存，处理过程可随时回看` : "这个对话没有绑定可用助手，只能查看历史消息。"}
+        description={canRun ? modeLabel(agent?.mode) : session.loading ? undefined : "没有可用助手，当前仅可查看消息。"}
         actions={
           <>
             {runActive ? <Badge tone="warning">正在处理</Badge> : null}
             <Button
               size="sm"
               variant="secondary"
-              aria-pressed={messagesExpanded}
-              onClick={() => setMessagesExpanded((current) => !current)}
+              aria-haspopup="dialog"
+              onClick={() => setMessagesExpanded(true)}
             >
-              {messagesExpanded ? "恢复窗口" : "放大阅读"}
+              <Icon name="expand" className="size-4" /> 放大阅读
             </Button>
           </>
         }
       >
         {(() => {
-          // 放大阅读必须用 Portal 挂到 body：页面根节点带入场动画的 transform，
-          // 会让 fixed 相对该容器定位，只有跳出这一层才能真正铺满视口。
+          // 普通和放大视图共享消息渲染，避免同时维护两份日志。
           const log = (
             <div
               ref={messageListRef}
               className={cn(
-                "flex flex-col gap-4 overflow-y-auto px-4 py-5",
+                "flex flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5",
                 messagesExpanded
-                  ? "min-h-0 flex-1 rounded-b-[3px] bg-paper/60"
-                  : "max-h-[calc(100vh-24rem)] min-h-[340px] rounded-[3px] border border-line bg-paper/60",
+                  ? "min-h-0 flex-1 overscroll-contain bg-paper"
+                  : "max-h-[max(21rem,calc(100dvh-25rem))] min-h-[19rem] rounded-xl border border-line bg-paper/65 sm:min-h-[22rem]",
               )}
               role="log"
+              aria-label="消息记录"
               aria-live="polite"
+              tabIndex={0}
               onScroll={onMessageScroll}
             >
-          {messages.loading ? (
+          {messages.error ? (
+            <ErrorBanner message={messages.error} onRetry={messages.reload} />
+          ) : messages.loading ? (
             <LoadingState label="加载消息" />
           ) : persistedMessages.length === 0 && liveMessages.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-5 py-8 text-center">
-              <span aria-hidden className="flex size-12 items-center justify-center rounded-full border border-line-strong font-display text-xl text-accent">
-                助
+              <span className="grid size-14 place-items-center rounded-2xl border border-accent/30 bg-accent-soft text-accent">
+                <Icon name="agent" className="size-7" />
               </span>
               <div>
-                <p className="text-lg text-ink">向{agent?.name ?? "助手"}描述你想完成什么</p>
-                <p className="mt-1 text-xs leading-5 text-muted">可以是一个目标、一段材料，或一个需要整理的问题。</p>
+                <p className="break-words text-lg font-semibold text-ink">{canRun ? "你想完成什么？" : "还没有消息"}</p>
               </div>
               {canRun ? (
-                <div className="grid w-full max-w-xl gap-2 sm:grid-cols-3">
+                <div className="flex w-full max-w-xl flex-wrap justify-center gap-2">
                   {["帮我梳理这段需求", "把材料拆成待办", "解释一下这个报错"].map((prompt) => (
                     <button
                       key={prompt}
@@ -819,9 +818,9 @@ export default function ChatPage() {
                         setDraft(prompt);
                         document.getElementById("chat-composer")?.focus();
                       }}
-                      className="rounded-[3px] border border-line bg-paper-raised px-3 py-2.5 text-left text-xs leading-5 text-ink-soft transition hover:border-accent hover:text-accent"
+                      className="inline-flex items-center gap-2 rounded-lg border border-line bg-paper-raised px-3 py-2.5 text-left text-xs leading-5 text-ink-soft transition-colors hover:border-accent/60 hover:text-accent"
                     >
-                      {prompt}
+                      {prompt} <Icon name="arrow" className="size-3.5 shrink-0 text-accent" />
                     </button>
                   ))}
                 </div>
@@ -911,7 +910,7 @@ export default function ChatPage() {
             <button
               type="button"
               onClick={scrollToLatest}
-              className="sticky bottom-0 z-10 mx-auto rounded-[3px] border border-line-strong bg-paper-raised px-3 py-1.5 text-xs text-ink shadow-[0_6px_20px_rgb(31_27_21/0.12)] transition hover:border-accent hover:text-accent"
+              className="sticky bottom-0 z-10 mx-auto rounded-lg border border-line-strong bg-paper-raised px-3 py-1.5 text-xs text-ink shadow-lg transition hover:border-accent hover:text-accent"
             >
               有新内容，回到底部
             </button>
@@ -922,22 +921,20 @@ export default function ChatPage() {
             return log;
           }
           return createPortal(
-            <>
-              <button
-                type="button"
-                aria-label="退出放大阅读"
-                tabIndex={-1}
-                onClick={() => setMessagesExpanded(false)}
-                className="fixed inset-0 z-40 cursor-default bg-ink/25"
-              />
-              <div className="fixed inset-4 z-50 flex flex-col rounded-[3px] border border-line bg-paper-raised shadow-[0_24px_80px_rgb(31_27_21/0.28)]">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
-                  <p className="text-xs text-muted">放大阅读 · 按 Esc 或点击「恢复窗口」返回</p>
-                  <Button size="sm" variant="secondary" onClick={() => setMessagesExpanded(false)}>恢复窗口</Button>
+            <dialog
+              ref={readingRef}
+              aria-label="放大阅读"
+              className="fixed inset-0 m-auto h-[calc(100dvh-2rem)] max-h-none w-[calc(100%_-_2rem)] max-w-5xl overflow-hidden rounded-2xl border border-line-strong bg-paper-raised text-ink shadow-2xl"
+              onClose={() => setMessagesExpanded(false)}
+            >
+              <div className="flex h-full flex-col">
+                <div className="flex items-center justify-between gap-2 border-b border-line px-4 py-2">
+                  <h2 className="text-sm">放大阅读</h2>
+                  <Button size="sm" variant="secondary" autoFocus onClick={() => readingRef.current?.close()}>恢复窗口</Button>
                 </div>
                 {log}
               </div>
-            </>,
+            </dialog>,
             document.body,
           );
         })()}
@@ -991,7 +988,7 @@ export default function ChatPage() {
           </div>
         ) : null}
 
-        <div className="sticky bottom-3 z-10 mt-4 rounded-[3px] border border-line-strong bg-paper-raised/95 p-3 shadow-[0_-6px_20px_rgb(31_27_21/0.06)] backdrop-blur focus-within:border-accent">
+        <div className="sticky bottom-3 z-10 mt-4 rounded-xl border border-line-strong bg-paper-raised p-3 shadow-lg focus-within:border-accent/70">
           <input
             ref={fileInputRef}
             type="file"
@@ -1028,13 +1025,14 @@ export default function ChatPage() {
               ))}
             </div>
           ) : null}
-          <Textarea
+          <textarea
             id="chat-composer"
+            rows={2}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder={canRun ? "说说你想完成什么…" : "这个对话没有绑定可用助手，暂时不能发送"}
             disabled={!canRun || runActive || sending}
-            className="min-h-20 resize-none border-0 bg-transparent p-0 focus:ring-0"
+            className="block min-h-16 w-full resize-y bg-transparent px-1 py-1 text-sm leading-6 text-ink placeholder:text-muted focus:outline-none disabled:opacity-60"
             aria-label="消息内容"
             onKeyDown={(event) => {
               // 输入法组合阶段按 Enter 只用于确认候选词，不触发发送。
@@ -1047,19 +1045,20 @@ export default function ChatPage() {
               }
             }}
           />
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-[11px] text-muted">
-              {runActive ? "助手正在处理，发送暂时不可用。" : "Enter 发送 · Shift + Enter 换行 · 单个文件 ≤20MB，最多 5 个，文本 / PDF / Word / Excel 内容会自动提供给助手"}
-            </p>
-            <div className="flex gap-2">
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() => fileInputRef.current?.click()}
+                title="最多 5 个附件，每个文件不超过 20 MB"
                 disabled={!canRun || runActive || sending || pendingAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE}
               >
-                添加附件
+                <Icon name="attach" className="size-4" /> 添加附件
               </Button>
+              <span className="hidden text-xs text-muted sm:inline">{runActive ? "助手正在处理" : "Enter 发送 · Shift + Enter 换行"}</span>
+            </div>
+            <div className="ml-auto flex items-center gap-2">
               {runActive ? (
                 <Button size="sm" variant="secondary" onClick={() => void cancel()}>停止本轮</Button>
               ) : null}
@@ -1069,15 +1068,28 @@ export default function ChatPage() {
                 loading={sending}
                 disabled={!canRun || runActive || (draft.trim() === "" && pendingAttachments.filter((item) => item.status === "ready").length === 0) || pendingAttachments.some((item) => item.status === "uploading")}
               >
-                发送
+                发送 <Icon name="send" className="size-4" />
               </Button>
             </div>
           </div>
         </div>
       </Card>
 
-        <div className="flex flex-col gap-4 xl:sticky xl:top-20">
-        <Card title="处理过程" description="默认收起。摘要会显示当前进度，展开后才能查看每一步。">
+        <aside
+          id="chat-inspector"
+          ref={inspectorRef}
+          aria-label="运行详情"
+          hidden={!inspectorOpen}
+          tabIndex={-1}
+          className="order-first space-y-4 rounded-xl xl:sticky xl:top-20 xl:order-none"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setInspectorOpen(false);
+              inspectorToggleRef.current?.focus();
+            }
+          }}
+        >
+        <Card title="处理过程">
           {activeRun ? (
             <details className="group rounded-[3px] border border-line bg-paper-raised">
               <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[3px] px-3 py-2 text-xs transition hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
@@ -1122,11 +1134,11 @@ export default function ChatPage() {
               </div>
             </details>
           ) : (
-            <p className="text-xs leading-5 text-muted">发送消息后，这里会实时显示思考步骤、工具调用和错误原因；SSE 断线会自动重连。</p>
+            <p className="flex items-center gap-2 text-sm text-muted"><Icon name="activity" /> 暂无正在处理的任务</p>
           )}
         </Card>
 
-        <Card title="历史处理记录" description="默认收起。展开后点“查看过程”可以看完整输入输出。">
+        <Card title="历史处理记录">
           {runs.loading ? (
             <LoadingState />
           ) : runs.data && runs.data.items.length > 0 ? (
@@ -1150,10 +1162,10 @@ export default function ChatPage() {
               </div>
             </details>
           ) : (
-            <EmptyState title="还没有处理记录" description="发送第一条消息后，这里会显示完整处理过程。" />
+            <p className="text-sm text-muted">还没有处理记录</p>
           )}
         </Card>
-        </div>
+        </aside>
       </div>
     </div>
   );
@@ -1194,7 +1206,7 @@ function MessageBubble({
     return (
       <div className="flex justify-end">
         <div className="max-w-[85%]">
-          <div className="whitespace-pre-wrap break-words rounded-[4px] bg-jade px-4 py-3 text-sm leading-6 text-paper-raised">{content}</div>
+          <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-accent/25 bg-accent-soft px-4 py-3 text-sm leading-6 text-ink">{content}</div>
           {attachments && attachments.length > 0 ? (
             <div className="mt-2 flex flex-col gap-1">
               {attachments.map((attachment) => (
@@ -1234,8 +1246,8 @@ function MessageBubble({
   if (hasToolCalls) {
     return (
       <div className="flex gap-3">
-        <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-line-strong bg-paper-raised font-display text-sm text-accent">
-          助
+        <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent-soft text-accent">
+          <Icon name="agent" className="size-4" />
         </span>
         <details className="group min-w-0 max-w-[85%] flex-1 rounded-[4px] border border-line bg-paper-raised">
           <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[4px] px-4 py-3 text-[11px] text-muted [&::-webkit-details-marker]:hidden">
@@ -1280,8 +1292,8 @@ function MessageBubble({
   }
   return (
     <div className="flex gap-3">
-      <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-full border border-line-strong bg-paper-raised font-display text-sm text-accent">
-        助
+      <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent-soft text-accent">
+        <Icon name="agent" className="size-4" />
       </span>
       <div className="min-w-0 max-w-[85%] flex-1">
         <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-muted">
@@ -1303,7 +1315,7 @@ function MessageBubble({
             </button>
           ) : null}
         </div>
-        <div className="rounded-[4px] border border-line bg-paper-raised px-4 py-3 text-sm leading-6">
+        <div className="rounded-2xl rounded-tl-sm border border-line bg-paper-raised px-4 py-3 text-sm leading-6">
           {content ? (
             <SafeMarkdown content={content} />
           ) : (

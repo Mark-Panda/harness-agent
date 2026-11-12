@@ -16,10 +16,10 @@ const DEFAULT_ROTATION = { yaw: -0.5, pitch: 0.32 };
 
 // 节点类型的中文名称与配色。
 const kindTheme: Record<MemoryGraphNodeKind, { label: string; color: string; dark: string; radius: number }> = {
-  session: { label: "会话", color: "#c14a35", dark: "#7c2417", radius: 14 },
-  fact: { label: "事实", color: "#3d8170", dark: "#1d4a3f", radius: 7 },
-  summary: { label: "摘要", color: "#a17a24", dark: "#5d430e", radius: 8 },
-  vector: { label: "长期记忆", color: "#6172b5", dark: "#33406f", radius: 6 },
+  session: { label: "会话", color: "#73efa6", dark: "#226648", radius: 14 },
+  fact: { label: "事实", color: "#53c9c2", dark: "#235d58", radius: 7 },
+  summary: { label: "摘要", color: "#f0cb80", dark: "#7a531c", radius: 8 },
+  vector: { label: "长期记忆", color: "#aab9ff", dark: "#43538f", radius: 6 },
 };
 
 // edgeTheme 按边类型给出颜色与线型，避免不同关系混在一起。
@@ -27,14 +27,14 @@ function edgeTheme(kind: string): { color: string; dashed: boolean } {
   switch (kind) {
     case "has_fact":
     case "from_fact":
-      return { color: "#3d8170", dashed: false };
+      return { color: "#53c9c2", dashed: false };
     case "has_summary":
     case "from_summary":
-      return { color: "#a17a24", dashed: false };
+      return { color: "#f0cb80", dashed: false };
     case "related":
-      return { color: "#c14a35", dashed: true };
+      return { color: "#73efa6", dashed: true };
     default:
-      return { color: "#8f8474", dashed: false };
+      return { color: "#7b9485", dashed: false };
   }
 }
 
@@ -443,7 +443,7 @@ export default function MemoryGraphPage() {
       context.fillStyle = gradient;
       context.fill();
       context.lineWidth = isSelected ? 2 : 1;
-      context.strokeStyle = isSelected ? "#1f1b15" : "rgba(255,250,241,0.85)";
+      context.strokeStyle = isSelected ? "#edf3ef" : "rgba(190,219,203,0.48)";
       context.stroke();
 
       if (node.kind === "session") {
@@ -461,7 +461,7 @@ export default function MemoryGraphPage() {
         context.font = `${node.kind === "session" ? 13 : 11}px ui-sans-serif, system-ui, sans-serif`;
         context.textAlign = "center";
         context.textBaseline = "top";
-        context.fillStyle = "#4a4237";
+        context.fillStyle = "#c5d0c9";
         context.fillText(shortLabel(node.label), projected.x, projected.y + radius + 6);
       }
     }

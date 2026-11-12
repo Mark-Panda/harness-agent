@@ -1,5 +1,5 @@
 // 应用路由：公开认证页 + 受保护工作台与管理后台。
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { createBrowserRouter, createRoutesFromElements, Route, RouterProvider } from "react-router-dom";
 import { AdminRoute, AppShell, ProtectedRoute } from "./components/AppShell";
 import { EmptyState } from "./components/ui";
 import { ToastProvider } from "./components/Toast";
@@ -23,42 +23,46 @@ import SkillsPage from "./pages/admin/SkillsPage";
 import UsersPage from "./pages/admin/UsersPage";
 import FeishuBotsPage from "./pages/admin/FeishuBotsPage";
 
-export default function App() {
+export const appRoutes = createRoutesFromElements(
+  <>
+    <Route path="/login" element={<LoginPage />} />
+    <Route path="/register" element={<RegisterPage />} />
+    <Route
+      element={
+        <ProtectedRoute>
+          <AppShell />
+        </ProtectedRoute>
+      }
+    >
+      <Route path="/" element={<HomePage />} />
+      <Route path="/agents" element={<AgentsPage />} />
+      <Route path="/agents/new" element={<AgentWizardPage />} />
+      <Route path="/agents/:agentId/edit" element={<AgentWizardPage />} />
+      <Route path="/sessions" element={<SessionsPage />} />
+      <Route path="/memory" element={<MemoryGraphPage />} />
+      <Route path="/sessions/:sessionId" element={<ChatPage />} />
+      <Route path="/audit" element={<AuditPage />} />
+      <Route path="/runs/:runId" element={<RunPage />} />
+      <Route path="/admin/providers" element={<AdminRoute><ProvidersPage /></AdminRoute>} />
+      <Route path="/admin/models" element={<AdminRoute><ModelsPage /></AdminRoute>} />
+      <Route path="/admin/policies" element={<AdminRoute><PoliciesPage /></AdminRoute>} />
+      <Route path="/admin/skills" element={<AdminRoute><SkillsPage /></AdminRoute>} />
+      <Route path="/admin/mcps" element={<AdminRoute><MCPsPage /></AdminRoute>} />
+      <Route path="/admin/feishu-bots" element={<AdminRoute><FeishuBotsPage /></AdminRoute>} />
+      <Route path="/admin/users" element={<AdminRoute><UsersPage /></AdminRoute>} />
+      <Route path="/admin/agents" element={<AdminRoute><AdminAgentsPage /></AdminRoute>} />
+      <Route path="*" element={<EmptyState title="页面不存在" description="请从工作区导航重新进入所需功能。" />} />
+    </Route>
+  </>,
+);
+
+const browserRouter = createBrowserRouter(appRoutes);
+
+export default function App({ router = browserRouter }: { router?: typeof browserRouter } = {}) {
   return (
     <AuthProvider>
       <ToastProvider>
-        <BrowserRouter>
-          <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/register" element={<RegisterPage />} />
-          <Route
-            element={
-              <ProtectedRoute>
-                <AppShell />
-              </ProtectedRoute>
-            }
-          >
-            <Route path="/" element={<HomePage />} />
-            <Route path="/agents" element={<AgentsPage />} />
-            <Route path="/agents/new" element={<AgentWizardPage />} />
-            <Route path="/agents/:agentId/edit" element={<AgentWizardPage />} />
-            <Route path="/sessions" element={<SessionsPage />} />
-            <Route path="/memory" element={<MemoryGraphPage />} />
-            <Route path="/sessions/:sessionId" element={<ChatPage />} />
-            <Route path="/audit" element={<AuditPage />} />
-            <Route path="/runs/:runId" element={<RunPage />} />
-            <Route path="/admin/providers" element={<AdminRoute><ProvidersPage /></AdminRoute>} />
-            <Route path="/admin/models" element={<AdminRoute><ModelsPage /></AdminRoute>} />
-            <Route path="/admin/policies" element={<AdminRoute><PoliciesPage /></AdminRoute>} />
-            <Route path="/admin/skills" element={<AdminRoute><SkillsPage /></AdminRoute>} />
-            <Route path="/admin/mcps" element={<AdminRoute><MCPsPage /></AdminRoute>} />
-            <Route path="/admin/feishu-bots" element={<AdminRoute><FeishuBotsPage /></AdminRoute>} />
-            <Route path="/admin/users" element={<AdminRoute><UsersPage /></AdminRoute>} />
-            <Route path="/admin/agents" element={<AdminRoute><AdminAgentsPage /></AdminRoute>} />
-            <Route path="*" element={<EmptyState title="页面不存在" description="请从顶部导航重新进入所需功能。" />} />
-          </Route>
-          </Routes>
-        </BrowserRouter>
+        <RouterProvider router={router} />
       </ToastProvider>
     </AuthProvider>
   );

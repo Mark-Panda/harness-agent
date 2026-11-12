@@ -1,10 +1,12 @@
 // 选模规则：用“主选 + 替补”的排班方式替代 JSON 配置，降低理解成本。
 import { useState } from "react";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select, Textarea } from "../../components/ui";
+import { FormDrawer } from "../../components/FormDrawer";
+import { useToast } from "../../components/Toast";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../../components/ui";
 import { ApiError, mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Model, ModelPolicy, Page } from "../../lib/types";
 
 interface PolicyFormState {
@@ -33,7 +35,7 @@ function describePolicyDeleteError(failure: unknown): string {
 }
 
 function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPolicy | null; models: Model[]; onSaved: () => void; onCancel: () => void }) {
-  const [form, setForm] = useState<PolicyFormState>(
+  const initialForm: PolicyFormState =
     initial
       ? {
           name: initial.name,
@@ -41,8 +43,9 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
           rules: JSON.stringify(initial.rules ?? {}, null, 2),
           candidates: initial.candidates.map((candidate) => candidate.model_id),
         }
-      : emptyPolicy,
-  );
+      : emptyPolicy;
+  const [form, setForm] = useState(initialForm);
+  const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [addID, setAddID] = useState("");
@@ -86,6 +89,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
       } else {
         await mutate<ModelPolicy>("/api/v1/model-policies", "POST", body, crypto.randomUUID());
       }
+      toast.show(initial ? "修改已保存" : "已创建规则", "success");
       onSaved();
     } catch (submitError) {
       const message = submitError instanceof Error && submitError.message.includes("高级规则") ? submitError.message : describeError(submitError);
@@ -104,116 +108,114 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
       }。`;
 
   return (
-    <Card
+    <FormDrawer
       title={initial ? `编辑「${initial.name}」` : "新建选模规则"}
       description="先排主选，再按顺序添加替补。系统遇到失败、超时或熔断时会自动切换到下一个。"
+      submitLabel={initial ? "保存修改" : "创建规则"}
+      busy={busy}
+      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      error={error}
+      bodyClassName="grid-cols-1"
+      submitDisabled={form.candidates.length === 0}
+      onSubmit={submit}
+      onCancel={onCancel}
     >
-      <form onSubmit={submit} className="flex flex-col gap-5">
-        <Field label="规则名称" hint="例如“日常任务”“高精度长文档”。给助手选择时你会看到这个名字。">
-          <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} autoFocus placeholder="给规则起个容易记住的名字" />
-        </Field>
+      <Field label="规则名称" hint="例如“日常任务”“高精度长文档”。给助手选择时你会看到这个名字。">
+        <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} autoFocus placeholder="给规则起个容易记住的名字" />
+      </Field>
 
-        <div className="rounded-[3px] border border-line bg-paper-deep/30 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <p className="text-sm font-medium text-ink">模型出场顺序</p>
-              <p className="mt-1 text-xs leading-5 text-muted">第 1 个是主选，其余是替补。拖动不方便时用“上移/下移”调整。</p>
-            </div>
-            <Badge tone="neutral">{form.candidates.length} 个候选</Badge>
+      <div className="rounded-[3px] border border-line bg-paper-deep/30 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-sm font-medium text-ink">模型出场顺序</p>
+            <p className="mt-1 text-xs leading-5 text-muted">第 1 个是主选，其余是替补。拖动不方便时用“上移/下移”调整。</p>
           </div>
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Select className="min-w-56 flex-1" value={addID} onChange={(event) => setAddID(event.target.value)} aria-label="选择要加入的模型">
-              <option value="">选择一个模型加入名单</option>
-              {eligibleModels.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.remote_model_name}（上下文 {model.context_window_tokens.toLocaleString("zh-CN")}）
-                </option>
-              ))}
-            </Select>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={!addID}
-              onClick={() => {
-                setForm({ ...form, candidates: [...form.candidates, addID] });
-                setAddID("");
-              }}
-            >
-              加入名单
-            </Button>
-          </div>
-          {eligibleModels.length === 0 ? (
-            <p className="mt-2 text-xs leading-5 text-muted">
-              没有可加入的模型。请先到“可用模型”登记已核验的生成模型，或降低最低上下文要求。
-            </p>
-          ) : null}
-
-          {form.candidates.length === 0 ? (
-            <div className="mt-3 rounded-[3px] border border-dashed border-line-strong px-4 py-6 text-center text-xs text-muted">
-              还没有候选模型。先选一个主选模型。
-            </div>
-          ) : (
-            <ol className="mt-3 flex flex-col gap-2">
-              {form.candidates.map((modelID, index) => {
-                const model = modelByID.get(modelID);
-                const eligible = model && model.kind === "chat" && model.context_window_tokens >= minContext && model.verified_at && model.status === "enabled";
-                return (
-                  <li key={modelID} className="flex flex-wrap items-center gap-3 rounded-[3px] border border-line bg-paper-raised px-3 py-2.5">
-                    <span className="flex w-14 shrink-0 items-center justify-center rounded-[2px] border border-line-strong px-1 py-1 text-[11px] text-ink-soft">
-                      {slotLabel(index)}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium text-ink">{model?.remote_model_name ?? modelID}</p>
-                      <p className={eligible ? "text-[11px] text-muted" : "text-[11px] text-rust"}>
-                        {model ? `上下文 ${model.context_window_tokens.toLocaleString("zh-CN")} · ${model.status === "enabled" ? "已启用" : "已停用"}` : "模型不存在"}
-                        {!eligible ? " · 不满足当前规则" : ""}
-                      </p>
-                    </div>
-                    <div className="flex gap-1">
-                      <Button type="button" size="sm" variant="ghost" onClick={() => move(index, -1)} disabled={index === 0} aria-label="上移">
-                        上移
-                      </Button>
-                      <Button type="button" size="sm" variant="ghost" onClick={() => move(index, 1)} disabled={index === form.candidates.length - 1} aria-label="下移">
-                        下移
-                      </Button>
-                      <Button type="button" size="sm" variant="ghost" onClick={() => setForm({ ...form, candidates: form.candidates.filter((_, i) => i !== index) })}>
-                        移除
-                      </Button>
-                    </div>
-                  </li>
-                );
-              })}
-            </ol>
-          )}
-
-          <p className="mt-3 rounded-[3px] border-l-4 border-jade bg-jade-soft/40 px-3 py-2 text-xs leading-5 text-jade">
-            效果预览：{summary}
-          </p>
+          <Badge tone="neutral">{form.candidates.length} 个候选</Badge>
         </div>
 
-        <details open={advanced} onToggle={(event) => setAdvanced((event.target as HTMLDetailsElement).open)} className="rounded-[3px] border border-line bg-paper-raised px-4 py-3">
-          <summary className="cursor-pointer text-sm font-medium text-ink">高级选项（大多数情况不用改）</summary>
-          <div className="mt-4 grid gap-4 md:grid-cols-2">
-            <Field label="最低上下文 Token" hint="生成模型必须达到这个长度。默认 1,000,000，调低会放宽准入。">
-              <Input type="number" min={1} value={form.minContextTokens} onChange={(event) => setForm({ ...form, minContextTokens: event.target.value })} required />
-            </Field>
-            <Field label="附加规则 JSON（可选）" hint="用于数据区域等特殊约束。不确定就保持 {}。">
-              <Textarea className="min-h-28 font-mono text-xs" value={form.rules} onChange={(event) => setForm({ ...form, rules: event.target.value })} spellCheck={false} />
-            </Field>
-          </div>
-        </details>
-
-        {error ? <Callout tone="danger">{error}</Callout> : null}
-
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="secondary" onClick={onCancel}>取消</Button>
-          <Button type="submit" loading={busy} disabled={form.candidates.length === 0}>
-            {initial ? "保存修改" : "创建规则"}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Select className="min-w-56 flex-1" value={addID} onChange={(event) => setAddID(event.target.value)} aria-label="选择要加入的模型">
+            <option value="">选择一个模型加入名单</option>
+            {eligibleModels.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.remote_model_name}（上下文 {model.context_window_tokens.toLocaleString("zh-CN")}）
+              </option>
+            ))}
+          </Select>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={!addID}
+            onClick={() => {
+              setForm({ ...form, candidates: [...form.candidates, addID] });
+              setAddID("");
+            }}
+          >
+            加入名单
           </Button>
         </div>
-      </form>
-    </Card>
+        {eligibleModels.length === 0 ? (
+          <p className="mt-2 text-xs leading-5 text-muted">
+            没有可加入的模型。请先到“可用模型”登记已核验的生成模型，或降低最低上下文要求。
+          </p>
+        ) : null}
+
+        {form.candidates.length === 0 ? (
+          <div className="mt-3 rounded-[3px] border border-dashed border-line-strong px-4 py-6 text-center text-xs text-muted">
+            还没有候选模型。先选一个主选模型。
+          </div>
+        ) : (
+          <ol className="mt-3 flex flex-col gap-2">
+            {form.candidates.map((modelID, index) => {
+              const model = modelByID.get(modelID);
+              const eligible = model && model.kind === "chat" && model.context_window_tokens >= minContext && model.verified_at && model.status === "enabled";
+              return (
+                <li key={modelID} className="flex flex-wrap items-center gap-3 rounded-[3px] border border-line bg-paper-raised px-3 py-2.5">
+                  <span className="flex w-14 shrink-0 items-center justify-center rounded-[2px] border border-line-strong px-1 py-1 text-[11px] text-ink-soft">
+                    {slotLabel(index)}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-ink">{model?.remote_model_name ?? modelID}</p>
+                    <p className={eligible ? "text-[11px] text-muted" : "text-[11px] text-rust"}>
+                      {model ? `上下文 ${model.context_window_tokens.toLocaleString("zh-CN")} · ${model.status === "enabled" ? "已启用" : "已停用"}` : "模型不存在"}
+                      {!eligible ? " · 不满足当前规则" : ""}
+                    </p>
+                  </div>
+                  <div className="flex gap-1">
+                    <Button type="button" size="sm" variant="ghost" onClick={() => move(index, -1)} disabled={index === 0} aria-label="上移">
+                      上移
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" onClick={() => move(index, 1)} disabled={index === form.candidates.length - 1} aria-label="下移">
+                      下移
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" onClick={() => setForm({ ...form, candidates: form.candidates.filter((_, i) => i !== index) })}>
+                      移除
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+
+        <p className="mt-3 rounded-[3px] border-l-4 border-jade bg-jade-soft/40 px-3 py-2 text-xs leading-5 text-jade">
+          效果预览：{summary}
+        </p>
+      </div>
+
+      <details open={advanced} onToggle={(event) => setAdvanced((event.target as HTMLDetailsElement).open)} className="rounded-[3px] border border-line bg-paper-raised px-4 py-3">
+        <summary className="cursor-pointer text-sm font-medium text-ink">高级选项（大多数情况不用改）</summary>
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <Field label="最低上下文 Token" hint="生成模型必须达到这个长度。默认 1,000,000，调低会放宽准入。">
+            <Input type="number" min={1} value={form.minContextTokens} onChange={(event) => setForm({ ...form, minContextTokens: event.target.value })} required />
+          </Field>
+          <Field label="附加规则 JSON（可选）" hint="用于数据区域等特殊约束。不确定就保持 {}。">
+            <Textarea className="min-h-28 font-mono text-xs" value={form.rules} onChange={(event) => setForm({ ...form, rules: event.target.value })} spellCheck={false} />
+          </Field>
+        </div>
+      </details>
+
+    </FormDrawer>
   );
 }
 
@@ -221,7 +223,6 @@ export default function PoliciesPage() {
   const models = useRemote(() => requestJSON<Page<Model>>("/api/v1/models"), []);
   const policies = useRemote(() => requestJSON<Page<ModelPolicy>>("/api/v1/model-policies"), []);
   const [editing, setEditing] = useState<ModelPolicy | null | "new">(null);
-  useScrollToTop(editing !== null);
   const [viewing, setViewing] = useState<ModelPolicy | null>(null);
   const [deleting, setDeleting] = useState<ModelPolicy | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -405,7 +406,7 @@ export default function PoliciesPage() {
           ) : null
         }
       >
-        {policies.loading ? (
+        {policies.loading && !policies.data ? (
           <LoadingState />
         ) : policies.data && policies.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
@@ -433,19 +434,19 @@ export default function PoliciesPage() {
                       <p className="mt-1 text-xs text-muted">最低上下文 {policy.min_context_tokens.toLocaleString("zh-CN")} Token · 更新于 {formatDateTime(policy.updated_at)}</p>
                     </div>
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button size="sm" variant="secondary" onClick={() => setViewing(policy)}>查看详情</Button>
+                  <RowMenu name={policy.name}>
+                    <MenuItem onClick={() => setViewing(policy)}>查看详情</MenuItem>
                     {policy.status === "draft" ? (
                       <>
-                        <Button size="sm" variant="secondary" onClick={() => setEditing(policy)}>继续编辑</Button>
-                        <Button size="sm" loading={busy} onClick={() => void runAction(() => mutate(`/api/v1/model-policies/${policy.id}/publish`, "POST", undefined, crypto.randomUUID()))}>发布</Button>
+                        <MenuItem icon="edit" onClick={() => setEditing(policy)}>继续编辑</MenuItem>
+                        <MenuItem disabled={busy} onClick={() => void runAction(() => mutate(`/api/v1/model-policies/${policy.id}/publish`, "POST", undefined, crypto.randomUUID()))}>发布</MenuItem>
                       </>
                     ) : (
-                      <Button size="sm" variant="secondary" loading={busy} onClick={() => void runAction(() => mutate(`/api/v1/model-policies/${policy.id}/versions`, "POST", undefined, crypto.randomUUID()))}>创建新版本</Button>
+                      <MenuItem disabled={busy} onClick={() => void runAction(() => mutate(`/api/v1/model-policies/${policy.id}/versions`, "POST", undefined, crypto.randomUUID()))}>创建新版本</MenuItem>
                     )}
                     {/* 删除入口对所有状态可见；是否允许删除由后端按引用关系判定。 */}
-                    <Button size="sm" variant="danger" disabled={busy} onClick={() => { setDeleting(policy); setDeleteError(null); }}>删除</Button>
-                  </div>
+                    <MenuItem icon="trash" danger disabled={busy} onClick={() => { setDeleting(policy); setDeleteError(null); }}>删除</MenuItem>
+                  </RowMenu>
                 </div>
 
                 <div className="mt-3 flex flex-wrap items-center gap-2">

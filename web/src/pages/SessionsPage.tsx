@@ -1,11 +1,13 @@
 // 会话列表：创建、打开、归档、导出与异步删除，并提供长期记忆数据操作。
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { FormDrawer } from "../components/FormDrawer";
+import { Icon } from "../components/Icon";
 import { useToast } from "../components/Toast";
-import { Badge, Button, Callout, Card, ConfirmDialog, CursorPager, DropdownMenu, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Select } from "../components/ui";
+import { ActionLink, Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, RowMenu, Select } from "../components/ui";
 import { downloadJSON, mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
-import { formatDateTime, formatRelative, statusLabel, statusTone } from "../lib/format";
+import { formatDateTime, formatRelative, formatSessionSource, statusLabel, statusTone } from "../lib/format";
 import { useCursorStack, useRemote } from "../lib/hooks";
 import type { Agent, DeletionRequest, Page, Session } from "../lib/types";
 
@@ -26,10 +28,12 @@ async function waitForDeletion(id: string): Promise<DeletionRequest> {
 }
 
 export default function SessionsPage() {
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
   const toast = useToast();
   const preselectedAgent = params.get("agent") ?? "";
+  const showCreate = params.get("new") === "1" || preselectedAgent !== "";
+  const titleRef = useRef<HTMLInputElement>(null);
   const paging = useCursorStack();
   const sessions = useRemote(
     () => requestJSON<Page<Session>>(`/api/v1/sessions?limit=20${paging.cursor ? `&cursor=${encodeURIComponent(paging.cursor)}` : ""}`),
@@ -38,7 +42,7 @@ export default function SessionsPage() {
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100"), []);
   const [query, setQuery] = useState("");
   const [title, setTitle] = useState("新对话");
-  const [agentID, setAgentID] = useState(preselectedAgent);
+  const [agentChoice, setAgentChoice] = useState<{ preset: string; id: string } | null>(null);
   const [creating, setCreating] = useState(false);
   const [creatingError, setCreatingError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -47,9 +51,34 @@ export default function SessionsPage() {
   const [confirmMemory, setConfirmMemory] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    if (showCreate && !agents.loading) titleRef.current?.focus();
+  }, [showCreate, preselectedAgent, agents.loading]);
+
+  const openCreate = () => {
+    const next = new URLSearchParams(params);
+    next.set("new", "1");
+    setParams(next, { replace: true });
+  };
+
+  const resetCreate = () => {
+    setTitle("新对话");
+    setAgentChoice(null);
+    setCreatingError(null);
+  };
+
+  const closeCreate = () => {
+    const next = new URLSearchParams(params);
+    next.delete("agent");
+    next.delete("new");
+    resetCreate();
+    setParams(next, { replace: true });
+  };
+
   const publishedAgents = (agents.data?.items ?? []).filter((agent) => agent.status === "published");
   const defaultAgentID = publishedAgents[0]?.id ?? "";
   // 从助手卡片带入的 agent 可能已下架，回退到第一个可用助手，避免提交无效 ID。
+  const agentID = agentChoice?.preset === preselectedAgent ? agentChoice.id : preselectedAgent;
   const selectedAgentID = publishedAgents.some((agent) => agent.id === agentID) ? agentID : defaultAgentID;
   const normalizedQuery = query.trim().toLowerCase();
   const visibleSessions = (sessions.data?.items ?? []).filter((session) =>
@@ -69,7 +98,7 @@ export default function SessionsPage() {
         title: title.trim(),
         source: "web",
       }, crypto.randomUUID());
-      navigate(`/sessions/${session.id}`);
+      navigate(`/sessions/${session.id}`, { replace: true });
     } catch (failure) {
       setCreatingError(failure instanceof Error && failure.message === "请先在助手页创建并发布一个助手" ? failure.message : describeError(failure));
     } finally {
@@ -164,43 +193,64 @@ export default function SessionsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="对话"
         title="对话"
-        description="选一个助手，像和同事说话一样描述目标。每次发送都会生成一条可回看的运行记录。"
+        description="继续最近的会话，或选择助手开始新任务。"
+        actions={
+          <Button onClick={openCreate} aria-haspopup="dialog">
+            <Icon name="plus" />
+            新建对话
+          </Button>
+        }
       />
       {sessions.error ? <ErrorBanner message={sessions.error} onRetry={sessions.reload} /> : null}
       {actionError ? <ErrorBanner message={actionError} /> : null}
-      {publishedAgents.length === 0 ? (
-        <Callout tone="warning" title="还没有可用助手">
-          先到 <Link to="/agents/new" className="text-accent underline underline-offset-2">助手页创建并发布一个助手</Link>，然后回到这里开始对话。
-        </Callout>
+      {showCreate ? (
+        <FormDrawer
+          title="新建对话"
+          description="选择助手，并为这次会话填写标题。"
+          bodyClassName="grid-cols-1"
+          submitLabel={!agents.loading && !agents.error && publishedAgents.length ? "开始对话" : undefined}
+          submitDisabled={!title.trim()}
+          dirty={title !== "新对话" || Boolean(agentChoice && selectedAgentID !== (preselectedAgent || defaultAgentID))}
+          busy={creating}
+          error={creatingError}
+          onSubmit={create}
+          onCancel={closeCreate}
+          onDiscardNavigation={resetCreate}
+        >
+          {agents.error ? <ErrorBanner message={agents.error} onRetry={agents.reload} /> : agents.loading ? (
+            <LoadingState label="加载可用助手" />
+          ) : publishedAgents.length === 0 ? (
+            <Callout tone="warning" title="还没有可用助手">
+              <Link to="/agents/new" className="text-ochre underline underline-offset-2">创建并发布助手</Link>后即可开始对话。
+            </Callout>
+          ) : (
+            <>
+              <Field label="对话标题">
+                <Input ref={titleRef} value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={256} placeholder="例如：整理本周需求" />
+              </Field>
+              <Field label="助手">
+                <Select value={selectedAgentID} onChange={(event) => setAgentChoice({ preset: preselectedAgent, id: event.target.value })} required>
+                  {publishedAgents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>{agent.name}（v{agent.version}）</option>
+                  ))}
+                </Select>
+              </Field>
+            </>
+          )}
+        </FormDrawer>
       ) : null}
-      <Card title="开始新对话" description="给这次对话起个标题，方便以后在列表中找到它。">
-        <form onSubmit={create} className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
-          <Field label="这次想聊什么？" hint="之后也可以修改标题。">
-            <Input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={256} placeholder="例如：整理本周需求" />
-          </Field>
-          <Field label="使用哪个助手" hint={publishedAgents.length === 0 ? "请先在助手页创建并发布一个助手。" : "只列出已发布版本。"}>
-            <Select value={selectedAgentID} onChange={(event) => setAgentID(event.target.value)} required>
-              {publishedAgents.map((agent) => (
-                <option key={agent.id} value={agent.id}>{agent.name}（v{agent.version}）</option>
-              ))}
-            </Select>
-          </Field>
-          <Button type="submit" loading={creating} disabled={publishedAgents.length === 0}>开始对话</Button>
-        </form>
-        {creatingError ? <p role="alert" className="mt-3 text-xs text-rust">{creatingError}</p> : null}
-      </Card>
       <Card
         title="我的对话"
-        description={`本页 ${sessions.data?.items.length ?? 0} 个会话，按最近更新排序。搜索只匹配当前页标题。`}
         actions={
-          <div className="w-56">
+          <div className="relative w-full sm:w-56">
+            <Icon name="search" className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" />
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="搜索本页标题"
               aria-label="搜索本页会话标题"
+              className="pl-9"
             />
           </div>
         }
@@ -208,82 +258,51 @@ export default function SessionsPage() {
         {sessions.loading ? (
           <LoadingState />
         ) : sessions.data && sessions.data.items.length > 0 ? (
-          visibleSessions.length === 0 ? (
-            <EmptyState title="没有匹配的会话" description="当前页没有标题包含该关键字的会话，可清空搜索或翻到其他页。" />
-          ) : (
           <>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[860px] text-left text-sm">
-              <thead className="text-xs uppercase tracking-wide text-muted">
-                <tr>
-                  <th className="pb-3 pr-4 font-medium">标题</th>
-                  <th className="pb-3 pr-4 font-medium">状态</th>
-                  <th className="pb-3 pr-4 font-medium">来源</th>
-                  <th className="pb-3 pr-4 font-medium">最近消息</th>
-                  <th className="pb-3 pr-4 font-medium">创建时间</th>
-                  <th className="pb-3 text-right font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-line">
+            {visibleSessions.length === 0 ? (
+              <EmptyState title="没有匹配的会话" action={<Button size="sm" variant="secondary" onClick={() => setQuery("")}>清空搜索</Button>} />
+            ) : (
+              <ul className="divide-y divide-line">
                 {visibleSessions.map((session) => (
-                  <tr key={session.id}>
-                    <td className="py-3 pr-4">
-                      <Link to={`/sessions/${session.id}`} className="font-medium text-ink underline-offset-2 hover:text-jade hover:underline">
-                        {session.title}
-                      </Link>
-                      <p className="font-mono text-[11px] text-muted">{session.id.slice(0, 8)}</p>
-                    </td>
-                    <td className="py-3 pr-4"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></td>
-                    <td className="py-3 pr-4 text-ink-soft">{session.source}</td>
-                    <td className="py-3 pr-4 text-xs text-muted">{formatRelative(session.last_message_at)}</td>
-                    <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(session.created_at)}</td>
-                    <td className="py-3 text-right">
-                      <DropdownMenu
-                        label={`更多操作：${session.title}`}
-                        triggerLabel="更多操作"
-                        trigger={<span aria-hidden className="font-display text-base leading-none">⋯</span>}
-                        triggerClassName="w-8 border border-line-strong bg-paper-raised text-base text-ink hover:border-accent"
-                        panelClassName="w-40"
-                      >
-                        {session.status === "active" ? (
-                          <MenuItem disabled={busy} onClick={() => void archive(session)}>归档对话</MenuItem>
-                        ) : null}
-                        <MenuItem disabled={busy} onClick={() => void exportSession(session)}>导出 JSON</MenuItem>
-                        <MenuItem
-                          danger
-                          disabled={busy}
-                          onClick={() => {
-                            setDeleting(session);
-                            setActionError(null);
-                          }}
-                        >
-                          删除对话
-                        </MenuItem>
-                      </DropdownMenu>
-                    </td>
-                  </tr>
+                  <li key={session.id} className="flex min-w-0 items-center gap-2 py-2 first:pt-0 sm:gap-4">
+                    <Link to={`/sessions/${session.id}`} className="group flex min-w-0 flex-1 items-center gap-3 rounded-lg p-2 transition-colors hover:bg-paper-deep">
+                      <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-line bg-paper text-muted group-hover:text-accent"><Icon name="chat" className="size-4" /></span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium group-hover:text-accent">{session.title}</span>
+                        <span className="mt-1 block text-xs text-muted">
+                          {formatSessionSource(session.source)} · {formatRelative(session.last_message_at ?? session.created_at)}
+                          <span className="sm:hidden"> · {statusLabel(session.status)}</span>
+                        </span>
+                      </span>
+                      <span className="hidden shrink-0 sm:block"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></span>
+                      <time className="hidden shrink-0 text-xs text-muted lg:block" dateTime={session.created_at}>{formatDateTime(session.created_at)}</time>
+                    </Link>
+                    <RowMenu name={session.title}>
+                      {session.status === "active" ? (
+                        <MenuItem disabled={busy} onClick={() => void archive(session)}>归档对话</MenuItem>
+                      ) : null}
+                      <MenuItem disabled={busy} onClick={() => void exportSession(session)}>导出 JSON</MenuItem>
+                      <MenuItem danger disabled={busy} onClick={() => { setDeleting(session); setActionError(null); }}>删除对话</MenuItem>
+                    </RowMenu>
+                  </li>
                 ))}
-              </tbody>
-            </table>
-          </div>
-          <CursorPager
-            page={paging.page}
-            count={sessions.data.items.length}
-            hasNext={Boolean(sessions.data.next_cursor)}
-            onPrev={paging.prev}
-            onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
-          />
+              </ul>
+            )}
+            <CursorPager
+              page={paging.page}
+              count={sessions.data.items.length}
+              hasNext={Boolean(sessions.data.next_cursor)}
+              onPrev={paging.prev}
+              onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
+            />
           </>
-          )
-        ) : (
-          <EmptyState title="还没有对话" description="创建第一个对话后，就可以和助手交流并查看处理过程。" />
+        ) : sessions.error ? null : (
+          <EmptyState title="还没有对话" description="选择助手后即可开始第一段对话。" action={showCreate ? undefined : <Button size="sm" variant="secondary" onClick={openCreate}>新建对话</Button>} />
         )}
       </Card>
       <Card title="隐私与记忆" description="助手会记住跨对话的偏好与事实。你可以随时导出或清空这些记忆；清空不会删除原始对话。">
         <div className="flex flex-wrap gap-2">
-          <Link to="/memory">
-            <Button variant="secondary">查看记忆图谱</Button>
-          </Link>
+          <ActionLink to="/memory" variant="secondary">查看记忆图谱</ActionLink>
           <Button variant="secondary" onClick={() => void exportMemory()}>导出我的记忆</Button>
           <Button variant="danger" onClick={() => setConfirmMemory(true)}>清空长期记忆</Button>
         </div>

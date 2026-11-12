@@ -1,6 +1,17 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import App from "./App";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryRouter } from "react-router-dom";
+import App, { appRoutes } from "./App";
+
+beforeEach(() => {
+  // 测试使用模拟的 fetch；去掉 JSDOM 信号，避免 Node 的 Request 跨运行时校验失败。
+  const NativeRequest = Request;
+  vi.stubGlobal("Request", class extends NativeRequest {
+    constructor(input: RequestInfo | URL, init?: RequestInit) {
+      super(input, { ...init, signal: undefined });
+    }
+  });
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -28,11 +39,10 @@ describe("App", () => {
         return Promise.resolve(jsonResponse({ error: { code: "unauthorized" } }, 401));
       }),
     );
-    render(<App />);
+    render(<App router={createMemoryRouter(appRoutes)} />);
     expect(await screen.findByRole("heading", { name: "登录" })).toBeInTheDocument();
-    // 登录页使用面向用户的说明，而不是内部术语。
-    expect(screen.getByText("把重复的事，交给一个懂你的助手。")).toBeInTheDocument();
-    expect(screen.getByText("高风险操作先征求你的同意")).toBeInTheDocument();
+    expect(screen.getByText("智能体工作区")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "注册" })).toHaveAttribute("href", "/register");
   });
 
   it("renders the workspace after restoring a session", async () => {
@@ -57,10 +67,12 @@ describe("App", () => {
         return Promise.resolve(jsonResponse({ items: [], next_cursor: null }));
       }),
     );
-    render(<App />);
+    render(<App router={createMemoryRouter(appRoutes)} />);
     // 账户菜单默认收起，先打开再确认注销入口可用。
     fireEvent.click(await screen.findByRole("button", { name: /alice/ }));
     expect(await screen.findByText("注销当前设备")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /创建与发布/ })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "主导航" });
+    expect(within(nav).getByRole("link", { name: "助手" })).toHaveAttribute("href", "/agents");
+    expect(within(screen.getByRole("complementary")).getByRole("link", { name: "新建对话" })).toHaveAttribute("href", "/sessions?new=1");
   });
 });

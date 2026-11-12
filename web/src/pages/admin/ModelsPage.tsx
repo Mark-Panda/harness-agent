@@ -1,10 +1,12 @@
 // 模型目录：展示上下文窗口核验、能力与价格，生成模型强制 1M+ 上下文。
-import { useState } from "react";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select } from "../../components/ui";
+import { useRef, useState } from "react";
+import { FormDrawer } from "../../components/FormDrawer";
+import { useToast } from "../../components/Toast";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, formatNumber, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Model, ModelHealth, ModelKind, Page, Provider, RemoteModel, VectorStatus } from "../../lib/types";
 
 interface ModelFormState {
@@ -54,7 +56,7 @@ function toLocalInput(value: string | null): string {
 }
 
 function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model | null; providers: Provider[]; onSaved: () => void; onCancel: () => void }) {
-  const [form, setForm] = useState<ModelFormState>(
+  const initialForm: ModelFormState =
     initial
       ? {
           providerId: initial.provider_id,
@@ -72,13 +74,15 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
           tools: Boolean(initial.capabilities?.tools),
           structuredOutput: Boolean(initial.capabilities?.structured_output),
         }
-      : emptyModel,
-  );
+      : emptyModel;
+  const [form, setForm] = useState(initialForm);
+  const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [remoteModels, setRemoteModels] = useState<RemoteModel[]>([]);
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
+  const remoteRequest = useRef(0);
   const contextTokens = Number(form.contextWindowTokens || 0);
   const contextWarning = form.kind === "chat" && contextTokens < 1_000_000;
   const verificationWarning = form.kind === "chat" && (!form.verifiedAt || !form.verificationSource.trim());
@@ -89,20 +93,22 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       setRemoteError("请先选择模型服务。");
       return;
     }
+    const request = ++remoteRequest.current;
     setRemoteBusy(true);
     setRemoteError(null);
     try {
       const response = await requestJSON<{ items: RemoteModel[] }>(`/api/v1/providers/${form.providerId}/models`);
+      if (request !== remoteRequest.current) return;
       setRemoteModels(response.items);
       if (response.items.length === 0) {
         setRemoteError("站点没有返回可用模型。");
-      } else if (!form.remoteModelName) {
-        setForm((current) => ({ ...current, remoteModelName: response.items[0].id }));
+      } else {
+        setForm((current) => current.remoteModelName ? current : { ...current, remoteModelName: response.items[0].id });
       }
     } catch (failure) {
-      setRemoteError(describeError(failure));
+      if (request === remoteRequest.current) setRemoteError(describeError(failure));
     } finally {
-      setRemoteBusy(false);
+      if (request === remoteRequest.current) setRemoteBusy(false);
     }
   };
 
@@ -130,6 +136,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       } else {
         await mutate<Model>("/api/v1/models", "POST", body, crypto.randomUUID());
       }
+      toast.show(initial ? "修改已保存" : "已登记模型", "success");
       onSaved();
     } catch (submitError) {
       setError(describeError(submitError));
@@ -139,102 +146,103 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
   };
 
   return (
-    <Card title={initial ? `编辑模型：${initial.remote_model_name}` : "登记模型"} description="登记后，模型才能被选模规则引用。生成模型需要 1,000,000 以上上下文，并记录核验来源。">
-      <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
-        <Field label="来自哪个服务" hint="先接入模型服务，这里才能选择。">
-          <Select value={form.providerId} onChange={(event) => { setForm({ ...form, providerId: event.target.value }); setRemoteModels([]); setRemoteError(null); }} required>
-            <option value="">选择模型服务</option>
-            {providers.map((provider) => (
-              <option key={provider.id} value={provider.id}>{provider.name}</option>
+    <FormDrawer
+      title={initial ? `编辑模型：${initial.remote_model_name}` : "登记模型"} description="登记后，模型才能被选模规则引用。生成模型需要 1,000,000 以上上下文，并记录核验来源。"
+      submitLabel={initial ? "保存修改" : "登记模型"}
+      busy={busy}
+      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      error={error}
+      onSubmit={submit}
+      onCancel={onCancel}
+    >
+      <Field label="来自哪个服务" hint="先接入模型服务，这里才能选择。">
+        <Select value={form.providerId} onChange={(event) => {
+          remoteRequest.current += 1;
+          setForm({ ...form, providerId: event.target.value });
+          setRemoteModels([]);
+          setRemoteError(null);
+          setRemoteBusy(false);
+        }} required>
+          <option value="">选择模型服务</option>
+          {providers.map((provider) => (
+            <option key={provider.id} value={provider.id}>{provider.name}</option>
+          ))}
+        </Select>
+      </Field>
+      <div className="min-w-0 sm:col-span-2">
+        <Field label="模型名称" hint="填写服务商提供的模型 ID。">
+          <Input className="min-w-0 flex-1" value={form.remoteModelName} onChange={(event) => setForm({ ...form, remoteModelName: event.target.value })} required placeholder="例如：deepseek-chat" />
+        </Field>
+        <Button type="button" size="sm" variant="secondary" className="mt-2" loading={remoteBusy} disabled={!form.providerId} onClick={() => void pullRemoteModels()}>
+          从站点拉取模型
+        </Button>
+        {remoteModels.length > 0 ? (
+          <Select
+            className="mt-2"
+            value=""
+            onChange={(event) => {
+              if (event.target.value) {
+                setForm({ ...form, remoteModelName: event.target.value });
+              }
+            }}
+            aria-label="选择拉取到的模型"
+          >
+            <option value="">选择拉取到的模型（{remoteModels.length} 个）</option>
+            {remoteModels.map((model) => (
+              <option key={model.id} value={model.id}>{model.id}{model.owned_by ? ` · ${model.owned_by}` : ""}</option>
             ))}
           </Select>
-        </Field>
-        <Field label="模型名称" hint="必须与服务商控制台里的模型 ID 完全一致。">
-          <div className="flex gap-2">
-            <Input className="min-w-0 flex-1" value={form.remoteModelName} onChange={(event) => setForm({ ...form, remoteModelName: event.target.value })} required placeholder="例如：deepseek-chat" />
-            <Button type="button" size="sm" variant="secondary" loading={remoteBusy} disabled={!form.providerId} onClick={() => void pullRemoteModels()}>
-              从站点拉取
-            </Button>
-          </div>
-          {remoteModels.length > 0 ? (
-            <Select
-              className="mt-2"
-              value=""
-              onChange={(event) => {
-                if (event.target.value) {
-                  setForm({ ...form, remoteModelName: event.target.value });
-                }
-              }}
-              aria-label="选择拉取到的模型"
-            >
-              <option value="">选择拉取到的模型（{remoteModels.length} 个）</option>
-              {remoteModels.map((model) => (
-                <option key={model.id} value={model.id}>{model.id}{model.owned_by ? ` · ${model.owned_by}` : ""}</option>
-              ))}
-            </Select>
-          ) : null}
-          {remoteError ? <p role="alert" className="mt-1 text-xs text-rust">{remoteError}</p> : null}
-        </Field>
-        <Field label="用它来做什么" hint="大多数助手只用“生成”；向量与重排用于记忆检索。">
-          <Select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as ModelKind })}>
-            <option value="chat">生成回答（chat）</option>
-            <option value="embedding">把文字转向量（embedding）</option>
-            <option value="rerank">结果重排（rerank）</option>
-          </Select>
-        </Field>
-        <Field label="上下文长度（Token）" hint={contextWarning ? "生成模型低于 1M，后端会拒绝保存。" : "一次能读入多长的内容。生成模型要求至少 100 万。"} error={contextWarning ? "生成模型上下文必须 ≥ 1,000,000" : null}>
-          <Input type="number" min={1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} required />
-        </Field>
-        <Field label="单次最长输出（Token）">
-          <Input type="number" min={1} value={form.maxOutputTokens} onChange={(event) => setForm({ ...form, maxOutputTokens: event.target.value })} required />
-        </Field>
-        <Field label="数据区域" hint="例如 cn / us，用于按合规要求筛选模型。">
-          <Input value={form.dataRegion} onChange={(event) => setForm({ ...form, dataRegion: event.target.value })} required />
-        </Field>
-        <Field label="输入价格 / 百万 Token" hint="填 0 表示不计费；仅用于预算与展示。">
-          <Input type="number" min={0} step="0.01" value={form.inputPrice} onChange={(event) => setForm({ ...form, inputPrice: event.target.value })} required />
-        </Field>
-        <Field label="输出价格 / 百万 Token">
-          <Input type="number" min={0} step="0.01" value={form.outputPrice} onChange={(event) => setForm({ ...form, outputPrice: event.target.value })} required />
-        </Field>
-        <Field label="核验来源" hint={verificationWarning ? "生成模型必须填写来源与时间，才能被发布使用。" : "官方文档或内部评测链接。"} error={verificationWarning ? "需要核验来源与核验时间" : null}>
-          <Input value={form.verificationSource} onChange={(event) => setForm({ ...form, verificationSource: event.target.value })} placeholder="https://docs.example.com/models" />
-        </Field>
-        <Field label="核验时间">
-          <Input type="datetime-local" value={form.verifiedAt} onChange={(event) => setForm({ ...form, verifiedAt: event.target.value })} />
-        </Field>
-        <Field label="状态">
-          <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ModelFormState["status"] })}>
-            <option value="enabled">启用</option>
-            <option value="disabled">停用</option>
-          </Select>
-        </Field>
-        <fieldset className="flex flex-wrap items-center gap-4 text-sm text-ink-soft">
-          <legend className="mb-1 block w-full text-sm font-medium text-ink">能力</legend>
-          {([
-            ["streaming", "流式"],
-            ["tools", "工具调用"],
-            ["structuredOutput", "结构化 JSON"],
-          ] as const).map(([key, label]) => (
-            <label key={key} className="flex items-center gap-2">
-              <input type="checkbox" checked={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.checked })} />
-              {label}
-            </label>
-          ))}
-        </fieldset>
-        {error ? (
-          <p role="alert" className="rounded-lg border border-rust bg-rust-soft px-3 py-2 text-xs text-rust md:col-span-2">
-            {error}
-          </p>
         ) : null}
-        <div className="flex justify-end gap-2 md:col-span-2">
-          <Button type="button" variant="secondary" onClick={onCancel}>取消</Button>
-          <Button type="submit" loading={busy} disabled={contextWarning || verificationWarning}>
-            {initial ? "保存修改" : "登记模型"}
-          </Button>
-        </div>
-      </form>
-    </Card>
+        {remoteError ? <p role="alert" className="mt-1 text-xs text-rust">{remoteError}</p> : null}
+      </div>
+      <Field label="用它来做什么" hint="大多数助手只用“生成”；向量与重排用于记忆检索。">
+        <Select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as ModelKind })}>
+          <option value="chat">生成回答（chat）</option>
+          <option value="embedding">把文字转向量（embedding）</option>
+          <option value="rerank">结果重排（rerank）</option>
+        </Select>
+      </Field>
+      <Field label="上下文长度（Token）" hint={contextWarning ? "生成模型低于 1M，后端会拒绝保存。" : "一次能读入多长的内容。生成模型要求至少 100 万。"} error={contextWarning ? "生成模型上下文必须 ≥ 1,000,000" : null}>
+        <Input type="number" min={form.kind === "chat" ? 1_000_000 : 1} value={form.contextWindowTokens} onChange={(event) => setForm({ ...form, contextWindowTokens: event.target.value })} required />
+      </Field>
+      <Field label="单次最长输出（Token）">
+        <Input type="number" min={1} value={form.maxOutputTokens} onChange={(event) => setForm({ ...form, maxOutputTokens: event.target.value })} required />
+      </Field>
+      <Field label="数据区域" hint="例如 cn / us，用于按合规要求筛选模型。">
+        <Input value={form.dataRegion} onChange={(event) => setForm({ ...form, dataRegion: event.target.value })} required />
+      </Field>
+      <Field label="输入价格 / 百万 Token" hint="填 0 表示不计费；仅用于预算与展示。">
+        <Input type="number" min={0} step="0.01" value={form.inputPrice} onChange={(event) => setForm({ ...form, inputPrice: event.target.value })} required />
+      </Field>
+      <Field label="输出价格 / 百万 Token">
+        <Input type="number" min={0} step="0.01" value={form.outputPrice} onChange={(event) => setForm({ ...form, outputPrice: event.target.value })} required />
+      </Field>
+      <Field label="核验来源" hint={verificationWarning ? "生成模型必须填写来源与时间，才能被发布使用。" : "官方文档或内部评测链接。"} error={verificationWarning ? "需要核验来源与核验时间" : null}>
+        <Input required={form.kind === "chat"} value={form.verificationSource} onChange={(event) => setForm({ ...form, verificationSource: event.target.value })} placeholder="https://docs.example.com/models" />
+      </Field>
+      <Field label="核验时间">
+        <Input type="datetime-local" required={form.kind === "chat"} value={form.verifiedAt} onChange={(event) => setForm({ ...form, verifiedAt: event.target.value })} />
+      </Field>
+      <Field label="状态">
+        <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ModelFormState["status"] })}>
+          <option value="enabled">启用</option>
+          <option value="disabled">停用</option>
+        </Select>
+      </Field>
+      <fieldset className="flex flex-wrap items-center gap-4 text-sm text-ink-soft">
+        <legend className="mb-1 block w-full text-sm font-medium text-ink">能力</legend>
+        {([
+          ["streaming", "流式"],
+          ["tools", "工具调用"],
+          ["structuredOutput", "结构化 JSON"],
+        ] as const).map(([key, label]) => (
+          <label key={key} className="flex items-center gap-2">
+            <input type="checkbox" checked={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.checked })} />
+            {label}
+          </label>
+        ))}
+      </fieldset>
+    </FormDrawer>
   );
 }
 
@@ -282,7 +290,6 @@ export default function ModelsPage() {
   const health = useRemote(() => requestJSON<{ items: ModelHealth[] }>("/api/v1/model-routing/health"), []);
   const vectorStatus = useRemote(() => requestJSON<VectorStatus>("/api/v1/memory/vector-status"), []);
   const [editing, setEditing] = useState<Model | null | "new">(null);
-  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Model | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -369,7 +376,7 @@ export default function ModelsPage() {
         eyebrow="平台设置 · 第二步"
         title="可用模型"
         description="这里是“具体能调用哪个模型”。登记并核验后，才能在选模规则里安排主选与替补。"
-        actions={<Button onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>}
+        actions={<Button aria-haspopup="dialog" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>}
       />
       {providers.error ? <ErrorBanner message={providers.error} onRetry={providers.reload} /> : null}
       {models.error ? <ErrorBanner message={models.error} onRetry={models.reload} /> : null}
@@ -424,7 +431,7 @@ export default function ModelsPage() {
               <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-[3px] border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
                 <span>{vector.warning}</span>
                 {!vector.model_configured ? (
-                  <Button size="sm" variant="secondary" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>
+                  <Button size="sm" variant="secondary" aria-haspopup="dialog" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>
                     登记 embedding 模型
                   </Button>
                 ) : null}
@@ -455,16 +462,20 @@ export default function ModelsPage() {
           </>
         }
       >
-        {models.loading ? (
+        {models.loading && !models.data ? (
           <LoadingState />
         ) : models.data && models.data.items.length > 0 ? (
           <>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] text-left text-sm">
+          <div className="admin-table-container overflow-x-auto">
+            <label className="admin-table-mobile-select min-h-10 items-center gap-2 border-b border-line text-sm text-muted">
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} />
+              全选本页
+            </label>
+            <table role="table" className="admin-table w-full min-w-[900px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
                 <tr>
                   <th className="w-8 pb-3 pr-2 font-medium">
-                    <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选可用模型" />
+                    <input className="admin-table-desktop-select" type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选可用模型" />
                   </th>
                   <th className="pb-3 pr-4 font-medium">模型</th>
                   <th className="pb-3 pr-4 font-medium">来自服务</th>
@@ -477,10 +488,10 @@ export default function ModelsPage() {
                   <th className="pb-3 font-medium">操作</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-line">
+              <tbody role="rowgroup" className="divide-y divide-line">
                 {paging.pageItems.map((model) => (
-                  <tr key={model.id}>
-                    <td className="py-3 pr-2">
+                  <tr role="row" key={model.id}>
+                    <td role="cell" data-row="select" className="py-3 pr-2">
                       <input
                         type="checkbox"
                         checked={selected.has(model.id)}
@@ -488,19 +499,21 @@ export default function ModelsPage() {
                         aria-label={`选择模型 ${model.remote_model_name}`}
                       />
                     </td>
-                    <td className="py-3 pr-4">
+                    <td role="cell" data-row="main" className="py-3 pr-4">
                       <p className="font-medium text-ink">{model.remote_model_name}</p>
                       <p className="font-mono text-[11px] text-muted">{model.id.slice(0, 8)}</p>
                     </td>
-                    <td className="py-3 pr-4 text-ink-soft">{providerNames.get(model.provider_id) ?? "—"}</td>
-                    <td className="py-3 pr-4"><Badge tone="neutral">{model.kind}</Badge></td>
-                    <td className="py-3 pr-4">
+                    <td role="cell" data-column="模型服务" className="py-3 pr-4 text-ink-soft">{providerNames.get(model.provider_id) ?? "—"}</td>
+                    <td role="cell" data-column="用途" className="py-3 pr-4"><Badge tone="neutral">{model.kind}</Badge></td>
+                    <td role="cell" data-column="上下文" className="py-3 pr-4">
+                      <div>
                       <p className={model.kind === "chat" && model.context_window_tokens < 1_000_000 ? "text-rust" : "text-ink"}>
                         {formatNumber(model.context_window_tokens)}
                       </p>
                       <p className="text-[11px] text-muted">输出上限 {formatNumber(model.max_output_tokens)}</p>
+                      </div>
                     </td>
-                    <td className="py-3 pr-4 text-xs text-muted">
+                    <td role="cell" data-column="核验状态" className="py-3 pr-4 text-xs text-muted">
                       {model.verified_at ? (
                         <>
                           <p>{formatDateTime(model.verified_at)}</p>
@@ -510,10 +523,10 @@ export default function ModelsPage() {
                         <Badge tone="warning">未核验</Badge>
                       )}
                     </td>
-                    <td className="py-3 pr-4 text-xs text-ink-soft">
+                    <td role="cell" data-column="价格 / 百万" className="py-3 pr-4 text-xs text-ink-soft">
                       入 ${model.input_price_per_million} / 出 ${model.output_price_per_million}
                     </td>
-                    <td className="py-3 pr-4">
+                    <td role="cell" data-column="可用性" className="py-3 pr-4">
                       {(() => {
                         const healthItem = healthByModel.get(model.id);
                         return (
@@ -524,12 +537,12 @@ export default function ModelsPage() {
                         );
                       })()}
                     </td>
-                    <td className="py-3 pr-4"><Badge tone={statusTone(model.status)}>{statusLabel(model.status)}</Badge></td>
-                    <td className="py-3">
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="secondary" onClick={() => setEditing(model)}>编辑</Button>
-                        <Button size="sm" variant="danger" onClick={() => { setDeleting(model); setDeleteError(null); }}>删除</Button>
-                      </div>
+                    <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(model.status)}>{statusLabel(model.status)}</Badge></td>
+                    <td role="cell" data-row="actions" className="py-3">
+                      <RowMenu name={model.remote_model_name}>
+                        <MenuItem icon="edit" onClick={() => setEditing(model)}>编辑</MenuItem>
+                        <MenuItem icon="trash" danger onClick={() => { setDeleting(model); setDeleteError(null); }}>删除</MenuItem>
+                      </RowMenu>
                     </td>
                   </tr>
                 ))}
@@ -539,7 +552,7 @@ export default function ModelsPage() {
           <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </>
         ) : (
-          <EmptyState title="还没有可用模型" description="先接入模型服务，再登记至少一个已核验的生成模型。" action={<Button size="sm" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>} />
+          <EmptyState title="还没有可用模型" description="先接入模型服务，再登记至少一个已核验的生成模型。" action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>} />
         )}
       </Card>
       <ConfirmDialog

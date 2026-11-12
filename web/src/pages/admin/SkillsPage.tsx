@@ -1,11 +1,13 @@
 // Skill 模板管理：提示词模板与参数 Schema，管理员维护平台级能力。
 import { useRef, useState } from "react";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select, Textarea } from "../../components/ui";
+import { FormDrawer } from "../../components/FormDrawer";
+import { useToast } from "../../components/Toast";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { parseSkillPackage } from "../../lib/skillPackage";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Page, Skill, SkillStatus } from "../../lib/types";
 
 interface SkillFormState {
@@ -19,11 +21,12 @@ interface SkillFormState {
 const emptySkill: SkillFormState = { name: "", description: "", promptTemplate: "", parameters: "{}", status: "draft" };
 
 function SkillForm({ initial, onSaved, onCancel }: { initial: Skill | null; onSaved: () => void; onCancel: () => void }) {
-  const [form, setForm] = useState<SkillFormState>(
+  const initialForm: SkillFormState =
     initial
       ? { name: initial.name, description: initial.description, promptTemplate: initial.prompt_template, parameters: JSON.stringify(initial.parameters ?? {}, null, 2), status: initial.status }
-      : emptySkill,
-  );
+      : emptySkill;
+  const [form, setForm] = useState(initialForm);
+  const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -50,6 +53,7 @@ function SkillForm({ initial, onSaved, onCancel }: { initial: Skill | null; onSa
       } else {
         await mutate<Skill>("/api/v1/skills", "POST", body, crypto.randomUUID());
       }
+      toast.show(initial ? "修改已保存" : "已创建技能", "success");
       onSaved();
     } catch (submitError) {
       setError(submitError instanceof Error && submitError.message === "参数 JSON 格式错误" ? submitError.message : describeError(submitError));
@@ -59,47 +63,47 @@ function SkillForm({ initial, onSaved, onCancel }: { initial: Skill | null; onSa
   };
 
   return (
-    <Card title={initial ? `编辑技能：${initial.name}` : "新建技能"} description="技能会作为额外说明交给助手。把它想成岗位手册，不要写密钥或个人隐私。">
-      <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
-        <Field label="技能名称" hint="例如“需求结构化”“代码审查清单”。">
-          <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} />
+    <FormDrawer
+      title={initial ? `编辑技能：${initial.name}` : "新建技能"} description="技能会作为额外说明交给助手。把它想成岗位手册，不要写密钥或个人隐私。"
+      submitLabel={initial ? "保存修改" : "创建技能"}
+      busy={busy}
+      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      error={error}
+      onSubmit={submit}
+      onCancel={onCancel}
+    >
+      <Field label="技能名称" hint="例如“需求结构化”“代码审查清单”。">
+        <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} />
+      </Field>
+      <Field label="状态">
+        <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as SkillStatus })}>
+          <option value="draft">草稿</option>
+          <option value="published">发布</option>
+          <option value="disabled">停用</option>
+        </Select>
+      </Field>
+      <div className="sm:col-span-2">
+        <Field label="一句话说明" hint="告诉使用者在什么场景下选这个技能。">
+          <Input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} maxLength={512} placeholder="例如：把零散需求整理成带优先级的清单" />
         </Field>
-        <Field label="状态">
-          <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as SkillStatus })}>
-            <option value="draft">草稿</option>
-            <option value="published">发布</option>
-            <option value="disabled">停用</option>
-          </Select>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="技能说明（会发给助手）" hint="用自然语言写做事步骤、输出格式和禁忌。">
+          <Textarea className="min-h-40 text-xs" value={form.promptTemplate} onChange={(event) => setForm({ ...form, promptTemplate: event.target.value })} required spellCheck={false} />
         </Field>
-        <div className="md:col-span-2">
-          <Field label="一句话说明" hint="告诉使用者在什么场景下选这个技能。">
-            <Input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} maxLength={512} placeholder="例如：把零散需求整理成带优先级的清单" />
-          </Field>
-        </div>
-        <div className="md:col-span-2">
-          <Field label="技能说明（会发给助手）" hint="用自然语言写做事步骤、输出格式和禁忌。">
-            <Textarea className="min-h-40 text-xs" value={form.promptTemplate} onChange={(event) => setForm({ ...form, promptTemplate: event.target.value })} required spellCheck={false} />
-          </Field>
-        </div>
-        <div className="md:col-span-2">
-          <Field label="参数定义（高级，可保持 {}）" hint="需要动态参数时才填写 JSON Schema。">
-            <Textarea className="min-h-28 font-mono text-xs" value={form.parameters} onChange={(event) => setForm({ ...form, parameters: event.target.value })} spellCheck={false} />
-          </Field>
-        </div>
-        {error ? <p role="alert" className="rounded-lg border border-rust bg-rust-soft px-3 py-2 text-xs text-rust md:col-span-2">{error}</p> : null}
-        <div className="flex justify-end gap-2 md:col-span-2">
-          <Button type="button" variant="secondary" onClick={onCancel}>取消</Button>
-          <Button type="submit" loading={busy}>{initial ? "保存修改" : "创建技能"}</Button>
-        </div>
-      </form>
-    </Card>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="参数定义（高级，可保持 {}）" hint="需要动态参数时才填写 JSON Schema。">
+          <Textarea className="min-h-28 font-mono text-xs" value={form.parameters} onChange={(event) => setForm({ ...form, parameters: event.target.value })} spellCheck={false} />
+        </Field>
+      </div>
+    </FormDrawer>
   );
 }
 
 export default function SkillsPage() {
   const skills = useRemote(() => requestJSON<Page<Skill>>("/api/v1/skills"), []);
   const [editing, setEditing] = useState<Skill | null | "new">(null);
-  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Skill | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -186,7 +190,7 @@ export default function SkillsPage() {
       {importNote ? <Callout tone="success">{importNote}</Callout> : null}
       {editing ? <SkillForm initial={editing === "new" ? null : editing} onCancel={() => setEditing(null)} onSaved={() => { setEditing(null); skills.reload(); }} /> : null}
       <Card title="已有技能" description={`共 ${skillItems.length} 个技能`}>
-        {skills.loading ? (
+        {skills.loading && !skills.data ? (
           <LoadingState />
         ) : skills.data && skills.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
@@ -202,10 +206,10 @@ export default function SkillsPage() {
                     <p className="mt-1 text-xs text-muted">{skill.description || "无描述"}</p>
                     <p className="mt-1 text-[11px] text-muted">更新于 {formatDateTime(skill.updated_at)}</p>
                   </div>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="secondary" onClick={() => setEditing(skill)}>编辑</Button>
-                    <Button size="sm" variant="danger" onClick={() => { setDeleting(skill); setDeleteError(null); }}>删除</Button>
-                  </div>
+                  <RowMenu name={skill.name}>
+                    <MenuItem icon="edit" onClick={() => setEditing(skill)}>编辑</MenuItem>
+                    <MenuItem icon="trash" danger onClick={() => { setDeleting(skill); setDeleteError(null); }}>删除</MenuItem>
+                  </RowMenu>
                 </div>
                 <details className="mt-3 text-xs text-muted">
                   <summary className="cursor-pointer text-muted">查看提示词模板</summary>

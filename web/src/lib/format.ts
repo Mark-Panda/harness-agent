@@ -34,6 +34,18 @@ export function formatRelative(value: string | null | undefined): string {
   return formatDateTime(value);
 }
 
+// formatSessionSource 把会话来源翻译成用户语言。
+export function formatSessionSource(source: string | undefined): string {
+  switch (source) {
+    case "feishu":
+      return "飞书";
+    case "api":
+      return "接口";
+    default:
+      return "网页";
+  }
+}
+
 // formatNumber 为整数添加千分位。
 export function formatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined) {

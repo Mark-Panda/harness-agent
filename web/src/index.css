@@ -1,97 +1,257 @@
 @import "tailwindcss";
 
-/* 纸墨主题：暖纸底色、墨色文字、朱砂强调，避免通用深色后台观感。 */
+/* 共用语义色保留既有组件的类名，让工作区、管理后台和认证页使用同一套主题。 */
 @theme {
-  --color-paper: #f4efe4;
-  --color-paper-raised: #fffaf1;
-  --color-paper-deep: #eae2d2;
-  --color-ink: #1f1b15;
-  --color-ink-soft: #4a4237;
-  --color-muted: #6b6051;
-  --color-line: #ded3c0;
-  --color-line-strong: #c6b9a3;
-  --color-accent: #b33a28;
-  --color-accent-soft: #f3ddd4;
-  --color-jade: #2e6a5c;
-  --color-jade-soft: #dcebe4;
-  --color-rust: #9c2f22;
-  --color-rust-soft: #f4ddd6;
-  --color-ochre: #7d5a10;
-  --color-ochre-soft: #f4e7c6;
-  --font-display: "Songti SC", "Noto Serif SC", "Source Han Serif SC", STSong, serif;
-  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --color-paper: #0b0e0d;
+  --color-paper-raised: #121715;
+  --color-paper-deep: #1a211e;
+  --color-ink: #edf3ef;
+  --color-ink-soft: #c5d0c9;
+  --color-muted: #95a69e;
+  --color-line: #26332d;
+  --color-line-strong: #55695e;
+  --color-accent: #73efa6;
+  --color-accent-hover: #9af5bf;
+  --color-accent-ink: #082217;
+  --color-accent-soft: #163427;
+  --color-jade: #7be4b5;
+  --color-jade-soft: #133226;
+  --color-rust: #ffa29a;
+  --color-rust-soft: #39201e;
+  --color-ochre: #f0cb80;
+  --color-ochre-soft: #382c19;
+  --font-sans: Inter, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: var(--font-sans);
   --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
 }
 
 :root {
   font-family: var(--font-sans);
-  color-scheme: light;
+  color-scheme: dark;
   font-synthesis: none;
   color: var(--color-ink);
   background: var(--color-paper);
-}
-
-* {
-  box-sizing: border-box;
+  scroll-padding-top: 5rem;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background-color: var(--color-paper);
-  /* 极轻的网点纸纹，让大面积留白不显得像默认白底。 */
-  background-image: radial-gradient(circle at 1px 1px, rgb(31 27 21 / 0.045) 1px, transparent 0);
-  background-size: 18px 18px;
 }
 
-h1,
-h2,
-h3 {
-  font-family: var(--font-display);
+h1, h2, h3 {
   font-weight: 600;
+}
+
+button:not(:disabled), summary {
+  cursor: pointer;
+}
+
+:where(a, button, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
 }
 
 ::selection {
   background: var(--color-accent);
-  color: var(--color-paper-raised);
+  color: var(--color-accent-ink);
 }
 
-/* 页面入场：一次性错峰上浮，避免滚动时到处跳动。 */
-@keyframes page-rise {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+dialog::backdrop {
+  background: rgb(0 0 0 / 0.65);
 }
 
-.page-rise {
-  animation: page-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+/* 工作台与认证页共用节点网格，呼应助手的执行流程。 */
+.workspace-grid {
+  background-image:
+    radial-gradient(ellipse at 92% 32%, #173b29 0%, transparent 64%),
+    linear-gradient(110deg, #141b17 0%, #101713 80%);
 }
 
-.page-rise > * {
-  animation: page-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.page-rise > *:nth-child(2) {
-  animation-delay: 60ms;
-}
-
-.page-rise > *:nth-child(3) {
-  animation-delay: 120ms;
-}
-
-.page-rise > *:nth-child(4) {
-  animation-delay: 180ms;
+.workflow-art {
+  --grid-line: rgb(115 239 166 / 0.13);
+  background-image:
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(var(--grid-line) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: linear-gradient(90deg, transparent, black 32%, black 90%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .page-rise,
-  .page-rise > * {
-    animation: none;
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+body:has(dialog:modal) {
+  overflow: hidden;
+}
+
+@layer components {
+  .form-control {
+    min-height: 2.75rem;
+    border: 1px solid var(--color-line-strong);
+    background-color: var(--color-paper);
+    transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+  }
+
+  .form-control::placeholder {
+    color: var(--color-muted);
+  }
+
+  .form-control:hover:not(:disabled) {
+    border-color: var(--color-muted);
+  }
+
+  .form-control:focus {
+    border-color: var(--color-accent);
+    outline: none;
+    box-shadow: 0 0 0 3px rgb(115 239 166 / 0.16);
+  }
+
+  .form-control[aria-invalid="true"] {
+    border-color: var(--color-rust);
+  }
+
+  .form-control[aria-invalid="true"]:focus {
+    box-shadow: 0 0 0 3px rgb(255 162 154 / 0.18);
+  }
+
+  .form-control:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+
+  .form-select {
+    appearance: none;
+    padding-right: 2.5rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' viewBox='0 0 16 16'%3E%3Cpath stroke='%2395a69e' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
+    background-position: right 0.8rem center;
+    background-repeat: no-repeat;
+  }
+
+  input:is([type="checkbox"], [type="radio"]) {
+    accent-color: var(--color-accent);
+  }
+}
+
+.editor-drawer:modal {
+  animation: editor-enter 170ms ease-out both;
+}
+
+@keyframes editor-enter {
+  from { opacity: 0; transform: translateX(1rem); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.menu-panel {
+  animation: menu-enter 140ms ease-out both;
+}
+
+@keyframes menu-enter {
+  from { opacity: 0; transform: translateY(var(--menu-offset, -4px)); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.admin-table-container {
+  container-type: inline-size;
+}
+
+.admin-table [data-row="actions"] {
+  position: sticky;
+  right: 0;
+  text-align: right;
+  background-color: var(--color-paper-raised);
+}
+
+.admin-table th:last-child {
+  text-align: right;
+}
+
+@container (width < 720px) {
+  .admin-table,
+  .admin-table tbody {
+    display: block;
+    min-width: 0;
+  }
+
+  .admin-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .admin-table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 0.75rem;
+    padding-block: 0.75rem;
+  }
+
+  .admin-table td {
+    min-width: 0;
+    max-width: none;
+    padding: 0.3rem 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .admin-table [data-row="main"] {
+    grid-area: 1 / 1;
+    font-weight: 600;
+  }
+
+  .admin-table [data-row="actions"] {
+    position: static;
+    grid-area: 1 / 2;
+  }
+
+  .admin-table [data-row="select"] {
+    grid-area: 2 / 2;
+    text-align: right;
+  }
+
+  .admin-table [data-column] {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: minmax(5rem, 27%) minmax(0, 1fr);
+    column-gap: 0.6rem;
+    font-size: 0.75rem;
+  }
+
+  .admin-table [data-column]::before {
+    content: attr(data-column);
+    color: var(--color-muted);
+    font-family: var(--font-sans);
+  }
+
+  .admin-table [data-row="select"] ~ [data-column]:nth-child(3) {
+    grid-area: 2 / 1;
+  }
+
+  .admin-table td input[type="checkbox"] {
+    width: 1.05rem;
+    height: 1.05rem;
+    margin-right: 0.65rem;
+  }
+}
+
+.admin-table-mobile-select {
+  display: none;
+}
+
+@container (width < 720px) {
+  .admin-table-mobile-select {
+    display: flex;
+  }
+
+  .admin-table-desktop-select {
+    display: none;
   }
 }

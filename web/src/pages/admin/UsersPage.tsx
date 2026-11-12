@@ -1,6 +1,7 @@
 // 用户管理：管理员查看账号目录、邀请新用户、启用/禁用账号并签发一次性改密令牌。
 import { useState } from "react";
-import { Badge, Button, Callout, Card, CursorPager, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea } from "../../components/ui";
+import { FormDrawer } from "../../components/FormDrawer";
+import { Badge, Button, Callout, Card, CursorPager, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, RowMenu, Select, Textarea } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
@@ -170,7 +171,7 @@ export default function UsersPage() {
         eyebrow="平台设置 · 账号"
         title="用户管理"
         description="查看账号状态、邀请新用户、处理离职或异常账号。禁用会立即撤销该账号的全部登录令牌。"
-        actions={<Button onClick={() => setFormOpen((value) => !value)}>{formOpen ? "收起邀请表单" : "邀请用户"}</Button>}
+        actions={<Button aria-haspopup="dialog" onClick={() => setFormOpen(true)}>邀请用户</Button>}
       />
 
       {users.error ? <ErrorBanner message={users.error} onRetry={users.reload} /> : null}
@@ -178,18 +179,29 @@ export default function UsersPage() {
       {notice ? <Callout tone="success">{notice}</Callout> : null}
 
       {formOpen ? (
-        <Card title="邀请新用户" description="新账号默认是普通用户；初始密码至少 12 位，请通过安全渠道交付。">
-          <form onSubmit={createUser} className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
-            <Field label="用户名" hint="3–64 位，会统一转为小写。">
-              <Input value={username} onChange={(event) => setUsername(event.target.value)} required minLength={3} maxLength={64} placeholder="例如：zhangsan" />
-            </Field>
-            <Field label="初始密码" hint="至少 12 位，建议使用长随机口令。">
-              <Input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={12} placeholder="至少 12 位" />
-            </Field>
-            <Button type="submit" loading={creating} disabled={username.trim().length < 3 || password.length < 12}>创建账号</Button>
-          </form>
-          {createError ? <p role="alert" className="mt-3 text-xs text-rust">{createError}</p> : null}
-        </Card>
+        <FormDrawer
+          title="邀请新用户"
+          description="创建普通用户账号后，请通过安全渠道交付初始密码。"
+          submitLabel="创建账号"
+          busy={creating}
+          dirty={Boolean(username || password)}
+          error={createError}
+          bodyClassName="grid-cols-1"
+          onSubmit={createUser}
+          onCancel={() => {
+            setUsername("");
+            setPassword("");
+            setCreateError(null);
+            setFormOpen(false);
+          }}
+        >
+          <Field label="用户名" hint="3–64 位，会统一转为小写。">
+            <Input value={username} onChange={(event) => setUsername(event.target.value)} required minLength={3} maxLength={64} autoComplete="off" placeholder="例如：zhangsan" />
+          </Field>
+          <Field label="初始密码" hint="至少 12 位。">
+            <Input type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required minLength={12} />
+          </Field>
+        </FormDrawer>
       ) : null}
 
       <Card
@@ -224,12 +236,12 @@ export default function UsersPage() {
           </div>
         }
       >
-        {users.loading ? (
+        {users.loading && !users.data ? (
           <LoadingState />
         ) : users.data && users.data.items.length > 0 ? (
           <>
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[820px] text-left text-sm">
+            <div className="admin-table-container overflow-x-auto">
+              <table role="table" className="admin-table w-full min-w-[820px] text-left text-sm">
                 <thead className="text-xs uppercase tracking-wide text-muted">
                   <tr>
                     <th className="pb-3 pr-4 font-medium">用户名</th>
@@ -240,36 +252,32 @@ export default function UsersPage() {
                     <th className="pb-3 font-medium">操作</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-line">
+                <tbody role="rowgroup" className="divide-y divide-line">
                   {items.map((user) => (
-                    <tr key={user.id}>
-                      <td className="py-3 pr-4">
+                    <tr role="row" key={user.id}>
+                      <td role="cell" data-row="main" className="py-3 pr-4">
                         <p className="font-medium text-ink">{user.username}</p>
                         <p className="font-mono text-[11px] text-muted">{user.id.slice(0, 8)}</p>
                       </td>
-                      <td className="py-3 pr-4">
+                      <td role="cell" data-column="角色" className="py-3 pr-4">
                         <Badge tone={user.role === "admin" ? "info" : "neutral"}>{user.role === "admin" ? "管理员" : "普通用户"}</Badge>
                       </td>
-                      <td className="py-3 pr-4"><Badge tone={statusTone(user.status)}>{statusLabel(user.status)}</Badge></td>
-                      <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(user.created_at)}</td>
-                      <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(user.updated_at)}</td>
-                      <td className="py-3">
+                      <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(user.status)}>{statusLabel(user.status)}</Badge></td>
+                      <td role="cell" data-column="创建时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(user.created_at)}</td>
+                      <td role="cell" data-column="更新时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(user.updated_at)}</td>
+                      <td role="cell" data-row="actions" className="py-3">
                         {user.status === "deleted" ? (
                           <span className="text-xs text-muted">账号已删除</span>
                         ) : (
-                          <div className="flex flex-wrap gap-2">
+                          <RowMenu name={user.username}>
                             {user.status === "disabled" ? (
-                              <Button size="sm" variant="secondary" onClick={() => void changeStatus(user, "active", "")}>启用</Button>
+                              <MenuItem onClick={() => void changeStatus(user, "active", "")}>启用</MenuItem>
                             ) : (
-                              <Button size="sm" variant="danger" onClick={() => { setStatusTarget(user); setReason(""); setStatusError(null); }}>禁用</Button>
+                              <MenuItem danger onClick={() => { setStatusTarget(user); setReason(""); setStatusError(null); }}>禁用</MenuItem>
                             )}
-                            <Button size="sm" variant="secondary" onClick={() => { setResetTarget(user); setResetError(null); }}>重置密码</Button>
-                            {user.id === currentUser?.id ? (
-                              <span className="text-[11px] text-muted">当前账号</span>
-                            ) : (
-                              <Button
-                                size="sm"
-                                variant="secondary"
+                            <MenuItem icon="edit" onClick={() => { setResetTarget(user); setResetError(null); }}>重置密码</MenuItem>
+                            {user.id !== currentUser?.id ? (
+                              <MenuItem
                                 onClick={() => {
                                   setRoleTarget({ user, role: user.role === "admin" ? "user" : "admin" });
                                   setRoleReason("");
@@ -277,9 +285,9 @@ export default function UsersPage() {
                                 }}
                               >
                                 {user.role === "admin" ? "降为普通用户" : "设为管理员"}
-                              </Button>
-                            )}
-                          </div>
+                              </MenuItem>
+                            ) : null}
+                          </RowMenu>
                         )}
                       </td>
                     </tr>

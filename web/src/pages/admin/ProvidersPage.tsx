@@ -1,10 +1,12 @@
 // 供应商管理：密钥只写不读，删除需二次确认。
 import { useState } from "react";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, PageHeader, Pager, Select } from "../../components/ui";
+import { FormDrawer } from "../../components/FormDrawer";
+import { useToast } from "../../components/Toast";
+import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select } from "../../components/ui";
 import { mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
-import { useClientPage, useRemote, useScrollToTop } from "../../lib/hooks";
+import { useClientPage, useRemote } from "../../lib/hooks";
 import type { Page, Provider } from "../../lib/types";
 
 interface ProviderFormState {
@@ -18,11 +20,12 @@ interface ProviderFormState {
 const emptyProvider: ProviderFormState = { name: "", baseUrl: "", apiKey: "", status: "enabled", dataRegion: "cn" };
 
 function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null; onSaved: () => void; onCancel: () => void }) {
-  const [form, setForm] = useState<ProviderFormState>(
+  const initialForm: ProviderFormState =
     initial
       ? { name: initial.name, baseUrl: initial.base_url, apiKey: "", status: initial.status, dataRegion: initial.data_region }
-      : emptyProvider,
-  );
+      : emptyProvider;
+  const [form, setForm] = useState(initialForm);
+  const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -43,6 +46,7 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
       } else {
         await mutate<Provider>("/api/v1/providers", "POST", body, crypto.randomUUID());
       }
+      toast.show(initial ? "修改已保存" : "已接入服务", "success");
       onSaved();
     } catch (submitError) {
       setError(describeError(submitError));
@@ -52,48 +56,40 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
   };
 
   return (
-    <Card title={initial ? `编辑服务：${initial.name}` : "接入模型服务"} description="通常只需配置一次。密钥会加密保存，保存后不再显示明文。">
-      <form onSubmit={submit} className="grid gap-4 md:grid-cols-2">
-        <Field label="服务名称" hint="自己看得懂即可，例如“DeepSeek 官方”“公司网关”。">
-          <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} placeholder="例如：DeepSeek 官方" />
-        </Field>
-        <Field label="接口地址" hint="模型服务的 OpenAI 兼容地址，通常以 /v1 结尾。必须使用 HTTPS。">
-          <Input type="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} required placeholder="https://api.example.com/v1" />
-        </Field>
-        <Field label="访问密钥" hint={initial ? "留空表示保留现有密钥；填写则替换并轮换。" : "从模型服务商控制台复制，只保存一次。"}>
-          <Input type="password" autoComplete="off" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} required={!initial} placeholder="sk-..." />
-        </Field>
-        <Field label="数据区域" hint="标记数据存放地区，例如 cn / us，用于合规筛选。">
-          <Input value={form.dataRegion} onChange={(event) => setForm({ ...form, dataRegion: event.target.value })} required maxLength={64} placeholder="例如：cn" />
-        </Field>
-        <Field label="状态">
-          <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ProviderFormState["status"] })}>
-            <option value="enabled">启用</option>
-            <option value="disabled">停用</option>
-          </Select>
-        </Field>
-        {error ? (
-          <p role="alert" className="rounded-lg border border-rust bg-rust-soft px-3 py-2 text-xs text-rust md:col-span-2">
-            {error}
-          </p>
-        ) : null}
-        <div className="flex justify-end gap-2 md:col-span-2">
-          <Button type="button" variant="secondary" onClick={onCancel}>
-            取消
-          </Button>
-          <Button type="submit" loading={busy}>
-            {initial ? "保存修改" : "接入服务"}
-          </Button>
-        </div>
-      </form>
-    </Card>
+    <FormDrawer
+      title={initial ? `编辑服务：${initial.name}` : "接入模型服务"} description="通常只需配置一次。密钥会加密保存，保存后不再显示明文。"
+      submitLabel={initial ? "保存修改" : "接入服务"}
+      busy={busy}
+      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      error={error}
+      onSubmit={submit}
+      onCancel={onCancel}
+    >
+      <Field label="服务名称" hint="自己看得懂即可，例如“DeepSeek 官方”“公司网关”。">
+        <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} placeholder="例如：DeepSeek 官方" />
+      </Field>
+      <Field label="接口地址" hint="模型服务的 OpenAI 兼容地址，通常以 /v1 结尾。必须使用 HTTPS。">
+        <Input type="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} required placeholder="https://api.example.com/v1" />
+      </Field>
+      <Field label="访问密钥" hint={initial ? "留空表示保留现有密钥；填写则替换并轮换。" : "从模型服务商控制台复制，只保存一次。"}>
+        <Input type="password" autoComplete="off" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} required={!initial} placeholder="sk-..." />
+      </Field>
+      <Field label="数据区域" hint="标记数据存放地区，例如 cn / us，用于合规筛选。">
+        <Input value={form.dataRegion} onChange={(event) => setForm({ ...form, dataRegion: event.target.value })} required maxLength={64} placeholder="例如：cn" />
+      </Field>
+      <Field label="状态">
+        <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ProviderFormState["status"] })}>
+          <option value="enabled">启用</option>
+          <option value="disabled">停用</option>
+        </Select>
+      </Field>
+    </FormDrawer>
   );
 }
 
 export default function ProvidersPage() {
   const { data, loading, error, reload } = useRemote(() => requestJSON<Page<Provider>>("/api/v1/providers"), []);
   const [editing, setEditing] = useState<Provider | null | "new">(null);
-  useScrollToTop(editing !== null);
   const [deleting, setDeleting] = useState<Provider | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -176,7 +172,7 @@ export default function ProvidersPage() {
         eyebrow="平台设置 · 第一步"
         title="模型服务"
         description="这里是“去哪儿调用模型”。填好服务地址和密钥后，下一步到“可用模型”登记具体模型。"
-        actions={<Button onClick={() => setEditing("new")}>接入模型服务</Button>}
+        actions={<Button aria-haspopup="dialog" onClick={() => setEditing("new")}>接入模型服务</Button>}
       />
       {error ? <ErrorBanner message={error} onRetry={reload} /> : null}
       {batchError ? <ErrorBanner message={batchError} /> : null}
@@ -193,16 +189,20 @@ export default function ProvidersPage() {
           ) : null
         }
       >
-        {loading ? (
+        {loading && !data ? (
           <LoadingState />
         ) : data && data.items.length > 0 ? (
           <>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[720px] text-left text-sm">
+          <div className="admin-table-container overflow-x-auto">
+            <label className="admin-table-mobile-select min-h-10 items-center gap-2 border-b border-line text-sm text-muted">
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} />
+              全选本页
+            </label>
+            <table role="table" className="admin-table w-full min-w-[720px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
                 <tr>
                   <th className="w-8 pb-3 pr-2 font-medium">
-                    <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选模型服务" />
+                    <input className="admin-table-desktop-select" type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选模型服务" />
                   </th>
                   <th className="pb-3 pr-4 font-medium">名称</th>
                   <th className="pb-3 pr-4 font-medium">基础地址</th>
@@ -213,10 +213,10 @@ export default function ProvidersPage() {
                   <th className="pb-3 font-medium">操作</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-line">
+              <tbody role="rowgroup" className="divide-y divide-line">
                 {paging.pageItems.map((provider) => (
-                  <tr key={provider.id}>
-                    <td className="py-3 pr-2">
+                  <tr role="row" key={provider.id}>
+                    <td role="cell" data-row="select" className="py-3 pr-2">
                       <input
                         type="checkbox"
                         checked={selected.has(provider.id)}
@@ -224,17 +224,17 @@ export default function ProvidersPage() {
                         aria-label={`选择模型服务 ${provider.name}`}
                       />
                     </td>
-                    <td className="py-3 pr-4 font-medium text-ink">{provider.name}</td>
-                    <td className="max-w-[220px] truncate py-3 pr-4 font-mono text-xs text-muted">{provider.base_url}</td>
-                    <td className="py-3 pr-4 text-ink-soft">{provider.data_region || "—"}</td>
-                    <td className="py-3 pr-4 text-ink-soft">v{provider.key_version}</td>
-                    <td className="py-3 pr-4"><Badge tone={statusTone(provider.status)}>{statusLabel(provider.status)}</Badge></td>
-                    <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(provider.updated_at)}</td>
-                    <td className="py-3">
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="secondary" onClick={() => setEditing(provider)}>编辑</Button>
-                        <Button size="sm" variant="danger" onClick={() => { setDeleting(provider); setDeleteError(null); }}>删除</Button>
-                      </div>
+                    <td role="cell" data-row="main" className="py-3 pr-4 font-medium text-ink">{provider.name}</td>
+                    <td role="cell" data-column="接口地址" className="max-w-[220px] truncate py-3 pr-4 font-mono text-xs text-muted">{provider.base_url}</td>
+                    <td role="cell" data-column="数据区域" className="py-3 pr-4 text-ink-soft">{provider.data_region || "—"}</td>
+                    <td role="cell" data-column="密钥版本" className="py-3 pr-4 text-ink-soft">v{provider.key_version}</td>
+                    <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(provider.status)}>{statusLabel(provider.status)}</Badge></td>
+                    <td role="cell" data-column="更新时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(provider.updated_at)}</td>
+                    <td role="cell" data-row="actions" className="py-3">
+                      <RowMenu name={provider.name}>
+                        <MenuItem icon="edit" onClick={() => setEditing(provider)}>编辑</MenuItem>
+                        <MenuItem icon="trash" danger onClick={() => { setDeleting(provider); setDeleteError(null); }}>删除</MenuItem>
+                      </RowMenu>
                     </td>
                   </tr>
                 ))}
@@ -244,7 +244,7 @@ export default function ProvidersPage() {
           <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </>
         ) : (
-          <EmptyState title="还没有模型服务" description="接入一个 OpenAI 兼容服务后，就能在下一步登记它提供的模型。" action={<Button size="sm" onClick={() => setEditing("new")}>接入模型服务</Button>} />
+          <EmptyState title="还没有模型服务" description="接入一个 OpenAI 兼容服务后，就能在下一步登记它提供的模型。" action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")}>接入模型服务</Button>} />
         )}
       </Card>
       <ConfirmDialog
