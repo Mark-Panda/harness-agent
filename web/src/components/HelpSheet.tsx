@@ -52,7 +52,7 @@ export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => voi
           <h3 className="text-lg text-ink">功能之间是怎么串起来的</h3>
           <ol className="mt-3 flex flex-col gap-2">
             {flow.map((item) => (
-              <li key={item.step} className="flex gap-3 rounded-[3px] border border-line bg-paper-raised px-3 py-3">
+              <li key={item.step} className="flex gap-3 rounded-lg border border-line bg-paper-raised px-3 py-3">
                 <span className="font-display text-lg leading-none text-accent">{item.step}</span>
                 <span>
                   <span className="block text-sm font-medium text-ink">{item.title}</span>
@@ -67,7 +67,7 @@ export function HelpSheet({ open, onClose }: { open: boolean; onClose: () => voi
           <h3 className="text-lg text-ink">名词对照表</h3>
           <div className="mt-3 flex flex-col gap-2">
             {glossary.map((item) => (
-              <div key={item.term} className="rounded-[3px] border border-line bg-paper-raised px-3 py-3">
+              <div key={item.term} className="rounded-lg border border-line bg-paper-raised px-3 py-3">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-ink">{item.term}</span>
                 </div>

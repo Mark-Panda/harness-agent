@@ -36,7 +36,7 @@ export default function SessionsPage() {
   const titleRef = useRef<HTMLInputElement>(null);
   const paging = useCursorStack();
   const sessions = useRemote(
-    () => requestJSON<Page<Session>>(`/api/v1/sessions?limit=20${paging.cursor ? `&cursor=${encodeURIComponent(paging.cursor)}` : ""}`),
+    () => requestJSON<Page<Session>>(`/api/v1/sessions?limit=10${paging.cursor ? `&cursor=${encodeURIComponent(paging.cursor)}` : ""}`),
     [paging.cursor],
   );
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100"), []);
@@ -248,57 +248,60 @@ export default function SessionsPage() {
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索本页标题"
-              aria-label="搜索本页会话标题"
+              placeholder="筛选当前页标题"
+              title="只在当前页的会话标题中筛选"
+              aria-label="在当前页中筛选会话标题"
               className="pl-9"
             />
           </div>
         }
       >
-        {sessions.loading ? (
+        {sessions.loading && !sessions.data ? (
           <LoadingState />
         ) : sessions.data && sessions.data.items.length > 0 ? (
-          <>
-            {visibleSessions.length === 0 ? (
-              <EmptyState title="没有匹配的会话" action={<Button size="sm" variant="secondary" onClick={() => setQuery("")}>清空搜索</Button>} />
-            ) : (
-              <ul className="divide-y divide-line">
-                {visibleSessions.map((session) => (
-                  <li key={session.id} className="flex min-w-0 items-center gap-2 py-2 first:pt-0 sm:gap-4">
-                    <Link to={`/sessions/${session.id}`} className="group flex min-w-0 flex-1 items-center gap-3 rounded-lg p-2 transition-colors hover:bg-paper-deep">
-                      <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-line bg-paper text-muted group-hover:text-accent"><Icon name="chat" className="size-4" /></span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium group-hover:text-accent">{session.title}</span>
-                        <span className="mt-1 block text-xs text-muted">
-                          {formatSessionSource(session.source)} · {formatRelative(session.last_message_at ?? session.created_at)}
-                          <span className="sm:hidden"> · {statusLabel(session.status)}</span>
-                        </span>
+          visibleSessions.length === 0 ? (
+            <EmptyState title="没有匹配的会话" action={<Button size="sm" variant="secondary" onClick={() => setQuery("")}>清空筛选</Button>} />
+          ) : (
+            <ul className="divide-y divide-line">
+              {visibleSessions.map((session) => (
+                <li key={session.id} className="flex min-w-0 items-center gap-2 py-2 first:pt-0 sm:gap-4">
+                  <Link to={`/sessions/${session.id}`} className="group flex min-w-0 flex-1 items-center gap-3 rounded-lg p-2 transition-colors hover:bg-paper-deep">
+                    <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-line bg-paper text-muted group-hover:text-accent"><Icon name="chat" className="size-4" /></span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium group-hover:text-accent">{session.title}</span>
+                      <span className="mt-1 block text-xs text-muted">
+                        {formatSessionSource(session.source)} · {formatRelative(session.last_message_at ?? session.created_at)}
+                        <span className="sm:hidden"> · {statusLabel(session.status)}</span>
                       </span>
-                      <span className="hidden shrink-0 sm:block"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></span>
-                      <time className="hidden shrink-0 text-xs text-muted lg:block" dateTime={session.created_at}>{formatDateTime(session.created_at)}</time>
-                    </Link>
-                    <RowMenu name={session.title}>
-                      {session.status === "active" ? (
-                        <MenuItem disabled={busy} onClick={() => void archive(session)}>归档对话</MenuItem>
-                      ) : null}
-                      <MenuItem disabled={busy} onClick={() => void exportSession(session)}>导出 JSON</MenuItem>
-                      <MenuItem danger disabled={busy} onClick={() => { setDeleting(session); setActionError(null); }}>删除对话</MenuItem>
-                    </RowMenu>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <CursorPager
-              page={paging.page}
-              count={sessions.data.items.length}
-              hasNext={Boolean(sessions.data.next_cursor)}
-              onPrev={paging.prev}
-              onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
-            />
-          </>
+                    </span>
+                    <span className="hidden shrink-0 sm:block"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></span>
+                    <time className="hidden shrink-0 text-xs text-muted lg:block" dateTime={session.created_at}>{formatDateTime(session.created_at)}</time>
+                  </Link>
+                  <RowMenu name={session.title}>
+                    {session.status === "active" ? (
+                      <MenuItem disabled={busy} onClick={() => void archive(session)}>归档对话</MenuItem>
+                    ) : null}
+                    <MenuItem disabled={busy} onClick={() => void exportSession(session)}>导出 JSON</MenuItem>
+                    <MenuItem danger disabled={busy} onClick={() => { setDeleting(session); setActionError(null); }}>删除对话</MenuItem>
+                  </RowMenu>
+                </li>
+              ))}
+            </ul>
+          )
         ) : sessions.error ? null : (
           <EmptyState title="还没有对话" description="选择助手后即可开始第一段对话。" action={showCreate ? undefined : <Button size="sm" variant="secondary" onClick={openCreate}>新建对话</Button>} />
         )}
+        {sessions.data || !sessions.error ? (
+          <CursorPager
+            page={paging.page}
+            count={sessions.data?.items.length ?? 0}
+            hasNext={Boolean(sessions.data?.next_cursor)}
+            busy={sessions.loading}
+            onFirst={paging.reset}
+            onPrev={paging.prev}
+            onNext={() => paging.next(sessions.data?.next_cursor ?? null)}
+          />
+        ) : null}
       </Card>
       <Card title="隐私与记忆" description="助手会记住跨对话的偏好与事实。你可以随时导出或清空这些记忆；清空不会删除原始对话。">
         <div className="flex flex-wrap gap-2">

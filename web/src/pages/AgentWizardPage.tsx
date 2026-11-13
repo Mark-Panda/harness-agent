@@ -357,22 +357,22 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       {step === 3 ? (
         <Card title="检查一下，然后发布" description="发布后配置会冻结为快照。需要修改时创建新版本，不会影响正在进行的对话。">
           <dl className="grid gap-4 md:grid-cols-2">
-            <div className="rounded-[3px] border border-line bg-paper-raised p-4">
+            <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">名称</dt>
               <dd className="mt-1 text-lg text-ink">{name.trim() || "未填写"}</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">{description.trim() || "暂无描述"}</dd>
             </div>
-            <div className="rounded-[3px] border border-line bg-paper-raised p-4">
+            <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">工作方式</dt>
               <dd className="mt-1 text-lg text-ink">{selectedMode.title}</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">{selectedMode.description}</dd>
             </div>
-            <div className="rounded-[3px] border border-line bg-paper-raised p-4">
+            <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">选模规则</dt>
               <dd className="mt-1 text-lg text-ink">{selectedPolicy?.name ?? "未选择"}</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">{selectedPolicy ? `v${selectedPolicy.version} · ${selectedPolicy.candidates.length} 个候选模型` : "发布前必须选择"}</dd>
             </div>
-            <div className="rounded-[3px] border border-line bg-paper-raised p-4">
+            <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">技能与工具</dt>
               <dd className="mt-1 text-lg text-ink">{skillIDs.length} 个技能 · {mcpIDs.length} 个工具</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">

@@ -141,7 +141,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
         <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required maxLength={128} autoFocus placeholder="给规则起个容易记住的名字" />
       </Field>
 
-      <div className="rounded-[3px] border border-line bg-paper-deep/30 p-4">
+      <div className="rounded-lg border border-line bg-paper-deep/30 p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium text-ink">模型出场顺序</p>
@@ -181,7 +181,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
         ) : null}
 
         {form.candidates.length === 0 ? (
-          <div className="mt-3 rounded-[3px] border border-dashed border-line-strong px-4 py-6 text-center text-xs text-muted">
+          <div className="mt-3 rounded-lg border border-dashed border-line-strong px-4 py-6 text-center text-xs text-muted">
             还没有候选模型。先选一个主选模型。
           </div>
         ) : (
@@ -190,8 +190,8 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
               const model = modelByID.get(modelID);
               const eligible = model && isEligibleModel(model, minContext);
               return (
-                <li key={modelID} className="flex flex-wrap items-center gap-3 rounded-[3px] border border-line bg-paper-raised px-3 py-2.5">
-                  <span className="flex w-14 shrink-0 items-center justify-center rounded-[2px] border border-line-strong px-1 py-1 text-[11px] text-ink-soft">
+                <li key={modelID} className="flex flex-wrap items-center gap-3 rounded-lg border border-line bg-paper-raised px-3 py-2.5">
+                  <span className="flex w-14 shrink-0 items-center justify-center rounded-md border border-line-strong px-1 py-1 text-[11px] text-ink-soft">
                     {slotLabel(index)}
                   </span>
                   <div className="min-w-0 flex-1">
@@ -218,7 +218,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
           </ol>
         )}
 
-        <p className="mt-3 rounded-[3px] border-l-4 border-jade bg-jade-soft/40 px-3 py-2 text-xs leading-5 text-jade">
+        <p className="mt-3 rounded-lg border-l-4 border-jade bg-jade-soft/40 px-3 py-2 text-xs leading-5 text-jade">
           效果预览：{summary}
         </p>
       </div>
@@ -414,31 +414,31 @@ export default function PoliciesPage() {
         >
           <div className="grid gap-4 md:grid-cols-2">
             <dl className="grid grid-cols-2 gap-2 text-xs">
-              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+              <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                 <dt className="text-muted">状态</dt>
                 <dd className="mt-1"><Badge tone={statusTone(viewing.status)}>{statusLabel(viewing.status)}</Badge></dd>
               </div>
-              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+              <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                 <dt className="text-muted">最低上下文</dt>
                 <dd className="mt-1 text-ink">{viewing.min_context_tokens.toLocaleString("zh-CN")} Token</dd>
               </div>
-              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+              <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                 <dt className="text-muted">候选模型</dt>
                 <dd className="mt-1 text-ink">{viewing.candidates.length} 个</dd>
               </div>
-              <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+              <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                 <dt className="text-muted">规则 ID</dt>
                 <dd className="mt-1 break-all font-mono text-[11px] text-ink-soft">{viewing.id}</dd>
               </div>
             </dl>
-            <div className="rounded-[3px] border border-line bg-paper-deep/40 p-3">
+            <div className="rounded-lg border border-line bg-paper-deep/40 p-3">
               <p className="text-xs font-medium text-ink">模型出场顺序</p>
               {viewing.candidates.length === 0 ? (
                 <p className="mt-2 text-xs text-muted">还没有候选模型。</p>
               ) : (
                 <ol className="mt-2 flex flex-col gap-1 text-xs">
                   {viewing.candidates.map((candidate, index) => (
-                    <li key={candidate.model_id} className="flex items-center justify-between gap-2 rounded-[2px] bg-paper-raised px-2 py-1.5">
+                    <li key={candidate.model_id} className="flex items-center justify-between gap-2 rounded-md bg-paper-raised px-2 py-1.5">
                       <span className="text-ink-soft">{slotLabel(index)}</span>
                       <span className="min-w-0 truncate text-ink">{modelNames.get(candidate.model_id) ?? candidate.model_id}</span>
                       <span className="shrink-0 text-muted">{candidateRegion(candidate) === null ? "无效区域" : candidateRegion(candidate) || "不限区域"}</span>
@@ -478,7 +478,7 @@ export default function PoliciesPage() {
               全选当前页
             </div>
             {paging.pageItems.map((policy) => (
-              <article key={policy.id} className="rounded-[3px] border border-line bg-paper-raised p-4">
+              <article key={policy.id} className="rounded-lg border border-line bg-paper-raised p-4">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex items-start gap-3">
                     <input
@@ -517,7 +517,7 @@ export default function PoliciesPage() {
                     <span className="text-xs text-muted">还没有候选模型</span>
                   ) : (
                     policy.candidates.map((candidate, index) => (
-                      <span key={candidate.model_id} className="inline-flex items-center gap-2 rounded-[2px] border border-line-strong bg-paper-deep/50 px-2 py-1 text-xs text-ink-soft">
+                      <span key={candidate.model_id} className="inline-flex items-center gap-2 rounded-md border border-line-strong bg-paper-deep/50 px-2 py-1 text-xs text-ink-soft">
                         <span className="font-display text-accent">{slotLabel(index)}</span>
                         {modelNames.get(candidate.model_id) ?? candidate.model_id.slice(0, 8)}
                       </span>
@@ -532,7 +532,6 @@ export default function PoliciesPage() {
                 ) : null}
               </article>
             ))}
-            <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </div>
         ) : (
           <EmptyState
@@ -541,6 +540,7 @@ export default function PoliciesPage() {
             action={<Button size="sm" onClick={() => setEditing("new")} disabled={!hasModels}>新建规则</Button>}
           />
         )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} busy={policies.loading} onChange={paging.setPage} />
       </Card>
 
       <ConfirmDialog

@@ -636,7 +636,7 @@ export default function MemoryGraphPage() {
                     aria-pressed={active}
                     onClick={() => toggleKind(kind)}
                     className={cn(
-                      "inline-flex items-center gap-2 rounded-[2px] border px-2 py-1 text-[11px] transition",
+                      "inline-flex items-center gap-2 rounded-md border px-2 py-1 text-[11px] transition",
                       active ? "border-line-strong bg-paper-raised text-ink-soft" : "border-line bg-paper-deep/40 text-muted opacity-70",
                     )}
                   >
@@ -648,7 +648,7 @@ export default function MemoryGraphPage() {
               })}
               <span className="ml-auto text-[11px] text-muted">拖拽旋转 3D 视角 · 滚轮缩放 · 点击节点查看详情 · 虚线表示同主题关联</span>
             </div>
-            <div className="relative overflow-hidden rounded-[3px] border border-line bg-[radial-gradient(circle_at_center,rgba(21,128,61,0.06),transparent_62%)]">
+            <div className="relative overflow-hidden rounded-lg border border-line bg-[radial-gradient(circle_at_center,rgba(21,128,61,0.06),transparent_62%)]">
               <canvas
                 ref={canvasRef}
                 role="img"

@@ -1141,7 +1141,7 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
           id="chat-inspector"
           ref={inspectorRef}
           aria-labelledby="chat-inspector-title"
-          className="editor-drawer fixed inset-y-0 right-0 left-auto m-0 h-dvh max-h-none w-full max-w-md overflow-hidden border-line bg-paper text-ink shadow-2xl sm:border-l"
+          className="editor-drawer fixed inset-y-0 right-0 left-auto m-0 h-dvh max-h-none w-full max-w-2xl overflow-hidden border-line bg-paper text-ink shadow-2xl sm:border-l"
           onCancel={(event) => { event.preventDefault(); setInspectorOpen(false); }}
           onPointerDown={(event) => { inspectorBackdropPress.current = event.target === event.currentTarget; }}
           onClick={(event) => {

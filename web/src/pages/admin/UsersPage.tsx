@@ -210,29 +210,33 @@ export default function UsersPage() {
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <form
-              className="flex items-center gap-2"
+              className="flex flex-nowrap items-center gap-2"
               onSubmit={(event) => {
                 event.preventDefault();
                 setSearch(searchDraft.trim());
                 paging.reset();
               }}
             >
-              <Input className="w-48" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="搜索用户名" aria-label="搜索用户名" />
+              <div className="w-40 shrink-0">
+                <Input className="w-full" value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} placeholder="搜索用户名" aria-label="搜索用户名" />
+              </div>
               <Button size="sm" variant="secondary" type="submit">搜索</Button>
             </form>
-            <Select
-              className="w-36"
-              value={status}
-              onChange={(event) => {
-                setStatus(event.target.value);
-                paging.reset();
-              }}
-              aria-label="按账号状态筛选"
-            >
-              {statusOptions.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </Select>
+            <div className="w-32 shrink-0">
+              <Select
+                className="w-full"
+                value={status}
+                onChange={(event) => {
+                  setStatus(event.target.value);
+                  paging.reset();
+                }}
+                aria-label="按账号状态筛选"
+              >
+                {statusOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </Select>
+            </div>
           </div>
         }
       >
@@ -295,17 +299,21 @@ export default function UsersPage() {
                 </tbody>
               </table>
             </div>
-            <CursorPager
-              page={paging.page}
-              count={items.length}
-              hasNext={Boolean(users.data.next_cursor)}
-              onPrev={paging.prev}
-              onNext={() => paging.next(users.data?.next_cursor ?? null)}
-            />
           </>
         ) : (
           <EmptyState title="没有匹配的账号" description="调整状态筛选或搜索关键字；也可以直接邀请一个新用户。" />
         )}
+        {users.data ? (
+          <CursorPager
+            page={paging.page}
+            count={items.length}
+            hasNext={Boolean(users.data.next_cursor)}
+            busy={users.loading}
+            onFirst={paging.reset}
+            onPrev={paging.prev}
+            onNext={() => paging.next(users.data?.next_cursor ?? null)}
+          />
+        ) : null}
       </Card>
 
       {resetResult ? (

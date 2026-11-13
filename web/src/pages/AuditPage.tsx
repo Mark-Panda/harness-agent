@@ -87,87 +87,93 @@ export default function AuditPage() {
           title="运行列表"
           description={`本页 ${adminRuns.data?.items.length ?? 0} 条，按创建时间倒序。`}
           actions={
-            <div className="flex flex-wrap items-center gap-2">
-              <Select
-                className="w-48"
-                value={adminUserID}
-                onChange={(event) => {
-                  setAdminUserID(event.target.value);
-                  adminPaging.reset();
-                }}
-                aria-label="按用户筛选"
-              >
-                <option value="">全部用户</option>
-                {adminUsers.data?.items.map((item) => (
-                  <option key={item.id} value={item.id}>{item.username}</option>
-                ))}
-              </Select>
-              <Select
-                className="w-36"
-                value={adminSource}
-                onChange={(event) => {
-                  setAdminSource(event.target.value);
-                  adminPaging.reset();
-                }}
-                aria-label="按来源筛选"
-              >
-                <option value="">全部来源</option>
-                <option value="web">网页</option>
-                <option value="feishu">飞书</option>
-                <option value="api">接口</option>
-              </Select>
+            <div className="flex flex-nowrap items-center gap-2">
+              <div className="w-36 shrink-0 sm:w-40">
+                <Select
+                  className="w-full"
+                  value={adminUserID}
+                  onChange={(event) => {
+                    setAdminUserID(event.target.value);
+                    adminPaging.reset();
+                  }}
+                  aria-label="按用户筛选"
+                >
+                  <option value="">全部用户</option>
+                  {adminUsers.data?.items.map((item) => (
+                    <option key={item.id} value={item.id}>{item.username}</option>
+                  ))}
+                </Select>
+              </div>
+              <div className="w-28 shrink-0 sm:w-32">
+                <Select
+                  className="w-full"
+                  value={adminSource}
+                  onChange={(event) => {
+                    setAdminSource(event.target.value);
+                    adminPaging.reset();
+                  }}
+                  aria-label="按来源筛选"
+                >
+                  <option value="">全部来源</option>
+                  <option value="web">网页</option>
+                  <option value="feishu">飞书</option>
+                  <option value="api">接口</option>
+                </Select>
+              </div>
             </div>
           }
         >
-          {adminRuns.loading ? (
+          {adminRuns.loading && !adminRuns.data ? (
             <LoadingState />
           ) : adminRuns.data && adminRuns.data.items.length > 0 ? (
-            <>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[980px] text-left text-sm">
-                  <thead className="text-xs uppercase tracking-wide text-muted">
-                    <tr>
-                      <th className="pb-3 pr-4 font-medium">用户</th>
-                      <th className="pb-3 pr-4 font-medium">会话</th>
-                      <th className="pb-3 pr-4 font-medium">来源</th>
-                      <th className="pb-3 pr-4 font-medium">状态</th>
-                      <th className="pb-3 pr-4 font-medium">工作方式</th>
-                      <th className="pb-3 pr-4 font-medium">尝试</th>
-                      <th className="pb-3 pr-4 font-medium">耗时</th>
-                      <th className="pb-3 pr-4 font-medium">创建时间</th>
-                      <th className="pb-3 font-medium">操作</th>
+            <div className="admin-table-container overflow-x-auto">
+              <table role="table" className="admin-table w-full min-w-[980px] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="pb-3 pr-4 font-medium">用户</th>
+                    <th className="pb-3 pr-4 font-medium">会话</th>
+                    <th className="pb-3 pr-4 font-medium">来源</th>
+                    <th className="pb-3 pr-4 font-medium">状态</th>
+                    <th className="pb-3 pr-4 font-medium">工作方式</th>
+                    <th className="pb-3 pr-4 font-medium">尝试</th>
+                    <th className="pb-3 pr-4 font-medium">耗时</th>
+                    <th className="pb-3 pr-4 font-medium">创建时间</th>
+                    <th className="pb-3 font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody role="rowgroup" className="divide-y divide-line">
+                  {adminRuns.data.items.map((run) => (
+                    <tr role="row" key={run.id}>
+                      <td role="cell" data-row="main" className="py-3 pr-4 font-medium text-ink">{run.username || "—"}</td>
+                      <td role="cell" data-column="会话" className="max-w-[220px] truncate py-3 pr-4 text-ink-soft">{run.session_title || run.session_id.slice(0, 8)}</td>
+                      <td role="cell" data-column="来源" className="py-3 pr-4"><Badge tone={run.source === "feishu" ? "info" : "neutral"}>{sourceLabel(run.source)}</Badge></td>
+                      <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
+                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
+                      <td role="cell" data-column="尝试" className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
+                      <td role="cell" data-column="耗时" className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
+                      <td role="cell" data-column="创建时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>
+                      <td role="cell" data-row="actions" className="py-3">
+                        <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-line">
-                    {adminRuns.data.items.map((run) => (
-                      <tr key={run.id}>
-                        <td className="py-3 pr-4 font-medium text-ink">{run.username || "—"}</td>
-                        <td className="max-w-[220px] truncate py-3 pr-4 text-ink-soft">{run.session_title || run.session_id.slice(0, 8)}</td>
-                        <td className="py-3 pr-4"><Badge tone={run.source === "feishu" ? "info" : "neutral"}>{sourceLabel(run.source)}</Badge></td>
-                        <td className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
-                        <td className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
-                        <td className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
-                        <td className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
-                        <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>
-                        <td className="py-3">
-                          <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <CursorPager
-                page={adminPaging.page}
-                count={adminRuns.data.items.length}
-                hasNext={Boolean(adminRuns.data.next_cursor)}
-                onPrev={adminPaging.prev}
-                onNext={() => adminPaging.next(adminRuns.data?.next_cursor ?? null)}
-              />
-            </>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           ) : (
             <EmptyState title="没有匹配的运行记录" description="调整用户或来源筛选；也可以先让助手执行一次任务。" />
           )}
+          {adminRuns.data ? (
+            <CursorPager
+              page={adminPaging.page}
+              count={adminRuns.data.items.length}
+              hasNext={Boolean(adminRuns.data.next_cursor)}
+              busy={adminRuns.loading}
+              onFirst={adminPaging.reset}
+              onPrev={adminPaging.prev}
+              onNext={() => adminPaging.next(adminRuns.data?.next_cursor ?? null)}
+            />
+          ) : null}
         </Card>
       </div>
     );
@@ -183,7 +189,7 @@ export default function AuditPage() {
       {sessions.error ? <ErrorBanner message={sessions.error} onRetry={sessions.reload} /> : null}
       {runs.error ? <ErrorBanner message={runs.error} onRetry={runs.reload} /> : null}
       <Card title="选择要查看的对话" description="按最近消息排序。选中后展示这个对话里的每一次运行。">
-        {sessions.loading ? (
+        {sessions.loading && !sessions.data ? (
           <LoadingState />
         ) : sessions.data && sessions.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
@@ -205,10 +211,13 @@ export default function AuditPage() {
                 <option key={session.id} value={session.id}>{session.title}（{formatRelative(session.last_message_at)}）</option>
               ))}
             </Select>
+            {sessions.data.next_cursor ? (
+              <p className="text-xs text-muted">这里只列出最近 100 个对话；更早的对话可以从「我的对话」进入。</p>
+            ) : null}
             {!sessionID ? (
               <>
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[720px] text-left text-sm">
+                <div className="admin-table-container overflow-x-auto">
+                  <table role="table" className="admin-table w-full min-w-[720px] text-left text-sm">
                     <thead className="text-xs uppercase tracking-wide text-muted">
                       <tr>
                         <th className="pb-3 pr-4 font-medium">会话</th>
@@ -218,14 +227,14 @@ export default function AuditPage() {
                         <th className="pb-3 font-medium">操作</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-line">
+                    <tbody role="rowgroup" className="divide-y divide-line">
                       {sessionPaging.pageItems.map((session) => (
-                        <tr key={session.id}>
-                          <td className="py-3 pr-4 text-ink">{session.title}</td>
-                          <td className="py-3 pr-4"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></td>
-                          <td className="py-3 pr-4 text-ink-soft">{sourceLabel(session.source)}</td>
-                          <td className="py-3 pr-4 text-xs text-muted">{formatRelative(session.last_message_at)}</td>
-                          <td className="py-3">
+                        <tr role="row" key={session.id}>
+                          <td role="cell" data-row="main" className="py-3 pr-4 text-ink">{session.title}</td>
+                          <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(session.status)}>{statusLabel(session.status)}</Badge></td>
+                          <td role="cell" data-column="来源" className="py-3 pr-4 text-ink-soft">{sourceLabel(session.source)}</td>
+                          <td role="cell" data-column="最近消息" className="py-3 pr-4 text-xs text-muted">{formatRelative(session.last_message_at)}</td>
+                          <td role="cell" data-row="actions" className="py-3">
                             <div className="flex gap-2">
                               <Link to={`/audit?session=${session.id}`} className="text-xs text-accent underline underline-offset-2">查看运行</Link>
                               <Link to={`/sessions/${session.id}`} className="text-xs text-muted underline underline-offset-2">打开对话</Link>
@@ -246,45 +255,43 @@ export default function AuditPage() {
       </Card>
       {sessionID ? (
         <Card title="运行列表" description={`会话 ${sessionID.slice(0, 8)} 的运行记录`}>
-          {runs.loading ? (
+          {runs.loading && !runs.data ? (
             <LoadingState />
           ) : runs.data && runs.data.items.length > 0 ? (
-            <>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[900px] text-left text-sm">
-                  <thead className="text-xs uppercase tracking-wide text-muted">
-                    <tr>
-                      <th className="pb-3 pr-4 font-medium">运行</th>
-                      <th className="pb-3 pr-4 font-medium">状态</th>
-                      <th className="pb-3 pr-4 font-medium">工作方式</th>
-                      <th className="pb-3 pr-4 font-medium">尝试次数</th>
-                      <th className="pb-3 pr-4 font-medium">耗时</th>
-                      <th className="pb-3 pr-4 font-medium">创建时间</th>
-                      <th className="pb-3 font-medium">操作</th>
+            <div className="admin-table-container overflow-x-auto">
+              <table role="table" className="admin-table w-full min-w-[900px] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="pb-3 pr-4 font-medium">运行</th>
+                    <th className="pb-3 pr-4 font-medium">状态</th>
+                    <th className="pb-3 pr-4 font-medium">工作方式</th>
+                    <th className="pb-3 pr-4 font-medium">尝试次数</th>
+                    <th className="pb-3 pr-4 font-medium">耗时</th>
+                    <th className="pb-3 pr-4 font-medium">创建时间</th>
+                    <th className="pb-3 font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody role="rowgroup" className="divide-y divide-line">
+                  {runPaging.pageItems.map((run) => (
+                    <tr role="row" key={run.id}>
+                      <td role="cell" data-row="main" className="py-3 pr-4 font-mono text-xs text-ink-soft">{run.id.slice(0, 12)}</td>
+                      <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
+                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
+                      <td role="cell" data-column="尝试次数" className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
+                      <td role="cell" data-column="耗时" className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
+                      <td role="cell" data-column="创建时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>
+                      <td role="cell" data-row="actions" className="py-3">
+                        <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-line">
-                    {runPaging.pageItems.map((run) => (
-                      <tr key={run.id}>
-                        <td className="py-3 pr-4 font-mono text-xs text-ink-soft">{run.id.slice(0, 12)}</td>
-                        <td className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
-                        <td className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
-                        <td className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
-                        <td className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
-                        <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>
-                        <td className="py-3">
-                          <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <Pager page={runPaging.page} totalPages={runPaging.totalPages} total={runItems.length} onChange={runPaging.setPage} />
-            </>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           ) : (
             <EmptyState title="该会话还没有 Run" description="在会话中发送消息后即可生成 Run 审计记录。" />
           )}
+          <Pager page={runPaging.page} totalPages={runPaging.totalPages} total={runItems.length} onChange={runPaging.setPage} />
         </Card>
       ) : null}
     </div>

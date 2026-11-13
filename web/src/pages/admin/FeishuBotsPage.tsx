@@ -174,9 +174,9 @@ export default function FeishuBotsPage() {
 
       {bots.loading && !bots.data ? (
         <LoadingState />
-      ) : items.length > 0 ? (
-        <>
-          <Card title="已登记机器人" description={`共 ${items.length} 个机器人，每个机器人只能绑定一个助手。`}>
+      ) : (
+        <Card title="已登记机器人" description={`共 ${items.length} 个机器人，每个机器人只能绑定一个助手。`}>
+          {items.length > 0 ? (
             <div className="admin-table-container overflow-x-auto">
               <table role="table" className="admin-table w-full min-w-[860px] text-left text-sm">
                 <thead>
@@ -221,18 +221,14 @@ export default function FeishuBotsPage() {
                 </tbody>
               </table>
             </div>
-            <div className="mt-4">
-              <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
-            </div>
-          </Card>
-        </>
-      ) : (
-        <Card>
-          <EmptyState
-            title="还没有飞书机器人"
-            description="登记一个飞书应用机器人，助手发布后就能绑定它并在飞书中对话。"
-            action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")}>登记第一个机器人</Button>}
-          />
+          ) : (
+            <EmptyState
+              title="还没有飞书机器人"
+              description="登记一个飞书应用机器人，助手发布后就能绑定它并在飞书中对话。"
+              action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")}>登记第一个机器人</Button>}
+            />
+          )}
+          <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} busy={bots.loading} onChange={paging.setPage} />
         </Card>
       )}
 

@@ -22,7 +22,7 @@ const buttonVariants: Record<ButtonVariant, string> = {
 };
 
 const buttonSizes: Record<ButtonSize, string> = {
-  sm: "min-h-9 px-3 py-1.5 text-xs max-sm:min-h-10",
+  sm: "min-h-9 px-3 py-1.5 text-xs max-sm:min-h-11",
   md: "min-h-11 px-4 py-2 text-sm",
 };
 
@@ -172,19 +172,44 @@ export function Badge({ tone = "neutral", children }: { tone?: BadgeTone; childr
   );
 }
 
-export function Card({ title, description, actions, children, className }: { title?: string; description?: string; actions?: ReactNode; children: ReactNode; className?: string }) {
+export function Card({
+  id, title, description, actions, children, className, collapsible = false, defaultOpen = true,
+}: {
+  id?: string;
+  title?: string;
+  description?: string;
+  actions?: ReactNode;
+  children: ReactNode;
+  className?: string;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const expanded = !collapsible || open;
   return (
-    <section className={cn("min-w-0 rounded-xl border border-line bg-paper-raised", className)}>
+    <section id={id} className={cn("min-w-0 scroll-mt-20 rounded-xl border border-line bg-paper-raised", className)}>
       {(title || actions) && (
         <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3 sm:px-5">
           <div className="min-w-0">
-            {title ? <h2 className="break-words text-base text-ink">{title}</h2> : null}
+            <h2 className="break-words text-base text-ink">
+              {collapsible && title ? (
+                <button
+                  type="button"
+                  aria-expanded={expanded}
+                  onClick={() => setOpen((value) => !value)}
+                  className="flex items-center gap-2 rounded text-left hover:text-accent"
+                >
+                  {title}
+                  <Icon name="chevronDown" className={cn("size-4 shrink-0 text-muted transition-transform", expanded && "rotate-180")} />
+                </button>
+              ) : title}
+            </h2>
             {description ? <p className="mt-1 max-w-2xl text-xs leading-5 text-muted">{description}</p> : null}
           </div>
           {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
         </header>
       )}
-      <div className="p-4 sm:p-5">{children}</div>
+      {expanded ? <div className="p-4 sm:p-5">{children}</div> : null}
     </section>
   );
 }
@@ -216,7 +241,7 @@ export function Callout({ tone = "info", title, children }: { tone?: "info" | "w
     success: "border-jade bg-jade-soft/60",
   } as const;
   return (
-    <div className={cn("rounded-[3px] border-l-4 px-4 py-3 text-sm leading-6 text-ink-soft", tones[tone])}>
+    <div className={cn("rounded-lg border-l-4 px-4 py-3 text-sm leading-6 text-ink-soft", tones[tone])}>
       {title ? <p className="mb-1 font-medium text-ink">{title}</p> : null}
       {children}
     </div>
@@ -278,59 +303,63 @@ export function EmptyState({ title, description, action }: { title: string; desc
   );
 }
 
-// Pager 为一次完整加载的列表提供页码导航。
+// Pager 为一次完整加载的列表提供页码导航，空列表也保留总数信息。
 export function Pager({
   page,
   totalPages,
   total,
   pageSize = 10,
+  busy = false,
   onChange,
 }: {
   page: number;
   totalPages: number;
   total: number;
   pageSize?: number;
+  busy?: boolean;
   onChange: (page: number) => void;
 }) {
-  if (total <= 0) {
-    return null;
-  }
+  const lastPage = Math.max(1, totalPages);
   return (
-    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted">
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted" aria-busy={busy || undefined}>
       <span>共 {total} 条 · 每页 {pageSize} 条</span>
-      <div className="flex items-center gap-2">
-        <Button size="sm" variant="secondary" disabled={page <= 1} onClick={() => onChange(page - 1)}>上一页</Button>
-        <span>第 {page} / {totalPages} 页</span>
-        <Button size="sm" variant="secondary" disabled={page >= totalPages} onClick={() => onChange(page + 1)}>下一页</Button>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Button size="sm" variant="secondary" disabled={busy || page <= 1} onClick={() => onChange(1)}>首页</Button>
+        <Button size="sm" variant="secondary" disabled={busy || page <= 1} onClick={() => onChange(page - 1)}>上一页</Button>
+        <span className="px-1 tabular-nums">第 {page} / {lastPage} 页</span>
+        <Button size="sm" variant="secondary" disabled={busy || page >= lastPage} onClick={() => onChange(page + 1)}>下一页</Button>
+        <Button size="sm" variant="secondary" disabled={busy || page >= lastPage} onClick={() => onChange(lastPage)}>末页</Button>
       </div>
     </div>
   );
 }
 
-// CursorPager 为后端游标分页的列表提供前后翻页；不知道总页数时只展示当前页。
+// CursorPager 为后端游标分页的列表提供翻页；可以一键回到首页。
 export function CursorPager({
   page,
   count,
   hasNext,
+  busy = false,
+  onFirst,
   onPrev,
   onNext,
 }: {
   page: number;
   count: number;
   hasNext: boolean;
+  busy?: boolean;
+  onFirst: () => void;
   onPrev: () => void;
   onNext: () => void;
 }) {
-  if (count <= 0) {
-    return null;
-  }
   return (
-    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted">
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3 text-xs text-muted" aria-busy={busy || undefined}>
       <span>本页 {count} 条</span>
-      <div className="flex items-center gap-2">
-        <Button size="sm" variant="secondary" disabled={page <= 1} onClick={onPrev}>上一页</Button>
-        <span>第 {page} 页</span>
-        <Button size="sm" variant="secondary" disabled={!hasNext} onClick={onNext}>下一页</Button>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Button size="sm" variant="secondary" disabled={busy || page <= 1} onClick={onFirst}>首页</Button>
+        <Button size="sm" variant="secondary" disabled={busy || page <= 1} onClick={onPrev}>上一页</Button>
+        <span className="px-1 tabular-nums">第 {page} 页</span>
+        <Button size="sm" variant="secondary" disabled={busy || !hasNext} onClick={onNext}>下一页</Button>
       </div>
     </div>
   );
@@ -338,7 +367,7 @@ export function CursorPager({
 
 export function ErrorBanner({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
-    <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-[3px] border-l-4 border-rust bg-rust-soft/70 px-4 py-3 text-sm text-rust">
+    <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border-l-4 border-rust bg-rust-soft/70 px-4 py-3 text-sm text-rust">
       <span>{message}</span>
       {onRetry ? (
         <Button size="sm" variant="secondary" onClick={onRetry}>
@@ -351,7 +380,7 @@ export function ErrorBanner({ message, onRetry }: { message: string; onRetry?: (
 
 export function LoadingState({ label = "加载中" }: { label?: string }) {
   return (
-    <div role="status" className="flex items-center gap-3 rounded-[3px] border border-line bg-paper-raised px-4 py-6 text-sm text-muted">
+    <div role="status" className="flex items-center gap-3 rounded-lg border border-line bg-paper-raised px-4 py-6 text-sm text-muted">
       <span aria-hidden className="size-4 animate-spin rounded-full border-2 border-accent border-t-transparent" />
       {label}
     </div>

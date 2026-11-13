@@ -241,11 +241,11 @@ export default function ProvidersPage() {
               </tbody>
             </table>
           </div>
-          <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </>
         ) : (
           <EmptyState title="还没有模型服务" description="接入一个 OpenAI 兼容服务后，就能在下一步登记它提供的模型。" action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")}>接入模型服务</Button>} />
         )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} busy={loading} onChange={paging.setPage} />
       </Card>
       <ConfirmDialog
         open={deleting !== null}

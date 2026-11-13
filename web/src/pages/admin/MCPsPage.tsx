@@ -354,7 +354,7 @@ export default function MCPsPage() {
                         <td className="py-3 text-xs text-muted">
                           <details>
                             <summary className="cursor-pointer hover:text-accent">查看参数</summary>
-                            <pre className="mt-2 max-h-48 overflow-auto rounded-[3px] border border-line bg-paper-deep/40 p-2 font-mono text-[11px] text-ink-soft">
+                            <pre className="mt-2 max-h-48 overflow-auto rounded-lg border border-line bg-paper-deep/40 p-2 font-mono text-[11px] text-ink-soft">
                               {JSON.stringify(tool.input_schema ?? {}, null, 2)}
                             </pre>
                           </details>
@@ -417,11 +417,11 @@ export default function MCPsPage() {
               </tbody>
             </table>
           </div>
-          <Pager page={paging.page} totalPages={paging.totalPages} total={mcpItems.length} onChange={paging.setPage} />
           </>
         ) : (
           <EmptyState title="还没有外部工具" description="接入工具服务后，创建助手时即可勾选使用。" action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")}>接入外部工具</Button>} />
         )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={mcpItems.length} busy={mcps.loading} onChange={paging.setPage} />
       </Card>
       <ConfirmDialog
         open={deleting !== null}

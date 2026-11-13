@@ -217,11 +217,11 @@ export default function SkillsPage() {
                 </details>
               </article>
             ))}
-            <Pager page={paging.page} totalPages={paging.totalPages} total={skillItems.length} onChange={paging.setPage} />
           </div>
         ) : (
           <EmptyState title="还没有技能" description="创建一段做事说明，之后可以在助手中勾选使用。" action={<Button size="sm" onClick={() => setEditing("new")}>新建技能</Button>} />
         )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={skillItems.length} busy={skills.loading} onChange={paging.setPage} />
       </Card>
       <ConfirmDialog
         open={deleting !== null}

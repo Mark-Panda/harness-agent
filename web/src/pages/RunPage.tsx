@@ -264,7 +264,7 @@ export default function RunPage() {
         description={`${modeLabel(run.data.mode)} · 创建于 ${formatDateTime(run.data.created_at)} · 对话 ${run.data.session_id.slice(0, 8)}`}
         actions={
           <>
-            <Link to={`/sessions/${run.data.session_id}`} className="inline-flex h-10 items-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
+            <Link to={`/sessions/${run.data.session_id}`} className="inline-flex h-10 items-center rounded-lg border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
               返回对话
             </Link>
             {(run.data.status === "queued" || run.data.status === "running") ? (
@@ -294,6 +294,24 @@ export default function RunPage() {
       {run.data.error_message ? (
         <ErrorBanner message={`${run.data.error_code ?? "error"}：${run.data.error_message}`} />
       ) : null}
+      <nav aria-label="本页分区" className="flex flex-wrap gap-2 text-xs">
+        {[
+          ["#steps", "步骤明细"],
+          ["#models", "模型使用记录"],
+          ...(run.data.mode === "super" ? [["#supervisor", "协作助手明细"]] : []),
+          ["#payloads", "输入与输出"],
+          ["#approvals", "工具审批"],
+          ["#snapshot", "配置快照"],
+        ].map(([href, label]) => (
+          <a
+            key={href}
+            href={href}
+            className="rounded-full border border-line bg-paper-raised px-3 py-1.5 text-muted transition-colors hover:border-accent/50 hover:text-accent"
+          >
+            {label}
+          </a>
+        ))}
+      </nav>
       {replayError ? <ErrorBanner message={`重新投递失败：${replayError}`} /> : null}
       {planError ? <ErrorBanner message={planError} /> : null}
       {plan.error ? <ErrorBanner message={`计划读取失败：${plan.error}`} onRetry={plan.reload} /> : null}
@@ -395,7 +413,7 @@ export default function RunPage() {
         onConfirm={() => void actPlan("cancel")}
       />
 
-      <Card title="步骤明细" description="按顺序展示助手做了什么；失败与重试都会保留。">
+      <Card id="steps" title="步骤明细" description="按顺序展示助手做了什么；失败与重试都会保留。">
         {steps.loading ? (
           <LoadingState />
         ) : stepRows.length === 0 ? (
@@ -432,12 +450,12 @@ export default function RunPage() {
         )}
       </Card>
 
-      <Card title="模型使用记录" description="每次调用用了哪个模型、花了多少 Token 与费用，以及失败后切换到哪个模型。">
+      <Card id="models" collapsible defaultOpen={false} title="模型使用记录" description="每次调用用了哪个模型、花了多少 Token 与费用，以及失败后切换到哪个模型。">
         {attempts.loading ? (
           <LoadingState />
         ) : attempts.data && attempts.data.items.length > 0 ? (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] text-left text-sm">
+          <div className="admin-table-container overflow-x-auto">
+            <table role="table" className="admin-table w-full min-w-[900px] text-left text-sm">
               <thead className="text-xs uppercase tracking-wide text-muted">
                 <tr>
                   <th className="pb-3 pr-4 font-medium">尝试</th>
@@ -448,22 +466,22 @@ export default function RunPage() {
                   <th className="pb-3 pr-4 font-medium">切换 / 错误</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-line">
+              <tbody role="rowgroup" className="divide-y divide-line">
                 {attempts.data.items.map((attempt) => (
-                  <tr key={attempt.id}>
-                    <td className="py-3 pr-4">
+                  <tr role="row" key={attempt.id}>
+                    <td role="cell" data-row="main" className="py-3 pr-4">
                       <p className="text-ink">#{attempt.attempt_no}</p>
                       <p className="text-[11px] text-muted">策略 v{attempt.policy_version ?? "—"}</p>
                     </td>
-                    <td className="py-3 pr-4 text-ink-soft">
+                    <td role="cell" data-column="模型" className="py-3 pr-4 text-ink-soft">
                       {attempt.model_id ? modelNames.get(attempt.model_id) ?? attempt.model_id.slice(0, 8) : "—"}
                     </td>
-                    <td className="py-3 pr-4"><Badge tone={statusTone(attempt.status)}>{statusLabel(attempt.status)}</Badge></td>
-                    <td className="py-3 pr-4 text-xs text-muted">{attempt.duration_ms === null ? "—" : `${attempt.duration_ms} ms`}</td>
-                    <td className="py-3 pr-4 text-xs text-ink-soft">
+                    <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(attempt.status)}>{statusLabel(attempt.status)}</Badge></td>
+                    <td role="cell" data-column="耗时" className="py-3 pr-4 text-xs text-muted">{attempt.duration_ms === null ? "—" : `${attempt.duration_ms} ms`}</td>
+                    <td role="cell" data-column="Token / 费用" className="py-3 pr-4 text-xs text-ink-soft">
                       {formatNumber(attempt.input_tokens)} / {formatNumber(attempt.output_tokens)} · {formatCost(attempt.estimated_cost)}
                     </td>
-                    <td className="py-3 pr-4 text-xs">
+                    <td role="cell" data-column="切换 / 错误" className="py-3 pr-4 text-xs">
                       {attempt.switch_reason ? <p className="text-ochre">切换：{attempt.switch_reason}</p> : null}
                       {attempt.error_message ? <p className="max-w-[260px] truncate text-rust" title={attempt.error_message}>{attempt.error_class || "error"}：{attempt.error_message}</p> : null}
                     </td>
@@ -478,7 +496,7 @@ export default function RunPage() {
       </Card>
 
       {run.data.mode === "super" ? (
-        <Card title="协作助手明细" description="每个子助手使用独立上下文；失败、取消或结果缺失都会如实显示。">
+        <Card id="supervisor" collapsible defaultOpen={false} title="协作助手明细" description="每个子助手使用独立上下文；失败、取消或结果缺失都会如实显示。">
           {supervisorTasks.loading ? (
             <LoadingState />
           ) : supervisorTasks.data && supervisorTasks.data.items.length > 0 ? (
@@ -526,7 +544,7 @@ export default function RunPage() {
         </Card>
       ) : null}
 
-      <Card title="查看输入与输出" description="这里保存模型请求、响应与工具读写的脱敏副本。查看需要填写理由，并会记入审计记录。">
+      <Card id="payloads" collapsible defaultOpen={false} title="查看输入与输出" description="这里保存模型请求、响应与工具读写的脱敏副本。查看需要填写理由，并会记入审计记录。">
         <div className="grid gap-4 md:grid-cols-[320px_1fr]">
           <div className="flex flex-col gap-3">
             <Field label="查看理由" error={reasonError}>
@@ -559,7 +577,7 @@ export default function RunPage() {
         </div>
       </Card>
 
-      <Card title="工具审批" description="展示风险等级、参数、决策人和执行结果。">
+      <Card id="approvals" collapsible defaultOpen={false} title="工具审批" description="展示风险等级、参数、决策人和执行结果。">
         {approvals.data && approvals.data.items.length > 0 ? (
           <div className="flex flex-col gap-3">
             {approvals.data.items.map((approval) => (
@@ -584,7 +602,7 @@ export default function RunPage() {
         )}
       </Card>
 
-      <Card title="当时的配置快照" description="这次处理开始时冻结的助手与选模规则，用于事后复现。">
+      <Card id="snapshot" collapsible defaultOpen={false} title="当时的配置快照" description="这次处理开始时冻结的助手与选模规则，用于事后复现。">
         <div className="grid gap-3 md:grid-cols-2">
           <div>
             <p className="mb-1 text-xs font-medium text-ink-soft">助手配置</p>

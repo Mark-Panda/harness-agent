@@ -453,7 +453,7 @@ export default function ModelsPage() {
               </div>
             </dl>
             {vector.warning ? (
-              <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-[3px] border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
+              <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border-l-4 border-ochre bg-ochre-soft/60 px-4 py-3 text-xs leading-5 text-ochre">
                 <span>{vector.warning}</span>
                 {!vector.model_configured ? (
                   <Button size="sm" variant="secondary" aria-haspopup="dialog" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>
@@ -478,12 +478,14 @@ export default function ModelsPage() {
                 <Button size="sm" variant="danger" onClick={() => setBatchOpen(true)}>批量删除</Button>
               </>
             ) : null}
-            <Select className="w-48" value={providerFilter} onChange={(event) => { setProviderFilter(event.target.value); setSelected(new Set()); paging.reset(); }} aria-label="按供应商筛选">
-              <option value="">全部供应商</option>
-              {providers.data?.items.map((provider) => (
-                <option key={provider.id} value={provider.id}>{provider.name}</option>
-              ))}
-            </Select>
+            <div className="w-44 shrink-0">
+              <Select className="w-full" value={providerFilter} onChange={(event) => { setProviderFilter(event.target.value); setSelected(new Set()); paging.reset(); }} aria-label="按供应商筛选">
+                <option value="">全部供应商</option>
+                {providers.data?.items.map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.name}</option>
+                ))}
+              </Select>
+            </div>
           </>
         }
       >
@@ -574,11 +576,11 @@ export default function ModelsPage() {
               </tbody>
             </table>
           </div>
-          <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} onChange={paging.setPage} />
           </>
         ) : (
           <EmptyState title="还没有可用模型" description="先接入模型服务，再登记至少一个已核验的生成模型。" action={<Button size="sm" aria-haspopup="dialog" onClick={() => setEditing("new")} disabled={!providers.data?.items.length}>登记模型</Button>} />
         )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} busy={models.loading} onChange={paging.setPage} />
       </Card>
       <ConfirmDialog
         open={deleting !== null}

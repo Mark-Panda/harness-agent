@@ -87,29 +87,33 @@ export default function AdminAgentsPage() {
         title="助手列表"
         description={`本页 ${items.length} 条，按创建时间倒序。`}
         actions={
-          <div className="flex flex-wrap items-center gap-2">
-            <Select className="w-48" value={userID} onChange={(event) => changeUser(event.target.value)} aria-label="按用户筛选">
-              <option value="">全部用户</option>
-              {(users.data?.items ?? []).map((item) => (
-                <option key={item.id} value={item.id}>{item.username}</option>
-              ))}
-            </Select>
-            <Select className="w-36" value={status} onChange={(event) => changeStatus(event.target.value)} aria-label="按状态筛选">
-              <option value="">全部状态</option>
-              <option value="draft">草稿</option>
-              <option value="published">已发布</option>
-              <option value="disabled">已停用</option>
-              <option value="archived">已归档</option>
-            </Select>
+          <div className="flex flex-nowrap items-center gap-2">
+            <div className="w-36 shrink-0 sm:w-40">
+              <Select className="w-full" value={userID} onChange={(event) => changeUser(event.target.value)} aria-label="按用户筛选">
+                <option value="">全部用户</option>
+                {(users.data?.items ?? []).map((item) => (
+                  <option key={item.id} value={item.id}>{item.username}</option>
+                ))}
+              </Select>
+            </div>
+            <div className="w-28 shrink-0 sm:w-32">
+              <Select className="w-full" value={status} onChange={(event) => changeStatus(event.target.value)} aria-label="按状态筛选">
+                <option value="">全部状态</option>
+                <option value="draft">草稿</option>
+                <option value="published">已发布</option>
+                <option value="disabled">已停用</option>
+                <option value="archived">已归档</option>
+              </Select>
+            </div>
           </div>
         }
       >
-        {agents.loading ? (
+        {agents.loading && !agents.data ? (
           <LoadingState />
         ) : items.length > 0 ? (
           <>
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[900px] text-left text-sm">
+            <div className="admin-table-container overflow-x-auto">
+              <table role="table" className="admin-table w-full min-w-[900px] text-left text-sm">
                 <thead className="text-xs uppercase tracking-wide text-muted">
                   <tr>
                     <th className="pb-3 pr-4 font-medium">助手</th>
@@ -122,24 +126,24 @@ export default function AdminAgentsPage() {
                     <th className="pb-3 font-medium">操作</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-line">
+                <tbody role="rowgroup" className="divide-y divide-line">
                   {items.map((agent) => (
-                    <tr key={agent.id}>
-                      <td className="py-3 pr-4">
+                    <tr role="row" key={agent.id}>
+                      <td role="cell" data-row="main" className="py-3 pr-4">
                         <p className="font-medium text-ink">{agent.name}</p>
                         <p className="mt-0.5 max-w-[320px] truncate text-[11px] text-muted">{agent.description || "—"}</p>
                       </td>
-                      <td className="py-3 pr-4 font-mono text-xs text-ink-soft">{agent.username || "—"}</td>
-                      <td className="py-3 pr-4 text-xs text-ink-soft">{modeLabel(agent.mode)}</td>
-                      <td className="py-3 pr-4"><Badge tone={statusTone(agent.status)}>{statusLabel(agent.status)}</Badge></td>
-                      <td className="py-3 pr-4 text-xs text-ink-soft">
+                      <td role="cell" data-column="用户" className="py-3 pr-4 font-mono text-xs text-ink-soft">{agent.username || "—"}</td>
+                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-xs text-ink-soft">{modeLabel(agent.mode)}</td>
+                      <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(agent.status)}>{statusLabel(agent.status)}</Badge></td>
+                      <td role="cell" data-column="选模规则" className="py-3 pr-4 text-xs text-ink-soft">
                         {agent.model_policy_id
                           ? policyNames.get(agent.model_policy_id) ?? `策略 v${agent.model_policy_version}`
                           : "未绑定"}
                       </td>
-                      <td className="py-3 pr-4 text-xs text-muted">v{agent.version}</td>
-                      <td className="py-3 pr-4 text-xs text-muted">{formatDateTime(agent.updated_at)}</td>
-                      <td className="py-3">
+                      <td role="cell" data-column="版本" className="py-3 pr-4 text-xs text-muted">v{agent.version}</td>
+                      <td role="cell" data-column="更新时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(agent.updated_at)}</td>
+                      <td role="cell" data-row="actions" className="py-3">
                         <Button size="sm" variant="danger" onClick={() => { setDeleting(agent); setDeleteError(null); }}>删除</Button>
                       </td>
                     </tr>
@@ -147,17 +151,21 @@ export default function AdminAgentsPage() {
                 </tbody>
               </table>
             </div>
-            <CursorPager
-              page={paging.page}
-              count={items.length}
-              hasNext={Boolean(agents.data?.next_cursor)}
-              onPrev={paging.prev}
-              onNext={() => paging.next(agents.data?.next_cursor ?? null)}
-            />
           </>
         ) : (
           <EmptyState title="没有符合条件的助手" description="调整用户或状态筛选后重试。" />
         )}
+        {agents.data ? (
+          <CursorPager
+            page={paging.page}
+            count={items.length}
+            hasNext={Boolean(agents.data.next_cursor)}
+            busy={agents.loading}
+            onFirst={paging.reset}
+            onPrev={paging.prev}
+            onNext={() => paging.next(agents.data?.next_cursor ?? null)}
+          />
+        ) : null}
       </Card>
       <ConfirmDialog
         open={deleting !== null}

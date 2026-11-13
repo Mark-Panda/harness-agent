@@ -99,7 +99,7 @@ export default function LoginPage() {
           </div>
           <a
             href="/api/v1/auth/feishu/start"
-            className="inline-flex h-10 w-full items-center justify-center rounded-[3px] border border-line-strong bg-paper-raised px-4 text-sm text-ink transition hover:border-accent hover:text-accent"
+            className="inline-flex h-10 w-full items-center justify-center rounded-lg border border-line-strong bg-paper-raised px-4 text-sm text-ink transition hover:border-accent hover:text-accent"
           >
             使用飞书登录
           </a>

@@ -1,7 +1,7 @@
 // 助手列表：用“我的助手”替代“Agent 编排”，突出创建、发布与开始对话。
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { ActionLink, Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, LoadingState, PageHeader, Select } from "../components/ui";
+import { ActionLink, Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, LoadingState, MenuItem, PageHeader, RowMenu, Select } from "../components/ui";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
@@ -163,13 +163,13 @@ export default function AgentsPage() {
         </Card>
       ) : null}
 
-      {agents.loading ? (
+      {agents.loading && !agents.data ? (
         <LoadingState />
       ) : agents.data && agents.data.items.length > 0 ? (
         <div className="flex flex-col gap-3">
           <div className="grid gap-4 md:grid-cols-2">
             {agents.data.items.map((agent) => (
-            <article key={agent.id} className="flex flex-col gap-4 rounded-[4px] border border-line bg-paper-raised p-5 transition hover:border-line-strong">
+            <article key={agent.id} className="flex flex-col gap-4 rounded-xl border border-line bg-paper-raised p-5 transition hover:border-line-strong">
               <header className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -178,29 +178,65 @@ export default function AgentsPage() {
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted">{agent.description || "还没有写描述，编辑时可以补上它擅长什么。"}</p>
                 </div>
-                <Badge tone="info">{modeLabel(agent.mode)}</Badge>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Badge tone="info">{modeLabel(agent.mode)}</Badge>
+                  <RowMenu name={agent.name}>
+                    {agent.status === "draft" ? (
+                      <MenuItem danger disabled={busy} onClick={() => setDeleting(agent)}>删除草稿</MenuItem>
+                    ) : agent.status === "archived" ? null : (
+                      <>
+                        <MenuItem icon="plus" disabled={busy} onClick={() => void runAction(() => mutate(`/api/v1/agents/${agent.id}/versions`, "POST", undefined, crypto.randomUUID()))}>
+                          创建新版本
+                        </MenuItem>
+                        {agent.status === "published" ? (
+                          <MenuItem disabled={busy} onClick={() => setUnpublishing(agent)}>取消发布</MenuItem>
+                        ) : null}
+                        {agent.status === "published" ? (
+                          botByAgent.get(agent.id) ? (
+                            <MenuItem disabled={busy} onClick={() => setUnbinding(agent)}>解绑飞书机器人</MenuItem>
+                          ) : (
+                            <MenuItem
+                              disabled={busy}
+                              onClick={() => {
+                                setBindingAgent(agent);
+                                setBindingBotID("");
+                                setBindingError(null);
+                              }}
+                            >
+                              绑定飞书机器人
+                            </MenuItem>
+                          )
+                        ) : null}
+                        <MenuItem disabled={busy} onClick={() => setArchiving(agent)}>归档</MenuItem>
+                        {agent.status === "published" ? (
+                          <MenuItem danger disabled={busy} onClick={() => setDeleting(agent)}>删除</MenuItem>
+                        ) : null}
+                      </>
+                    )}
+                  </RowMenu>
+                </div>
               </header>
 
               <dl className="grid grid-cols-2 gap-2 text-xs">
-                <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                   <dt className="text-muted">选模规则</dt>
                   <dd className="mt-0.5 truncate text-ink">
                     {agent.model_policy_id ? policyNames.get(agent.model_policy_id) ?? `v${agent.model_policy_version}` : "未绑定"}
                   </dd>
                 </div>
-                <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                   <dt className="text-muted">版本</dt>
                   <dd className="mt-0.5 text-ink">v{agent.version} · {formatDateTime(agent.updated_at)}</dd>
                 </div>
-                <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                   <dt className="text-muted">技能</dt>
                   <dd className="mt-0.5 truncate text-ink">{agent.skill_ids.length > 0 ? agent.skill_ids.map((id) => skillNames.get(id) ?? "技能").join("、") : "未绑定"}</dd>
                 </div>
-                <div className="rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <div className="rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                   <dt className="text-muted">外部工具</dt>
                   <dd className="mt-0.5 truncate text-ink">{agent.mcp_ids.length > 0 ? agent.mcp_ids.map((id) => mcpNames.get(id) ?? "工具").join("、") : "未绑定"}</dd>
                 </div>
-                <div className="col-span-2 rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2">
+                <div className="col-span-2 rounded-lg border border-line bg-paper-deep/40 px-3 py-2">
                   <dt className="text-muted">飞书机器人</dt>
                   <dd className="mt-0.5 truncate text-ink">
                     {agent.status === "published" ? (botByAgent.get(agent.id)?.name ?? "未绑定") : "—"}
@@ -208,83 +244,35 @@ export default function AgentsPage() {
                 </div>
               </dl>
 
-              <div className="flex flex-wrap gap-2">
+              <div className="mt-auto flex flex-wrap items-center gap-2 pt-1">
                 {agent.status === "draft" ? (
                   <>
                     <Link
                       to={`/agents/${agent.id}/edit`}
-                      className="inline-flex h-8 items-center rounded-[3px] border border-line-strong bg-paper-raised px-3 text-xs text-ink transition hover:border-accent hover:text-accent"
+                      className="inline-flex h-9 items-center rounded-lg border border-line-strong bg-paper-raised px-3 text-xs text-ink transition hover:border-accent hover:text-accent"
                     >
                       继续编辑
                     </Link>
                     <Button size="sm" onClick={() => setPublishing(agent)} disabled={publishedPolicies.length === 0}>发布</Button>
-                    <Button size="sm" variant="danger" onClick={() => setDeleting(agent)}>删除草稿</Button>
                   </>
                 ) : agent.status === "archived" ? (
                   <p className="text-xs leading-5 text-muted">已归档版本仅用于追溯历史对话与运行记录，不再出现在可用助手列表中。</p>
+                ) : agent.status === "published" ? (
+                  <ActionLink to={`/sessions?agent=${agent.id}`} size="sm">用它开始对话</ActionLink>
                 ) : (
-                  <>
-                    {agent.status === "published" ? (
-                      <ActionLink to={`/sessions?agent=${agent.id}`} size="sm">用它开始对话</ActionLink>
-                    ) : null}
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      loading={busy}
-                      onClick={() => void runAction(() => mutate(`/api/v1/agents/${agent.id}/versions`, "POST", undefined, crypto.randomUUID()))}
-                    >
-                      创建新版本
-                    </Button>
-                    {agent.status === "published" ? (
-                      <Button size="sm" variant="secondary" onClick={() => setUnpublishing(agent)}>
-                        取消发布
-                      </Button>
-                    ) : null}
-                    {agent.status === "published" ? (
-                      botByAgent.get(agent.id) ? (
-                        <Button size="sm" variant="secondary" onClick={() => setUnbinding(agent)}>解绑飞书机器人</Button>
-                      ) : (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => {
-                            setBindingAgent(agent);
-                            setBindingBotID("");
-                            setBindingError(null);
-                          }}
-                        >
-                          绑定飞书机器人
-                        </Button>
-                      )
-                    ) : null}
-                    <Button size="sm" variant="secondary" onClick={() => setArchiving(agent)}>
-                      归档
-                    </Button>
-                    {agent.status === "published" ? (
-                      <Button size="sm" variant="danger" onClick={() => setDeleting(agent)}>
-                        删除
-                      </Button>
-                    ) : null}
-                  </>
+                  <p className="text-xs leading-5 text-muted">这个版本已停止使用，可从右上角菜单创建新版本或归档。</p>
                 )}
               </div>
 
               {agent.config_snapshot ? (
                 <details className="text-xs text-muted">
                   <summary className="cursor-pointer hover:text-accent">查看发布快照（高级）</summary>
-                  <pre className="mt-2 max-h-48 overflow-auto rounded-[3px] border border-line bg-paper-deep/40 p-3 font-mono text-[11px] text-ink-soft">{JSON.stringify(agent.config_snapshot, null, 2)}</pre>
+                  <pre className="mt-2 max-h-48 overflow-auto rounded-lg border border-line bg-paper-deep/40 p-3 font-mono text-[11px] text-ink-soft">{JSON.stringify(agent.config_snapshot, null, 2)}</pre>
                 </details>
               ) : null}
             </article>
           ))}
           </div>
-          <CursorPager
-            page={paging.page}
-            count={agents.data.items.length}
-            hasNext={Boolean(agents.data.next_cursor)}
-            onPrev={paging.prev}
-            onNext={() => paging.next(agents.data?.next_cursor ?? null)}
-          />
         </div>
       ) : (
         <Card>
@@ -297,6 +285,17 @@ export default function AgentsPage() {
           />
         </Card>
       )}
+      {agents.data ? (
+        <CursorPager
+          page={paging.page}
+          count={agents.data.items.length}
+          hasNext={Boolean(agents.data.next_cursor)}
+          busy={agents.loading}
+          onFirst={paging.reset}
+          onPrev={paging.prev}
+          onNext={() => paging.next(agents.data?.next_cursor ?? null)}
+        />
+      ) : null}
 
       <ConfirmDialog
         open={publishing !== null}
