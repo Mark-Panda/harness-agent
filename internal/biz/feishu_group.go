@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
@@ -20,24 +19,16 @@ type feishuGroupRunHistoryReader interface {
 	ListFeishuGroupRunHistory(ctx context.Context, userID, sessionID, runID uuid.UUID) ([]Message, error)
 }
 
-type feishuGroupReplyCompleter interface {
-	CompleteGroupReply(ctx context.Context, outbound FeishuOutbound, workerID, text string, now time.Time) error
-}
-
-type feishuGroupThreadPromoter interface {
-	PromoteGroupConversationThread(ctx context.Context, outbound FeishuOutbound, threadID string) (int, error)
-}
-
 func isFeishuSharedGroup(run Run) bool {
 	shared, _ := run.ConfigSnapshot["feishu_shared_group"].(bool)
 	return shared
 }
 
 func (w *FeishuEventWorker) processSharedChat(ctx context.Context, record FeishuEventRecord, event feishu.MessageEvent,
-	speakerID, routeOwnerID, policyID uuid.UUID, text, threadID, rootMessageID string, defaultBot bool,
+	speakerID, routeOwnerID, policyID uuid.UUID, text, threadID, rootMessageID string, botID uuid.UUID,
 ) (string, error) {
 	// 默认应用的旧绑定没有 App ID。尊重其停用状态，但共享路径始终使用带应用作用域的绑定。
-	if defaultBot {
+	if botID == uuid.Nil {
 		legacy, found, err := w.findConversation(ctx, "", record.TenantKey, event.ChatID, threadID, rootMessageID)
 		if err != nil {
 			return "", err
@@ -101,5 +92,5 @@ func (w *FeishuEventWorker) processSharedChat(ctx context.Context, record Feishu
 		return "", fmt.Errorf("%w: shared feishu run does not match its authorized projection", ErrResourceConflict)
 	}
 	ctx = logging.WithRunID(ctx, run.ID.String())
-	return w.createReply(ctx, record.AppID, event, threadID, speakerID, projected.SessionID, run.ID)
+	return w.createReply(ctx, record.AppID, botID, event, threadID, speakerID, projected.SessionID, run.ID)
 }

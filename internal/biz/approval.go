@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
 
@@ -64,6 +65,8 @@ type ToolApproval struct {
 	ToolCallID string
 	// ToolName 规范化工具名。
 	ToolName string
+	// MCPBinding 审批时实际选择的工具目标，旧审批的值为空。
+	MCPBinding mcp.ToolIdentity
 	// Arguments 待确认的工具参数快照，必须为合法 JSON。
 	Arguments json.RawMessage
 	// RiskLevel 风险等级：low/medium/high。
@@ -102,8 +105,8 @@ type ToolApprovalRepository interface {
 	CountPendingApprovals(ctx context.Context, userID, runID uuid.UUID) (int, error)
 	// DecideApproval 以 CAS 方式把 pending 推进到 approved/denied；重复相同决策幂等返回。
 	DecideApproval(ctx context.Context, userID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error)
-	// ClaimApprovalExecution 以 CAS 方式把 approved 推进到 executing，确保同一审批只有一个执行者。
-	ClaimApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, now time.Time) (ToolApproval, error)
+	// ClaimApprovalExecution 仅在 Run 租约及当前 Plan 状态允许时领取审批。
+	ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence RunFence, now time.Time) (ToolApproval, error)
 	// FinishApprovalExecution 以 CAS 方式把 executing 推进到 executed/failed，并保存结果或脱敏错误。
 	FinishApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, status ApprovalStatus, result json.RawMessage, errorCode, errorMessage string, now time.Time) (ToolApproval, error)
 	// MarkApprovalDelivered 记录结果已回填为 tool 消息，重复调用幂等。

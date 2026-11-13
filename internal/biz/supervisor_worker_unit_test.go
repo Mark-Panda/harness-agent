@@ -136,7 +136,7 @@ func (s *memorySupervisorSessions) AppendMessage(_ context.Context, message Mess
 	s.messages = append(s.messages, message)
 	return message, nil
 }
-func (s *memorySupervisorSessions) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+func (s *memorySupervisorSessions) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent, _ RunFence) (Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.messages {

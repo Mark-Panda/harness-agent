@@ -73,6 +73,8 @@ func (internalIndexStub) SetDualWrite(context.Context, string, bool) error { ret
 // CountVectors 返回 0。
 func (internalIndexStub) CountVectors(context.Context, string) (int64, error) { return 0, nil }
 
+func (internalIndexStub) CountIndexedMessages(context.Context, string) (int64, error) { return 0, nil }
+
 // CountEligibleMessages 返回 0。
 func (internalIndexStub) CountEligibleMessages(context.Context) (int64, error) { return 0, nil }
 

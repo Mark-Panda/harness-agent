@@ -136,7 +136,9 @@ type EmbeddingIndexRepository interface {
 	SetDualWrite(ctx context.Context, version string, enabled bool) error
 	// CountVectors 统计指定版本的向量总数，维护任务使用系统作用域。
 	CountVectors(ctx context.Context, version string) (int64, error)
-	// CountEligibleMessages 统计可向量化的消息总数（仅 user 且未删除）。
+	// CountIndexedMessages 统计指定版本中已建立索引且仍可向量化的消息。
+	CountIndexedMessages(ctx context.Context, version string) (int64, error)
+	// CountEligibleMessages 统计私有会话中可向量化的用户消息。
 	CountEligibleMessages(ctx context.Context) (int64, error)
 	// ListUnembeddedMessages 读取尚未写入指定版本的候选用户消息，按时间正序。
 	ListUnembeddedMessages(ctx context.Context, version string, limit int) ([]Message, error)

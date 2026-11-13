@@ -2,8 +2,10 @@ package biz_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,9 +64,9 @@ func approvalMCPToolServer(t *testing.T, toolName string, onCall func(params map
 }
 
 // approvalWorkerDependencies 构造带审批仓储的 Worker 依赖。
-func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, mcpServer *httptest.Server, riskLevel string, budgetCheckers ...biz.BudgetChecker) (*biz.ExecutionWorker, *mocks.MockJobQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockExecutionStepRepository, *mocks.MockToolApprovalRepository) {
+func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, modelURL string, mcpServer *httptest.Server, riskLevel string, budgetCheckers ...biz.BudgetChecker) (*biz.ExecutionWorker, *mocks.MockRunExecutionQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockExecutionStepRepository, *mocks.MockToolApprovalRepository) {
 	t.Helper()
-	jobs := mocks.NewMockJobQueue(ctrl)
+	jobs := mocks.NewMockRunExecutionQueue(ctrl)
 	runs := mocks.NewMockRunRepository(ctrl)
 	sessions := mocks.NewMockSessionRepository(ctrl)
 	attempts := mocks.NewMockModelCallRepository(ctrl)
@@ -109,7 +111,7 @@ func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, mcpServer
 	worker, err := biz.NewExecutionWorker(biz.ExecutionWorkerDependencies{
 		Jobs: jobs, Runs: runs, Sessions: sessions,
 		Providers: fakeProviderCredentials{
-			provider:   biz.Provider{Status: biz.ProviderEnabled},
+			provider:   biz.Provider{Status: biz.ProviderEnabled, BaseURL: modelURL},
 			credential: providerCredential,
 		},
 		Opener: fakeOpener{key: "test-key"}, Attempts: attempts, Steps: steps, Approvals: approvals,
@@ -153,7 +155,7 @@ func TestWorkerPausesRunForHighRiskToolApproval(t *testing.T) {
 		mcpCalled = true
 		mutex.Unlock()
 	})
-	worker, jobs, runs, sessions, steps, approvals := approvalWorkerDependencies(t, ctrl, mcpServer, "high")
+	worker, jobs, runs, sessions, steps, approvals := approvalWorkerDependencies(t, ctrl, modelServer.URL, mcpServer, "high")
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -178,8 +180,8 @@ func TestWorkerPausesRunForHighRiskToolApproval(t *testing.T) {
 	runs.EXPECT().SetRunAttempt(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), fence).Return(nil).AnyTimes()
 	runs.EXPECT().AppendEventFenced(gomock.Any(), gomock.Any(), fence).Return(biz.RunEvent{}, nil).AnyTimes()
 	var persistedCallID string
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent, _ biz.RunFence) (biz.Message, error) {
 			if len(message.ToolCalls) > 0 {
 				persistedCallID, _ = message.ToolCalls[0]["id"].(string)
 			}
@@ -250,7 +252,7 @@ func TestWorkerExecutesApprovedToolAndResumes(t *testing.T) {
 		toolParams = params
 		mutex.Unlock()
 	})
-	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, mcpServer, "high")
+	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, modelServer.URL, mcpServer, "high")
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -270,12 +272,16 @@ func TestWorkerExecutesApprovedToolAndResumes(t *testing.T) {
 	approved := biz.ToolApproval{
 		ID: approvalID, RunID: runID, UserID: userID, StepID: &stepID,
 		ToolCallID: "call-1", ToolName: "mcp_admin_delete", Arguments: json.RawMessage(`{"id":"x"}`),
+		MCPBinding: mcp.ToolIdentity{
+			ServerID: uuid.MustParse(mcpID), OriginalName: "delete",
+			EndpointFingerprint: fmt.Sprintf("%x", sha256.Sum256([]byte(mcpServer.URL))),
+		},
 		RiskLevel: "high", Status: biz.ApprovalApproved, IdempotencyKey: "idem-1",
 	}
 	approvals.EXPECT().ListApprovals(gomock.Any(), userID, runID).Return([]biz.ToolApproval{approved}, nil)
 	executing := approved
 	executing.Status = biz.ApprovalExecuting
-	approvals.EXPECT().ClaimApprovalExecution(gomock.Any(), userID, approvalID, gomock.Any()).Return(executing, nil)
+	approvals.EXPECT().ClaimApprovalExecution(gomock.Any(), userID, runID, approvalID, fence, gomock.Any()).Return(executing, nil)
 	executed := executing
 	executed.Status = biz.ApprovalExecuted
 	executed.ResultJSON = json.RawMessage(`{"content":[{"type":"text","text":"approved-result"}],"is_error":false}`)
@@ -284,8 +290,8 @@ func TestWorkerExecutesApprovedToolAndResumes(t *testing.T) {
 
 	// 审批结果消息必须先落库，模型才能在上下文中看到工具返回。
 	var persisted []biz.Message
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent, _ biz.RunFence) (biz.Message, error) {
 			mutex.Lock()
 			persisted = append(persisted, message)
 			mutex.Unlock()
@@ -338,7 +344,7 @@ func TestWorkerReconcilesUnknownApprovalExecution(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	providerID, modelID := uuid.NewString(), uuid.NewString()
-	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "high")
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -375,7 +381,7 @@ func TestWorkerExpiresApprovalWithoutLosingRunnableJob(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+			worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "high")
 			userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
 			job := jobFixture(userID, runID)
 			run := biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval, UpdatedAt: time.Now().Add(-7 * 24 * time.Hour)}
@@ -387,23 +393,19 @@ func TestWorkerExpiresApprovalWithoutLosingRunnableJob(t *testing.T) {
 			}, nil)
 			approvals.EXPECT().DecideApproval(gomock.Any(), userID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).
 				Return(biz.ToolApproval{ID: approvalID, Status: biz.ApprovalDenied}, nil)
-			runs.EXPECT().TransitionRun(gomock.Any(), userID, runID, biz.RunWaitingApproval, biz.RunFailed,
+			runs.EXPECT().FinishRunWithEvent(gomock.Any(), userID, runID, biz.RunWaitingApproval, biz.RunFailed,
 				gomock.Cond(func(value any) bool {
 					fields, ok := value.(map[string]any)
 					return ok && fields["error_code"] == "approval_timeout"
-				})).
-				Return(biz.Run{ID: runID, Status: biz.RunFailed}, tc.transitionErr)
-			switch tc.transitionErr {
-			case nil:
-				runs.EXPECT().AppendEvent(gomock.Any(), gomock.Cond(func(value any) bool {
+				}), gomock.Cond(func(value any) bool {
 					event, ok := value.(biz.RunEvent)
 					return ok && event.RunID == runID && event.EventType == "run.failed" && event.Payload["code"] == "approval_timeout"
-				})).Return(biz.RunEvent{}, nil)
+				}), biz.RunFence{}, gomock.Any()).
+				Return(biz.Run{ID: runID, Status: biz.RunFailed}, tc.transitionErr)
+			if tc.transitionErr == nil {
 				jobs.EXPECT().Complete(gomock.Any(), job.ID, "worker-1", job.FencingToken).Return(nil)
-			case biz.ErrResourceConflict:
+			} else {
 				jobs.EXPECT().Release(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any()).Return(nil)
-			default:
-				jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			}
 			if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
 				t.Fatalf("ProcessOne() = %t, %v", processed, err)
@@ -417,8 +419,8 @@ func TestWorkerDeliversDeniedApproval(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	providerID, modelID := uuid.NewString(), uuid.NewString()
-	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
 	modelServer := completionServer(t, "已取消操作")
+	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, modelServer.URL, nil, "high")
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -436,8 +438,8 @@ func TestWorkerDeliversDeniedApproval(t *testing.T) {
 	approvals.EXPECT().ListApprovals(gomock.Any(), userID, runID).Return([]biz.ToolApproval{denied}, nil)
 	approvals.EXPECT().MarkApprovalDelivered(gomock.Any(), userID, denied.ID, gomock.Any()).Return(denied, nil)
 	var persisted []biz.Message
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent, _ biz.RunFence) (biz.Message, error) {
 			persisted = append(persisted, message)
 			return message, nil
 		},
@@ -469,7 +471,7 @@ func TestWorkerDeliversDeniedApproval(t *testing.T) {
 // TestWorkerStartStopsOnContextCancel 验证 Worker 启动循环在上下文取消后退出。
 func TestWorkerStartStopsOnContextCancel(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	worker, jobs, _, _, _, _ := approvalWorkerDependencies(t, ctrl, nil, "high")
+	worker, jobs, _, _, _, _ := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "high")
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(biz.Job{}, false, nil).AnyTimes()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -492,7 +494,7 @@ func TestWorkerFailsRunWhenBudgetExhausted(t *testing.T) {
 	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	providerID, modelID := uuid.NewString(), uuid.NewString()
 	checker := mocks.NewMockBudgetChecker(ctrl)
-	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "low", checker)
+	worker, jobs, runs, sessions, _, approvals := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "low", checker)
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -528,7 +530,7 @@ func TestWorkerResumesDecidedApprovalRun(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	providerID, modelID := uuid.NewString(), uuid.NewString()
-	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "high")
 
 	job := jobFixture(userID, runID)
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
@@ -551,9 +553,10 @@ func TestWorkerRetriesWhenReconciliationWriteFails(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	userID, runID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	providerID, modelID := uuid.NewString(), uuid.NewString()
-	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, nil, "high")
+	worker, jobs, runs, _, _, approvals := approvalWorkerDependencies(t, ctrl, "https://models.example.com", nil, "high")
 
 	job := jobFixture(userID, runID)
+	job.Attempts = job.MaxAttempts
 	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(job, true, nil)
 	run := runFixture(userID, runID, sessionID, snapshotFixture("https://models.example.com", providerID, modelID))
 	run.Status = biz.RunRunning
@@ -569,10 +572,31 @@ func TestWorkerRetriesWhenReconciliationWriteFails(t *testing.T) {
 	runs.EXPECT().MarkRunReconciliationRequired(gomock.Any(), userID, runID, fence, "tool_execution_unknown", gomock.Any(), gomock.Any()).Return(
 		biz.Run{}, context.DeadlineExceeded,
 	)
-	// 对账未落库时不得完成任务：否则 Run 永久停在 running 且无人再执行。
-	jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+	var settlement *biz.RunJobSettlement
+	jobs.EXPECT().DeferRunSettlement(gomock.Any(), job, gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ biz.Job, pending *biz.RunJobSettlement, _, _ time.Time) error {
+			settlement = pending
+			return nil
+		})
 
 	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
 		t.Fatalf("ProcessOne() = %t, %v", processed, err)
+	}
+	if settlement == nil || settlement.Status != biz.RunReconciliationRequired || settlement.Code != "tool_execution_unknown" {
+		t.Fatalf("deferred settlement = %#v", settlement)
+	}
+	reclaimed := job
+	reclaimed.FencingToken++
+	reclaimed.RunSettlementOnly, reclaimed.RunSettlement = true, settlement
+	nextFence := biz.RunFence{Owner: "worker-1", Token: 10}
+	jobs.EXPECT().Claim(gomock.Any(), "worker-1", "agent.run", gomock.Any(), gomock.Any()).Return(reclaimed, true, nil)
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
+	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(run, nextFence, nil)
+	runs.EXPECT().MarkRunReconciliationRequired(gomock.Any(), userID, runID, nextFence, settlement.Code, settlement.Message, gomock.Any()).Return(
+		biz.Run{ID: runID, Status: biz.RunReconciliationRequired}, nil,
+	)
+	jobs.EXPECT().Complete(gomock.Any(), reclaimed.ID, "worker-1", reclaimed.FencingToken).Return(nil)
+	if processed, err := worker.ProcessOne(context.Background()); err != nil || !processed {
+		t.Fatalf("settlement ProcessOne() = %t, %v", processed, err)
 	}
 }

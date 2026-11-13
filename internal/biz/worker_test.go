@@ -94,9 +94,9 @@ func completionServer(t *testing.T, content string) *httptest.Server {
 }
 
 // newWorker 构造 Worker 与测试依赖；调用方负责设置 gomock 期望。
-func newWorker(t *testing.T, ctrl *gomock.Controller, cancelPoll time.Duration, providerID, baseURL string) (*biz.ExecutionWorker, *mocks.MockJobQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockModelCallRepository) {
+func newWorker(t *testing.T, ctrl *gomock.Controller, cancelPoll time.Duration, providerID, baseURL string) (*biz.ExecutionWorker, *mocks.MockRunExecutionQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockModelCallRepository) {
 	t.Helper()
-	jobs := mocks.NewMockJobQueue(ctrl)
+	jobs := mocks.NewMockRunExecutionQueue(ctrl)
 	runs := mocks.NewMockRunRepository(ctrl)
 	sessions := mocks.NewMockSessionRepository(ctrl)
 	attempts := mocks.NewMockModelCallRepository(ctrl)
@@ -169,8 +169,8 @@ func TestExecutionWorkerRunsReActSuccessfully(t *testing.T) {
 		},
 	)
 	runs.EXPECT().AppendEventFenced(gomock.Any(), gomock.Any(), fence).Return(biz.RunEvent{}, nil).AnyTimes()
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent, _ biz.RunFence) (biz.Message, error) {
 			if message.Role != biz.MessageAssistant || message.Content != "最终回答" {
 				t.Fatalf("unexpected assistant message: %#v", message)
 			}

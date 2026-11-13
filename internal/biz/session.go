@@ -140,8 +140,8 @@ type SessionRepository interface {
 	GetAgent(ctx context.Context, userID, agentID uuid.UUID) (Agent, error)
 	// AppendMessage 追加消息并更新会话最近消息时间。
 	AppendMessage(ctx context.Context, message Message, event OutboxEvent) (Message, error)
-	// AppendMessageIdempotent 按消息 ID 幂等追加 Agent 消息；已存在时返回原消息且不重复写审计事件。
-	AppendMessageIdempotent(ctx context.Context, message Message, event OutboxEvent) (Message, error)
+	// AppendMessageIdempotent 在 Run 租约有效时按消息 ID 幂等追加 Agent 消息。
+	AppendMessageIdempotent(ctx context.Context, message Message, event OutboxEvent, fence RunFence) (Message, error)
 	// ListMessages 按会话游标分页列出消息（倒序）。
 	ListMessages(ctx context.Context, userID, sessionID uuid.UUID, limit int, cursor string) (Page[Message], error)
 	// CountSessions 统计当前用户会话总数，用于配额校验。

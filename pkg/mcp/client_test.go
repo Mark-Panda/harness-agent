@@ -139,6 +139,54 @@ func TestClientParsesSSEAndRPCError(t *testing.T) {
 	}
 }
 
+func TestToolResponseDistinguishesRejectionFromUnknownOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		want       error
+		unknown    bool
+		mismatchID bool
+	}{
+		{name: "handler failure", body: `"error":{"code":-32603,"message":"internal error"}`, want: ErrRPC, unknown: true},
+		{name: "preflight rejection", body: `"error":{"code":-32602,"message":"invalid params"}`, want: ErrRPC},
+		{name: "null result", body: `"result":null`, want: ErrTransport, unknown: true},
+		{name: "missing result fields", body: `"result":{}`, want: ErrTransport, unknown: true},
+		{name: "explicitly empty result", body: `"result":{"content":[]}`},
+		{name: "unrelated response", body: `"result":{"content":[]}`, want: ErrTransport, unknown: true, mismatchID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					ID     json.RawMessage
+					Method string
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch body.Method {
+				case "initialize":
+					_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18"}}`, body.ID)
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/call":
+					if tc.mismatchID {
+						body.ID = json.RawMessage("0")
+					}
+					_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,%s}`, body.ID, tc.body)
+				}
+			}))
+			t.Cleanup(server.Close)
+			_, err := newTestClient(t, server, "none", "").CallTool(context.Background(), "test", nil)
+			if !errors.Is(err, tc.want) || errors.Is(err, ErrToolOutcomeUnknown) != tc.unknown {
+				t.Fatalf("CallTool() error = %v, want %v, unknown=%t", err, tc.want, tc.unknown)
+			}
+		})
+	}
+}
+
 // TestClientSendsMultipleAuthHeaders 验证握手请求携带完整的多请求头凭证。
 func TestClientSendsMultipleAuthHeaders(t *testing.T) {
 	server := mockRPCServer(t, func(method string, _ json.RawMessage, request *http.Request, response http.ResponseWriter) (any, bool) {
@@ -380,7 +428,8 @@ func TestCallToolRetriesAfterSessionExpired(t *testing.T) {
 	var initializes int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Method string `json:"method"`
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		switch body.Method {
@@ -398,7 +447,7 @@ func TestCallToolRetriesAfterSessionExpired(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`, body.ID)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

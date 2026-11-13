@@ -249,8 +249,8 @@ func TestPlanAPIRevisePlan(t *testing.T) {
 		Version: 1, Status: biz.PlanPaused, Revision: 5, Goal: "old goal",
 		UpdatedAt: time.Now().Add(time.Hour).UTC(),
 	}, nil)
-	fixture.planRepo.EXPECT().CreatePlan(gomock.Any(), fixture.principal.UserID, gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, userID uuid.UUID, plan biz.Plan, event biz.OutboxEvent) (biz.Plan, error) {
+	fixture.planRepo.EXPECT().ReplacePlan(gomock.Any(), fixture.principal.UserID, gomock.Any(), int64(5), biz.PlanFence{}, gomock.Any()).DoAndReturn(
+		func(_ context.Context, userID uuid.UUID, plan biz.Plan, _ int64, _ biz.PlanFence, event biz.OutboxEvent) (biz.Plan, error) {
 			if plan.Version != 2 || plan.ParentPlanID == nil || *plan.ParentPlanID != oldPlanID ||
 				plan.Status != biz.PlanExecuting || plan.Goal != "revised goal" || plan.SessionID != sessionID {
 				t.Fatalf("revised plan = %#v", plan)
@@ -264,9 +264,6 @@ func TestPlanAPIRevisePlan(t *testing.T) {
 			}
 			return plan, nil
 		},
-	)
-	fixture.planRepo.EXPECT().UpdatePlan(gomock.Any(), fixture.principal.UserID, oldPlanID, biz.PlanPaused, biz.PlanCancelled, int64(5), gomock.Any(), gomock.Any()).Return(
-		biz.Plan{ID: oldPlanID, Status: biz.PlanCancelled}, nil,
 	)
 	fixture.enqueuer.EXPECT().EnqueueRun(gomock.Any(), fixture.principal.UserID, runID, gomock.Any()).Return(nil)
 	recorder := fixture.doPlanRequest(t, http.MethodPost, "/api/v1/runs/"+runID.String()+"/plan/revise",

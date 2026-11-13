@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // planModel 对应 plans 表：版本化计划与预算事实。
@@ -122,19 +124,71 @@ func NewPlanRepository(db *gorm.DB) *PlanRepository {
 	return &PlanRepository{db: db}
 }
 
-// CreatePlan 在同一事务内创建计划、全部步骤与审计事件。
+// CreatePlan 在同一事务内创建初始计划、全部步骤与审计事件。
 func (r *PlanRepository) CreatePlan(ctx context.Context, userID uuid.UUID, plan biz.Plan, event biz.OutboxEvent) (biz.Plan, error) {
+	if plan.Version != 1 || plan.ParentPlanID != nil {
+		return biz.Plan{}, fmt.Errorf("%w: only the initial plan can be created without replacing its parent", biz.ErrInvalidConfig)
+	}
+	return r.writePlan(ctx, userID, plan, event, nil)
+}
+
+// ReplacePlan 只有在锁定 Run 和最新父版本并验证状态后才发布后继版本。
+func (r *PlanRepository) ReplacePlan(ctx context.Context, userID uuid.UUID, plan biz.Plan, parentRevision int64, fence biz.PlanFence, event biz.OutboxEvent) (biz.Plan, error) {
+	if plan.Version <= 1 || plan.ParentPlanID == nil || plan.Status != biz.PlanExecuting ||
+		(fence.Owner == "" && fence.Token != 0) || (fence.Owner != "" && fence.Token <= 0) {
+		return biz.Plan{}, fmt.Errorf("%w: invalid plan replacement", biz.ErrInvalidConfig)
+	}
+	return r.writePlan(ctx, userID, plan, event, &planReplacement{revision: parentRevision, fence: fence})
+}
+
+type planReplacement struct {
+	revision int64
+	fence    biz.PlanFence
+}
+
+func (r *PlanRepository) writePlan(ctx context.Context, userID uuid.UUID, plan biz.Plan, event biz.OutboxEvent, replacement *planReplacement) (biz.Plan, error) {
 	planRecord, err := fromBizPlan(plan)
 	if err != nil {
 		return biz.Plan{}, err
 	}
-	steps, err := fromBizPlanSteps(plan.ID, userID, plan.Steps)
-	if err != nil {
-		return biz.Plan{}, err
-	}
+	var steps []planStepModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if replacement == nil {
+			if err := lockPlanUsageRun(tx, userID, plan.RunID); err != nil {
+				return err
+			}
+			usage, err := sumModelCallUsage(tx, userID, plan.RunID)
+			if err != nil {
+				return err
+			}
+			planRecord.TotalInputTokens = max(planRecord.TotalInputTokens, usage.InputTokens)
+			planRecord.TotalOutputTokens = max(planRecord.TotalOutputTokens, usage.OutputTokens)
+			planRecord.EstimatedCost = max(planRecord.EstimatedCost, usage.EstimatedCost)
+		} else {
+			parent, err := supersedePlan(tx, userID, &planRecord, *replacement)
+			if err != nil {
+				return err
+			}
+			olderTools, err := completedAncestorTools(tx, userID, parent)
+			if err != nil {
+				return err
+			}
+			plan.Steps = biz.CarryCompletedPlanSteps(plan.Steps, parent, replacement.fence.Owner == "", olderTools...)
+		}
+		steps, err = fromBizPlanSteps(plan.ID, userID, plan.Steps)
+		if err != nil {
+			return err
+		}
 		if err := tx.Create(&planRecord).Error; err != nil {
 			return err
+		}
+		if replacement == nil {
+			// An interrupted planner call can settle after the plan is rebound to another Run.
+			if err := tx.Model(&modelCallModel{}).
+				Where("user_id = ? AND run_id = ? AND status = ? AND request_manifest ->> 'plan_usage' = 'true'", userID, plan.RunID, biz.ModelCallRunning).
+				UpdateColumn("request_manifest", gorm.Expr("request_manifest || jsonb_build_object('plan_id', CAST(? AS text))", plan.ID.String())).Error; err != nil {
+				return err
+			}
 		}
 		if len(steps) > 0 {
 			if err := tx.Create(&steps).Error; err != nil {
@@ -146,6 +200,162 @@ func (r *PlanRepository) CreatePlan(ctx context.Context, userID uuid.UUID, plan 
 		return biz.Plan{}, catalogError("create plan", err)
 	}
 	return toBizPlan(planRecord, steps)
+}
+
+// completedAncestorTools keeps a settled operation reusable even when an intermediate
+// revision omitted it. Rebinding to a new Run preserves the parent links.
+func completedAncestorTools(tx *gorm.DB, userID uuid.UUID, parent biz.Plan) ([]biz.PlanStep, error) {
+	if parent.ParentPlanID == nil {
+		return nil, nil
+	}
+	var records []planStepModel
+	if err := tx.Raw(`
+WITH RECURSIVE ancestors(id, parent_plan_id, version) AS (
+  SELECT id, parent_plan_id, version FROM plans WHERE id = ? AND user_id = ? AND session_id = ?
+  UNION
+  SELECT p.id, p.parent_plan_id, p.version FROM plans p JOIN ancestors a ON p.id = a.parent_plan_id
+  WHERE p.user_id = ? AND p.session_id = ?
+)
+SELECT s.* FROM plan_steps s JOIN ancestors a ON a.id = s.plan_id
+WHERE s.user_id = ? AND s.status = 'completed' AND s.tool_name <> ''
+ORDER BY a.version DESC, s.step_no`, *parent.ParentPlanID, userID, parent.SessionID,
+		userID, parent.SessionID, userID).Scan(&records).Error; err != nil {
+		return nil, err
+	}
+	steps := make([]biz.PlanStep, 0, len(records))
+	for _, record := range records {
+		step, err := toBizPlanStep(record)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, step)
+	}
+	return steps, nil
+}
+
+func supersedePlan(tx *gorm.DB, userID uuid.UUID, next *planModel, replacement planReplacement) (biz.Plan, error) {
+	now := time.Now().UTC()
+	manual := replacement.fence.Owner == ""
+	var run runModel
+	if err := tx.Select("status", "deadline_at").Clauses(clause.Locking{Strength: "UPDATE"}).
+		Take(&run, "id = ? AND user_id = ?", next.RunID, userID).Error; err != nil {
+		return biz.Plan{}, err
+	}
+	if manual && run.Status != string(biz.RunQueued) && run.Status != string(biz.RunRunning) {
+		return biz.Plan{}, fmt.Errorf("%w: run cannot accept a revised plan in its current state", biz.ErrResourceConflict)
+	}
+	var parent planModel
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND run_id = ?", userID, next.RunID).Order("version DESC").Take(&parent).Error; err != nil {
+		return biz.Plan{}, err
+	}
+	if parent.ID != *next.ParentPlanID || parent.SessionID != next.SessionID || next.Version != parent.Version+1 {
+		return biz.Plan{}, fmt.Errorf("%w: parent plan is no longer the latest version", biz.ErrPlanRevisionConflict)
+	}
+	status, target := biz.PlanExecuting, biz.PlanFailed
+	code, message := "plan_replanned", "步骤失败，已生成新版本计划"
+	if manual {
+		status, target = biz.PlanPaused, biz.PlanCancelled
+		code, message = "plan_superseded", "计划已由人工修订版本替代"
+	} else {
+		switch biz.PlanStatus(parent.Status) {
+		case biz.PlanPaused:
+			return biz.Plan{}, biz.ErrPlanPaused
+		case biz.PlanCancelled:
+			return biz.Plan{}, biz.ErrPlanCancelled
+		}
+	}
+	if parent.Status != string(status) || parent.Revision != replacement.revision {
+		return biz.Plan{}, fmt.Errorf("%w: parent plan status or revision changed", biz.ErrPlanRevisionConflict)
+	}
+	// Dispatch and approval claims lock Run then Plan. Lock step rows as well so
+	// settlement cannot change the completed results while they are being carried forward.
+	var steps []planStepModel
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND plan_id = ?", userID, parent.ID).Order("step_no").Find(&steps).Error; err != nil {
+		return biz.Plan{}, err
+	}
+	if err := guardPlanReplacementEffects(tx, userID, parent); err != nil {
+		if !manual {
+			return biz.Plan{}, planReplacementConflict(err)
+		}
+		return biz.Plan{}, err
+	}
+	if manual {
+		if err := extendRevisedPlanDeadline(tx, userID, &parent, &run, now); err != nil {
+			return biz.Plan{}, err
+		}
+		next.DeadlineAt = parent.DeadlineAt
+	} else if _, err := lockRunningRunLease(tx, userID, next.RunID, biz.RunFence(replacement.fence), now); err != nil {
+		return biz.Plan{}, planReplacementConflict(err)
+	}
+	next.TotalInputTokens = parent.TotalInputTokens
+	next.TotalOutputTokens = parent.TotalOutputTokens
+	next.EstimatedCost = parent.EstimatedCost
+	result := tx.Model(&planModel{}).
+		Where("id = ? AND user_id = ? AND status = ? AND revision = ?", parent.ID, userID, status, replacement.revision).Updates(map[string]any{
+		"status": target, "revision": gorm.Expr("revision + 1"), "error_code": code, "error_message": message,
+		"deadline_at": parent.DeadlineAt, "updated_at": now, "finished_at": now,
+	})
+	if result.Error != nil {
+		return biz.Plan{}, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return biz.Plan{}, biz.ErrPlanRevisionConflict
+	}
+	return toBizPlan(parent, steps)
+}
+
+func planReplacementConflict(err error) error {
+	if errors.Is(err, biz.ErrResourceConflict) {
+		return fmt.Errorf("%w: %w", biz.ErrPlanRevisionConflict, err)
+	}
+	return err
+}
+
+func guardPlanReplacementEffects(tx *gorm.DB, userID uuid.UUID, parent planModel) error {
+	var unsettled bool
+	if err := tx.Raw(`
+SELECT EXISTS (
+  SELECT 1 FROM plan_steps AS step
+  WHERE step.user_id = ? AND step.plan_id = ? AND (
+    step.status = 'unknown'
+    OR (step.status = 'running' AND (step.tool_name <> '' OR EXISTS (
+      SELECT 1 FROM execution_steps AS tool
+      WHERE tool.user_id = step.user_id AND tool.run_id = ? AND tool.parent_step_id = step.execution_step_id
+        AND tool.kind = 'tool' AND tool.status IN ('running', 'completed', 'reconciliation_required')
+    )))
+    OR (step.status IN ('running', 'waiting_approval') AND EXISTS (
+      SELECT 1 FROM tool_approvals AS approval
+      WHERE approval.user_id = step.user_id AND approval.run_id = ?
+        AND (approval.tool_call_id = 'plan-step-' || step.id::text OR approval.step_id = step.execution_step_id)
+        AND approval.status IN ('pending', 'approved', 'executing', 'executed', 'failed')
+    ))
+  )
+)`, userID, parent.ID, parent.RunID, parent.RunID).Scan(&unsettled).Error; err != nil {
+		return err
+	}
+	if unsettled {
+		return fmt.Errorf("%w: settle the current plan's tool effects before replacing it", biz.ErrResourceConflict)
+	}
+	return nil
+}
+
+func extendRevisedPlanDeadline(tx *gorm.DB, userID uuid.UUID, parent *planModel, run *runModel, now time.Time) error {
+	pausedFor := now.Sub(parent.UpdatedAt)
+	if pausedFor <= 0 {
+		return nil
+	}
+	if parent.DeadlineAt != nil {
+		deadline := parent.DeadlineAt.Add(pausedFor)
+		parent.DeadlineAt = &deadline
+	}
+	base := now
+	if run.DeadlineAt != nil {
+		base = *run.DeadlineAt
+	}
+	return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", parent.RunID, userID).
+		Updates(map[string]any{"deadline_at": base.Add(pausedFor), "updated_at": now}).Error
 }
 
 // GetPlanByRun 读取 Run 的最新版本计划及步骤。
@@ -161,6 +371,50 @@ func (r *PlanRepository) GetPlanByRun(ctx context.Context, userID, runID uuid.UU
 		return biz.Plan{}, catalogError("get plan by run", err)
 	}
 	return toBizPlan(planRecord, steps)
+}
+
+// RecoverPlanUsage reconciles the latest Plan with retained model calls, including
+// calls written by older workers and by Runs from which the Plan was resumed.
+func (r *PlanRepository) RecoverPlanUsage(ctx context.Context, userID, runID uuid.UUID) (biz.ModelCallUsage, error) {
+	var usage biz.ModelCallUsage
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockPlanUsageRun(tx, userID, runID); err != nil {
+			return err
+		}
+		var plan planModel
+		query := tx.Select("id", "total_input_tokens", "total_output_tokens", "estimated_cost").
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ? AND run_id = ?", userID, runID).Order("version DESC").Limit(1)
+		if err := query.Find(&plan).Error; err != nil {
+			return err
+		}
+		if err := tx.Raw(`
+WITH RECURSIVE plan_runs(id) AS (
+  SELECT ?::uuid
+  UNION
+  SELECT previous.id FROM plan_runs current
+  JOIN run_events e ON e.run_id = current.id AND e.user_id = ? AND e.event_type = 'plan.resumed'
+  JOIN agent_runs previous ON previous.id::text = e.payload ->> 'previous_run_id' AND previous.user_id = ?
+)
+SELECT COUNT(*) AS count, COALESCE(SUM(c.input_tokens), 0) AS input_tokens,
+       COALESCE(SUM(c.output_tokens), 0) AS output_tokens, COALESCE(SUM(c.estimated_cost), 0) AS estimated_cost
+FROM model_calls c JOIN plan_runs ON plan_runs.id = c.run_id WHERE c.user_id = ?`,
+			runID, userID, userID, userID).Scan(&usage).Error; err != nil {
+			return err
+		}
+		// Some older attempts may have been pruned. Never decrease a stored total.
+		usage.InputTokens = max(usage.InputTokens, plan.TotalInputTokens)
+		usage.OutputTokens = max(usage.OutputTokens, plan.TotalOutputTokens)
+		usage.EstimatedCost = max(usage.EstimatedCost, plan.EstimatedCost)
+		if plan.ID == uuid.Nil || (usage.InputTokens == plan.TotalInputTokens &&
+			usage.OutputTokens == plan.TotalOutputTokens && usage.EstimatedCost == plan.EstimatedCost) {
+			return nil
+		}
+		return tx.Model(&planModel{}).Where("id = ? AND user_id = ?", plan.ID, userID).UpdateColumns(map[string]any{
+			"total_input_tokens": usage.InputTokens, "total_output_tokens": usage.OutputTokens, "estimated_cost": usage.EstimatedCost,
+		}).Error
+	})
+	return usage, catalogError("recover plan usage", err)
 }
 
 // ExtendPlanDeadline 延长非终态计划的截止时间，不递增 revision，避免恢复路径产生额外冲突。
@@ -251,13 +505,14 @@ func (r *PlanRepository) UpdatePlan(ctx context.Context, userID, planID uuid.UUI
 	}
 	var result *gorm.DB
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		query := tx.Model(&planModel{}).
-			Where("id = ? AND user_id = ? AND status = ? AND revision = ?", planID, userID, string(from), expectedRevision)
 		if fence.Owner != "" {
-			query = query.Where("EXISTS (SELECT 1 FROM agent_runs r WHERE r.id = plans.run_id AND r.user_id = ? AND r.lease_owner = ? AND r.fencing_token = ? AND r.status IN ('running', 'waiting_approval'))",
-				userID, fence.Owner, fence.Token)
+			if _, err := lockWorkerPlan(tx, userID, planID, fence, now); err != nil {
+				return planReplacementConflict(err)
+			}
 		}
-		result = query.Updates(fields)
+		result = tx.Model(&planModel{}).
+			Where("id = ? AND user_id = ? AND status = ? AND revision = ?", planID, userID, string(from), expectedRevision).
+			Updates(fields)
 		return result.Error
 	}); err != nil {
 		return biz.Plan{}, catalogError("update plan", err)
@@ -266,6 +521,24 @@ func (r *PlanRepository) UpdatePlan(ctx context.Context, userID, planID uuid.UUI
 		return biz.Plan{}, fmt.Errorf("%w: plan revision or status changed", biz.ErrPlanRevisionConflict)
 	}
 	return r.GetPlan(ctx, userID, planID)
+}
+
+// lockWorkerPlan serializes a worker mutation with Run takeover, pause and rebinding.
+// Keep the lock order consistent with plan claims, replacement and tool dispatch.
+func lockWorkerPlan(tx *gorm.DB, userID, planID uuid.UUID, fence biz.PlanFence, now time.Time) (biz.PlanStatus, error) {
+	var plan planModel
+	if err := tx.Select("run_id").Take(&plan, "id = ? AND user_id = ?", planID, userID).Error; err != nil {
+		return "", err
+	}
+	if _, err := lockRunningRunLease(tx, userID, plan.RunID, biz.RunFence(fence), now); err != nil {
+		return "", err
+	}
+	err := tx.Model(&planModel{}).Select("status").Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND user_id = ? AND run_id = ?", planID, userID, plan.RunID).Take(&plan).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", fmt.Errorf("%w: plan was rebound", biz.ErrResourceConflict)
+	}
+	return biz.PlanStatus(plan.Status), err
 }
 
 // FindPausedPlanBySession 读取会话中最近一个暂停中的计划，用于新消息自动续跑。
@@ -281,9 +554,7 @@ func (r *PlanRepository) FindPausedPlanBySession(ctx context.Context, userID, se
 }
 
 // RebindPlanRun 把暂停中的计划迁移到新的 Run 并恢复执行，保留已完成步骤。
-// 迁移时：无副作用的模型步骤与尚未执行的审批步骤退回 pending；仍在 running 的
-// 工具步骤保留原状，交给 recoverPlanSteps 按“副作用未知”处理；旧 Run 上未决策的
-// 审批作废，避免审批列表残留无法投递的请求。
+// 已领取的工具调用保留对账证据，纯模型与未执行的审批步骤可以重跑。
 func (r *PlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runID uuid.UUID, expectedRevision int64, deadlineAt *time.Time, now time.Time) (biz.Plan, error) {
 	var result *gorm.DB
 	var oldRunID uuid.UUID
@@ -293,6 +564,9 @@ func (r *PlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runI
 			return err
 		}
 		oldRunID = planRecord.RunID
+		if err := lockPlanUsageRun(tx, userID, oldRunID); err != nil {
+			return err
+		}
 		result = tx.Model(&planModel{}).
 			Where("id = ? AND user_id = ? AND status = ? AND revision = ?", planID, userID, string(biz.PlanPaused), expectedRevision).
 			Updates(map[string]any{
@@ -306,20 +580,41 @@ func (r *PlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runI
 		if result.RowsAffected != 1 {
 			return nil
 		}
-		// 模型步骤没有外部副作用，可以安全重跑。
-		if err := tx.Model(&planStepModel{}).
-			Where("plan_id = ? AND user_id = ? AND status = ? AND tool_name = ''", planID, userID, string(biz.PlanStepRunning)).
-			Updates(map[string]any{
-				"status": string(biz.PlanStepPending), "lease_owner": "", "fence_token": int64(0),
-				// 中断不是业务失败，重置尝试次数，避免达到 MaxAttempts 后新 Run 永远领不到该步骤。
-				"attempts": 0, "started_at": nil, "finished_at": nil, "updated_at": now.UTC(),
-				"error_code": "", "error_message": "",
-			}).Error; err != nil {
+		if err := tx.Exec(`
+UPDATE plan_steps AS step
+SET status = 'completed', result_json = jsonb_build_object('content', COALESCE(approval.result_json::text, '')),
+    lease_owner = '', fence_token = 0, updated_at = ?, finished_at = approval.updated_at,
+    error_code = '', error_message = ''
+FROM tool_approvals AS approval
+WHERE step.plan_id = ? AND step.user_id = ? AND step.status = 'waiting_approval'
+  AND approval.user_id = step.user_id AND approval.run_id = ?
+  AND approval.tool_call_id = 'plan-step-' || step.id::text AND approval.status = 'executed'`,
+			now.UTC(), planID, userID, oldRunID).Error; err != nil {
 			return err
 		}
-		// 等待审批的步骤尚未执行，退回 pending 让新 Run 重新发起审批。
+		// 保留旧 Run 的执行步骤关联，供新 Run 与人工对账时定位工具记录。
+		if err := tx.Exec(`
+UPDATE plan_steps AS step
+SET status = 'unknown', lease_owner = '', fence_token = 0, updated_at = ?, finished_at = ?,
+    error_code = 'tool_execution_unknown', error_message = '旧执行轮次的工具副作用需要人工对账'
+WHERE step.plan_id = ? AND step.user_id = ? AND (
+  (step.status = 'running' AND step.tool_name = '' AND EXISTS (
+    SELECT 1 FROM execution_steps AS tool
+    WHERE tool.user_id = step.user_id AND tool.run_id = ? AND tool.parent_step_id = step.execution_step_id
+      AND tool.kind = 'tool' AND tool.status IN ('running', 'completed', 'reconciliation_required')
+  )) OR (step.status = 'waiting_approval' AND EXISTS (
+    SELECT 1 FROM tool_approvals AS approval
+    WHERE approval.user_id = step.user_id AND approval.run_id = ?
+      AND approval.tool_call_id = 'plan-step-' || step.id::text
+      AND approval.status IN ('executing', 'executed', 'failed')
+  ))
+)`, now.UTC(), now.UTC(), planID, userID, oldRunID, oldRunID).Error; err != nil {
+			return err
+		}
+		// 仅重置没有已领取工具调用的步骤。独立工具步骤的 running 状态由 Worker 对账。
 		if err := tx.Model(&planStepModel{}).
-			Where("plan_id = ? AND user_id = ? AND status = ?", planID, userID, string(biz.PlanStepWaitingApproval)).
+			Where("plan_id = ? AND user_id = ?", planID, userID).
+			Where("(status = ? AND tool_name = '') OR status = ?", biz.PlanStepRunning, biz.PlanStepWaitingApproval).
 			Updates(map[string]any{
 				"status": string(biz.PlanStepPending), "lease_owner": "", "fence_token": int64(0),
 				"attempts": 0, "execution_step_id": nil, "started_at": nil, "finished_at": nil,
@@ -347,6 +642,33 @@ func (r *PlanRepository) RebindPlanRun(ctx context.Context, userID, planID, runI
 		return biz.Plan{}, fmt.Errorf("%w: plan revision or status changed", biz.ErrPlanRevisionConflict)
 	}
 	return r.GetPlan(ctx, userID, planID)
+}
+
+func lockLatestRunPlan(tx *gorm.DB, userID, runID uuid.UUID) (planModel, error) {
+	var plan planModel
+	err := tx.Select("id", "status").Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND run_id = ?", userID, runID).Order("version DESC").Take(&plan).Error
+	return plan, err
+}
+
+func lockExecutingPlan(tx *gorm.DB, userID, runID uuid.UUID, fence biz.PlanFence, now time.Time) (uuid.UUID, error) {
+	if _, err := lockRunningRunLease(tx, userID, runID, biz.RunFence(fence), now); err != nil {
+		return uuid.Nil, err
+	}
+	plan, err := lockLatestRunPlan(tx, userID, runID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	switch biz.PlanStatus(plan.Status) {
+	case biz.PlanExecuting:
+		return plan.ID, nil
+	case biz.PlanPaused:
+		return uuid.Nil, biz.ErrPlanPaused
+	case biz.PlanCancelled:
+		return uuid.Nil, biz.ErrPlanCancelled
+	default:
+		return uuid.Nil, fmt.Errorf("%w: plan is not executing", biz.ErrResourceConflict)
+	}
 }
 
 // AddPlanUsage 累加计划的 Token 与费用，revision 递增用于展示最新事实。
@@ -380,6 +702,17 @@ func (r *PlanRepository) AddPlanUsage(ctx context.Context, userID, planID uuid.U
 func (r *PlanRepository) ClaimPlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, executionStepID *uuid.UUID, fence biz.PlanFence, now time.Time) (biz.PlanStep, error) {
 	var record planStepModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var plan planModel
+		if err := tx.Select("run_id").Take(&plan, "id = ? AND user_id = ?", planID, userID).Error; err != nil {
+			return err
+		}
+		activeID, err := lockExecutingPlan(tx, userID, plan.RunID, fence, now)
+		if err != nil {
+			return err
+		}
+		if activeID != planID {
+			return fmt.Errorf("%w: plan version changed", biz.ErrResourceConflict)
+		}
 		return tx.Raw(`
 UPDATE plan_steps
 SET status = 'running', attempts = attempts + 1, fence_token = ?, lease_owner = ?,
@@ -387,11 +720,7 @@ SET status = 'running', attempts = attempts + 1, fence_token = ?, lease_owner = 
     started_at = COALESCE(started_at, ?), finished_at = NULL, updated_at = ?, error_code = '', error_message = ''
 WHERE id = ? AND user_id = ? AND plan_id = ?
   AND status IN ('pending', 'failed') AND attempts < max_attempts
-  AND EXISTS (SELECT 1 FROM plans p JOIN agent_runs r ON r.id = p.run_id
-              WHERE p.id = plan_steps.plan_id AND p.user_id = ? AND r.user_id = ?
-                AND r.lease_owner = ? AND r.fencing_token = ? AND r.status IN ('running', 'waiting_approval'))
-RETURNING *`, fence.Token, fence.Owner, executionStepID, now.UTC(), now.UTC(), stepID, userID, planID,
-			userID, userID, fence.Owner, fence.Token).Scan(&record).Error
+RETURNING *`, fence.Token, fence.Owner, executionStepID, now.UTC(), now.UTC(), stepID, userID, planID).Scan(&record).Error
 	}); err != nil {
 		return biz.PlanStep{}, catalogError("claim plan step", err)
 	}
@@ -418,6 +747,13 @@ func (r *PlanRepository) UpdatePlanStep(ctx context.Context, userID, planID, ste
 	}
 	var record planStepModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		status, err := lockWorkerPlan(tx, userID, planID, fence, now)
+		if err != nil {
+			return err
+		}
+		if biz.PlanTerminal(status) {
+			return fmt.Errorf("%w: plan no longer accepts step settlement", biz.ErrResourceConflict)
+		}
 		return tx.Raw(`
 UPDATE plan_steps
 SET status = ?, result_json = ?, error_code = ?, error_message = ?,
@@ -425,12 +761,8 @@ SET status = ?, result_json = ?, error_code = ?, error_message = ?,
     finished_at = ?, updated_at = ?, lease_owner = '', fence_token = 0
 WHERE id = ? AND user_id = ? AND plan_id = ?
   AND status = 'running' AND lease_owner = ? AND fence_token = ?
-  AND EXISTS (SELECT 1 FROM plans p JOIN agent_runs r ON r.id = p.run_id
-              WHERE p.id = plan_steps.plan_id AND p.user_id = ? AND r.user_id = ?
-                AND r.lease_owner = ? AND r.fencing_token = ? AND r.status IN ('running', 'waiting_approval'))
 RETURNING *`, string(update.Status), resultJSON, update.ErrorCode, update.ErrorMessage,
-			update.ExecutionStepID, finishedAt, now, stepID, userID, planID, fence.Owner, fence.Token,
-			userID, userID, fence.Owner, fence.Token).Scan(&record).Error
+			update.ExecutionStepID, finishedAt, now, stepID, userID, planID, fence.Owner, fence.Token).Scan(&record).Error
 	}); err != nil {
 		return biz.PlanStep{}, catalogError("update plan step", err)
 	}
@@ -441,7 +773,7 @@ RETURNING *`, string(update.Status), resultJSON, update.ErrorCode, update.ErrorM
 }
 
 // ResolvePlanStep 以当前状态为前置条件推进等待审批或待执行步骤。
-func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from biz.PlanStepStatus, update biz.PlanStepUpdate) (biz.PlanStep, error) {
+func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from biz.PlanStepStatus, fence biz.PlanFence, update biz.PlanStepUpdate) (biz.PlanStep, error) {
 	if err := biz.TransitionPlanStepStatus(from, update.Status); err != nil {
 		return biz.PlanStep{}, err
 	}
@@ -456,6 +788,13 @@ func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, st
 	}
 	var record planStepModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		status, err := lockWorkerPlan(tx, userID, planID, fence, now)
+		if err != nil {
+			return err
+		}
+		if biz.PlanTerminal(status) && (status != biz.PlanFailed || update.Status != biz.PlanStepSkipped) {
+			return fmt.Errorf("%w: plan no longer accepts step resolution", biz.ErrResourceConflict)
+		}
 		return tx.Raw(`
 UPDATE plan_steps
 SET status = ?, result_json = ?, error_code = ?, error_message = ?,

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestClientCacheEvictsStaleToolsAndRetriesFailedDiscovery(t *testing.T) {
@@ -60,7 +62,7 @@ func TestClientCacheReusesClientAndTools(t *testing.T) {
 	var listCalls int32
 	server := countListCalls(t, &listCalls)
 	cache := NewClientCache(time.Minute)
-	key := CacheKey("cache-key", nil, false, time.Second)
+	key := CacheKey(uuid.New(), uuid.New(), "cache-key", nil, false, time.Second)
 	build := func(context.Context) (*Client, error) {
 		return NewClient(server.URL, "", "", 5*time.Second, WithHTTPClient(server.Client()))
 	}
@@ -156,14 +158,15 @@ func TestClientCacheSingleFlight(t *testing.T) {
 
 // TestCacheKeySeparatesAuth 验证不同鉴权头生成不同缓存键。
 func TestCacheKeySeparatesAuth(t *testing.T) {
+	userID, serverID := uuid.New(), uuid.New()
 	headersA := http.Header{"Authorization": []string{"Bearer a"}}
 	headersB := http.Header{"Authorization": []string{"Bearer b"}}
-	if CacheKey("https://example.com/mcp", headersA, false, time.Second) ==
-		CacheKey("https://example.com/mcp", headersB, false, time.Second) {
+	if CacheKey(userID, serverID, "https://example.com/mcp", headersA, false, time.Second) ==
+		CacheKey(userID, serverID, "https://example.com/mcp", headersB, false, time.Second) {
 		t.Fatal("different credentials must not share a cache entry")
 	}
-	if CacheKey("https://example.com/mcp", headersA, false, time.Second) !=
-		CacheKey("https://example.com/mcp", headersA, false, time.Second) {
+	if CacheKey(userID, serverID, "https://example.com/mcp", headersA, false, time.Second) !=
+		CacheKey(userID, serverID, "https://example.com/mcp", headersA, false, time.Second) {
 		t.Fatal("cache key must be stable")
 	}
 	// 头顺序不同不应影响键。
@@ -173,8 +176,8 @@ func TestCacheKeySeparatesAuth(t *testing.T) {
 	same := http.Header{}
 	same.Set("X-A", "1")
 	same.Set("X-B", "2")
-	if CacheKey("https://example.com/mcp", reordered, false, time.Second) !=
-		CacheKey("https://example.com/mcp", same, false, time.Second) {
+	if CacheKey(userID, serverID, "https://example.com/mcp", reordered, false, time.Second) !=
+		CacheKey(userID, serverID, "https://example.com/mcp", same, false, time.Second) {
 		t.Fatal("header order must not change the cache key")
 	}
 }

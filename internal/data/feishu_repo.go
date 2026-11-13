@@ -502,37 +502,6 @@ func (r *FeishuConversationRepositoryImpl) RestoreConversation(ctx context.Conte
 	return int(affected), nil
 }
 
-// PromoteConversationThread 把主时间线根消息过渡别名升级为飞书真实话题 ID。
-// 升级后话题内追问可直接按 thread_id 命中绑定，无需依赖 root_id 回退。
-func (r *FeishuConversationRepositoryImpl) PromoteConversationThread(ctx context.Context, userID, sessionID uuid.UUID, legacyThreadID, threadID string) (int, error) {
-	if userID == uuid.Nil || sessionID == uuid.Nil || legacyThreadID == "" || threadID == "" {
-		return 0, fmt.Errorf("%w: promote requires user, session and thread ids", biz.ErrInvalidConfig)
-	}
-	if legacyThreadID == threadID {
-		return 0, nil
-	}
-	var affected int64
-	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		result := tx.Model(&externalBindingModel{}).
-			Where("user_id = ? AND session_id = ? AND thread_id = ? AND status = ?", userID, sessionID, legacyThreadID, biz.FeishuBindingActive).
-			Update("thread_id", threadID)
-		if result.Error != nil && errors.Is(result.Error, gorm.ErrDuplicatedKey) {
-			// 其他副本已完成升级并写入了真实话题 ID，视为幂等成功。
-			affected = 0
-			return nil
-		}
-		if result.Error != nil {
-			return result.Error
-		}
-		affected = result.RowsAffected
-		return nil
-	})
-	if err != nil {
-		return 0, catalogError("promote feishu conversation thread", err)
-	}
-	return int(affected), nil
-}
-
 // IsSharedSession 判断会话是否存在群聊话题绑定；查询必须按 user_id 与会话 ID 限定。
 // 关键步骤：单聊绑定固定使用 p2p 话题键，任何非 p2p 的历史绑定都视为群聊共享会话。
 func (r *FeishuConversationRepositoryImpl) IsSharedSession(ctx context.Context, userID, sessionID uuid.UUID) (bool, error) {
@@ -666,6 +635,9 @@ type feishuOutboundModel struct {
 	RunID uuid.UUID `gorm:"type:uuid"`
 	// AppID 接收消息的飞书应用。
 	AppID string
+	// BotID 和 DefaultRoute 保存验签时的发送方路由。
+	BotID        *uuid.UUID `gorm:"type:uuid"`
+	DefaultRoute bool
 	// ChatID 目标会话。
 	ChatID string
 	// ThreadID 目标话题。
@@ -686,6 +658,8 @@ type feishuOutboundModel struct {
 	AvailableAt time.Time
 	// LeaseOwner 租约持有者。
 	LeaseOwner string
+	// FencingToken 每次领取时递增，与失败预算分别计数。
+	FencingToken int64
 	// LeaseExpiresAt 租约到期时间。
 	LeaseExpiresAt *time.Time
 	// DedupeKey 业务去重键。
@@ -722,8 +696,17 @@ func (r *FeishuOutboundRepository) CreateOutbound(ctx context.Context, outbound 
 	if outbound.DedupeKey == "" || outbound.ChatID == "" || outbound.RunID == uuid.Nil {
 		return fmt.Errorf("%w: outbound requires dedupe key, chat and run", biz.ErrInvalidConfig)
 	}
+	registeredRoute := outbound.BotID != uuid.Nil
+	if outbound.AppID == "" || outbound.DefaultRoute == registeredRoute {
+		return fmt.Errorf("%w: outbound requires a verified sender route", biz.ErrInvalidConfig)
+	}
+	var botID *uuid.UUID
+	if registeredRoute {
+		botID = &outbound.BotID
+	}
 	record := feishuOutboundModel{
 		ID: outbound.ID, UserID: outbound.UserID, SessionID: outbound.SessionID, RunID: outbound.RunID, AppID: outbound.AppID,
+		BotID: botID, DefaultRoute: outbound.DefaultRoute,
 		ChatID: outbound.ChatID, ThreadID: outbound.ThreadID, ReplyToMessageID: outbound.ReplyToMessageID,
 		Kind: outbound.Kind, Status: "pending", MaxAttempts: 8, AvailableAt: time.Now().UTC(),
 		DedupeKey: outbound.DedupeKey, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
@@ -739,47 +722,23 @@ func (r *FeishuOutboundRepository) ClaimOutbound(ctx context.Context, workerID s
 	if workerID == "" || lease <= 0 {
 		return biz.FeishuOutbound{}, false, fmt.Errorf("%w: worker and lease are required", biz.ErrInvalidConfig)
 	}
-	type claimed struct {
-		ID               uuid.UUID
-		UserID           uuid.UUID
-		SessionID        uuid.UUID
-		RunID            uuid.UUID
-		AppID            string
-		ChatID           string
-		ThreadID         string
-		ReplyToMessageID string
-		MessageID        string
-		Kind             string
-		Status           string
-		Attempts         int
-		MaxAttempts      int
-		DedupeKey        string
-		CardUpdatedAt    *time.Time
-		CardFingerprint  string
-		CreatedAt        time.Time
-	}
-	var record claimed
+	var record feishuOutboundModel
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
 		query := `
 WITH candidate AS (
   SELECT id FROM feishu_outbound_messages
   WHERE (
     (status IN ('pending', 'retrying') AND available_at <= ?)
-    OR (status = 'sending' AND (lease_expires_at IS NULL OR lease_expires_at < ?))
+    OR (status = 'sending' AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
   )
   ORDER BY available_at, created_at, id
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
 UPDATE feishu_outbound_messages SET status = 'sending', attempts = attempts + 1,
-  lease_owner = ?, lease_expires_at = ?, updated_at = ?
+  lease_owner = ?, lease_expires_at = ?, fencing_token = fencing_token + 1, updated_at = ?
 FROM candidate WHERE feishu_outbound_messages.id = candidate.id
-RETURNING feishu_outbound_messages.id, feishu_outbound_messages.user_id, feishu_outbound_messages.session_id,
-  feishu_outbound_messages.run_id, feishu_outbound_messages.app_id, feishu_outbound_messages.chat_id, feishu_outbound_messages.thread_id,
-  feishu_outbound_messages.reply_to_message_id, feishu_outbound_messages.message_id, feishu_outbound_messages.kind,
-  feishu_outbound_messages.status, feishu_outbound_messages.attempts, feishu_outbound_messages.max_attempts,
-  feishu_outbound_messages.dedupe_key, feishu_outbound_messages.card_updated_at,
-  feishu_outbound_messages.card_fingerprint, feishu_outbound_messages.created_at`
+RETURNING feishu_outbound_messages.*`
 		return tx.Raw(query, now, now, workerID, now.Add(lease), now).Scan(&record).Error
 	})
 	if err != nil {
@@ -792,8 +751,14 @@ RETURNING feishu_outbound_messages.id, feishu_outbound_messages.user_id, feishu_
 	if record.CardUpdatedAt != nil {
 		cardUpdatedAt = *record.CardUpdatedAt
 	}
+	var botID uuid.UUID
+	if record.BotID != nil {
+		botID = *record.BotID
+	}
 	return biz.FeishuOutbound{
 		ID: record.ID, UserID: record.UserID, SessionID: record.SessionID, RunID: record.RunID, AppID: record.AppID,
+		BotID: botID, DefaultRoute: record.DefaultRoute,
+		LeaseOwner: record.LeaseOwner, FencingToken: record.FencingToken, LeaseExpiresAt: *record.LeaseExpiresAt,
 		ChatID: record.ChatID, ThreadID: record.ThreadID, ReplyToMessageID: record.ReplyToMessageID,
 		MessageID: record.MessageID, Kind: record.Kind, Status: record.Status, Attempts: record.Attempts,
 		MaxAttempts: record.MaxAttempts, DedupeKey: record.DedupeKey, CardUpdatedAt: cardUpdatedAt,
@@ -801,79 +766,93 @@ RETURNING feishu_outbound_messages.id, feishu_outbound_messages.user_id, feishu_
 	}, true, nil
 }
 
-// UpdateOutboundMessageID 保存飞书回复消息 ID。
-func (r *FeishuOutboundRepository) UpdateOutboundMessageID(ctx context.Context, id uuid.UUID, messageID string, now time.Time) error {
+// feishuOutboundClaim filters by the durable claim and never matches a legacy claim with token zero.
+func feishuOutboundClaim(tx *gorm.DB, outbound biz.FeishuOutbound, now time.Time) *gorm.DB {
+	return tx.Model(&feishuOutboundModel{}).
+		Where("id = ? AND status = 'sending' AND lease_owner = ? AND fencing_token = ? AND fencing_token > 0 AND lease_expires_at > ?",
+			outbound.ID, outbound.LeaseOwner, outbound.FencingToken, now)
+}
+
+func checkFeishuOutboundClaimResult(result *gorm.DB) error {
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return biz.ErrFeishuOutboundClaimLost
+	}
+	return nil
+}
+
+// CheckOutboundClaim 在调用外部 API 前重新校验领取凭证。
+func (r *FeishuOutboundRepository) CheckOutboundClaim(ctx context.Context, outbound biz.FeishuOutbound, now time.Time) error {
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Model(&feishuOutboundModel{}).Where("id = ?", id).
-			Updates(map[string]any{"message_id": messageID, "updated_at": now}).Error
+		var record struct{ ID uuid.UUID }
+		return checkFeishuOutboundClaimResult(feishuOutboundClaim(tx, outbound, now).Select("id").Find(&record))
 	})
-	return catalogError("update feishu outbound message id", err)
+	return catalogError("check feishu outbound claim", err)
+}
+
+func (r *FeishuOutboundRepository) updateOutboundClaim(ctx context.Context, operation string, outbound biz.FeishuOutbound, now time.Time, updates map[string]any) error {
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return checkFeishuOutboundClaimResult(feishuOutboundClaim(tx, outbound, now).Updates(updates))
+	})
+	return catalogError(operation, err)
+}
+
+// UpdateOutboundMessageID 保存飞书回复消息 ID。
+func (r *FeishuOutboundRepository) UpdateOutboundMessageID(ctx context.Context, outbound biz.FeishuOutbound, messageID string, now time.Time) error {
+	return r.updateOutboundClaim(ctx, "update feishu outbound message id", outbound, now,
+		map[string]any{"message_id": messageID, "updated_at": now})
 }
 
 // MarkOutboundCardUpdated 记录卡片成功更新时间与内容指纹，供跨副本更新节流与去重。
-func (r *FeishuOutboundRepository) MarkOutboundCardUpdated(ctx context.Context, id uuid.UUID, fingerprint string, now time.Time) error {
+func (r *FeishuOutboundRepository) MarkOutboundCardUpdated(ctx context.Context, outbound biz.FeishuOutbound, fingerprint string, now time.Time) error {
 	if fingerprint == "" {
 		return fmt.Errorf("%w: card fingerprint is required", biz.ErrInvalidConfig)
 	}
-	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Model(&feishuOutboundModel{}).Where("id = ?", id).
-			Updates(map[string]any{"card_updated_at": now, "card_fingerprint": fingerprint, "updated_at": now}).Error
-	})
-	return catalogError("mark feishu card updated", err)
+	return r.updateOutboundClaim(ctx, "mark feishu card updated", outbound, now,
+		map[string]any{"card_updated_at": now, "card_fingerprint": fingerprint, "updated_at": now})
 }
 
 // DeferOutbound 延后检查且回退本次领取计数，避免轮询耗尽失败预算。
-func (r *FeishuOutboundRepository) DeferOutbound(ctx context.Context, id uuid.UUID, retryAt, now time.Time) error {
+func (r *FeishuOutboundRepository) DeferOutbound(ctx context.Context, outbound biz.FeishuOutbound, retryAt, now time.Time) error {
 	if retryAt.IsZero() {
 		retryAt = now
 	}
-	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Model(&feishuOutboundModel{}).Where("id = ? AND status = 'sending'", id).
-			Updates(map[string]any{
-				"status": "pending", "attempts": gorm.Expr("GREATEST(attempts - 1, 0)"),
-				"available_at": retryAt, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
-			}).Error
+	return r.updateOutboundClaim(ctx, "defer feishu outbound", outbound, now, map[string]any{
+		"status": "pending", "attempts": gorm.Expr("GREATEST(attempts - 1, 0)"),
+		"available_at": retryAt, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
 	})
-	return catalogError("defer feishu outbound", err)
+}
+
+func feishuOutboundCompletion(now time.Time) map[string]any {
+	return map[string]any{
+		"status": "completed", "completed_at": now, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
+	}
 }
 
 // CompleteOutbound 标记外发成功。
-func (r *FeishuOutboundRepository) CompleteOutbound(ctx context.Context, id uuid.UUID, now time.Time) error {
-	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Model(&feishuOutboundModel{}).Where("id = ? AND status = 'sending'", id).
-			Updates(map[string]any{
-				"status": "completed", "completed_at": now, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
-			}).Error
-	})
-	return catalogError("complete feishu outbound", err)
+func (r *FeishuOutboundRepository) CompleteOutbound(ctx context.Context, outbound biz.FeishuOutbound, now time.Time) error {
+	return r.updateOutboundClaim(ctx, "complete feishu outbound", outbound, now, feishuOutboundCompletion(now))
 }
 
 // FailOutbound 记录失败并在预算内退避，超出预算进入死信。
-func (r *FeishuOutboundRepository) FailOutbound(ctx context.Context, id uuid.UUID, reason string, retryAt, now time.Time) error {
+func (r *FeishuOutboundRepository) FailOutbound(ctx context.Context, outbound biz.FeishuOutbound, reason string, retryAt, now time.Time) error {
+	if retryAt.IsZero() {
+		retryAt = now
+	}
 	if len(reason) > 1024 {
 		reason = reason[:1024]
 	}
-	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		var record feishuOutboundModel
-		if err := tx.First(&record, "id = ? AND status = 'sending'", id).Error; err != nil {
-			return err
-		}
-		status := "retrying"
-		updates := map[string]any{
-			"status": status, "last_error": reason, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
-		}
-		if record.Attempts >= record.MaxAttempts {
-			updates["status"] = "dead"
-			updates["completed_at"] = now
-		} else {
-			if retryAt.IsZero() {
-				retryAt = now
-			}
-			updates["available_at"] = retryAt
-		}
-		return tx.Model(&feishuOutboundModel{}).Where("id = ?", id).Updates(updates).Error
+	return r.updateOutboundClaim(ctx, "fail feishu outbound", outbound, now, map[string]any{
+		"status":           gorm.Expr("CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'retrying' END"),
+		"completed_at":     gorm.Expr("CASE WHEN attempts >= max_attempts THEN ? ELSE completed_at END", now),
+		"available_at":     gorm.Expr("CASE WHEN attempts >= max_attempts THEN available_at ELSE ? END", retryAt),
+		"last_error":       reason,
+		"lease_owner":      "",
+		"lease_expires_at": nil,
+		"updated_at":       now,
 	})
-	return catalogError("fail feishu outbound", err)
 }
 
 // LatestAssistantMessage 读取指定 Run 产生的助手消息；runID 为空时退回会话最近一条助手消息。

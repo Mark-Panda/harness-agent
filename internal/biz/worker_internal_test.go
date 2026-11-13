@@ -47,6 +47,7 @@ func TestFailureDetailsMapping(t *testing.T) {
 		{name: "step limit", err: fmt.Errorf("%w: 12", react.ErrStepLimit), code: "step_limit_exceeded"},
 		{name: "tool loop", err: fmt.Errorf("%w: search", react.ErrToolLoop), code: "tool_loop_detected"},
 		{name: "budget", err: fmt.Errorf("%w: cost", react.ErrBudgetExceeded), code: "budget_exceeded"},
+		{name: "plan budget", err: ErrPlanBudget, code: "plan_budget_exceeded"},
 		{name: "no candidates", err: fmt.Errorf("%w: none", model.ErrNoCandidates), code: "no_model_candidates"},
 		{name: "attempt limit", err: fmt.Errorf("%w", model.ErrAttemptLimit), code: "model_attempts_exhausted"},
 		{name: "switch limit", err: fmt.Errorf("%w", model.ErrSwitchLimit), code: "model_switches_exhausted"},
@@ -358,6 +359,58 @@ func newObservedWorker(steps ExecutionStepRepository) *ExecutionWorker {
 	return &ExecutionWorker{steps: steps, config: WorkerConfig{}.normalize(), clock: func() time.Time { return time.Now().UTC() }, logger: slog.Default()}
 }
 
+type pausedPlanToolSteps struct {
+	fakeStepRepository
+	fence PlanFence
+}
+
+func (r *pausedPlanToolSteps) StartPlanToolStep(_ context.Context, _ ExecutionStep, fence PlanFence) (ExecutionStep, error) {
+	r.fence = fence
+	return ExecutionStep{}, ErrPlanPaused
+}
+
+func TestObservedPlanToolHonorsDispatchFence(t *testing.T) {
+	repo := &pausedPlanToolSteps{}
+	inner := &fakeRuntimeTool{name: "mcp_docs_search"}
+	tool := observedTool{inner: inner, worker: newObservedWorker(repo), run: Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan}}
+	fence := PlanFence{Owner: "plan-worker", Token: 9}
+	ctx := context.WithValue(withParentStep(context.Background(), uuid.New()), planToolFenceContextKey{}, fence)
+	_, err := tool.Invoke(ctx, json.RawMessage(`{}`))
+	if !errors.Is(err, ErrPlanPaused) || inner.calls != 0 || len(repo.started) != 0 || len(repo.payloads) != 0 || repo.fence != fence {
+		t.Fatalf("paused tool reached dispatch: calls=%d, starts=%v, fence=%+v, error=%v", inner.calls, repo.started, repo.fence, err)
+	}
+}
+
+type planBudgetRejectingAttempts struct {
+	fakeAttemptRepository
+	call ModelCall
+}
+
+func (r *planBudgetRejectingAttempts) CreateModelCall(_ context.Context, call ModelCall) (ModelCall, error) {
+	r.call = call
+	return ModelCall{}, ErrPlanBudget
+}
+
+func TestPlanAttemptStopsOnDurableBudgetRejection(t *testing.T) {
+	steps := &fakeStepRepository{}
+	attempts := &planBudgetRejectingAttempts{}
+	worker := newObservedWorker(steps)
+	worker.runs, worker.attempts = stubRunRepository{}, attempts
+	worker.config.PlanMaxTokens, worker.config.PlanMaxCost = 50, 1.25
+	observer := &runAttemptObserver{
+		worker: worker, run: Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan},
+		stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
+	}
+	err := observer.AttemptStarted(context.Background(), model.AttemptRecord{
+		AttemptNo: 1, ProviderID: uuid.NewString(), ModelID: uuid.NewString(), InputTokens: 10, OutputTokens: 20,
+	})
+	if !errors.Is(err, ErrPlanBudget) || attempts.call.PlanMaxTokens != 50 || attempts.call.PlanMaxCost != 1.25 ||
+		attempts.call.RequestManifest["plan_usage"] != true || len(steps.finished) != 1 ||
+		steps.finished[0].Status != StepCancelled || steps.finished[0].ErrorCode != "plan_budget_exceeded" {
+		t.Fatalf("durable budget rejection = %v, call=%+v, steps=%+v", err, attempts.call, steps.finished)
+	}
+}
+
 // TestObservedToolPersistsStepsAndPayloads 验证工具调用前后的步骤、入参与结果均落库。
 func TestObservedToolPersistsStepsAndPayloads(t *testing.T) {
 	repo := &fakeStepRepository{}
@@ -378,6 +431,22 @@ func TestObservedToolPersistsStepsAndPayloads(t *testing.T) {
 	}
 	if inner.calls != 1 {
 		t.Fatalf("tool was called %d times", inner.calls)
+	}
+}
+
+func TestObservedToolRedactsExecutionAuditWithoutChangingToolResult(t *testing.T) {
+	steps := &fakeStepRepository{}
+	const result = `{"content":[{"text":"{\"access_token\":\"output-secret\",\"status\":\"ok\"}"}]}`
+	inner := &fakeRuntimeTool{name: "mcp_docs_search", output: json.RawMessage(result)}
+	tool := observedTool{inner: inner, worker: newObservedWorker(steps), run: Run{ID: uuid.New(), UserID: uuid.New()}}
+	output, err := tool.Invoke(context.Background(), json.RawMessage(`{"password":"input-secret","query":"visible"}`))
+	if err != nil || string(output) != result || len(steps.payloads) != 2 {
+		t.Fatalf("tool result or audit capture changed: %s, %v, %d payloads", output, err, len(steps.payloads))
+	}
+	inputAudit, outputAudit := steps.payloads[0].ContentText, steps.payloads[1].ContentText
+	if strings.Contains(inputAudit, "input-secret") || strings.Contains(outputAudit, "output-secret") ||
+		!strings.Contains(inputAudit, "visible") || !strings.Contains(outputAudit, "ok") {
+		t.Fatalf("audit content was not selectively redacted: %s, %s", inputAudit, outputAudit)
 	}
 }
 
@@ -601,10 +670,10 @@ func (f *fakeApprovalRepository) DecideApproval(_ context.Context, userID, appro
 }
 
 // ClaimApprovalExecution 以 approved 为前置条件进入执行态。
-func (f *fakeApprovalRepository) ClaimApprovalExecution(_ context.Context, userID, approvalID uuid.UUID, now time.Time) (ToolApproval, error) {
+func (f *fakeApprovalRepository) ClaimApprovalExecution(_ context.Context, userID, runID, approvalID uuid.UUID, _ RunFence, now time.Time) (ToolApproval, error) {
 	for index := range f.approvals {
 		approval := &f.approvals[index]
-		if approval.ID != approvalID || approval.UserID != userID {
+		if approval.ID != approvalID || approval.UserID != userID || approval.RunID != runID {
 			continue
 		}
 		if approval.Status != ApprovalApproved {
@@ -848,7 +917,7 @@ func (f fakeSessionRepository) AppendMessage(_ context.Context, message Message,
 }
 
 // AppendMessageIdempotent 返回原消息，测试不使用。
-func (f fakeSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+func (f fakeSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent, _ RunFence) (Message, error) {
 	return message, nil
 }
 
@@ -1132,7 +1201,7 @@ func TestPersistRunnerMessageRejectsReusedIDWithDifferentContent(t *testing.T) {
 	}}
 	worker := &ExecutionWorker{sessions: sessions}
 	payload := map[string]any{"index": 3, "role": "assistant", "content": "第二次内容"}
-	if err := worker.persistRunnerMessage(context.Background(), run, payload); err == nil {
+	if err := worker.persistRunnerMessage(context.Background(), run, RunFence{}, payload); err == nil {
 		t.Fatalf("expected conflict error when a deterministic message ID is reused with different content")
 	}
 }

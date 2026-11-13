@@ -91,7 +91,7 @@ func TestWorkerExecutesLowRiskMCPTool(t *testing.T) {
 	t.Cleanup(modelServer.Close)
 	mcpServer := mcpToolServer(t, "mcp-result")
 
-	jobs := mocks.NewMockJobQueue(ctrl)
+	jobs := mocks.NewMockRunExecutionQueue(ctrl)
 	runs := mocks.NewMockRunRepository(ctrl)
 	sessions := mocks.NewMockSessionRepository(ctrl)
 	attempts := mocks.NewMockModelCallRepository(ctrl)
@@ -159,6 +159,7 @@ func TestWorkerExecutesLowRiskMCPTool(t *testing.T) {
 	fence := biz.RunFence{Owner: "worker-1", Token: 9}
 	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
 	runs.EXPECT().ClaimRun(gomock.Any(), userID, runID, "worker-1", gomock.Any(), gomock.Any()).Return(running, fence, nil)
+	runs.EXPECT().AuthorizeToolDispatch(gomock.Any(), userID, runID, gomock.Not(gomock.Nil()), fence, gomock.Any()).Return(nil)
 	sessions.EXPECT().ListMessages(gomock.Any(), userID, sessionID, 50, "").Return(biz.Page[biz.Message]{
 		Items: []biz.Message{{Role: biz.MessageUser, Content: "请搜索"}},
 	}, nil)
@@ -179,8 +180,8 @@ func TestWorkerExecutesLowRiskMCPTool(t *testing.T) {
 	).AnyTimes()
 	var muMessages sync.Mutex
 	var persistedMessages []biz.Message
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, message biz.Message, _ biz.OutboxEvent) (biz.Message, error) {
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, message biz.Message, _ biz.OutboxEvent, _ biz.RunFence) (biz.Message, error) {
 			muMessages.Lock()
 			persistedMessages = append(persistedMessages, message)
 			muMessages.Unlock()

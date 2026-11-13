@@ -183,6 +183,11 @@ func (r *SummaryRepository) LatestSummaryVersion(ctx context.Context, userID, se
 	return version, nil
 }
 
+// Legacy Feishu topics can keep a summary within their own session. Shared group
+// projections are reconstructed from the transcript and cannot produce summaries.
+const summarizableSession = `s.status = 'active' AND NOT s.feishu_group_projection
+AND s.memory_policy IN ('private', 'group')`
+
 // SaveSummary 以期望版本、父版本与来源完整性守卫写入新版本，并原子替换旧 active 版本。
 // 返回 applied=false 表示任务已过期或被并发版本超越，调用方应视为幂等完成。
 func (r *SummaryRepository) SaveSummary(ctx context.Context, summary biz.SessionSummary, expectedVersion int64, event biz.OutboxEvent) (biz.SessionSummary, bool, error) {
@@ -209,6 +214,15 @@ func (r *SummaryRepository) SaveSummary(ctx context.Context, summary biz.Session
 	applied := false
 	conflict := false
 	err := WithScope(ctx, r.db, Scope{UserID: summary.UserID}, func(tx *gorm.DB) error {
+		// Hold the policy row through the summary and outbox write.
+		var eligible bool
+		if err := tx.Raw(`SELECT true FROM sessions s WHERE s.user_id = ? AND s.id = ? AND `+
+			summarizableSession+` FOR SHARE OF s`, summary.UserID, summary.SessionID).Scan(&eligible).Error; err != nil {
+			return err
+		}
+		if !eligible {
+			return biz.ErrSummarySourceInvalid
+		}
 		var active sessionSummaryModel
 		lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("user_id = ? AND session_id = ? AND status = ?", summary.UserID, summary.SessionID, biz.SummaryActive).
@@ -418,6 +432,15 @@ func (r *SessionRepository) ListMessagesAfter(ctx context.Context, userID, sessi
 
 // ListMessagesByIDs 按 ID 读取消息并按时间正序返回；缺失或已删除的消息不会返回。
 func (r *SessionRepository) ListMessagesByIDs(ctx context.Context, userID, sessionID uuid.UUID, messageIDs []uuid.UUID) ([]biz.Message, error) {
+	return r.listMessagesByIDs(ctx, userID, sessionID, messageIDs, false)
+}
+
+// ListSummarizableMessages filters queued sources using the current session policy.
+func (r *SessionRepository) ListSummarizableMessages(ctx context.Context, userID, sessionID uuid.UUID, messageIDs []uuid.UUID) ([]biz.Message, error) {
+	return r.listMessagesByIDs(ctx, userID, sessionID, messageIDs, true)
+}
+
+func (r *SessionRepository) listMessagesByIDs(ctx context.Context, userID, sessionID uuid.UUID, messageIDs []uuid.UUID, forSummary bool) ([]biz.Message, error) {
 	if userID == uuid.Nil || sessionID == uuid.Nil || len(messageIDs) == 0 {
 		return nil, fmt.Errorf("%w: user, session and message ids are required", biz.ErrInvalidConfig)
 	}
@@ -426,7 +449,12 @@ func (r *SessionRepository) ListMessagesByIDs(ctx context.Context, userID, sessi
 	}
 	var records []messageModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.Where("user_id = ? AND session_id = ? AND deleted_at IS NULL AND id IN ?", userID, sessionID, messageIDs).
+		query := tx.Table("messages m").Where("m.user_id = ? AND m.session_id = ? AND m.deleted_at IS NULL AND m.id IN ?", userID, sessionID, messageIDs)
+		if forSummary {
+			query = query.Where(`m.feishu_group_message_id IS NULL AND EXISTS (
+				SELECT 1 FROM sessions s WHERE s.id = m.session_id AND s.user_id = m.user_id AND ` + summarizableSession + `)`)
+		}
+		return query.
 			Order("created_at ASC, id ASC").Find(&records).Error
 	})
 	if err != nil {

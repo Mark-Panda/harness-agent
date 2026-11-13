@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -108,6 +109,15 @@ func NewExecutionStepRepository(db *gorm.DB) *ExecutionStepRepository {
 
 // StartStep 在 Run 级 advisory lock 内分配单调 step_seq，避免并发步骤产生重复序号。
 func (r *ExecutionStepRepository) StartStep(ctx context.Context, step biz.ExecutionStep) (biz.ExecutionStep, error) {
+	return r.startStep(ctx, step, nil)
+}
+
+// StartPlanToolStep records dispatch of a model step's tool while the Run and Plan are locked.
+func (r *ExecutionStepRepository) StartPlanToolStep(ctx context.Context, step biz.ExecutionStep, fence biz.PlanFence) (biz.ExecutionStep, error) {
+	return r.startStep(ctx, step, &fence)
+}
+
+func (r *ExecutionStepRepository) startStep(ctx context.Context, step biz.ExecutionStep, fence *biz.PlanFence) (biz.ExecutionStep, error) {
 	if step.ID == uuid.Nil {
 		step.ID = uuid.New()
 	}
@@ -131,11 +141,23 @@ func (r *ExecutionStepRepository) StartStep(ctx context.Context, step biz.Execut
 	}
 	var record executionStepModel
 	err := WithScope(ctx, r.db, Scope{UserID: step.UserID}, func(tx *gorm.DB) error {
+		if fence != nil {
+			planID, err := lockExecutingPlan(tx, step.UserID, step.RunID, *fence, step.CreatedAt)
+			if err != nil {
+				return err
+			}
+			var parent planStepModel
+			if err := tx.Select("id").Take(&parent, `user_id = ? AND plan_id = ? AND execution_step_id = ?
+AND status = 'running' AND lease_owner = ? AND fence_token = ?`,
+				step.UserID, planID, step.ParentStepID, fence.Owner, fence.Token).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "step:"+step.RunID.String()).Error; err != nil {
 			return err
 		}
 		var maximum int64
-		if err := tx.Model(&executionStepModel{}).Where("run_id = ?", step.RunID).
+		if err := tx.Model(&executionStepModel{}).Where("user_id = ? AND run_id = ?", step.UserID, step.RunID).
 			Select("COALESCE(MAX(step_seq), 0)").Scan(&maximum).Error; err != nil {
 			return err
 		}
@@ -222,6 +244,26 @@ func (r *ExecutionStepRepository) ListSteps(ctx context.Context, userID, runID u
 	return steps, nil
 }
 
+// ListToolStepsForRecovery 读取 Run 的工具步骤，可按父步骤限定范围。
+func (r *ExecutionStepRepository) ListToolStepsForRecovery(ctx context.Context, userID, runID uuid.UUID, parentStepID *uuid.UUID) ([]biz.ExecutionStep, error) {
+	var records []executionStepModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		query := tx.Where("user_id = ? AND run_id = ? AND kind = ?", userID, runID, biz.StepKindTool)
+		if parentStepID != nil {
+			query = query.Where("parent_step_id = ?", *parentStepID)
+		}
+		return query.Order("step_seq").Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list tool steps for recovery", err)
+	}
+	steps := make([]biz.ExecutionStep, 0, len(records))
+	for _, record := range records {
+		steps = append(steps, toBizStep(record))
+	}
+	return steps, nil
+}
+
 // SavePayload 保存脱敏载荷；JSON 与文本互斥，二者都为空时仅保存元数据。
 func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.ExecutionPayload) (biz.ExecutionPayload, error) {
 	if payload.ID == uuid.Nil {
@@ -239,7 +281,9 @@ func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.E
 	if payload.SchemaVersion <= 0 {
 		payload.SchemaVersion = 1
 	}
-	if payload.RedactionVersion <= 0 {
+	if payload.CaptureMode == biz.CaptureRedacted {
+		payload.RedactionVersion = biz.ExecutionRedactionVersion
+	} else if payload.RedactionVersion <= 0 {
 		payload.RedactionVersion = 1
 	}
 	if payload.CreatedAt.IsZero() {
@@ -258,15 +302,19 @@ func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.E
 		if err != nil {
 			return biz.ExecutionPayload{}, err
 		}
+		if payload.CaptureMode == biz.CaptureRedacted {
+			encoded = []byte(biz.RedactExecutionText(string(encoded)))
+		}
 		record.ContentJSON = datatypes.JSON(encoded)
 		record.SavedSizeBytes = int64(len(encoded))
 	}
 	if payload.ContentText != "" {
-		text := payload.ContentText
-		record.ContentText = &text
-		if record.SavedSizeBytes == 0 {
-			record.SavedSizeBytes = int64(len(text))
+		text := biz.RedactExecutionText(payload.ContentText)
+		if payload.Truncated && len(text) > len(payload.ContentText) {
+			text = strings.ToValidUTF8(text[:len(payload.ContentText)], "")
 		}
+		record.ContentText = &text
+		record.SavedSizeBytes = int64(len(text))
 	}
 	err := WithScope(ctx, r.db, Scope{UserID: payload.UserID}, func(tx *gorm.DB) error {
 		return tx.Create(&record).Error
@@ -318,15 +366,31 @@ func toBizStep(record executionStepModel) biz.ExecutionStep {
 
 // toBizPayload 将数据库行转换为领域载荷。
 func toBizPayload(record executionPayloadModel) (biz.ExecutionPayload, error) {
+	legacy := record.CaptureMode == string(biz.CaptureRedacted) && record.RedactionVersion < biz.ExecutionRedactionVersion
 	var content map[string]any
 	if len(record.ContentJSON) > 0 {
-		if err := json.Unmarshal(record.ContentJSON, &content); err != nil {
+		encoded := []byte(record.ContentJSON)
+		if legacy {
+			encoded = []byte(biz.RedactExecutionText(string(encoded)))
+			record.SavedSizeBytes = int64(len(encoded))
+		}
+		if err := json.Unmarshal(encoded, &content); err != nil {
 			return biz.ExecutionPayload{}, err
 		}
 	}
 	text := ""
 	if record.ContentText != nil {
 		text = *record.ContentText
+		if legacy {
+			if record.Truncated {
+				// The old capture truncated raw content before redaction. A partial
+				// structured value can no longer be reliably decoded or sanitized.
+				text = ""
+			} else {
+				text = biz.RedactExecutionText(text)
+			}
+			record.SavedSizeBytes = int64(len(text))
+		}
 	}
 	return biz.ExecutionPayload{
 		ID: record.ID, RunID: record.RunID, StepID: record.StepID, UserID: record.UserID,

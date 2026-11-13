@@ -45,7 +45,7 @@ type stubSessionRepository struct {
 }
 
 // AppendMessageIdempotent 返回输入消息。
-func (stubSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+func (stubSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent, _ RunFence) (Message, error) {
 	return message, nil
 }
 
@@ -56,7 +56,7 @@ type statefulSessionRepository struct {
 }
 
 // AppendMessageIdempotent 已存在时返回首次保存的内容，模拟 ON CONFLICT DO NOTHING。
-func (r *statefulSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
+func (r *statefulSessionRepository) AppendMessageIdempotent(_ context.Context, message Message, _ OutboxEvent, _ RunFence) (Message, error) {
 	if r.messages == nil {
 		r.messages = map[uuid.UUID]Message{}
 	}
@@ -69,7 +69,7 @@ func (r *statefulSessionRepository) AppendMessageIdempotent(_ context.Context, m
 
 // stubJobQueue 仅用于满足构造函数依赖。
 type stubJobQueue struct {
-	JobQueue
+	RunExecutionQueue
 }
 
 // stubProviders 仅用于满足构造函数依赖。
@@ -105,6 +105,36 @@ func (r *memoryPlanRepo) CreatePlan(_ context.Context, userID uuid.UUID, plan Pl
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	plan.UserID = userID
+	r.plans[plan.ID] = clonePlan(plan)
+	return clonePlan(plan), nil
+}
+
+func (r *memoryPlanRepo) ReplacePlan(_ context.Context, userID uuid.UUID, plan Plan, parentRevision int64, fence PlanFence, _ OutboxEvent) (Plan, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	parent, ok := r.plans[*plan.ParentPlanID]
+	if !ok {
+		return Plan{}, ErrResourceNotFound
+	}
+	manual := fence.Owner == ""
+	if !manual && parent.Status == PlanPaused {
+		return Plan{}, ErrPlanPaused
+	}
+	if !manual && parent.Status == PlanCancelled {
+		return Plan{}, ErrPlanCancelled
+	}
+	if parent.Revision != parentRevision || (manual && parent.Status != PlanPaused) || (!manual && parent.Status != PlanExecuting) {
+		return Plan{}, ErrPlanRevisionConflict
+	}
+	plan.UserID = userID
+	plan.Steps = CarryCompletedPlanSteps(plan.Steps, parent, manual)
+	parent.Status, parent.ErrorCode = PlanFailed, "plan_replanned"
+	if manual {
+		parent.Status, parent.ErrorCode = PlanCancelled, "plan_superseded"
+	}
+	parent.Revision++
+	parent.FinishedAt = &plan.CreatedAt
+	r.plans[parent.ID] = parent
 	r.plans[plan.ID] = clonePlan(plan)
 	return clonePlan(plan), nil
 }
@@ -397,6 +427,41 @@ func (noopAttemptRepository) ListModelCalls(_ context.Context, _, _ uuid.UUID, _
 	return nil, nil
 }
 
+type recoveredPlanUsageRepository struct {
+	*memoryPlanRepo
+	usage ModelCallUsage
+}
+
+func (r recoveredPlanUsageRepository) RecoverPlanUsage(context.Context, uuid.UUID, uuid.UUID) (ModelCallUsage, error) {
+	return r.usage, nil
+}
+
+func TestPlanModelUsageSeedsBudgetFromPersistedUsage(t *testing.T) {
+	ctx := context.Background()
+	run := Run{ID: uuid.New(), UserID: uuid.New()}
+	plans := newMemoryPlanRepo()
+	worker := &ExecutionWorker{plans: plans, attempts: &usageAttemptRepository{usage: ModelCallUsage{InputTokens: 25, OutputTokens: 11}}}
+	if usage, err := worker.planModelUsage(ctx, run); err != nil || usage.InputTokens != 25 || usage.OutputTokens != 11 {
+		t.Fatalf("usage before the first plan = %+v, %v", usage, err)
+	}
+	plans.seedPlan(Plan{ID: uuid.New(), RunID: run.ID, UserID: run.UserID, TotalInputTokens: 70})
+	if usage, err := worker.planModelUsage(ctx, run); err != nil || usage.InputTokens != 70 {
+		t.Fatalf("usage of an existing plan = %+v, %v", usage, err)
+	}
+	worker.plans = recoveredPlanUsageRepository{plans, ModelCallUsage{InputTokens: 90, OutputTokens: 10, EstimatedCost: 1.25}}
+	usage, err := worker.planModelUsage(ctx, run)
+	if err != nil || usage.InputTokens != 90 || usage.OutputTokens != 10 || usage.EstimatedCost != 1.25 {
+		t.Fatalf("usage recovered from prior runs = %+v, %v", usage, err)
+	}
+	budget := planAttemptBudget{&supervisorBudget{
+		changed: make(chan struct{}), maxTokens: 100, maxCost: 2,
+		used: supervisorUsage{input: usage.InputTokens, output: usage.OutputTokens, cost: usage.EstimatedCost},
+	}}
+	if _, _, err := budget.ReserveAttempt(ctx, model.Candidate{}, 1, 1); !errors.Is(err, ErrPlanBudget) {
+		t.Fatalf("attempt after budget exhaustion = %v", err)
+	}
+}
+
 // planWorkerFixture 构造可直接调用 executePlan 的 Worker 与测试服务器。
 func planWorkerFixture(t *testing.T, handler func(body string, w http.ResponseWriter)) (*ExecutionWorker, *memoryPlanRepo, *model.Router, *httptest.Server) {
 	t.Helper()
@@ -639,6 +704,26 @@ func TestExecutePlanToolStepSuccess(t *testing.T) {
 	stored, err := plans.GetPlanByRun(context.Background(), plan.UserID, plan.RunID)
 	if err != nil || stored.Steps[0].Status != PlanStepCompleted || stored.Steps[0].Result["content"] != `{"ok":true}` {
 		t.Fatalf("tool step = %#v, %v", stored.Steps[0], err)
+	}
+}
+
+type pausedPlanClaimRepository struct{ *memoryPlanRepo }
+
+func (r pausedPlanClaimRepository) ClaimPlanStep(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, *uuid.UUID, PlanFence, time.Time) (PlanStep, error) {
+	return PlanStep{}, ErrPlanPaused
+}
+
+func TestExplicitPlanToolClosesAuditStepWhenDispatchIsPaused(t *testing.T) {
+	steps := &fakeStepRepository{}
+	worker, plans, plan, step := planToolFixture(t, nil, nil)
+	worker.steps = steps
+	worker.plans = pausedPlanClaimRepository{plans}
+	tool := &fakeRuntimeTool{name: step.ToolName}
+	fence := RunFence{Owner: "plan-worker", Token: 1}
+	err := worker.executePlanToolStep(context.Background(), Run{ID: plan.RunID, UserID: plan.UserID}, fence, PlanFence(fence),
+		singleToolRegistry{tool: tool}, plan, step)
+	if !errors.Is(err, ErrPlanPaused) || tool.calls != 0 || len(steps.finished) != 1 || steps.finished[0].Status != StepCancelled {
+		t.Fatalf("paused dispatch = %v, calls=%d, steps=%+v", err, tool.calls, steps.finished)
 	}
 }
 

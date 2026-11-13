@@ -290,8 +290,9 @@ func (r *SessionRepository) AppendMessage(ctx context.Context, message biz.Messa
 
 // AppendMessageIdempotent 以消息 ID 为幂等键追加 Agent 消息。
 // 已存在时直接返回原消息，不重复推进会话时间或写入审计 Outbox，避免 Worker 重试产生重复消息。
-func (r *SessionRepository) AppendMessageIdempotent(ctx context.Context, message biz.Message, event biz.OutboxEvent) (biz.Message, error) {
-	if message.ID == uuid.Nil || message.UserID == uuid.Nil || message.SessionID == uuid.Nil {
+func (r *SessionRepository) AppendMessageIdempotent(ctx context.Context, message biz.Message, event biz.OutboxEvent, fence biz.RunFence) (biz.Message, error) {
+	if message.ID == uuid.Nil || message.UserID == uuid.Nil || message.SessionID == uuid.Nil ||
+		message.RunID == nil || *message.RunID == uuid.Nil || fence.Owner == "" || fence.Token <= 0 {
 		return biz.Message{}, fmt.Errorf("%w: message identity is required", biz.ErrInvalidConfig)
 	}
 	if message.Role != biz.MessageAssistant && message.Role != biz.MessageTool {
@@ -312,6 +313,28 @@ func (r *SessionRepository) AppendMessageIdempotent(ctx context.Context, message
 	}
 	var existing messageModel
 	err = WithScope(ctx, r.db, Scope{UserID: message.UserID}, func(tx *gorm.DB) error {
+		// Hold the Run row through commit so cancellation or takeover cannot interleave
+		// between validation and insertion. Supervisor may write to its own child sessions.
+		// The materialized query evaluates the expiry after acquiring the lock.
+		var valid bool
+		if err := tx.Raw(`
+WITH locked_run AS MATERIALIZED (
+  SELECT lease_expires_at FROM agent_runs
+  WHERE id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?
+    AND (session_id = ? OR EXISTS (
+      SELECT 1 FROM supervisor_tasks
+      WHERE parent_run_id = agent_runs.id AND user_id = agent_runs.user_id AND child_session_id = ?
+    ))
+  FOR UPDATE
+)
+SELECT EXISTS (SELECT 1 FROM locked_run WHERE lease_expires_at > clock_timestamp())`,
+			*message.RunID, message.UserID, biz.RunRunning, fence.Owner, fence.Token,
+			message.SessionID, message.SessionID).Scan(&valid).Error; err != nil {
+			return err
+		}
+		if !valid {
+			return fmt.Errorf("%w: run lease or message session is no longer valid", biz.ErrResourceConflict)
+		}
 		var session sessionModel
 		if err := tx.First(&session, "id = ? AND user_id = ?", message.SessionID, message.UserID).Error; err != nil {
 			return err

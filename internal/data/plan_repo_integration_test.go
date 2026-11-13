@@ -49,7 +49,7 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 直接持有一个有效租约，模拟 Worker 已认领 Run。
-	if err := adminDB.Exec("UPDATE agent_runs SET status = 'running', lease_owner = 'worker-a', fencing_token = 7 WHERE id = ?", run.ID).Error; err != nil {
+	if err := adminDB.Exec("UPDATE agent_runs SET status = 'running', lease_owner = 'worker-a', fencing_token = 7, lease_expires_at = clock_timestamp() + interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -75,6 +75,30 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 	if err != nil || loaded.Goal != "生成报告" || loaded.Steps[0].Status != biz.PlanStepPending {
 		t.Fatalf("GetPlanByRun() = %#v, %v", loaded, err)
 	}
+	t.Run("step claims require executing plan and live lease", func(t *testing.T) {
+		planFence := biz.PlanFence{Owner: "worker-a", Token: 7}
+		for _, tc := range []struct {
+			status string
+			expiry string
+			want   error
+		}{
+			{"paused", "1 minute", biz.ErrPlanPaused},
+			{"executing", "-1 minute", biz.ErrResourceConflict},
+		} {
+			if err := adminDB.Exec("UPDATE plans SET status = ? WHERE id = ?", tc.status, planID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() + ?::interval WHERE id = ?", tc.expiry, run.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := repo.ClaimPlanStep(ctx, user.ID, planID, steps[0].ID, nil, planFence, time.Now().UTC()); !errors.Is(err, tc.want) {
+				t.Errorf("claim with status %s and lease %s = %v, want %v", tc.status, tc.expiry, err, tc.want)
+			}
+		}
+		if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() + interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	fence := biz.PlanFence{Owner: "worker-a", Token: 7}
 	updated, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanExecuting, biz.PlanWaitingApproval, 0, fence, biz.PlanUpdate{})
@@ -91,9 +115,47 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	claimed, err := repo.ClaimPlanStep(ctx, user.ID, planID, steps[0].ID, nil, fence, time.Now().UTC())
+	execution := NewExecutionStepRepository(appDB)
+	parent, err := execution.StartStep(ctx, biz.ExecutionStep{UserID: user.ID, RunID: run.ID, Kind: biz.StepKindPlan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := repo.ClaimPlanStep(ctx, user.ID, planID, steps[0].ID, &parent.ID, fence, time.Now().UTC())
 	if err != nil || claimed.Status != biz.PlanStepRunning || claimed.Attempts != 1 {
 		t.Fatalf("ClaimPlanStep() = %#v, %v", claimed, err)
+	}
+	t.Run("expired Run cannot settle Plan or step", func(t *testing.T) {
+		if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() - interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() + interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := repo.UpdatePlanStep(ctx, user.ID, planID, claimed.ID, fence, biz.PlanStepUpdate{Status: biz.PlanStepCompleted}); !errors.Is(err, biz.ErrResourceConflict) {
+			t.Errorf("expired worker settled a plan step: %v", err)
+		}
+		current, err := repo.GetPlan(ctx, user.ID, planID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanExecuting, biz.PlanCompleted, current.Revision, fence, biz.PlanUpdate{}); !errors.Is(err, biz.ErrPlanRevisionConflict) && !errors.Is(err, biz.ErrResourceConflict) {
+			t.Errorf("expired worker completed a plan: %v", err)
+		}
+	})
+	tool := biz.ExecutionStep{UserID: user.ID, RunID: run.ID, Kind: biz.StepKindTool, ParentStepID: &parent.ID}
+	if err := adminDB.Exec("UPDATE plans SET status = 'paused' WHERE id = ?", planID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.StartPlanToolStep(ctx, tool, fence); !errors.Is(err, biz.ErrPlanPaused) {
+		t.Fatalf("start tool in paused model step = %v", err)
+	}
+	if err := adminDB.Exec("UPDATE plans SET status = 'executing' WHERE id = ?", planID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.StartPlanToolStep(ctx, tool, fence); err != nil {
+		t.Fatalf("start tool in claimed model step = %v", err)
 	}
 	// 同一 running 步骤不能被重复领取，阻止多 Worker 重复推进。
 	if _, err := repo.ClaimPlanStep(ctx, user.ID, planID, steps[0].ID, nil, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
@@ -123,6 +185,31 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 	if err != nil || reloaded.TotalInputTokens != 10 || reloaded.TotalOutputTokens != 20 || reloaded.EstimatedCost != 0.5 {
 		t.Fatalf("usage totals = %#v, %v", reloaded, err)
 	}
+	t.Run("replacement rolls back unless parent and successor commit together", func(t *testing.T) {
+		next := biz.Plan{ID: uuid.New(), UserID: user.ID, RunID: run.ID, SessionID: session.ID,
+			Version: 2, ParentPlanID: &planID, Status: biz.PlanExecuting, Goal: "replacement", MaxSteps: 50}
+		event := testOutboxEvent(user.ID, "plan.replanned")
+		if _, err := repo.ReplacePlan(ctx, user.ID, next, reloaded.Revision-1, fence, event); !errors.Is(err, biz.ErrPlanRevisionConflict) {
+			t.Fatalf("replacement with stale revision = %v", err)
+		}
+		if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() - interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.ReplacePlan(ctx, user.ID, next, reloaded.Revision, fence, event); !errors.Is(err, biz.ErrResourceConflict) {
+			t.Fatalf("replacement with expired lease = %v", err)
+		}
+		if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() + interval '1 minute' WHERE id = ?", run.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		event.Payload = map[string]any{"invalid_json": make(chan int)}
+		if _, err := repo.ReplacePlan(ctx, user.ID, next, reloaded.Revision, fence, event); err == nil {
+			t.Fatal("replacement with unencodable outbox event succeeded")
+		}
+		versions, err := repo.ListPlanVersions(ctx, user.ID, run.ID)
+		if err != nil || len(versions) != 1 || versions[0].ID != planID || versions[0].Status != biz.PlanExecuting || versions[0].Revision != reloaded.Revision {
+			t.Fatalf("versions after rejected replacements = %#v, %v", versions, err)
+		}
+	})
 
 	// 终态计划不得被迟到事件回写。
 	if _, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanExecuting, biz.PlanCancelled, reloaded.Revision, fence, biz.PlanUpdate{}); err != nil {
@@ -130,5 +217,125 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 	}
 	if _, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanCancelled, biz.PlanExecuting, reloaded.Revision+1, fence, biz.PlanUpdate{}); !errors.Is(err, biz.ErrPlanTerminal) {
 		t.Fatalf("cancelled plan was rewritten: %v", err)
+	}
+}
+
+func TestRevisePlanToolEffects(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	ctx := context.Background()
+	admin := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	app := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	auth := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	user, err := NewUserRepository(app, auth).CreateUser(ctx, biz.User{
+		Username: "plan_revision_" + uuid.NewString(), PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { admin.Exec("DELETE FROM users WHERE id = ?", user.ID) })
+	sessions, runs, jobs := NewSessionRepository(app), NewRunRepository(app), NewJobRepository(app)
+	plans, execution, approvals := NewPlanRepository(app), NewExecutionStepRepository(app), NewToolApprovalRepository(app)
+	runService, err := biz.NewRunService(runs, sessions, biz.WithRunEnqueuer(jobs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	planService, err := biz.NewPlanService(plans, runService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := biz.Principal{UserID: user.ID}
+	for _, scenario := range []string{"direct tool running", "model tool dispatched", "approval executing", "approval executed awaiting result", "completed tool"} {
+		t.Run(scenario, func(t *testing.T) {
+			session, err := sessions.CreateSession(ctx, biz.Session{
+				ID: uuid.New(), UserID: user.ID, Title: "revision", Source: biz.SessionSourceWeb, Status: biz.SessionActive, Version: 1,
+			}, testOutboxEvent(user.ID, "session.created"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			deadline := now.Add(time.Minute)
+			run, err := runs.CreateRun(ctx, biz.Run{
+				ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan, Status: biz.RunQueued, DeadlineAt: &deadline,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			draft := biz.PlanDraft{Goal: "revise", Steps: []biz.PlanDraftStep{{StepNo: 1, Title: "send", ToolName: "send"}}}
+			step := biz.PlanStep{ID: uuid.New(), StepNo: 1, Title: "send", ToolName: "send", Status: biz.PlanStepRunning,
+				Attempts: 1, MaxAttempts: 1, IdempotencyKey: "original"}
+			switch scenario {
+			case "model tool dispatched":
+				modelStep, err := execution.StartStep(ctx, biz.ExecutionStep{UserID: user.ID, RunID: run.ID, Kind: biz.StepKindPlan})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := execution.StartStep(ctx, biz.ExecutionStep{UserID: user.ID, RunID: run.ID, ParentStepID: &modelStep.ID,
+					Kind: biz.StepKindTool, ToolName: "send", Status: biz.StepCompleted}); err != nil {
+					t.Fatal(err)
+				}
+				step.ToolName, step.ExecutionStepID, draft.Steps[0].ToolName = "", &modelStep.ID, ""
+			case "approval executing", "approval executed awaiting result":
+				step.Status = biz.PlanStepWaitingApproval
+				status := biz.ApprovalExecuting
+				if scenario == "approval executed awaiting result" {
+					status = biz.ApprovalExecuted
+				}
+				if _, err := approvals.CreateApproval(ctx, biz.ToolApproval{RunID: run.ID, UserID: user.ID, ToolName: step.ToolName,
+					ToolCallID: "plan-step-" + step.ID.String(), Status: status, Arguments: []byte(`{}`), IdempotencyKey: step.IdempotencyKey}); err != nil {
+					t.Fatal(err)
+				}
+			case "completed tool":
+				step.Status, step.Result = biz.PlanStepCompleted, map[string]any{"content": "sent"}
+				draft.Steps[0].Title = "renamed send"
+			}
+			plan, err := plans.CreatePlan(ctx, user.ID, biz.Plan{ID: uuid.New(), UserID: user.ID, RunID: run.ID, SessionID: session.ID,
+				Version: 1, Status: biz.PlanPaused, Goal: "send", MaxSteps: 50, DeadlineAt: &deadline, UpdatedAt: now.Add(-time.Second),
+				Steps: []biz.PlanStep{step}}, testOutboxEvent(user.ID, "plan.created"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			revised, err := planService.Revise(ctx, principal, run.ID, draft)
+			if scenario == "completed tool" {
+				if err != nil || len(revised.Steps) != 1 || revised.Steps[0].Status != biz.PlanStepCompleted || revised.Steps[0].Result["content"] != "sent" {
+					t.Fatalf("Revise() completed tool = %#v, %v", revised, err)
+				}
+				versions, err := plans.ListPlanVersions(ctx, user.ID, run.ID)
+				if err != nil || len(versions) != 2 || versions[0].ID != revised.ID || versions[1].ID != plan.ID || versions[1].Status != biz.PlanCancelled {
+					t.Fatalf("versions after completed tool revision = %#v, %v", versions, err)
+				}
+				if _, err := planService.Pause(ctx, principal, run.ID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := planService.Revise(ctx, principal, run.ID, biz.PlanDraft{Goal: "omit tool", Steps: []biz.PlanDraftStep{{StepNo: 1, Title: "model step"}}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := planService.Pause(ctx, principal, run.ID); err != nil {
+					t.Fatal(err)
+				}
+				restored, err := planService.Revise(ctx, principal, run.ID, draft)
+				if err != nil || restored.Version != 4 || len(restored.Steps) != 1 || restored.Steps[0].Status != biz.PlanStepCompleted || restored.Steps[0].Result["content"] != "sent" {
+					t.Fatalf("older completed operation was lost after reintroduction: %#v, %v", restored, err)
+				}
+				return
+			}
+			if !errors.Is(err, biz.ErrResourceConflict) {
+				t.Fatalf("Revise() with %s = %v, want resource conflict", scenario, err)
+			}
+			versions, err := plans.ListPlanVersions(ctx, user.ID, run.ID)
+			if err != nil || len(versions) != 1 || versions[0].ID != plan.ID || versions[0].Status != biz.PlanPaused ||
+				versions[0].DeadlineAt == nil || !versions[0].DeadlineAt.Equal(deadline) {
+				t.Fatalf("plan versions after rejected revision = %#v, %v", versions, err)
+			}
+			persisted, err := runs.GetRun(ctx, user.ID, run.ID)
+			if err != nil || persisted.DeadlineAt == nil || !persisted.DeadlineAt.Equal(deadline) {
+				t.Fatalf("run deadline after rejected revision = %v, %v", persisted.DeadlineAt, err)
+			}
+			if exists, err := jobs.HasRunJob(ctx, user.ID, run.ID); err != nil || exists {
+				t.Fatalf("job after rejected revision = %t, %v", exists, err)
+			}
+		})
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // TestClientExecuteAuthenticatesAndParses 验证 Sandbox 调用携带认证头并正确解析输出。
@@ -45,6 +47,35 @@ func TestClientExecuteAuthenticatesAndParses(t *testing.T) {
 	}
 }
 
+func TestClientUsesMCPIdentityWithoutAliasFallback(t *testing.T) {
+	target := MCPTarget{
+		UserID: uuid.New(), ServerID: uuid.New(), OriginalName: "delete",
+		EndpointFingerprint: strings.Repeat("a", 64),
+	}
+	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request Request
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || r.URL.Path != "/execute/mcp" ||
+					request.Tool != "" || request.MCP == nil || *request.MCP != target {
+					t.Errorf("unexpected dispatch route %s, request %+v, error %v", r.URL.Path, request, err)
+				}
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"output":{}}`))
+			}))
+			defer server.Close()
+			client, err := NewClient(Config{Endpoint: server.URL, Token: "t", AllowInsecure: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Execute(context.Background(), Request{MCP: &target, Arguments: json.RawMessage(`{}`), RiskLevel: "high"})
+			if status == http.StatusOK && err != nil || status != http.StatusOK && !errors.Is(err, ErrSandboxUnavailable) {
+				t.Fatalf("execute with status %d = %v", status, err)
+			}
+		})
+	}
+}
+
 // TestClientRejectsInsecureConfigAndBadRequests 验证不安全配置、非法参数与上游错误被拒绝。
 func TestClientRejectsInsecureConfigAndBadRequests(t *testing.T) {
 	if _, err := NewClient(Config{Endpoint: "http://sandbox:8080", Token: "t"}); !errors.Is(err, ErrInvalidConfig) {
@@ -76,7 +107,7 @@ func TestClientHandlesUpstreamFailureAndOversize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	if _, err := client.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrSandboxUnavailable) {
+	if _, err := client.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrSandboxUnavailable) || !errors.Is(err, ErrToolOutcomeUnknown) {
 		t.Fatalf("upstream error = %v", err)
 	}
 
@@ -88,7 +119,7 @@ func TestClientHandlesUpstreamFailureAndOversize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new small client: %v", err)
 	}
-	if _, err := small.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrResponseTooLarge) {
+	if _, err := small.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrResponseTooLarge) || !errors.Is(err, ErrToolOutcomeUnknown) {
 		t.Fatalf("oversize error = %v", err)
 	}
 
@@ -100,7 +131,7 @@ func TestClientHandlesUpstreamFailureAndOversize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new invalid client: %v", err)
 	}
-	if _, err := invalidClient.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrSandboxUnavailable) {
+	if _, err := invalidClient.Execute(context.Background(), Request{Tool: "x", Arguments: json.RawMessage(`{}`)}); !errors.Is(err, ErrSandboxUnavailable) || !errors.Is(err, ErrToolOutcomeUnknown) {
 		t.Fatalf("invalid output error = %v", err)
 	}
 }

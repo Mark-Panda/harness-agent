@@ -11,6 +11,18 @@ Content-Type: application/json
 {"tool":"<tool>","arguments":{...},"risk_level":"high","timeout_ms":30000}
 ```
 
+经审批的 MCP 工具使用独立接口，鉴权与响应格式相同。
+
+```http
+POST /execute/mcp
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"mcp":{"user_id":"<uuid>","server_id":"<uuid>","original_name":"<tool>","endpoint_fingerprint":"<sha256-hex>"},"arguments":{...},"risk_level":"high","timeout_ms":30000}
+```
+
+Runner 必须在该用户可用的 MCP 注册中查找 `server_id`，校验配置端点的 SHA-256 指纹，并仅调用匹配的 `original_name`。目标无法核验时返回 4xx。部署新版应用前需为 Runner 提供此接口，应用收到接口错误时会停止调用。
+
 成功响应：
 
 ```json

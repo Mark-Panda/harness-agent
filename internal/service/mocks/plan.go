@@ -201,6 +201,21 @@ func (mr *MockPlanRepositoryMockRecorder) RebindPlanRun(ctx, userID, planID, run
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RebindPlanRun", reflect.TypeOf((*MockPlanRepository)(nil).RebindPlanRun), ctx, userID, planID, runID, expectedRevision, deadlineAt, now)
 }
 
+// ReplacePlan mocks base method.
+func (m *MockPlanRepository) ReplacePlan(ctx context.Context, userID uuid.UUID, plan biz.Plan, parentRevision int64, fence biz.PlanFence, event biz.OutboxEvent) (biz.Plan, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReplacePlan", ctx, userID, plan, parentRevision, fence, event)
+	ret0, _ := ret[0].(biz.Plan)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ReplacePlan indicates an expected call of ReplacePlan.
+func (mr *MockPlanRepositoryMockRecorder) ReplacePlan(ctx, userID, plan, parentRevision, fence, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReplacePlan", reflect.TypeOf((*MockPlanRepository)(nil).ReplacePlan), ctx, userID, plan, parentRevision, fence, event)
+}
+
 // ResolvePlanStep mocks base method.
 func (m *MockPlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from biz.PlanStepStatus, update biz.PlanStepUpdate) (biz.PlanStep, error) {
 	m.ctrl.T.Helper()

@@ -693,7 +693,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			workerStatus = StepWaitingApproval
 			workerCode = "approval_required"
 			// 先保存助手工具调用消息，审批结果回填子会话后重建上下文即可继续。
-			if persistErr := w.persistWorkerMessages(ctx, run, task, recorded, len(childMessages)); persistErr != nil {
+			if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, len(childMessages)); persistErr != nil {
 				workerStatus = StepFailed
 				workerCode = "worker_message_persist_failed"
 				w.recordWorkerFailure(ctx, run, fence, task, persistErr, recorded)
@@ -713,7 +713,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			replayable := truncateUnfinishedToolCalls(recorded)
 			if hasSupervisorToolResult(recorded[len(replayable):]) {
 				err = errors.Join(ErrToolResultPersistence, err)
-			} else if persistErr := w.persistWorkerMessages(ctx, run, task, replayable, len(childMessages)); persistErr != nil {
+			} else if persistErr := w.persistWorkerMessages(ctx, run, fence, task, replayable, len(childMessages)); persistErr != nil {
 				err = errors.Join(err, persistErr)
 			}
 		}
@@ -721,7 +721,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 		// Eino 会保留失败前已成功模型步的用量，调用方必须把它计入共享预算与任务事实。
 		return result, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, err
 	}
-	if persistErr := w.persistWorkerMessages(ctx, run, task, recorded, len(childMessages)); persistErr != nil {
+	if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, len(childMessages)); persistErr != nil {
 		workerStatus = StepFailed
 		workerCode = "worker_message_persist_failed"
 		w.recordWorkerFailure(ctx, run, fence, task, persistErr, recorded)
@@ -757,7 +757,7 @@ func truncateUnfinishedToolCalls(messages []react.Message) []react.Message {
 
 // persistWorkerMessages 把 Worker 产生的助手与工具消息幂等写入子会话。
 // 消息 ID 以任务 ID 与上下文基底序号派生，重试时不会覆盖既有消息。
-func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, task SupervisorTask, recorded []react.Message, baseIndex int) error {
+func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, fence RunFence, task SupervisorTask, recorded []react.Message, baseIndex int) error {
 	if w.sessions == nil {
 		return nil
 	}
@@ -776,12 +776,12 @@ func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, ta
 		stored := Message{
 			ID: deterministicMessageID(task.ID, index+baseIndex), SessionID: task.ChildSessionID, UserID: run.UserID,
 			Role: MessageRole(string(message.Role)), Content: message.Content, ToolCalls: toolCalls,
-			ToolCallID: message.ToolCallID, ToolName: message.Name,
+			ToolCallID: message.ToolCallID, ToolName: message.Name, RunID: &run.ID,
 		}
 		if _, err := w.sessions.AppendMessageIdempotent(writeContext, stored, OutboxEvent{
 			UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message", AggregateID: stored.ID.String(),
 			DedupeKey: "message.created.agent:" + stored.ID.String(), Payload: map[string]any{"parent_run_id": run.ID.String(), "task_id": task.ID.String()},
-		}); err != nil {
+		}, fence); err != nil {
 			if hasSupervisorToolResult(recorded) {
 				return errors.Join(ErrToolResultPersistence, err)
 			}
@@ -983,7 +983,7 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 	index := len(messages)
 	finalMessageID := deterministicSupervisorFinalMessageID(run.ID)
 	payload := map[string]any{"index": index, "role": string(MessageAssistant), "content": content, "message_id": finalMessageID}
-	stored, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, payload)
+	stored, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, fence, payload)
 	if err != nil {
 		return react.Result{}, err
 	}
@@ -1084,12 +1084,10 @@ func (r scopedToolRegistry) Lookup(name string) (react.Tool, bool) {
 
 type supervisorScopedTool struct{ react.Tool }
 
+func (t supervisorScopedTool) MCPIdentity() mcp.ToolIdentity { return mcp.IdentityOf(t.Tool) }
+
 func (t supervisorScopedTool) Invoke(ctx context.Context, arguments json.RawMessage) (json.RawMessage, error) {
-	output, err := t.Tool.Invoke(ctx, arguments)
-	if errors.Is(err, mcp.ErrToolOutcomeUnknown) {
-		return nil, errors.Join(ErrToolResultPersistence, react.NewInfrastructureError("mcp_tool_outcome", err))
-	}
-	return output, err
+	return normalizeToolOutcome(t.Tool.Invoke(ctx, arguments))
 }
 
 // List 仅返回允许列表中的工具定义。

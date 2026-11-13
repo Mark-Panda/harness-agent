@@ -176,31 +176,50 @@ func insertFeishuGroupProjection(tx *gorm.DB, current feishuGroupMessageModel, p
 
 var _ biz.FeishuGroupMessageStore = (*FeishuMessageRepository)(nil)
 
-// PromoteGroupConversationThread 通过本次投影定位正式的群聊绑定。
-func (r *FeishuConversationRepositoryImpl) PromoteGroupConversationThread(ctx context.Context, outbound biz.FeishuOutbound, threadID string) (int, error) {
-	if outbound.AppID == "" || outbound.ChatID == "" || outbound.ReplyToMessageID == "" ||
-		outbound.ThreadID != outbound.ReplyToMessageID || threadID == "" ||
-		outbound.UserID == uuid.Nil || outbound.SessionID == uuid.Nil || outbound.ThreadID == threadID {
-		return 0, nil
-	}
+// PromoteOutboundThread locks the current outbound claim while updating its topic binding.
+func (r *FeishuOutboundRepository) PromoteOutboundThread(ctx context.Context, outbound biz.FeishuOutbound, threadID string, now time.Time) (int, error) {
 	var affected int64
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		result := tx.Exec(`
+		var record feishuOutboundModel
+		if err := checkFeishuOutboundClaimResult(feishuOutboundClaim(tx, outbound, now).
+			Clauses(clause.Locking{Strength: "UPDATE"}).Find(&record)); err != nil {
+			return err
+		}
+		if threadID == "" || record.ThreadID == "" || record.ThreadID != record.ReplyToMessageID || record.ThreadID == threadID {
+			return nil
+		}
+
+		bindingAppID := record.AppID
+		if record.DefaultRoute {
+			// 默认应用的普通会话使用旧的空应用作用域。
+			bindingAppID = ""
+		}
+		result := tx.Model(&externalBindingModel{}).
+			Where("provider = 'feishu' AND user_id = ? AND session_id = ? AND app_id = ? AND chat_id = ? AND thread_id = ? AND status = ?",
+				record.UserID, record.SessionID, bindingAppID, record.ChatID, record.ThreadID, biz.FeishuBindingActive).
+			Update("thread_id", threadID)
+		affected = result.RowsAffected
+		if result.Error != nil || affected != 0 {
+			return result.Error
+		}
+
+		// 共享群聊的投影与正式绑定属于不同会话。按入站消息定位该绑定。
+		result = tx.Exec(`
 UPDATE external_conversation_bindings AS binding
 SET thread_id = ?, updated_at = NOW()
 FROM feishu_group_messages AS source
 WHERE source.binding_id = binding.id AND source.projection_session_id = ? AND source.sender_user_id = ?
   AND source.external_message_id = ? AND binding.provider = 'feishu' AND binding.app_id = ?
   AND binding.chat_id = ? AND binding.thread_id = ? AND binding.status = 'active'`,
-			threadID, outbound.SessionID, outbound.UserID, outbound.ReplyToMessageID,
-			outbound.AppID, outbound.ChatID, outbound.ThreadID)
+			threadID, record.SessionID, record.UserID, record.ReplyToMessageID,
+			record.AppID, record.ChatID, record.ThreadID)
 		affected = result.RowsAffected
 		return result.Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
 		return 0, nil
 	}
-	return int(affected), catalogError("promote feishu group conversation thread", err)
+	return int(affected), catalogError("promote feishu outbound thread", err)
 }
 
 // ListFeishuGroupRunHistory 读取已验证的投影与当前 Run 自身产物，忽略 Web 写入的消息及 Redis 缓存。
@@ -225,19 +244,25 @@ func (r *SessionRepository) ListFeishuGroupRunHistory(ctx context.Context, userI
 }
 
 // CompleteGroupReply 将已发送的可见正文与外发完成状态原子提交，供后续同话题 Run 读取。
-func (r *FeishuOutboundRepository) CompleteGroupReply(ctx context.Context, outbound biz.FeishuOutbound, workerID, text string, now time.Time) error {
+func (r *FeishuOutboundRepository) CompleteGroupReply(ctx context.Context, outbound biz.FeishuOutbound, text string, now time.Time) error {
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		completed := tx.Model(&feishuOutboundModel{}).
-			Where("id = ? AND user_id = ? AND session_id = ? AND run_id = ? AND status = 'sending' AND lease_owner = ?",
-				outbound.ID, outbound.UserID, outbound.SessionID, outbound.RunID, workerID).
-			Updates(map[string]any{"status": "completed", "completed_at": now, "lease_owner": "", "lease_expires_at": nil, "updated_at": now})
-		if completed.Error != nil || completed.RowsAffected == 0 {
-			return completed.Error
+		var record feishuOutboundModel
+		result := feishuOutboundClaim(tx, outbound, now).Model(&record).
+			Clauses(clause.Returning{}).Updates(feishuOutboundCompletion(now))
+		if err := checkFeishuOutboundClaimResult(result); err != nil {
+			return err
 		}
-		return tx.Model(&feishuGroupMessageModel{}).
+		projected := tx.Model(&feishuGroupMessageModel{}).
 			Where("projection_session_id = ? AND sender_user_id = ? AND external_message_id = ?",
-				outbound.SessionID, outbound.UserID, outbound.ReplyToMessageID).
-			Updates(map[string]any{"reply_text": text, "replied_at": now}).Error
+				record.SessionID, record.UserID, record.ReplyToMessageID).
+			Updates(map[string]any{"reply_text": text, "replied_at": now})
+		if projected.Error != nil {
+			return projected.Error
+		}
+		if projected.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
 	})
 	return catalogError("complete feishu group reply", err)
 }

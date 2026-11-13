@@ -37,7 +37,7 @@ func TestFeishuSharedGroupRunsUnderEachSpeaker(t *testing.T) {
 		identities.userID = actor
 		eventID := "event-" + messageID
 		events.event = biz.FeishuEventRecord{EventID: eventID, TenantKey: tenant, AppID: appID,
-			Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				chatType: feishu.ChatTypeGroup, chatID: chatID, threadID: "omt_shared", senderOpenID: &openID,
 				messageID: messageID, mentions: []map[string]string{{"open_id": "ou_bot"}},
 			})}}

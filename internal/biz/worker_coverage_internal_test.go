@@ -219,21 +219,20 @@ func TestRecentAttachmentTexts(t *testing.T) {
 	}
 }
 
-// requeueRunRepository 捕获 TransitionRun 调用参数，用于验证暂停 Run 退回队列。
+// requeueRunRepository captures the worker fence and deadline for a paused Run.
 type requeueRunRepository struct {
 	RunRepository
-	calls  int
-	from   RunStatus
-	to     RunStatus
-	fields map[string]any
-	err    error
+	calls    int
+	fence    RunFence
+	deadline *time.Time
+	now      time.Time
+	err      error
 }
 
-// TransitionRun 记录调用并返回预设错误。
-func (r *requeueRunRepository) TransitionRun(_ context.Context, _, _ uuid.UUID, from, to RunStatus, fields map[string]any) (Run, error) {
+func (r *requeueRunRepository) RequeuePausedRun(_ context.Context, _, _ uuid.UUID, fence RunFence, deadline *time.Time, now time.Time) error {
 	r.calls++
-	r.from, r.to, r.fields = from, to, fields
-	return Run{}, r.err
+	r.fence, r.deadline, r.now = fence, deadline, now
+	return r.err
 }
 
 // TestRequeuePausedRun 验证暂停 Run 退回 queued 并清空租约、顺延截止时间。
@@ -252,24 +251,20 @@ func TestRequeuePausedRun(t *testing.T) {
 		clock:  func() time.Time { return now },
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	worker.requeuePausedRun(context.Background(), run)
+	fence := RunFence{Owner: "worker-a", Token: 1}
+	if err := worker.requeuePausedRun(context.Background(), run, fence); err != nil {
+		t.Fatal(err)
+	}
 
-	if repo.calls != 1 || repo.from != RunRunning || repo.to != RunQueued {
-		t.Fatalf("transition = %d calls %s->%s", repo.calls, repo.from, repo.to)
-	}
-	if repo.fields["lease_owner"] != "" {
-		t.Fatalf("lease_owner = %v, want cleared", repo.fields["lease_owner"])
-	}
-	if value, ok := repo.fields["lease_expires_at"]; !ok || value != nil {
-		t.Fatalf("lease_expires_at = %v (ok=%t), want nil", value, ok)
+	if repo.calls != 1 || repo.fence != fence {
+		t.Fatalf("transition = %d calls with fence %+v", repo.calls, repo.fence)
 	}
 	// 暂停耗时 2 分钟必须补回截止时间，避免恢复后被误判超时。
-	gotDeadline, ok := repo.fields["deadline_at"].(time.Time)
-	if !ok || !gotDeadline.Equal(deadline.Add(2*time.Minute)) {
-		t.Fatalf("deadline_at = %v (ok=%t), want %v", gotDeadline, ok, deadline.Add(2*time.Minute))
+	if repo.deadline == nil || !repo.deadline.Equal(deadline.Add(2*time.Minute)) {
+		t.Fatalf("deadline_at = %v, want %v", repo.deadline, deadline.Add(2*time.Minute))
 	}
-	if gotUpdated, ok := repo.fields["updated_at"].(time.Time); !ok || !gotUpdated.Equal(now) {
-		t.Fatalf("updated_at = %v (ok=%t), want %v", gotUpdated, ok, now)
+	if !repo.now.Equal(now) {
+		t.Fatalf("updated_at = %v, want %v", repo.now, now)
 	}
 
 	// 无截止时间：不得写入 deadline_at 字段。
@@ -278,8 +273,10 @@ func TestRequeuePausedRun(t *testing.T) {
 		runs: repoNoDeadline, clock: func() time.Time { return now },
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	workerNoDeadline.requeuePausedRun(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Status: RunRunning})
-	if _, exists := repoNoDeadline.fields["deadline_at"]; exists {
+	if err := workerNoDeadline.requeuePausedRun(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Status: RunRunning}, fence); err != nil {
+		t.Fatal(err)
+	}
+	if repoNoDeadline.deadline != nil {
 		t.Fatal("deadline_at written for run without deadline")
 	}
 
@@ -290,9 +287,8 @@ func TestRequeuePausedRun(t *testing.T) {
 			runs: repoErr, clock: func() time.Time { return now },
 			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}
-		workerErr.requeuePausedRun(context.Background(), run)
-		if repoErr.calls != 1 {
-			t.Fatalf("err %v: transition not attempted", cause)
+		if err := workerErr.requeuePausedRun(context.Background(), run, fence); !errors.Is(err, cause) || repoErr.calls != 1 {
+			t.Fatalf("transition calls = %d, error = %v, want %v", repoErr.calls, err, cause)
 		}
 	}
 }

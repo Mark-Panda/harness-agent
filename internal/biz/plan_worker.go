@@ -29,7 +29,72 @@ var (
 	ErrPlanCancelled = errors.New("plan was cancelled")
 	// ErrPlanStepUnknown 步骤副作用结果未知，需要人工对账。
 	ErrPlanStepUnknown = errors.New("plan step side effect is unknown")
+	// ErrPlanBudget 表示下一次调用的预留用量超过计划剩余预算。
+	ErrPlanBudget = fmt.Errorf("%w: plan model budget exhausted", ErrPlanFailed)
 )
+
+type planModelUsageReader interface {
+	SumModelCallUsage(context.Context, uuid.UUID, uuid.UUID) (ModelCallUsage, error)
+}
+
+func (w *ExecutionWorker) planModelUsage(ctx context.Context, run Run) (ModelCallUsage, error) {
+	if recovery, ok := w.plans.(interface {
+		RecoverPlanUsage(context.Context, uuid.UUID, uuid.UUID) (ModelCallUsage, error)
+	}); ok {
+		return recovery.RecoverPlanUsage(ctx, run.UserID, run.ID)
+	}
+	plan, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
+	if err == nil {
+		return ModelCallUsage{InputTokens: plan.TotalInputTokens, OutputTokens: plan.TotalOutputTokens, EstimatedCost: plan.EstimatedCost}, nil
+	}
+	if !errors.Is(err, ErrResourceNotFound) {
+		return ModelCallUsage{}, err
+	}
+	if reader, ok := w.attempts.(planModelUsageReader); ok {
+		return reader.SumModelCallUsage(ctx, run.UserID, run.ID)
+	}
+	return ModelCallUsage{}, nil
+}
+
+// planAttemptBudget shares the same reservation algorithm as Supervisor, with Plan limits.
+type planAttemptBudget struct {
+	*supervisorBudget
+}
+
+func (b planAttemptBudget) ReserveAttempt(ctx context.Context, candidate model.Candidate, input int64, output int) (int, func(*model.AttemptRecord) error, error) {
+	cap, settle, err := b.supervisorBudget.ReserveAttempt(ctx, candidate, input, output)
+	if errors.Is(err, ErrSupervisorBudget) {
+		return 0, nil, ErrPlanBudget
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	return cap, func(record *model.AttemptRecord) error {
+		if err := settle(record); errors.Is(err, ErrSupervisorBudget) {
+			return ErrPlanBudget
+		} else {
+			return err
+		}
+	}, nil
+}
+
+func (w *ExecutionWorker) recordPlanUsage(ctx context.Context, plan Plan, input, output int64, cost float64) error {
+	if _, durable := w.attempts.(planModelUsageReader); durable {
+		// Production settles attempts and their Plan totals in the same transaction.
+		return nil
+	}
+	return w.plans.AddPlanUsage(ctx, plan.UserID, plan.ID, input, output, cost, w.clock())
+}
+
+func (w *ExecutionWorker) checkPlanBudget(ctx context.Context, plan Plan, fence PlanFence) error {
+	if w.config.PlanMaxTokens > 0 && plan.TotalInputTokens+plan.TotalOutputTokens > w.config.PlanMaxTokens {
+		return w.persistPlanFailure(ctx, plan, fence, "plan_budget_exceeded", "计划 Token 用量超过上限")
+	}
+	if w.config.PlanMaxCost > 0 && plan.EstimatedCost > w.config.PlanMaxCost {
+		return w.persistPlanFailure(ctx, plan, fence, "plan_budget_exceeded", "计划费用超过上限")
+	}
+	return nil
+}
 
 // planPlannerInstruction 是 Planner 的系统指令，要求只输出受限 JSON。
 const planPlannerInstruction = `你是 Plan-and-Execute 规划器。请只输出一个 JSON 对象，不要输出 Markdown 代码围栏或额外说明。
@@ -201,8 +266,8 @@ func (w *ExecutionWorker) loadOrCreatePlan(ctx context.Context, run Run, fence R
 		}
 		return Plan{}, err
 	}
-	if err := w.plans.AddPlanUsage(ctx, run.UserID, planID, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost, now); err != nil {
-		w.logger.Warn("record planner usage failed", "run_id", run.ID, "error", err)
+	if err := w.recordPlanUsage(ctx, created, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost); err != nil {
+		return Plan{}, err
 	}
 	w.emitPlanEvent(ctx, run, fence, "plan.created", map[string]any{
 		"plan_id": planID.String(), "version": 1, "steps": len(steps), "goal": draft.Goal,
@@ -276,27 +341,31 @@ func (w *ExecutionWorker) generatePlan(ctx context.Context, router *model.Router
 	if err := validatePlanDraftTools(repaired, executable); err != nil {
 		return PlanDraft{}, react.Completion{}, fmt.Errorf("%w: planner repair failed: %v", ErrPlanInvalid, err)
 	}
+	repairCompletion.Usage.InputTokens += completion.Usage.InputTokens
+	repairCompletion.Usage.OutputTokens += completion.Usage.OutputTokens
+	repairCompletion.EstimatedCost += completion.EstimatedCost
 	return repaired, repairCompletion, nil
 }
 
-// recoverPlanSteps 处理上次执行中断留下的 running 步骤：
-// 工具步骤副作用未知，标记 unknown 并要求对账；纯模型步骤可安全重试。
+const planToolOutcomeUnknownCode = "tool_execution_unknown"
+
+// recoverPlanSteps 处理上次执行中断留下的 running 步骤。
+// 已触达工具的步骤无法从中间结果恢复，需要人工对账。
 func (w *ExecutionWorker) recoverPlanSteps(ctx context.Context, plan Plan, fence RunFence) (Plan, error) {
+	planFence := PlanFence{Owner: w.config.WorkerID, Token: fence.Token}
 	for _, step := range plan.Steps {
+		if step.Status == PlanStepUnknown {
+			return Plan{}, w.markPlanStepUnknown(ctx, plan, planFence, step, false, nil)
+		}
 		if step.Status != PlanStepRunning {
 			continue
 		}
-		if step.ToolName != "" {
-			if _, err := w.plans.ResolvePlanStep(ctx, plan.UserID, plan.ID, step.ID, PlanStepRunning, PlanStepUpdate{
-				Status: PlanStepUnknown, ErrorCode: "side_effect_unknown", ErrorMessage: "Worker 重启时工具步骤结果未知，需人工对账", FinishedAt: ptrTime(w.clock()),
-			}); err != nil && !errors.Is(err, ErrResourceConflict) {
-				return Plan{}, err
-			}
-			if failErr := w.failPlan(ctx, plan, PlanFence{Owner: w.config.WorkerID, Token: fence.Token}, "side_effect_unknown", "工具步骤副作用结果未知，计划已终止并等待人工对账"); failErr != nil && !errors.Is(failErr, ErrPlanFailed) {
-				// 计划未能落到失败终态时向上传递真实错误，避免 Run 带着未终止的计划继续执行。
-				return Plan{}, failErr
-			}
-			return Plan{}, fmt.Errorf("%w: step %d side effect unknown", ErrPlanStepUnknown, step.StepNo)
+		mayHaveRunTool, err := w.planModelStepHasToolEffect(ctx, plan, step)
+		if err != nil {
+			return Plan{}, err
+		}
+		if step.ToolName != "" || mayHaveRunTool {
+			return Plan{}, w.markPlanStepUnknown(ctx, plan, planFence, step, false, nil)
 		}
 		if _, err := w.plans.ResolvePlanStep(ctx, plan.UserID, plan.ID, step.ID, PlanStepRunning, PlanStepUpdate{
 			Status: PlanStepFailed, ErrorCode: "worker_restarted", ErrorMessage: "Worker 重启，纯模型步骤将重试", FinishedAt: ptrTime(w.clock()),
@@ -305,6 +374,62 @@ func (w *ExecutionWorker) recoverPlanSteps(ctx context.Context, plan Plan, fence
 		}
 	}
 	return w.plans.GetPlanByRun(ctx, plan.UserID, plan.RunID)
+}
+
+func (w *ExecutionWorker) planModelStepHasToolEffect(ctx context.Context, plan Plan, step PlanStep) (bool, error) {
+	if step.ToolName != "" || step.ExecutionStepID == nil {
+		return false, nil
+	}
+	steps, complete, err := w.toolStepsForRecovery(ctx, plan.UserID, plan.RunID, step.ExecutionStepID)
+	if err != nil {
+		return false, err
+	}
+	for _, toolStep := range steps {
+		switch toolStep.Status {
+		case StepRunning, StepCompleted, StepReconciliationRequired:
+			return true, nil
+		}
+	}
+	return !complete, nil
+}
+
+// markPlanStepUnknown 终止当前计划并保留对账错误，防止重试与重规划再次执行工具。
+func (w *ExecutionWorker) markPlanStepUnknown(ctx context.Context, plan Plan, fence PlanFence, step PlanStep, claimed bool, cause error) error {
+	writeContext := context.WithoutCancel(ctx)
+	err := errors.Join(ErrToolResultPersistence, fmt.Errorf("%w: step %d", ErrPlanStepUnknown, step.StepNo), cause)
+	const message = "工具副作用结果需要人工对账"
+	if step.Status != PlanStepUnknown {
+		update := PlanStepUpdate{
+			Status: PlanStepUnknown, ErrorCode: planToolOutcomeUnknownCode, ErrorMessage: message, FinishedAt: ptrTime(w.clock()),
+		}
+		var updateErr error
+		if claimed {
+			_, updateErr = w.plans.UpdatePlanStep(writeContext, plan.UserID, plan.ID, step.ID, fence, update)
+		} else {
+			_, updateErr = w.plans.ResolvePlanStep(writeContext, plan.UserID, plan.ID, step.ID, step.Status, update)
+		}
+		if updateErr != nil && !errors.Is(updateErr, ErrResourceConflict) {
+			err = errors.Join(err, updateErr)
+		}
+	}
+	if failErr := w.failPlan(writeContext, plan, fence, planToolOutcomeUnknownCode, message); failErr != nil && !errors.Is(failErr, ErrPlanFailed) {
+		err = errors.Join(err, failErr)
+	}
+	return err
+}
+
+// reconcilePlanApproval 同步直接工具步骤的审批执行结果。步内工具只允许低风险调用。
+func (w *ExecutionWorker) reconcilePlanApproval(ctx context.Context, run Run, fence PlanFence, approval ToolApproval) error {
+	plan, err := w.plans.GetPlanByRun(context.WithoutCancel(ctx), run.UserID, run.ID)
+	if err != nil {
+		return err
+	}
+	for _, step := range plan.Steps {
+		if step.Status == PlanStepWaitingApproval && approval.ToolCallID == "plan-step-"+step.ID.String() {
+			return w.markPlanStepUnknown(ctx, plan, fence, step, false, nil)
+		}
+	}
+	return nil
 }
 
 // resolvePlanApprovals 根据审批终态推进等待审批的步骤；仍有待决策审批时返回 pending。
@@ -345,13 +470,7 @@ func (w *ExecutionWorker) resolvePlanApprovals(ctx context.Context, run Run, pla
 		case ApprovalPending, ApprovalApproved:
 			pending = true
 		case ApprovalExecuting:
-			if _, err := w.plans.ResolvePlanStep(ctx, plan.UserID, plan.ID, step.ID, PlanStepWaitingApproval, PlanStepUpdate{
-				Status: PlanStepUnknown, ErrorCode: "tool_execution_unknown", ErrorMessage: "工具审批执行结果未知", FinishedAt: ptrTime(w.clock()),
-			}); err != nil && !errors.Is(err, ErrResourceConflict) {
-				return Plan{}, false, err
-			}
-			_ = w.failPlan(ctx, plan, fence, "tool_execution_unknown", "工具审批执行结果未知，需人工对账")
-			return Plan{}, false, fmt.Errorf("%w: approval %s", ErrApprovalExecutionUnknown, approval.ID)
+			return Plan{}, false, w.markPlanStepUnknown(ctx, plan, fence, step, false, ErrApprovalExecutionUnknown)
 		case ApprovalExecuted:
 			content := string(approval.ResultJSON)
 			if len(content) > int(w.config.MaxPayloadBytes) && w.config.MaxPayloadBytes > 0 {
@@ -532,14 +651,37 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 	agentCtx := stepCtx
 	if planStepRecordID != nil {
 		agentCtx = withParentStep(stepCtx, *planStepRecordID)
+		agentCtx = context.WithValue(agentCtx, planToolFenceContextKey{}, fence)
 	}
 	result, err := agent.Run(agentCtx, stepMessages)
 	sinkState.Flush()
-	if sinkErr := sinkState.Err(); sinkErr != nil {
+	sinkErr := sinkState.Err()
+	usageErr := w.recordPlanUsage(context.WithoutCancel(ctx), plan, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost)
+	if failure := errors.Join(err, sinkErr); failure != nil {
+		toolEffect, recoveryErr := w.planModelStepHasToolEffect(context.WithoutCancel(ctx), plan, claimed)
+		if errors.Is(failure, ErrToolResultPersistence) || toolEffect {
+			stepStatus = StepReconciliationRequired
+			stepCode = planToolOutcomeUnknownCode
+			return sinkState.Streamed(), w.markPlanStepUnknown(ctx, plan, fence, claimed, true, errors.Join(failure, recoveryErr))
+		}
+		if recoveryErr != nil {
+			return sinkState.Streamed(), errors.Join(failure, recoveryErr)
+		}
+		if errors.Is(failure, ErrPlanPaused) || errors.Is(failure, ErrPlanCancelled) {
+			return sinkState.Streamed(), failure
+		}
+	}
+	if sinkErr != nil {
 		return sinkState.Streamed(), fmt.Errorf("persist plan step event: %w", sinkErr)
+	}
+	if usageErr != nil {
+		return sinkState.Streamed(), usageErr
 	}
 	if err != nil {
 		code, message := failureDetails(err)
+		if errors.Is(err, ErrPlanBudget) {
+			code = "plan_budget_exceeded"
+		}
 		stepCode = code
 		_, updateErr := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
 			Status: PlanStepFailed, ErrorCode: code, ErrorMessage: message, FinishedAt: ptrTime(w.clock()),
@@ -550,6 +692,9 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 		w.emitPlanEvent(ctx, run, RunFence(fence), "plan.step.failed", map[string]any{
 			"step_no": step.StepNo, "code": code, "message": message,
 		})
+		if errors.Is(err, ErrPlanBudget) {
+			return sinkState.Streamed(), w.failPlan(ctx, plan, fence, code, "计划模型用量超过上限")
+		}
 		return sinkState.Streamed(), nil
 	}
 	content := strings.TrimSpace(result.Content)
@@ -560,9 +705,6 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 		Status: PlanStepCompleted, Result: map[string]any{"content": content}, FinishedAt: ptrTime(w.clock()),
 	}); err != nil {
 		return sinkState.Streamed(), err
-	}
-	if err := w.plans.AddPlanUsage(ctx, run.UserID, plan.ID, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, w.clock()); err != nil {
-		w.logger.Warn("record plan step usage failed", "run_id", run.ID, "error", err)
 	}
 	w.emitPlanEvent(ctx, run, RunFence(fence), "plan.step.completed", map[string]any{
 		"step_no": step.StepNo, "status": "completed",
@@ -625,18 +767,30 @@ func (r lowRiskToolRegistry) List() []react.ToolSpec {
 	return result
 }
 
-// carryCompletedPlanSteps 把上一版本中已完成步骤的结果复制到新版本。
-// 重规划与人工修订都会创建全新的 PlanStep；若不复制结果，已产生副作用且成功的步骤
-// 会因为状态回到 pending 而再次执行。仅复用参数一致且所有依赖也可复用的结果。
-func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription bool) []PlanStep {
-	if len(steps) == 0 || len(previous.Steps) == 0 {
-		return steps
-	}
-	completed := make(map[int]PlanStep, len(previous.Steps))
-	for _, step := range previous.Steps {
-		if step.Status == PlanStepCompleted {
-			completed[step.StepNo] = step
+// CarryCompletedPlanSteps reuses settled tool operations across versions. Model steps
+// still need matching instructions and reusable dependencies to reuse their results.
+func CarryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription bool, olderTools ...PlanStep) []PlanStep {
+	completedModels := make(map[int]PlanStep)
+	completedTools := make(map[planToolOperation]PlanStep)
+	rememberTool := func(step PlanStep) {
+		if operation, ok := planOperation(step); ok {
+			if _, exists := completedTools[operation]; !exists {
+				completedTools[operation] = step
+			}
 		}
+	}
+	for _, step := range previous.Steps {
+		if step.Status != PlanStepCompleted {
+			continue
+		}
+		if step.ToolName == "" {
+			completedModels[step.StepNo] = step
+			continue
+		}
+		rememberTool(step)
+	}
+	for _, step := range olderTools {
+		rememberTool(step)
 	}
 	order := make([]int, len(steps))
 	for index := range steps {
@@ -647,36 +801,58 @@ func carryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 	})
 	carried := make(map[int]PlanStepStatus, len(steps))
 	for _, index := range order {
-		old, exists := completed[steps[index].StepNo]
-		if !exists {
-			continue
+		step := &steps[index]
+		var old PlanStep
+		var exists bool
+		if step.ToolName == "" {
+			old, exists = completedModels[step.StepNo]
+			if !exists || !matchingPlanModelStep(old, *step, matchDescription, carried) {
+				continue
+			}
+		} else {
+			operation, ok := planOperation(*step)
+			old, exists = completedTools[operation]
+			if !ok || !exists {
+				continue
+			}
+			step.IdempotencyKey = old.IdempotencyKey
 		}
-		if strings.TrimSpace(old.Title) != strings.TrimSpace(steps[index].Title) ||
-			strings.TrimSpace(old.ToolName) != strings.TrimSpace(steps[index].ToolName) {
-			continue
-		}
-		if matchDescription && strings.TrimSpace(old.Description) != strings.TrimSpace(steps[index].Description) {
-			continue
-		}
-		if !slices.Equal(slices.Sorted(slices.Values(old.DependsOn)), slices.Sorted(slices.Values(steps[index].DependsOn))) ||
-			!dependenciesCompleted(steps[index].DependsOn, carried) {
-			continue
-		}
-		oldArgs, oldErr := json.Marshal(planArguments(old.Arguments))
-		newArgs, newErr := json.Marshal(planArguments(steps[index].Arguments))
-		if oldErr != nil || newErr != nil || !bytes.Equal(oldArgs, newArgs) {
-			continue
-		}
-		steps[index].Status = PlanStepCompleted
-		carried[steps[index].StepNo] = PlanStepCompleted
-		steps[index].Result = old.Result
-		steps[index].Attempts = old.Attempts
-		steps[index].StartedAt = old.StartedAt
-		steps[index].FinishedAt = old.FinishedAt
-		// 执行步骤 ID 属于旧 Run 的执行树，新计划重新绑定 Run 后不能复用。
-		steps[index].ExecutionStepID = nil
+		step.Status = PlanStepCompleted
+		carried[step.StepNo] = PlanStepCompleted
+		step.Result = old.Result
+		step.Attempts = old.Attempts
+		step.StartedAt = old.StartedAt
+		step.FinishedAt = old.FinishedAt
+		// The original execution tree remains associated with the original step.
+		step.ExecutionStepID = nil
 	}
 	return steps
+}
+
+type planToolOperation struct {
+	toolName  string
+	arguments string
+}
+
+func planOperation(step PlanStep) (planToolOperation, bool) {
+	name := strings.TrimSpace(step.ToolName)
+	if name == "" {
+		return planToolOperation{}, false
+	}
+	arguments, err := json.Marshal(planArguments(step.Arguments))
+	return planToolOperation{toolName: name, arguments: string(arguments)}, err == nil
+}
+
+func matchingPlanModelStep(old, step PlanStep, matchDescription bool, carried map[int]PlanStepStatus) bool {
+	if strings.TrimSpace(old.Title) != strings.TrimSpace(step.Title) ||
+		matchDescription && strings.TrimSpace(old.Description) != strings.TrimSpace(step.Description) ||
+		!slices.Equal(slices.Sorted(slices.Values(old.DependsOn)), slices.Sorted(slices.Values(step.DependsOn))) ||
+		!dependenciesCompleted(step.DependsOn, carried) {
+		return false
+	}
+	oldArgs, oldErr := json.Marshal(planArguments(old.Arguments))
+	newArgs, newErr := json.Marshal(planArguments(step.Arguments))
+	return oldErr == nil && newErr == nil && bytes.Equal(oldArgs, newArgs)
 }
 
 // replanPlan 基于失败原因生成新版本计划，保留已完成步骤的成果并替换失败步骤。
@@ -691,7 +867,26 @@ func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunF
 	})
 	draft, completion, err := w.generatePlan(ctx, router, replanMessages, tools)
 	if err != nil {
-		return Plan{}, err
+		code, message := "plan_step_failed", "计划步骤失败或依赖无法满足"
+		if errors.Is(err, ErrPlanBudget) {
+			code, message = "plan_budget_exceeded", "计划修订超出模型用量上限"
+		} else {
+			w.logger.Warn("could not generate revised plan", "run_id", run.ID, "plan_id", plan.ID, "error", err)
+		}
+		failure := w.persistPlanFailure(ctx, plan, PlanFence(runFence), code, message)
+		if errors.Is(failure, ErrPlanRevisionConflict) {
+			latest, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
+			if err != nil {
+				return Plan{}, err
+			}
+			switch latest.Status {
+			case PlanPaused:
+				return Plan{}, ErrPlanPaused
+			case PlanCancelled:
+				return Plan{}, ErrPlanCancelled
+			}
+		}
+		return Plan{}, failure
 	}
 	limits := DefaultPlanLimits()
 	now := w.clock()
@@ -715,15 +910,15 @@ func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunF
 	if snapshot == nil {
 		snapshot = map[string]any{}
 	}
-	steps = carryCompletedPlanSteps(steps, plan, false)
 	parentID := plan.ID
 	newPlan := Plan{
 		ID: planID, UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID,
 		Version: plan.Version + 1, ParentPlanID: &parentID, Status: PlanExecuting,
 		Goal: draft.Goal, ConfigSnapshot: snapshot, MaxSteps: limits.MaxSteps,
 		DeadlineAt: run.DeadlineAt, Revision: 0, CreatedAt: now, UpdatedAt: now, Steps: steps,
+		TotalInputTokens: plan.TotalInputTokens, TotalOutputTokens: plan.TotalOutputTokens, EstimatedCost: plan.EstimatedCost,
 	}
-	created, err := w.plans.CreatePlan(ctx, run.UserID, newPlan, OutboxEvent{
+	created, err := w.plans.ReplacePlan(ctx, run.UserID, newPlan, plan.Revision, PlanFence(runFence), OutboxEvent{
 		UserID: run.UserID, EventType: "plan.created", AggregateType: "plan", AggregateID: planID.String(),
 		DedupeKey: "plan.created:" + planID.String(),
 		Payload: map[string]any{
@@ -734,14 +929,8 @@ func (w *ExecutionWorker) replanPlan(ctx context.Context, run Run, runFence RunF
 	if err != nil {
 		return Plan{}, err
 	}
-	if err := w.plans.AddPlanUsage(ctx, run.UserID, planID, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost, now); err != nil {
-		w.logger.Warn("record replanner usage failed", "run_id", run.ID, "error", err)
-	}
-	// 旧版本保留为失败终态，便于审计失败原因与重规划链路。
-	if _, err := w.plans.UpdatePlan(ctx, run.UserID, plan.ID, plan.Status, PlanFailed, plan.Revision, PlanFence{Owner: w.config.WorkerID, Token: runFence.Token}, PlanUpdate{
-		ErrorCode: "plan_replanned", ErrorMessage: "步骤失败，已生成新版本计划", FinishedAt: &now,
-	}); err != nil && !errors.Is(err, ErrPlanRevisionConflict) {
-		w.logger.Warn("mark old plan failed after replan failed", "run_id", run.ID, "plan_id", plan.ID, "error", err)
+	if err := w.recordPlanUsage(ctx, created, int64(completion.Usage.InputTokens), int64(completion.Usage.OutputTokens), completion.EstimatedCost); err != nil {
+		return Plan{}, err
 	}
 	w.emitPlanEvent(ctx, run, runFence, "plan.replanned", map[string]any{
 		"plan_id": planID.String(), "version": newPlan.Version, "parent_plan_id": plan.ID.String(),
@@ -788,7 +977,7 @@ func (w *ExecutionWorker) executePlanToolStep(ctx context.Context, run Run, runF
 			return startErr
 		}
 		executionStepID = &executionStep.ID
-		text, truncated := truncatePayloadText(string(arguments), w.config.MaxPayloadBytes)
+		text, truncated := captureExecutionText(string(arguments), w.config.MaxPayloadBytes)
 		if _, payloadErr := w.steps.SavePayload(ctx, ExecutionPayload{
 			RunID: run.ID, UserID: run.UserID, StepID: executionStepID, Type: PayloadToolInput,
 			ContentText: text, CaptureMode: CaptureRedacted, OriginalSizeBytes: int64(len(arguments)), Truncated: truncated,
@@ -798,6 +987,14 @@ func (w *ExecutionWorker) executePlanToolStep(ctx context.Context, run Run, runF
 	}
 	claimed, err := w.plans.ClaimPlanStep(ctx, run.UserID, plan.ID, step.ID, executionStepID, fence, w.clock())
 	if err != nil {
+		if executionStepID != nil {
+			_, finishErr := w.steps.FinishStep(context.WithoutCancel(ctx), run.UserID, *executionStepID, StepUpdate{
+				Status: StepCancelled, ErrorCode: "plan_step_not_claimed", FinishedAt: w.clock(),
+			})
+			if finishErr != nil {
+				return errors.Join(err, finishErr)
+			}
+		}
 		if errors.Is(err, ErrResourceConflict) {
 			return nil
 		}
@@ -815,14 +1012,16 @@ func (w *ExecutionWorker) executePlanToolStep(ctx context.Context, run Run, runF
 			return nil
 		}
 		callID := "plan-step-" + claimed.ID.String()
+		target := mcp.IdentityOf(tool)
 		approval, createErr := w.approvals.CreateApproval(ctx, ToolApproval{
 			RunID: run.ID, StepID: executionStepID, UserID: run.UserID, ToolCallID: callID,
-			ToolName: step.ToolName, Arguments: arguments, RiskLevel: tool.RiskLevel(),
+			ToolName: step.ToolName, MCPBinding: target, Arguments: arguments, RiskLevel: tool.RiskLevel(),
 			Status: ApprovalPending, IdempotencyKey: step.IdempotencyKey,
 		})
 		if createErr != nil {
 			existing, lookupErr := w.findPlanApproval(ctx, run, callID)
-			if lookupErr != nil || existing == nil || existing.Status != ApprovalPending {
+			if errors.Is(createErr, ErrResourceConflict) || lookupErr != nil || existing == nil ||
+				existing.Status != ApprovalPending || existing.MCPBinding != target {
 				_, updateErr := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
 					Status: PlanStepFailed, ErrorCode: "approval_persist_failed", ErrorMessage: "审批记录创建失败", FinishedAt: ptrTime(w.clock()),
 				})
@@ -857,6 +1056,19 @@ func (w *ExecutionWorker) executePlanToolStep(ctx context.Context, run Run, runF
 	toolContext = react.WithToolCall(toolContext, "plan-step-"+claimed.ID.String(), step.ToolName)
 	output, invokeErr := w.invokeTool(toolContext, tool, arguments)
 	finishedAt := w.clock()
+	markUnknown := func(cause error) error {
+		if executionStepID != nil {
+			if _, err := w.steps.FinishStep(context.WithoutCancel(ctx), run.UserID, *executionStepID, StepUpdate{
+				Status: StepReconciliationRequired, ErrorCode: planToolOutcomeUnknownCode, FinishedAt: finishedAt,
+			}); err != nil {
+				cause = errors.Join(cause, err)
+			}
+		}
+		return w.markPlanStepUnknown(ctx, plan, fence, claimed, true, cause)
+	}
+	if errors.Is(invokeErr, ErrToolResultPersistence) {
+		return markUnknown(invokeErr)
+	}
 	if invokeErr != nil {
 		code, message := failureDetails(invokeErr)
 		var failedResult map[string]any
@@ -882,13 +1094,13 @@ func (w *ExecutionWorker) executePlanToolStep(ctx context.Context, run Run, runF
 	if w.config.MaxPayloadBytes > 0 && int64(len(content)) > w.config.MaxPayloadBytes {
 		content, _ = truncatePayloadText(content, w.config.MaxPayloadBytes)
 	}
-	if _, err := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
+	if _, err := w.plans.UpdatePlanStep(context.WithoutCancel(ctx), run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
 		Status: PlanStepCompleted, Result: map[string]any{"content": content}, FinishedAt: &finishedAt,
 	}); err != nil {
-		return err
+		return markUnknown(err)
 	}
 	if executionStepID != nil && w.steps != nil {
-		text, truncated := truncatePayloadText(string(output), w.config.MaxPayloadBytes)
+		text, truncated := captureExecutionText(string(output), w.config.MaxPayloadBytes)
 		if _, payloadErr := w.steps.SavePayload(ctx, ExecutionPayload{
 			RunID: run.ID, UserID: run.UserID, StepID: executionStepID, Type: PayloadToolOutput,
 			ContentText: text, CaptureMode: CaptureRedacted, OriginalSizeBytes: int64(len(output)), Truncated: truncated,
@@ -927,10 +1139,10 @@ const planAggregatorMaxRunes = 8_000
 
 // summarizePlan 用一次无工具模型调用把步骤结果整理成最终答案；失败时回退为结构化拼接。
 // 同时返回本次调用的用量，调用方必须把它纳入计划预算与累计统计。
-func (w *ExecutionWorker) summarizePlan(ctx context.Context, router *model.Router, plan Plan) (string, react.Completion) {
+func (w *ExecutionWorker) summarizePlan(ctx context.Context, router *model.Router, plan Plan) (string, react.Completion, error) {
 	fallback := planFinalContent(plan)
 	if router == nil {
-		return fallback, react.Completion{}
+		return fallback, react.Completion{}, nil
 	}
 	bundle := truncateText(fallback, planAggregatorMaxRunes)
 	completion, err := router.Complete(ctx, []react.Message{
@@ -938,13 +1150,16 @@ func (w *ExecutionWorker) summarizePlan(ctx context.Context, router *model.Route
 		{Role: react.RoleUser, Content: "计划目标：\n" + plan.Goal + "\n\n步骤结果：\n" + bundle},
 	}, nil)
 	if err != nil {
+		if errors.Is(err, ErrPlanBudget) {
+			return "", react.Completion{}, err
+		}
 		w.logger.Warn("summarize plan failed; falling back to step concatenation", "plan_id", plan.ID, "error", err)
-		return fallback, react.Completion{}
+		return fallback, react.Completion{}, nil
 	}
 	if content := strings.TrimSpace(completion.Content); content != "" {
-		return content, completion
+		return content, completion, nil
 	}
-	return fallback, completion
+	return fallback, completion, nil
 }
 
 // deterministicPlanFinalMessageID 为计划最终答复提供跨重试稳定、独立于局部步骤序号的幂等键。
@@ -955,27 +1170,36 @@ func deterministicPlanFinalMessageID(planID uuid.UUID) string {
 // finishPlan 汇总步骤结果、落库最终消息并推进计划终态。
 func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunFence, router *model.Router, plan Plan, messages []react.Message) (react.Result, error) {
 	// 先汇总再落终态：汇总失败只回退文本，不影响计划完成状态。
-	content, aggregation := w.summarizePlan(ctx, router, plan)
-	if aggregation.Usage.InputTokens != 0 || aggregation.Usage.OutputTokens != 0 || aggregation.EstimatedCost != 0 {
-		if err := w.plans.AddPlanUsage(ctx, run.UserID, plan.ID, int64(aggregation.Usage.InputTokens), int64(aggregation.Usage.OutputTokens), aggregation.EstimatedCost, w.clock()); err != nil {
-			w.logger.Warn("record plan aggregator usage failed", "run_id", run.ID, "plan_id", plan.ID, "error", err)
-		} else {
-			// AddPlanUsage 会递增 revision，完成状态迁移前必须读取最新版本。
-			plan, err = w.plans.GetPlan(ctx, run.UserID, plan.ID)
-			if err != nil {
-				return react.Result{}, err
-			}
-		}
+	content, aggregation, aggregateErr := w.summarizePlan(ctx, router, plan)
+	fence := PlanFence(runFence)
+	if err := w.recordPlanUsage(ctx, plan, int64(aggregation.Usage.InputTokens), int64(aggregation.Usage.OutputTokens), aggregation.EstimatedCost); err != nil {
+		return react.Result{}, err
 	}
-	if w.config.PlanMaxTokens > 0 && plan.TotalInputTokens+plan.TotalOutputTokens > w.config.PlanMaxTokens {
-		return react.Result{}, w.failPlan(ctx, plan, PlanFence{Owner: w.config.WorkerID, Token: runFence.Token}, "plan_budget_exceeded", "计划 Token 用量超过上限")
+	latest, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
+	if err != nil {
+		return react.Result{}, err
 	}
-	if w.config.PlanMaxCost > 0 && plan.EstimatedCost > w.config.PlanMaxCost {
-		return react.Result{}, w.failPlan(ctx, plan, PlanFence{Owner: w.config.WorkerID, Token: runFence.Token}, "plan_budget_exceeded", "计划费用超过上限")
+	if latest.ID != plan.ID {
+		return react.Result{}, ErrPlanRevisionConflict
+	}
+	switch latest.Status {
+	case PlanPaused:
+		return react.Result{}, ErrPlanPaused
+	case PlanCancelled:
+		return react.Result{}, ErrPlanCancelled
+	case PlanExecuting:
+	default:
+		return react.Result{}, ErrPlanRevisionConflict
+	}
+	if aggregateErr != nil {
+		return react.Result{}, w.persistPlanFailure(ctx, latest, fence, "plan_budget_exceeded", "计划汇总超出模型用量上限")
+	}
+	if err := w.checkPlanBudget(ctx, latest, fence); err != nil {
+		return react.Result{}, err
 	}
 	now := w.clock()
-	updated, err := w.plans.UpdatePlan(ctx, run.UserID, plan.ID, plan.Status, PlanCompleted, plan.Revision,
-		PlanFence{Owner: w.config.WorkerID, Token: runFence.Token}, PlanUpdate{FinishedAt: &now})
+	updated, err := w.plans.UpdatePlan(ctx, run.UserID, plan.ID, PlanExecuting, PlanCompleted, latest.Revision,
+		fence, PlanUpdate{FinishedAt: &now})
 	if err != nil {
 		return react.Result{}, err
 	}
@@ -1000,7 +1224,7 @@ func (w *ExecutionWorker) planFinalResult(ctx context.Context, run Run, fence Ru
 func (w *ExecutionWorker) planResultWithStoredFinal(ctx context.Context, run Run, fence RunFence, plan Plan, messages []react.Message, content string) (react.Result, error) {
 	finalMessageID := deterministicPlanFinalMessageID(plan.ID)
 	payload := map[string]any{"index": len(messages), "role": string(MessageAssistant), "content": content, "message_id": finalMessageID}
-	stored, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, payload)
+	stored, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, fence, payload)
 	if err != nil {
 		return react.Result{}, err
 	}
@@ -1024,7 +1248,31 @@ func (w *ExecutionWorker) planResultWithStoredFinal(ctx context.Context, run Run
 
 // failPlan 标记计划失败、跳过依赖失败的待执行步骤并返回业务错误。
 func (w *ExecutionWorker) failPlan(ctx context.Context, plan Plan, fence PlanFence, code, message string) error {
+	reloaded, err := w.plans.GetPlanByRun(ctx, plan.UserID, plan.RunID)
+	if err != nil {
+		return err
+	}
+	if reloaded.ID != plan.ID {
+		return ErrPlanRevisionConflict
+	}
+	if PlanTerminal(reloaded.Status) {
+		return fmt.Errorf("%w: %s", ErrPlanFailed, message)
+	}
+	err = w.persistPlanFailure(ctx, reloaded, fence, code, message)
+	if errors.Is(err, ErrPlanRevisionConflict) {
+		return fmt.Errorf("%w: %s", ErrPlanFailed, message)
+	}
+	return err
+}
+
+func (w *ExecutionWorker) persistPlanFailure(ctx context.Context, plan Plan, fence PlanFence, code, message string) error {
 	now := w.clock()
+	updated, err := w.plans.UpdatePlan(ctx, plan.UserID, plan.ID, plan.Status, PlanFailed, plan.Revision, fence, PlanUpdate{
+		ErrorCode: code, ErrorMessage: message, FinishedAt: &now,
+	})
+	if err != nil {
+		return err
+	}
 	for _, step := range plan.Steps {
 		if step.Status != PlanStepPending {
 			continue
@@ -1034,19 +1282,6 @@ func (w *ExecutionWorker) failPlan(ctx context.Context, plan Plan, fence PlanFen
 		}); err != nil && !errors.Is(err, ErrResourceConflict) {
 			w.logger.Warn("skip dependent plan step failed", "plan_id", plan.ID, "error", err)
 		}
-	}
-	reloaded, err := w.plans.GetPlanByRun(ctx, plan.UserID, plan.RunID)
-	if err != nil {
-		return err
-	}
-	if PlanTerminal(reloaded.Status) {
-		return fmt.Errorf("%w: %s", ErrPlanFailed, message)
-	}
-	updated, err := w.plans.UpdatePlan(ctx, plan.UserID, reloaded.ID, reloaded.Status, PlanFailed, reloaded.Revision, fence, PlanUpdate{
-		ErrorCode: code, ErrorMessage: message, FinishedAt: &now,
-	})
-	if err != nil && !errors.Is(err, ErrPlanRevisionConflict) {
-		return err
 	}
 	if updated.ID != uuid.Nil {
 		w.emitPlanEvent(ctx, Run{ID: plan.RunID, UserID: plan.UserID}, RunFence(fence), "plan.failed", map[string]any{

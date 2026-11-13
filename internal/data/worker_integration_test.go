@@ -17,11 +17,11 @@ import (
 )
 
 // integrationCredentials 返回可解密的测试凭证，避免依赖真实供应商。
-type integrationCredentials struct{}
+type integrationCredentials struct{ baseURL string }
 
 // GetProviderCredential 实现凭证读取端口。
-func (integrationCredentials) GetProviderCredential(_ context.Context, providerID uuid.UUID) (biz.Provider, biz.ProviderCredential, error) {
-	return biz.Provider{ID: providerID, Status: biz.ProviderEnabled, BaseURL: "https://models.example.com"},
+func (c integrationCredentials) GetProviderCredential(_ context.Context, providerID uuid.UUID) (biz.Provider, biz.ProviderCredential, error) {
+	return biz.Provider{ID: providerID, Status: biz.ProviderEnabled, BaseURL: c.baseURL},
 		biz.ProviderCredential{KeyVersion: "v1", Encrypted: []byte("ciphertext")}, nil
 }
 
@@ -104,8 +104,9 @@ func TestExecutionWorkerIntegrationSuccessAndCancel(t *testing.T) {
 	}
 	// 通用 Worker 构造函数参数保持与真实仓储一致，避免测试使用不同实现。
 	steps := NewExecutionStepRepository(appDB)
+	credentials := &integrationCredentials{baseURL: server.URL}
 	worker, err := biz.NewExecutionWorker(biz.ExecutionWorkerDependencies{
-		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{}, Opener: integrationOpener{},
+		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: credentials, Opener: integrationOpener{},
 		Attempts: calls, Steps: steps,
 	}, biz.WorkerConfig{
 		WorkerID: "integration-worker", JobType: "agent.run.test", Concurrency: 1, PollInterval: time.Millisecond,
@@ -208,6 +209,7 @@ func TestExecutionWorkerIntegrationSuccessAndCancel(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"req-2","choices":[{"message":{"content":"late"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 	}))
 	defer slowServer.Close()
+	credentials.baseURL = slowServer.URL
 	cancelSession := uuid.New()
 	if _, err := sessions.CreateSession(ctx, biz.Session{
 		ID: cancelSession, UserID: user.ID, Title: "cancel", Source: biz.SessionSourceWeb, Status: biz.SessionActive, Version: 1,

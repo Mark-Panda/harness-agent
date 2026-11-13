@@ -45,18 +45,18 @@ func (m *MockToolApprovalRepository) EXPECT() *MockToolApprovalRepositoryMockRec
 }
 
 // ClaimApprovalExecution mocks base method.
-func (m *MockToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, now time.Time) (biz.ToolApproval, error) {
+func (m *MockToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence biz.RunFence, now time.Time) (biz.ToolApproval, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ClaimApprovalExecution", ctx, userID, approvalID, now)
+	ret := m.ctrl.Call(m, "ClaimApprovalExecution", ctx, userID, runID, approvalID, fence, now)
 	ret0, _ := ret[0].(biz.ToolApproval)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ClaimApprovalExecution indicates an expected call of ClaimApprovalExecution.
-func (mr *MockToolApprovalRepositoryMockRecorder) ClaimApprovalExecution(ctx, userID, approvalID, now any) *gomock.Call {
+func (mr *MockToolApprovalRepositoryMockRecorder) ClaimApprovalExecution(ctx, userID, runID, approvalID, fence, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClaimApprovalExecution", reflect.TypeOf((*MockToolApprovalRepository)(nil).ClaimApprovalExecution), ctx, userID, approvalID, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClaimApprovalExecution", reflect.TypeOf((*MockToolApprovalRepository)(nil).ClaimApprovalExecution), ctx, userID, runID, approvalID, fence, now)
 }
 
 // CountPendingApprovals mocks base method.

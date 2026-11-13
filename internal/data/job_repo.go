@@ -130,6 +130,7 @@ func (r *JobRepository) RequeueRun(ctx context.Context, runID uuid.UUID, now tim
 			Updates(map[string]any{
 				"status": "pending", "attempts": 0, "available_at": now, "updated_at": now,
 				"lease_owner": "", "lease_expires_at": nil, "last_error": "",
+				"payload": gorm.Expr("payload - 'run_settlement'"),
 			})
 		if result.Error != nil {
 			return result.Error
@@ -300,34 +301,43 @@ func (r *JobRepository) Claim(ctx context.Context, workerID string, jobType stri
 		return biz.Job{}, false, fmt.Errorf("%w: worker, lease and job types are required", biz.ErrInvalidConfig)
 	}
 	type claimed struct {
-		ID           uuid.UUID
-		UserID       *uuid.UUID
-		JobType      string
-		Payload      datatypes.JSON
-		Attempts     int
-		MaxAttempts  int
-		FencingToken int64
-		LeaseOwner   string
+		ID             uuid.UUID
+		UserID         *uuid.UUID
+		JobType        string
+		Payload        datatypes.JSON
+		Attempts       int
+		MaxAttempts    int
+		FencingToken   int64
+		LeaseOwner     string
+		SettlementOnly bool
 	}
 	var record claimed
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
 		// 先锁定可领取行，再更新租约与 fencing token；SKIP LOCKED 避免多 Worker 阻塞。
 		query := `
 WITH candidate AS (
-  SELECT id FROM jobs
-  WHERE job_type = ? AND (
-    (status = 'pending' AND available_at <= ?)
-    OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?))
+  SELECT j.id, (j.dedupe_key IS NOT NULL AND j.dedupe_key LIKE 'run:%' AND
+    (j.attempts >= j.max_attempts OR j.payload->'run_settlement' IS NOT NULL OR j.status = 'dead')) AS settlement_only
+  FROM jobs AS j
+  WHERE j.job_type = ? AND (
+    (j.status = 'pending' AND j.available_at <= ?)
+    OR (j.status = 'running' AND (j.lease_expires_at IS NULL OR j.lease_expires_at < ?))
+    OR (j.status = 'dead' AND j.dedupe_key LIKE 'run:%' AND EXISTS (
+      SELECT 1 FROM agent_runs AS ar WHERE ar.user_id = j.user_id
+        AND j.dedupe_key = 'run:' || ar.id::text
+        AND ar.status IN ('queued', 'running', 'waiting_approval')
+    ))
   )
-  ORDER BY available_at, created_at, id
+  ORDER BY j.available_at, j.created_at, j.id
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
-UPDATE jobs SET status = 'running', attempts = attempts + 1, lease_owner = ?,
+UPDATE jobs SET status = 'running',
+  attempts = attempts + CASE WHEN candidate.settlement_only THEN 0 ELSE 1 END, lease_owner = ?,
   lease_expires_at = ?, fencing_token = fencing_token + 1, updated_at = ?
 FROM candidate WHERE jobs.id = candidate.id
 RETURNING jobs.id, jobs.user_id, jobs.job_type, jobs.payload, jobs.attempts, jobs.max_attempts,
-  jobs.fencing_token, jobs.lease_owner`
+  jobs.fencing_token, jobs.lease_owner, candidate.settlement_only`
 		return tx.Raw(query, jobType, now, now, workerID, now.Add(lease), now).Scan(&record).Error
 	})
 	if err != nil {
@@ -340,19 +350,40 @@ RETURNING jobs.id, jobs.user_id, jobs.job_type, jobs.payload, jobs.attempts, job
 	if err := json.Unmarshal(record.Payload, &payload); err != nil {
 		return biz.Job{}, false, fmt.Errorf("decode job payload: %w", err)
 	}
-	return biz.Job{
+	job := biz.Job{
 		ID: record.ID, UserID: record.UserID, Type: record.JobType, Payload: payload,
 		Attempts: record.Attempts, MaxAttempts: record.MaxAttempts, FencingToken: record.FencingToken,
 		LeaseOwner: record.LeaseOwner, AvailableAt: now,
-	}, true, nil
+		RunSettlementOnly: record.SettlementOnly,
+	}
+	if record.SettlementOnly {
+		var meta struct {
+			Settlement *biz.RunJobSettlement `json:"run_settlement"`
+		}
+		// A malformed intent is treated as an unknown outcome by the settlement worker.
+		if err := json.Unmarshal(record.Payload, &meta); err == nil && meta.Settlement != nil {
+			switch meta.Settlement.Status {
+			case biz.RunCompleted, biz.RunFailed, biz.RunReconciliationRequired:
+				job.RunSettlement = meta.Settlement
+			}
+		}
+	}
+	return job, true, nil
 }
 
-// Renew 续约任务租约；租约已被其他 Worker 接管时返回冲突。
+// Renew 续约任务租约；租约过期或已被其他 Worker 接管时返回冲突。
 func (r *JobRepository) Renew(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, lease time.Duration, now time.Time) error {
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		result := tx.Model(&jobModel{}).
-			Where("id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?", jobID, workerID, fencingToken).
-			Updates(map[string]any{"lease_expires_at": now.Add(lease), "updated_at": now})
+		result := tx.Exec(`
+WITH locked_job AS MATERIALIZED (
+  SELECT id, lease_expires_at FROM jobs
+  WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?
+  FOR UPDATE
+)
+UPDATE jobs SET lease_expires_at = ?, updated_at = ?
+FROM locked_job
+WHERE jobs.id = locked_job.id AND locked_job.lease_expires_at > GREATEST(?::timestamptz, clock_timestamp())`,
+			jobID, workerID, fencingToken, now.Add(lease), now, now)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -393,6 +424,7 @@ func (r *JobRepository) Complete(ctx context.Context, jobID uuid.UUID, workerID 
 		result := tx.Model(&jobModel{}).
 			Where("id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?", jobID, workerID, fencingToken).
 			Updates(map[string]any{"status": "completed", "lease_owner": "", "lease_expires_at": nil,
+				"payload":      gorm.Expr("CASE WHEN dedupe_key LIKE 'run:%' THEN payload - 'run_settlement' ELSE payload END"),
 				"completed_at": time.Now().UTC(), "updated_at": time.Now().UTC()})
 		if result.Error != nil {
 			return result.Error
@@ -403,6 +435,36 @@ func (r *JobRepository) Complete(ctx context.Context, jobID uuid.UUID, workerID 
 		return nil
 	})
 	return catalogError("complete job", err)
+}
+
+// DeferRunSettlement 保留 Run 的终态重试信息，使用当前 Job 栅栏退回队列。
+func (r *JobRepository) DeferRunSettlement(ctx context.Context, job biz.Job, settlement *biz.RunJobSettlement, retryAt, now time.Time) error {
+	if job.UserID == nil || *job.UserID == uuid.Nil {
+		return fmt.Errorf("%w: run settlement requires a job owner", biz.ErrInvalidConfig)
+	}
+	fields := map[string]any{
+		"status": "pending", "available_at": retryAt, "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
+	}
+	if settlement != nil {
+		payload, err := json.Marshal(settlement)
+		if err != nil {
+			return err
+		}
+		fields["payload"] = gorm.Expr("jsonb_set(payload, '{run_settlement}', CAST(? AS jsonb))", string(payload))
+	}
+	err := WithScope(ctx, r.db, Scope{UserID: *job.UserID}, func(tx *gorm.DB) error {
+		result := tx.Model(&jobModel{}).
+			Where("id = ? AND user_id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?",
+				job.ID, *job.UserID, job.LeaseOwner, job.FencingToken).Updates(fields)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: job lease is no longer valid", biz.ErrResourceConflict)
+		}
+		return nil
+	})
+	return catalogError("defer run settlement", err)
 }
 
 // Fail 记录失败：预算内退回 pending 并按指数退避延后，超出预算进入 dead 等待人工重放。
@@ -436,8 +498,8 @@ func (r *JobRepository) Fail(ctx context.Context, jobID uuid.UUID, workerID stri
 	return catalogError("fail job", err)
 }
 
-// 编译期断言接口实现。
-var _ biz.JobQueue = (*JobRepository)(nil)
+// 编译期断言执行队列接口实现。
+var _ biz.RunExecutionQueue = (*JobRepository)(nil)
 
 // 编译期断言 Run 入队端口实现。
 var _ biz.RunEnqueuer = (*JobRepository)(nil)

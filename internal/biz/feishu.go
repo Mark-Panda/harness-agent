@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -150,8 +151,6 @@ type FeishuConversationRepository interface {
 	ReleaseConversation(ctx context.Context, userID, sessionID uuid.UUID, status string, event OutboxEvent) (int, error)
 	// RestoreConversation 将已关闭或已归档的绑定恢复为活跃，返回受影响绑定数；必须按 user_id 限定。
 	RestoreConversation(ctx context.Context, userID, sessionID uuid.UUID, event OutboxEvent) (int, error)
-	// PromoteConversationThread 把主时间线根消息别名升级为飞书真实话题 ID，返回受影响绑定数。
-	PromoteConversationThread(ctx context.Context, userID, sessionID uuid.UUID, legacyThreadID, threadID string) (int, error)
 }
 
 // FeishuBindingService 提供飞书话题关闭、归档、恢复与解绑用例。
@@ -224,6 +223,9 @@ type FeishuInboundMessageStore interface {
 	AppendInbound(ctx context.Context, message Message, event OutboxEvent) (Message, bool, error)
 }
 
+// ErrFeishuOutboundClaimLost 表示外发租约已到期、结束或由其他 Worker 接管。
+var ErrFeishuOutboundClaimLost = errors.New("feishu outbound claim lost")
+
 // FeishuOutbound 是外发回复记录。
 type FeishuOutbound struct {
 	// ID 外发记录主键。
@@ -234,8 +236,12 @@ type FeishuOutbound struct {
 	SessionID uuid.UUID
 	// RunID 关联 Run。
 	RunID uuid.UUID
-	// AppID 接收消息的飞书应用，回复 Worker 据此选择机器人客户端。
+	// AppID 接收消息的飞书应用。
 	AppID string
+	// BotID 是接收入站事件的注册机器人。删除机器人后仍保留此标识。
+	BotID uuid.UUID
+	// DefaultRoute 表示入站事件由默认应用的凭据验证。
+	DefaultRoute bool
 	// ChatID 目标飞书会话。
 	ChatID string
 	// ThreadID 目标话题。
@@ -246,12 +252,18 @@ type FeishuOutbound struct {
 	MessageID string
 	// Kind 回复形态：card/text。
 	Kind string
+	// Post 保存尚未确认的飞书请求，或已确认的文本回复，直到外发记录完成。
+	Post *FeishuOutboundPost
 	// Status 投递状态。
 	Status string
 	// Attempts 已尝试次数。
 	Attempts int
 	// MaxAttempts 最大尝试次数。
 	MaxAttempts int
+	// LeaseOwner 与 FencingToken 标识本次领取，令牌在每次领取时递增。
+	LeaseOwner     string
+	FencingToken   int64
+	LeaseExpiresAt time.Time
 	// DedupeKey 业务去重键。
 	DedupeKey string
 	// CardUpdatedAt 最近一次卡片成功更新的时间；零值表示尚未更新过卡片。
@@ -262,22 +274,38 @@ type FeishuOutbound struct {
 	CreatedAt time.Time
 }
 
+// FeishuOutboundPost preserves the exact request across leases and worker restarts.
+type FeishuOutboundPost struct {
+	Request         feishu.ReplyRequest `json:"request"`
+	StartedAt       time.Time           `json:"started_at"`
+	CardFingerprint string              `json:"card_fingerprint,omitempty"`
+	GroupText       *string             `json:"group_text,omitempty"`
+}
+
 // FeishuOutboundStore 定义外发回复的持久化与投递状态契约。
 type FeishuOutboundStore interface {
 	// CreateOutbound 幂等创建外发记录。
 	CreateOutbound(ctx context.Context, outbound FeishuOutbound) error
 	// ClaimOutbound 领取一个到期外发记录。
 	ClaimOutbound(ctx context.Context, workerID string, lease time.Duration, now time.Time) (FeishuOutbound, bool, error)
-	// UpdateOutboundMessageID 保存飞书返回的消息 ID。
-	UpdateOutboundMessageID(ctx context.Context, id uuid.UUID, messageID string, now time.Time) error
+	// CheckOutboundClaim 在调用飞书前校验本次领取仍然有效。
+	CheckOutboundClaim(ctx context.Context, outbound FeishuOutbound, now time.Time) error
+	// PromoteOutboundThread 把本次外发的根消息别名升级为真实话题 ID。
+	PromoteOutboundThread(ctx context.Context, outbound FeishuOutbound, threadID string, now time.Time) (int, error)
+	// SetOutboundPost writes a new POST intent before sending, or clears a rejected intent.
+	SetOutboundPost(ctx context.Context, outbound FeishuOutbound, post *FeishuOutboundPost, now time.Time) error
+	// UpdateOutboundMessageID atomically records the ID and metadata for a successful POST.
+	UpdateOutboundMessageID(ctx context.Context, outbound FeishuOutbound, messageID string, now time.Time) error
 	// MarkOutboundCardUpdated 记录卡片成功更新时间与内容指纹，用于跨副本限制更新频率并跳过重复内容。
-	MarkOutboundCardUpdated(ctx context.Context, id uuid.UUID, fingerprint string, now time.Time) error
+	MarkOutboundCardUpdated(ctx context.Context, outbound FeishuOutbound, fingerprint string, now time.Time) error
 	// DeferOutbound 在等待 Run 完成时延后再次处理，不消耗失败预算。
-	DeferOutbound(ctx context.Context, id uuid.UUID, retryAt, now time.Time) error
+	DeferOutbound(ctx context.Context, outbound FeishuOutbound, retryAt, now time.Time) error
 	// CompleteOutbound 标记外发成功。
-	CompleteOutbound(ctx context.Context, id uuid.UUID, now time.Time) error
+	CompleteOutbound(ctx context.Context, outbound FeishuOutbound, now time.Time) error
+	// CompleteGroupReply 原子标记外发成功并保存共享群聊中已发送的正文。
+	CompleteGroupReply(ctx context.Context, outbound FeishuOutbound, text string, now time.Time) error
 	// FailOutbound 记录失败并在预算内重试，超出预算进入死信。
-	FailOutbound(ctx context.Context, id uuid.UUID, reason string, retryAt, now time.Time) error
+	FailOutbound(ctx context.Context, outbound FeishuOutbound, reason string, retryAt, now time.Time) error
 	// LatestAssistantMessage 读取指定 Run 产生的助手消息，用于生成最终回复；runID 为空时退回会话最近一条。
 	LatestAssistantMessage(ctx context.Context, userID, sessionID uuid.UUID, runID *uuid.UUID) (Message, error)
 }
@@ -288,16 +316,10 @@ type FeishuThreadedMessage = feishu.ThreadReply
 
 // FeishuReplySender 是外发回复的端口，生产实现调用飞书开放平台。
 type FeishuReplySender interface {
-	// ReplyCard 以可更新卡片回复指定消息。
-	ReplyCard(ctx context.Context, replyTo string, card any) (string, error)
-	// ReplyCardInThread 在指定消息下创建或复用话题并回复卡片，用于主时间线 @ 消息建立话题。
-	ReplyCardInThread(ctx context.Context, replyTo string, card any) (FeishuThreadedMessage, error)
+	// Reply sends the persisted Feishu reply request.
+	Reply(ctx context.Context, replyTo string, request feishu.ReplyRequest) (FeishuThreadedMessage, error)
 	// UpdateCard 更新已发送卡片。
 	UpdateCard(ctx context.Context, messageID string, card any) error
-	// ReplyText 以纯文本回复指定消息。
-	ReplyText(ctx context.Context, replyTo, text string) (string, error)
-	// ReplyTextInThread 在话题内回复纯文本，作为卡片降级方案。
-	ReplyTextInThread(ctx context.Context, replyTo, text string) (FeishuThreadedMessage, error)
 }
 
 // FeishuIngestConfig 是事件接入的安全参数。
@@ -357,7 +379,7 @@ func (s *FeishuIngestService) WithBotVerification(credentials FeishuBotCredentia
 
 // Handle 校验并持久化事件，成功后仅入队异步任务，不在请求内调用模型。
 func (s *FeishuIngestService) Handle(ctx context.Context, request feishu.Request) (FeishuIngestResult, error) {
-	return s.handleWithVerifier(ctx, s.verifier, s.defaultAppID, request)
+	return s.handleWithVerifier(ctx, s.verifier, s.defaultAppID, uuid.Nil, request)
 }
 
 // HandleForBot 使用管理员登记的机器人应用凭据验签并处理回调。
@@ -396,7 +418,7 @@ func (s *FeishuIngestService) HandleForBot(ctx context.Context, botID uuid.UUID,
 	}
 	// 回调路由按 botID 选择凭据，事件头中的 app_id 必须与该机器人登记的应用一致，
 	// 防止把其他应用的事件投递到本机器人并触发其绑定的助手。
-	return s.handleWithVerifier(ctx, verifier, bot.AppID, request)
+	return s.handleWithVerifier(ctx, verifier, bot.AppID, botID, request)
 }
 
 // AcceptTrusted 接收已由飞书长连接认证的事件载荷；连接本身由应用凭据建立，因此跳过 HTTP 签名与 Token 校验。
@@ -410,28 +432,48 @@ func (s *FeishuIngestService) AcceptTrusted(ctx context.Context, botID uuid.UUID
 	if int64(len(payload)) > s.maxBodyBytes {
 		return FeishuIngestResult{}, invalid("feishu event body exceeds the limit")
 	}
+	appID = strings.TrimSpace(appID)
+	if appID == "" {
+		return FeishuIngestResult{}, invalid("feishu connection app id is required")
+	}
+	if s.botCredentials != nil {
+		bot, _, err := s.botCredentials.GetFeishuBotCredential(ctx, botID)
+		if err != nil {
+			return FeishuIngestResult{}, err
+		}
+		if bot.Status != FeishuBotEnabled {
+			return FeishuIngestResult{}, fmt.Errorf("%w: feishu bot is disabled", ErrResourceNotFound)
+		}
+		if bot.AppID != appID {
+			return FeishuIngestResult{}, invalid("feishu connection app id mismatch")
+		}
+	}
 	envelope, err := feishu.DecodeEnvelope(payload)
 	if err != nil {
 		return FeishuIngestResult{}, err
 	}
-	// 长连接按应用建立，事件头中的 app_id 必须与连接使用的应用一致，防止事件串应用。
-	if expected := strings.TrimSpace(appID); expected != "" && strings.TrimSpace(envelope.Header.AppID) != "" && envelope.Header.AppID != expected {
-		return FeishuIngestResult{}, invalid("feishu event app id mismatch")
-	}
-	return s.persistEnvelope(ctx, envelope, payload)
+	return s.persistEnvelope(ctx, envelope, payload, appID, botID)
 }
 
 // persistEnvelope 完成事件格式校验、幂等入库与异步任务入队。
-func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feishu.Envelope, plaintext []byte) (FeishuIngestResult, error) {
+func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feishu.Envelope, plaintext []byte, appID string, botID uuid.UUID) (FeishuIngestResult, error) {
 	if envelope.Header.EventID == "" || envelope.Header.EventType == "" {
 		return FeishuIngestResult{}, invalid("feishu event header is incomplete")
 	}
+	if (botID != uuid.Nil && appID == "") || (envelope.Header.AppID != "" && envelope.Header.AppID != appID) {
+		return FeishuIngestResult{}, invalid("feishu event app id mismatch")
+	}
 	record := FeishuEventRecord{
 		EventID: envelope.Header.EventID, EventType: envelope.Header.EventType,
-		TenantKey: envelope.Header.TenantKey, AppID: envelope.Header.AppID,
+		TenantKey: envelope.Header.TenantKey, AppID: appID,
 		// 原始事件只保存在受数据库权限保护的内部回执中，日志与错误只使用事件 ID。
 		Payload: map[string]any{"body": string(plaintext)},
 		Status:  FeishuEventReceived,
+	}
+	if botID != uuid.Nil {
+		record.Payload["bot_id"] = botID.String()
+	} else {
+		record.Payload["default_route"] = true
 	}
 	inserted, err := s.events.RecordEvent(ctx, record)
 	if err != nil {
@@ -448,15 +490,15 @@ func (s *FeishuIngestService) persistEnvelope(ctx context.Context, envelope feis
 }
 
 // handleWithVerifier 在验签器就绪后进入统一处理流程，并携带期望的应用 ID。
-func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, request feishu.Request) (FeishuIngestResult, error) {
+func (s *FeishuIngestService) handleWithVerifier(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, botID uuid.UUID, request feishu.Request) (FeishuIngestResult, error) {
 	if verifier == nil {
 		return FeishuIngestResult{}, fmt.Errorf("%w: feishu verifier is not configured", ErrInvalidConfig)
 	}
-	return s.handle(ctx, verifier, expectedAppID, request)
+	return s.handle(ctx, verifier, expectedAppID, botID, request)
 }
 
 // handle 执行验签、解密、幂等入库与任务入队。
-func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, request feishu.Request) (FeishuIngestResult, error) {
+func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verifier, expectedAppID string, botID uuid.UUID, request feishu.Request) (FeishuIngestResult, error) {
 	if len(request.Body) == 0 {
 		return FeishuIngestResult{}, invalid("feishu event body is empty")
 	}
@@ -471,12 +513,11 @@ func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verif
 	if err != nil {
 		return FeishuIngestResult{}, err
 	}
-	// URL 验证请求没有业务头 app_id，只在事件自带 app_id 时做一致性校验。
-	if expectedAppID != "" && strings.TrimSpace(envelope.Header.AppID) != "" && envelope.Header.AppID != expectedAppID {
-		return FeishuIngestResult{}, invalid("feishu event app id mismatch")
-	}
 	// URL 验证请求必须在验签后校验 Verification Token，再原样返回 challenge。
 	if envelope.IsURLVerification() {
+		if envelope.Header.AppID != "" && envelope.Header.AppID != expectedAppID {
+			return FeishuIngestResult{}, invalid("feishu event app id mismatch")
+		}
 		if err := verifier.VerifyToken(envelope.Token); err != nil {
 			return FeishuIngestResult{}, err
 		}
@@ -488,7 +529,7 @@ func (s *FeishuIngestService) handle(ctx context.Context, verifier *feishu.Verif
 	if err := verifier.VerifyToken(envelope.Header.Token); err != nil {
 		return FeishuIngestResult{}, err
 	}
-	return s.persistEnvelope(ctx, envelope, plaintext)
+	return s.persistEnvelope(ctx, envelope, plaintext, expectedAppID, botID)
 }
 
 // feishuErrorCode 返回可安全写入回执与日志的稳定错误分类，不包含事件正文。

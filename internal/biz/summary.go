@@ -151,6 +151,11 @@ type SummaryMessageReader interface {
 	CountMessagesThrough(ctx context.Context, userID, sessionID uuid.UUID, boundary MessagePosition) (int64, error)
 }
 
+// SummarySourceReader reads only messages still eligible for queued summarization.
+type SummarySourceReader interface {
+	ListSummarizableMessages(ctx context.Context, userID, sessionID uuid.UUID, messageIDs []uuid.UUID) ([]Message, error)
+}
+
 // SummaryTask 是异步摘要任务的载荷，包含来源范围、期望版本与内容指纹。
 type SummaryTask struct {
 	// UserID 任务归属用户。
@@ -398,8 +403,8 @@ type SummaryWorkerDependencies struct {
 	Jobs JobQueue
 	// Sessions 会话仓储，用于校验会话仍活跃。
 	Sessions SessionRepository
-	// Messages 摘要来源消息读取端口。
-	Messages SummaryMessageReader
+	// Messages 读取执行时仍允许摘要的来源消息。
+	Messages SummarySourceReader
 	// Summaries 摘要版本仓储。
 	Summaries SummaryRepository
 	// Generator 摘要生成器。
@@ -414,7 +419,7 @@ type SummaryWorkerDependencies struct {
 type SummaryWorker struct {
 	jobs      JobQueue
 	sessions  SessionRepository
-	messages  SummaryMessageReader
+	messages  SummarySourceReader
 	summaries SummaryRepository
 	generator SummaryGenerator
 	config    SummaryWorkerConfig
@@ -564,7 +569,7 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		previous = active.SummaryText
 	}
 
-	source, err := w.messages.ListMessagesByIDs(ctx, task.UserID, task.SessionID, task.SourceMessageIDs)
+	source, err := w.messages.ListSummarizableMessages(ctx, task.UserID, task.SessionID, task.SourceMessageIDs)
 	if err != nil {
 		failureClass = "retryable_failure"
 		w.failJob(ctx, job, err)

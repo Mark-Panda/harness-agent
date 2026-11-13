@@ -241,3 +241,138 @@ func memoryVectorFor(userID, sessionID uuid.UUID, message biz.Message, index biz
 		Version: index.Version, CreatedAt: time.Now().UTC(),
 	}
 }
+
+func TestMemoryRepositoryKeepsNonPrivateFeishuSourcesOutOfPersonalMemory(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	owner, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "memory_scope_" + uuid.NewString(), PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", owner.ID).Error })
+
+	sessions := NewSessionRepository(appDB)
+	memory := NewMemoryRepository(appDB)
+	index := biz.EmbeddingIndex{Version: uuid.NewString(), ProviderID: uuid.New(), Model: "embedding-model", Dimension: biz.EmbeddingDimension}
+	wantBackfill := make(map[uuid.UUID]bool)
+	wantMatches := make(map[uuid.UUID]bool)
+	for _, test := range []struct {
+		name       string
+		source     biz.SessionSource
+		policy     biz.SessionMemoryPolicy
+		thread     string
+		projection bool
+		eligible   bool
+	}{
+		{name: "web", source: biz.SessionSourceWeb, policy: biz.SessionMemoryPrivate, eligible: true},
+		{name: "Feishu direct", source: biz.SessionSourceFeishu, policy: biz.SessionMemoryPrivate, thread: "p2p", eligible: true},
+		{name: "Feishu group", source: biz.SessionSourceFeishu, policy: biz.SessionMemoryGroup, thread: "topic"},
+		{name: "legacy Feishu group", source: biz.SessionSourceFeishu, policy: biz.SessionMemoryPrivate, thread: "old-topic"},
+		{name: "group projection", source: biz.SessionSourceFeishu, policy: biz.SessionMemoryGroup, projection: true},
+		{name: "disabled", source: biz.SessionSourceWeb, policy: biz.SessionMemoryDisabled},
+	} {
+		sessionID := createMemoryIntegrationSession(t, ctx, sessions, owner.ID, test.name)
+		messages := appendMemoryIntegrationMessages(t, ctx, sessions, owner.ID, sessionID, 2)
+		vector := memoryVectorFor(owner.ID, sessionID, messages[0], index, memoryIntegrationVector(0, -1))
+		if test.projection {
+			// Legacy vector metadata can omit session_id despite carrying a source message ID.
+			vector.SessionID = nil
+		}
+		if err := memory.UpsertVectors(ctx, owner.ID, []biz.MemoryVector{vector}); err != nil {
+			t.Fatal(err)
+		}
+		if err := adminDB.Exec("UPDATE sessions SET source = ?, memory_policy = ?, feishu_group_projection = ? WHERE id = ?",
+			test.source, test.policy, test.projection, sessionID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if test.thread != "" {
+			if err := adminDB.Exec(`
+INSERT INTO external_conversation_bindings (user_id, provider, tenant_key, chat_id, thread_id, session_id)
+VALUES (?, 'feishu', 'tenant', ?, ?, ?)`, owner.ID, uuid.NewString(), test.thread, sessionID).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		wantBackfill[messages[1].ID] = test.eligible
+		wantMatches[vector.ID] = test.eligible
+
+		t.Run(test.name+"/queued embedding", func(t *testing.T) {
+			batch, err := memory.ListEmbeddableMessages(ctx, owner.ID, sessionID, []uuid.UUID{messages[1].ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.eligible {
+				if len(batch) != 1 || batch[0].ID != messages[1].ID {
+					t.Fatalf("eligible messages = %#v", batch)
+				}
+				return
+			}
+			if len(batch) != 0 {
+				t.Fatalf("non-private content returned to the embedding worker")
+			}
+			// Emulate a provider response returning after a policy change.
+			stale := memoryVectorFor(owner.ID, sessionID, messages[1], index, memoryIntegrationVector(0, -1))
+			if err := memory.UpsertVectors(ctx, owner.ID, []biz.MemoryVector{stale}); err != nil {
+				t.Fatal(err)
+			}
+			var count int64
+			if err := adminDB.Table("memory_vectors").Where("id = ?", stale.ID).Count(&count).Error; err != nil || count != 0 {
+				t.Fatalf("vectors written after policy change = %d, err=%v", count, err)
+			}
+		})
+	}
+
+	standalone := biz.MemoryVector{
+		ID: uuid.New(), UserID: owner.ID, SourceType: biz.MemorySourceFact, Content: "standalone user memory",
+		Embedding: memoryIntegrationVector(0, -1), ProviderID: index.ProviderID, Model: index.Model,
+		Dimension: index.Dimension, Version: index.Version, CreatedAt: time.Now().UTC(),
+	}
+	if err := memory.UpsertVectors(ctx, owner.ID, []biz.MemoryVector{standalone}); err != nil {
+		t.Fatal(err)
+	}
+	wantMatches[standalone.ID] = true
+
+	if count, err := memory.CountIndexedMessages(ctx, index.Version); err != nil || count != 2 {
+		t.Fatalf("eligible indexed messages = %d, err=%v", count, err)
+	}
+
+	t.Run("backfill", func(t *testing.T) {
+		messages, err := memory.ListUnembeddedMessages(ctx, index.Version, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual := make(map[uuid.UUID]bool)
+		for _, message := range messages {
+			if message.UserID == owner.ID {
+				actual[message.ID] = true
+			}
+		}
+		for id, want := range wantBackfill {
+			if actual[id] != want {
+				t.Errorf("backfill eligibility for message %s = %v, want %v", id, actual[id], want)
+			}
+		}
+	})
+	t.Run("retrieval", func(t *testing.T) {
+		matches, err := memory.SearchVectors(ctx, owner.ID, memoryIntegrationVector(0, -1), index.Version, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual := make(map[uuid.UUID]bool)
+		for _, match := range matches {
+			actual[match.VectorID] = true
+		}
+		for id, want := range wantMatches {
+			if actual[id] != want {
+				t.Errorf("retrieval eligibility for vector %s = %v, want %v", id, actual[id], want)
+			}
+		}
+	})
+}

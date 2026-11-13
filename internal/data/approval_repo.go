@@ -32,6 +32,12 @@ type toolApprovalModel struct {
 	ToolCallID string
 	// ToolName 规范化工具名。
 	ToolName string
+	// MCPServerID 是审批时选中的 MCP 服务 ID，旧审批为空。
+	MCPServerID *uuid.UUID `gorm:"column:mcp_server_id;type:uuid"`
+	// MCPToolName 是发送给远端的原始工具名。
+	MCPToolName string `gorm:"column:mcp_tool_name"`
+	// MCPEndpointFingerprint 用于拒绝指向新端点的旧审批。
+	MCPEndpointFingerprint string `gorm:"column:mcp_endpoint_fingerprint"`
 	// Arguments 待确认参数快照。
 	Arguments datatypes.JSON
 	// RiskLevel 风险等级。
@@ -88,6 +94,14 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 	if approval.IdempotencyKey == "" {
 		return biz.ToolApproval{}, fmt.Errorf("%w: approval idempotency key is required", biz.ErrInvalidConfig)
 	}
+	var mcpServerID *uuid.UUID
+	target := approval.MCPBinding
+	if target.ServerID != uuid.Nil || target.OriginalName != "" || target.EndpointFingerprint != "" {
+		if target.ServerID == uuid.Nil || target.OriginalName == "" || target.EndpointFingerprint == "" {
+			return biz.ToolApproval{}, fmt.Errorf("%w: approval MCP target is incomplete", biz.ErrInvalidConfig)
+		}
+		mcpServerID = &target.ServerID
+	}
 	arguments := bytes.TrimSpace(approval.Arguments)
 	if !json.Valid(arguments) || (arguments[0] != '{' && arguments[0] != '[') {
 		return biz.ToolApproval{}, fmt.Errorf("%w: approval arguments must be a JSON object or array", biz.ErrInvalidConfig)
@@ -105,6 +119,7 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 	record := toolApprovalModel{
 		ID: approval.ID, RunID: approval.RunID, StepID: approval.StepID, SessionID: sessionID, UserID: approval.UserID,
 		ToolCallID: approval.ToolCallID, ToolName: approval.ToolName, Arguments: datatypes.JSON(arguments),
+		MCPServerID: mcpServerID, MCPToolName: target.OriginalName, MCPEndpointFingerprint: target.EndpointFingerprint,
 		RiskLevel: approval.RiskLevel, Status: string(approval.Status), IdempotencyKey: approval.IdempotencyKey,
 		ResultJSON: result, ErrorCode: approval.ErrorCode, ErrorMessage: approval.ErrorMessage,
 		DecidedBy: approval.DecidedBy, DecidedAt: approval.DecidedAt, DeliveredAt: approval.DeliveredAt,
@@ -128,6 +143,8 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 			// effective session and let PostgreSQL compare JSONB without float rounding.
 			err := tx.Where("user_id = ? AND run_id = ? AND tool_call_id = ?", approval.UserID, approval.RunID, approval.ToolCallID).
 				Where("tool_name = ? AND risk_level = ? AND arguments = ?::jsonb", approval.ToolName, approval.RiskLevel, string(arguments)).
+				Where("mcp_server_id IS NOT DISTINCT FROM ?::uuid AND mcp_tool_name = ? AND mcp_endpoint_fingerprint = ?",
+					mcpServerID, target.OriginalName, target.EndpointFingerprint).
 				Where(`EXISTS (
 					SELECT 1 FROM agent_runs AS ar
 					WHERE ar.id = tool_approvals.run_id AND ar.user_id = tool_approvals.user_id
@@ -241,12 +258,37 @@ func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, app
 	return toBizApproval(record)
 }
 
-// ClaimApprovalExecution 以 CAS 方式把 approved 推进到 executing，确保同一审批只有一个执行者。
-func (r *ToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, now time.Time) (biz.ToolApproval, error) {
+// ClaimApprovalExecution atomically authorizes dispatch against the live Run and Plan.
+func (r *ToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence biz.RunFence, now time.Time) (biz.ToolApproval, error) {
 	var record toolApprovalModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		result := tx.Model(&toolApprovalModel{}).
-			Where("id = ? AND user_id = ? AND status = ?", approvalID, userID, string(biz.ApprovalApproved)).
+		mode, err := lockRunningRunLease(tx, userID, runID, fence, now)
+		if err != nil {
+			return err
+		}
+		claim := tx.Model(&toolApprovalModel{}).
+			Where("id = ? AND user_id = ? AND run_id = ? AND status = ?", approvalID, userID, runID, biz.ApprovalApproved)
+		if mode == biz.AgentModePlan {
+			plan, err := lockLatestRunPlan(tx, userID, runID)
+			if err != nil {
+				return err
+			}
+			switch biz.PlanStatus(plan.Status) {
+			case biz.PlanPaused:
+				return biz.ErrPlanPaused
+			case biz.PlanCancelled:
+				return biz.ErrPlanCancelled
+			case biz.PlanExecuting, biz.PlanWaitingApproval:
+				claim = claim.Where(`EXISTS (
+					SELECT 1 FROM plan_steps
+					WHERE plan_id = ? AND user_id = ? AND status = 'waiting_approval'
+					  AND tool_approvals.tool_call_id = 'plan-step-' || plan_steps.id::text
+				)`, plan.ID, userID)
+			default:
+				return fmt.Errorf("%w: plan is not accepting tool execution", biz.ErrResourceConflict)
+			}
+		}
+		result := claim.
 			Updates(map[string]any{"status": string(biz.ApprovalExecuting), "updated_at": now})
 		if result.Error != nil {
 			return result.Error
@@ -254,7 +296,7 @@ func (r *ToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, use
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: approval is not approved for execution", biz.ErrResourceConflict)
 		}
-		return tx.First(&record, "id = ? AND user_id = ?", approvalID, userID).Error
+		return tx.First(&record, "id = ? AND user_id = ? AND run_id = ?", approvalID, userID, runID).Error
 	})
 	if err != nil {
 		return biz.ToolApproval{}, catalogError("claim tool approval execution", err)
@@ -350,6 +392,11 @@ func toBizApproval(record toolApprovalModel) (biz.ToolApproval, error) {
 	if record.SessionID != nil {
 		approval.SessionID = *record.SessionID
 	}
+	if record.MCPServerID != nil {
+		approval.MCPBinding.ServerID = *record.MCPServerID
+	}
+	approval.MCPBinding.OriginalName = record.MCPToolName
+	approval.MCPBinding.EndpointFingerprint = record.MCPEndpointFingerprint
 	return approval, nil
 }
 

@@ -433,6 +433,9 @@ func (c *Client) callTool(ctx context.Context, name string, arguments json.RawMe
 	if err := json.Unmarshal(response.Result, &result); err != nil {
 		return CallResult{}, fmt.Errorf("%w: %w: decode tools/call result", ErrToolOutcomeUnknown, ErrTransport)
 	}
+	if result.Content == nil && result.StructuredContent == nil {
+		return CallResult{}, fmt.Errorf("%w: %w: missing tools/call result content", ErrToolOutcomeUnknown, ErrTransport)
+	}
 	return result, nil
 }
 
@@ -552,8 +555,20 @@ func (c *Client) roundTrip(ctx context.Context, id int64, sessionID, method stri
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return rpcResponse{}, "", fmt.Errorf("%w: decode response", ErrTransport)
 	}
+	if method == "tools/call" && (decoded.JSONRPC != "2.0" || string(decoded.ID) != strconv.FormatInt(id, 10)) {
+		return rpcResponse{}, "", fmt.Errorf("%w: response does not match tools/call request", ErrTransport)
+	}
 	if decoded.Error != nil {
-		return rpcResponse{}, "", fmt.Errorf("%w: code %d: %s", ErrRPC, decoded.Error.Code, truncate(decoded.Error.Message, 256))
+		rpcErr := fmt.Errorf("%w: code %d: %s", ErrRPC, decoded.Error.Code, truncate(decoded.Error.Message, 256))
+		if method == "tools/call" {
+			switch decoded.Error.Code {
+			case -32700, -32600, -32601, -32602:
+				// Protocol and parameter rejection indicate that dispatch did not occur.
+			default:
+				rpcErr = errors.Join(ErrToolOutcomeUnknown, rpcErr)
+			}
+		}
+		return rpcResponse{}, "", rpcErr
 	}
 	if len(decoded.Result) == 0 {
 		return rpcResponse{}, "", fmt.Errorf("%w: empty result", ErrTransport)

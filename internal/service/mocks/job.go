@@ -129,6 +129,130 @@ func (mr *MockJobQueueMockRecorder) Renew(ctx, jobID, workerID, fencingToken, le
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Renew", reflect.TypeOf((*MockJobQueue)(nil).Renew), ctx, jobID, workerID, fencingToken, lease, now)
 }
 
+// MockRunExecutionQueue is a mock of RunExecutionQueue interface.
+type MockRunExecutionQueue struct {
+	ctrl     *gomock.Controller
+	recorder *MockRunExecutionQueueMockRecorder
+	isgomock struct{}
+}
+
+// MockRunExecutionQueueMockRecorder is the mock recorder for MockRunExecutionQueue.
+type MockRunExecutionQueueMockRecorder struct {
+	mock *MockRunExecutionQueue
+}
+
+// NewMockRunExecutionQueue creates a new mock instance.
+func NewMockRunExecutionQueue(ctrl *gomock.Controller) *MockRunExecutionQueue {
+	mock := &MockRunExecutionQueue{ctrl: ctrl}
+	mock.recorder = &MockRunExecutionQueueMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockRunExecutionQueue) EXPECT() *MockRunExecutionQueueMockRecorder {
+	return m.recorder
+}
+
+// Claim mocks base method.
+func (m *MockRunExecutionQueue) Claim(ctx context.Context, workerID, jobType string, lease time.Duration, now time.Time) (biz.Job, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Claim", ctx, workerID, jobType, lease, now)
+	ret0, _ := ret[0].(biz.Job)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// Claim indicates an expected call of Claim.
+func (mr *MockRunExecutionQueueMockRecorder) Claim(ctx, workerID, jobType, lease, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Claim", reflect.TypeOf((*MockRunExecutionQueue)(nil).Claim), ctx, workerID, jobType, lease, now)
+}
+
+// Complete mocks base method.
+func (m *MockRunExecutionQueue) Complete(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Complete", ctx, jobID, workerID, fencingToken)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Complete indicates an expected call of Complete.
+func (mr *MockRunExecutionQueueMockRecorder) Complete(ctx, jobID, workerID, fencingToken any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Complete", reflect.TypeOf((*MockRunExecutionQueue)(nil).Complete), ctx, jobID, workerID, fencingToken)
+}
+
+// DeferRunSettlement mocks base method.
+func (m *MockRunExecutionQueue) DeferRunSettlement(ctx context.Context, job biz.Job, settlement *biz.RunJobSettlement, retryAt, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeferRunSettlement", ctx, job, settlement, retryAt, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeferRunSettlement indicates an expected call of DeferRunSettlement.
+func (mr *MockRunExecutionQueueMockRecorder) DeferRunSettlement(ctx, job, settlement, retryAt, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeferRunSettlement", reflect.TypeOf((*MockRunExecutionQueue)(nil).DeferRunSettlement), ctx, job, settlement, retryAt, now)
+}
+
+// EnqueueRun mocks base method.
+func (m *MockRunExecutionQueue) EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EnqueueRun", ctx, userID, runID, availableAt)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// EnqueueRun indicates an expected call of EnqueueRun.
+func (mr *MockRunExecutionQueueMockRecorder) EnqueueRun(ctx, userID, runID, availableAt any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnqueueRun", reflect.TypeOf((*MockRunExecutionQueue)(nil).EnqueueRun), ctx, userID, runID, availableAt)
+}
+
+// Fail mocks base method.
+func (m *MockRunExecutionQueue) Fail(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, retryAt time.Time, reason string, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Fail", ctx, jobID, workerID, fencingToken, retryAt, reason, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Fail indicates an expected call of Fail.
+func (mr *MockRunExecutionQueueMockRecorder) Fail(ctx, jobID, workerID, fencingToken, retryAt, reason, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Fail", reflect.TypeOf((*MockRunExecutionQueue)(nil).Fail), ctx, jobID, workerID, fencingToken, retryAt, reason, now)
+}
+
+// Release mocks base method.
+func (m *MockRunExecutionQueue) Release(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, retryAt, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Release", ctx, jobID, workerID, fencingToken, retryAt, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Release indicates an expected call of Release.
+func (mr *MockRunExecutionQueueMockRecorder) Release(ctx, jobID, workerID, fencingToken, retryAt, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Release", reflect.TypeOf((*MockRunExecutionQueue)(nil).Release), ctx, jobID, workerID, fencingToken, retryAt, now)
+}
+
+// Renew mocks base method.
+func (m *MockRunExecutionQueue) Renew(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, lease time.Duration, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Renew", ctx, jobID, workerID, fencingToken, lease, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Renew indicates an expected call of Renew.
+func (mr *MockRunExecutionQueueMockRecorder) Renew(ctx, jobID, workerID, fencingToken, lease, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Renew", reflect.TypeOf((*MockRunExecutionQueue)(nil).Renew), ctx, jobID, workerID, fencingToken, lease, now)
+}
+
 // MockRunJobReplayer is a mock of RunJobReplayer interface.
 type MockRunJobReplayer struct {
 	ctrl     *gomock.Controller

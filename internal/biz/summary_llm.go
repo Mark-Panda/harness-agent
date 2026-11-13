@@ -239,22 +239,21 @@ func resolveSessionModel(ctx context.Context, runs RunRepository, providers Prov
 		if err != nil || provider.Status != ProviderEnabled {
 			continue
 		}
+		if candidate.ProviderBaseURL != "" && candidate.ProviderBaseURL != provider.BaseURL {
+			continue
+		}
 		plaintext, err := opener.Open(credential.KeyVersion, credential.Encrypted)
 		if err != nil || len(plaintext) == 0 {
 			continue
 		}
-		baseURL := candidate.ProviderBaseURL
-		if baseURL == "" {
-			baseURL = provider.BaseURL
-		}
 		return resolvedSummaryModel{
 			providerID: providerID, modelID: candidate.ModelID, remoteModelName: candidate.RemoteModelName,
-			baseURL: baseURL, apiKey: string(plaintext),
+			baseURL: provider.BaseURL, apiKey: string(plaintext),
 			contextWindow: candidate.ContextWindowTokens, maxOutput: candidate.MaxOutputTokens,
 			inputPrice: candidate.InputPricePerMillion, outputPrice: candidate.OutputPricePerMillion,
 		}, nil
 	}
-	return resolvedSummaryModel{}, fmt.Errorf("%w: no enabled provider with decryptable credential", ErrSummaryModelUnavailable)
+	return resolvedSummaryModel{}, fmt.Errorf("%w: no compatible enabled provider with decryptable credential", ErrSummaryModelUnavailable)
 }
 
 // toSummaryMessages 把领域消息转换为摘要输入，保留群聊发言人归属。

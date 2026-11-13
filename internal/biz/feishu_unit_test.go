@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ type feishuEventStoreStub struct {
 	biz.FeishuEventStore
 	event        biz.FeishuEventRecord
 	recorded     int
+	lastRecorded biz.FeishuEventRecord
 	recordErr    error
 	getErr       error
 	statuses     map[string]string
@@ -33,6 +36,7 @@ func (s *feishuEventStoreStub) RecordEvent(_ context.Context, event biz.FeishuEv
 		return false, s.recordErr
 	}
 	s.recorded++
+	s.lastRecorded = event
 	return true, nil
 }
 
@@ -140,20 +144,6 @@ type feishuConversationStub struct {
 	restoreEvent biz.OutboxEvent
 	// restoreCalls 恢复调用次数。
 	restoreCalls int
-	// promoted 话题升级影响的绑定数。
-	promoted int
-	// promoteErr 话题升级失败错误。
-	promoteErr error
-	// promoteUserID 话题升级调用时的用户 ID。
-	promoteUserID uuid.UUID
-	// promoteSessionID 话题升级调用时的会话 ID。
-	promoteSessionID uuid.UUID
-	// promoteLegacyThreadID 过渡别名话题键。
-	promoteLegacyThreadID string
-	// promoteThreadID 飞书真实话题 ID。
-	promoteThreadID string
-	// promoteCalls 话题升级调用次数。
-	promoteCalls int
 }
 
 func (s *feishuConversationStub) FindConversation(_ context.Context, _, _, _, _ string) (biz.FeishuConversationBinding, bool, error) {
@@ -170,19 +160,6 @@ func (s *feishuConversationStub) RestoreConversation(_ context.Context, userID, 
 		return 0, s.restoreErr
 	}
 	return s.restored, nil
-}
-
-// PromoteConversationThread 记录话题升级入参，供断言过渡别名被真实话题替换。
-func (s *feishuConversationStub) PromoteConversationThread(_ context.Context, userID, sessionID uuid.UUID, legacyThreadID, threadID string) (int, error) {
-	s.promoteCalls++
-	s.promoteUserID = userID
-	s.promoteSessionID = sessionID
-	s.promoteLegacyThreadID = legacyThreadID
-	s.promoteThreadID = threadID
-	if s.promoteErr != nil {
-		return 0, s.promoteErr
-	}
-	return s.promoted, nil
 }
 
 func (s *feishuConversationStub) EnsureConversation(_ context.Context, binding biz.FeishuConversationBinding, session biz.Session, _ biz.OutboxEvent) (biz.FeishuConversationBinding, biz.Session, error) {
@@ -315,6 +292,11 @@ type feishuOutboundStub struct {
 	failed            int
 	failReason        string
 	lastRetryAfter    time.Time
+	promoteCalls      int
+	promotedThread    string
+	promotedOutbound  biz.FeishuOutbound
+	checkClaim        func() error
+	saveMessageErr    error
 }
 
 func (s *feishuOutboundStub) CreateOutbound(_ context.Context, outbound biz.FeishuOutbound) error {
@@ -325,32 +307,54 @@ func (s *feishuOutboundStub) CreateOutbound(_ context.Context, outbound biz.Feis
 	return nil
 }
 
-func (s *feishuOutboundStub) ClaimOutbound(_ context.Context, _ string, _ time.Duration, _ time.Time) (biz.FeishuOutbound, bool, error) {
-	return s.claimed, s.hasClaim, nil
+func (s *feishuOutboundStub) ClaimOutbound(_ context.Context, worker string, lease time.Duration, now time.Time) (biz.FeishuOutbound, bool, error) {
+	outbound := s.claimed
+	outbound.LeaseOwner = worker
+	outbound.FencingToken = 1
+	outbound.LeaseExpiresAt = now.Add(lease)
+	return outbound, s.hasClaim, nil
 }
 
-func (s *feishuOutboundStub) UpdateOutboundMessageID(_ context.Context, _ uuid.UUID, messageID string, _ time.Time) error {
-	s.updateIDs = append(s.updateIDs, messageID)
+func (s *feishuOutboundStub) CheckOutboundClaim(_ context.Context, _ biz.FeishuOutbound, _ time.Time) error {
+	if s.checkClaim != nil {
+		return s.checkClaim()
+	}
 	return nil
 }
 
-func (s *feishuOutboundStub) MarkOutboundCardUpdated(_ context.Context, _ uuid.UUID, fingerprint string, now time.Time) error {
+func (s *feishuOutboundStub) PromoteOutboundThread(_ context.Context, outbound biz.FeishuOutbound, threadID string, _ time.Time) (int, error) {
+	s.promoteCalls++
+	s.promotedThread = threadID
+	s.promotedOutbound = outbound
+	return 1, nil
+}
+
+func (s *feishuOutboundStub) UpdateOutboundMessageID(_ context.Context, _ biz.FeishuOutbound, messageID string, _ time.Time) error {
+	s.updateIDs = append(s.updateIDs, messageID)
+	if s.saveMessageErr != nil {
+		return s.saveMessageErr
+	}
+	s.claimed.MessageID = messageID
+	return nil
+}
+
+func (s *feishuOutboundStub) MarkOutboundCardUpdated(_ context.Context, _ biz.FeishuOutbound, fingerprint string, now time.Time) error {
 	s.cardFingerprints = append(s.cardFingerprints, fingerprint)
 	s.lastCardUpdatedAt = now
 	return nil
 }
 
-func (s *feishuOutboundStub) DeferOutbound(_ context.Context, _ uuid.UUID, _ time.Time, _ time.Time) error {
+func (s *feishuOutboundStub) DeferOutbound(_ context.Context, _ biz.FeishuOutbound, _ time.Time, _ time.Time) error {
 	s.deferred++
 	return nil
 }
 
-func (s *feishuOutboundStub) CompleteOutbound(_ context.Context, _ uuid.UUID, _ time.Time) error {
+func (s *feishuOutboundStub) CompleteOutbound(_ context.Context, _ biz.FeishuOutbound, _ time.Time) error {
 	s.completed++
 	return nil
 }
 
-func (s *feishuOutboundStub) FailOutbound(_ context.Context, _ uuid.UUID, reason string, retryAt, _ time.Time) error {
+func (s *feishuOutboundStub) FailOutbound(_ context.Context, _ biz.FeishuOutbound, reason string, retryAt, _ time.Time) error {
 	s.failed++
 	s.failReason = reason
 	s.lastRetryAfter = retryAt
@@ -512,7 +516,7 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	userID := uuid.New()
 	events := &feishuEventStoreStub{event: biz.FeishuEventRecord{
 		EventID: "evt-om_1", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
-		Payload: map[string]any{"body": feishuMessageBody(t, feishu.ChatTypeP2P, "oc_1", "om_1", "", nil)},
+		Payload: map[string]any{"default_route": true, "body": feishuMessageBody(t, feishu.ChatTypeP2P, "oc_1", "om_1", "", nil)},
 		Status:  biz.FeishuEventReceived,
 	}}
 	conversations := &feishuConversationStub{}
@@ -563,7 +567,7 @@ func TestFeishuEventWorkerGroupPolicies(t *testing.T) {
 	build := func(body string, created bool) (*biz.FeishuEventWorker, *feishuEventStoreStub, *feishuMessagesStub, *feishuRunCreatorStub) {
 		events := &feishuEventStoreStub{event: biz.FeishuEventRecord{
 			EventID: "evt-group", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
-			Payload: map[string]any{"body": body}, Status: biz.FeishuEventReceived,
+			Payload: map[string]any{"default_route": true, "body": body}, Status: biz.FeishuEventReceived,
 		}}
 		messages := &feishuMessagesStub{created: created}
 		runs := &feishuRunCreatorStub{run: biz.Run{ID: uuid.New(), Status: biz.RunQueued}}
@@ -605,7 +609,7 @@ func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 	// 群聊话题：消息归属会话所有者，事实提取身份切换为发言人本人。
 	groupRecord := biz.FeishuEventRecord{
 		EventID: "evt-speaker-group", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 			chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: "om_speaker_group",
 			parentID: "omt_parent", mentions: []map[string]string{{"open_id": "ou_bot", "name": "机器人"}},
 		})},
@@ -655,7 +659,7 @@ func TestFeishuEventWorkerSpeakerFactOwnership(t *testing.T) {
 	// 单聊不触发发言人事实提取，个人事实仍由会话消息链路负责。
 	p2pFixture := newFeishuWorkerFixture(t, biz.FeishuEventRecord{
 		EventID: "evt-speaker-p2p", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{chatID: "oc_p2p", messageID: "om_speaker_p2p"})},
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{chatID: "oc_p2p", messageID: "om_speaker_p2p"})},
 	}, feishuJob("evt-speaker-p2p", 1, 3), biz.FeishuEventWorkerConfig{})
 	if _, err := p2pFixture.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("p2p process: %v", err)
@@ -670,14 +674,14 @@ func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	runID := uuid.New()
 	outbound := &feishuOutboundStub{
-		claimed:  biz.FeishuOutbound{ID: uuid.New(), UserID: uuid.New(), RunID: runID, ChatID: "oc_1", ReplyToMessageID: "om_1", Kind: "card", Status: "sending", Attempts: 1, CreatedAt: now},
+		claimed:  biz.FeishuOutbound{DefaultRoute: true, AppID: "cli_default", ID: uuid.New(), UserID: uuid.New(), RunID: runID, ChatID: "oc_1", ReplyToMessageID: "om_1", Kind: "card", Status: "sending", Attempts: 1, CreatedAt: now},
 		hasClaim: true, assistant: biz.Message{Content: "最终答案"},
 	}
 	sender := &feishuSenderStub{cardMessageID: "om_card"}
 	worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
 		Outbound: outbound, Runs: &feishuRunsStub{run: biz.Run{ID: runID, Status: biz.RunCompleted, SessionID: uuid.New(), UserID: uuid.New()}}, Sender: sender,
 		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
-	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-1"})
+	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-1", DefaultAppID: "cli_default"})
 	if err != nil {
 		t.Fatalf("new reply worker: %v", err)
 	}
@@ -706,7 +710,7 @@ func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	worker, err = biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
 		Outbound: outbound, Runs: runs, Sender: sender,
 		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
-	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-1"})
+	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-1", DefaultAppID: "cli_default"})
 	if err != nil {
 		t.Fatalf("new pending worker: %v", err)
 	}
@@ -725,7 +729,7 @@ func TestFeishuEventWorkerOutOfOrderAndConcurrentSpeakers(t *testing.T) {
 	build := func(messageID, speaker, createTime string) *feishuWorkerFixture {
 		record := biz.FeishuEventRecord{
 			EventID: "evt-" + messageID, TenantKey: "tenant",
-			Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: messageID,
 				threadID: "omt_topic", senderOpenID: &speaker, createTime: createTime,
 				mentions: []map[string]string{{"open_id": "ou_bot", "name": "机器人"}},
@@ -1048,6 +1052,144 @@ func TestFeishuIngestBotVerification(t *testing.T) {
 	}
 }
 
+func TestFeishuIngestUsesAuthenticatedAppForAppLessEvents(t *testing.T) {
+	verifier, err := feishu.NewVerifier(feishu.VerifierConfig{VerificationToken: "default-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	botID := uuid.New()
+	reader := &feishuBotCredentialStub{
+		bot: biz.FeishuBot{ID: botID, AppID: "cli_bot", Status: biz.FeishuBotEnabled},
+		credential: biz.ProviderCredential{
+			Encrypted: []byte(`sealed:{"app_secret":"secret","verification_token":"bot-token"}`), KeyVersion: "v1",
+		},
+	}
+	store := &feishuEventStoreStub{}
+	enqueuer := &feishuEnqueuerStub{}
+	service, err := biz.NewFeishuIngestService(verifier, store, enqueuer, biz.FeishuIngestConfig{DefaultAppID: "cli_default"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithBotVerification(reader, feishuTestOpener{})
+	event := func(token, appID string) []byte {
+		return []byte(fmt.Sprintf(`{"header":{"event_id":"evt","event_type":"im.message.receive_v1","token":%q,"app_id":%q},"event":{}}`, token, appID))
+	}
+	ctx := context.Background()
+
+	if _, err := service.HandleForBot(ctx, botID, feishu.Request{Body: event("bot-token", "")}); err != nil {
+		t.Fatal(err)
+	}
+	if store.lastRecorded.AppID != "cli_bot" || store.lastRecorded.Payload["bot_id"] != botID.String() {
+		t.Fatalf("registered HTTP route = %#v", store.lastRecorded)
+	}
+	if _, err := service.AcceptTrusted(ctx, botID, "cli_bot", event("", "")); err != nil {
+		t.Fatal(err)
+	}
+	if store.lastRecorded.AppID != "cli_bot" || store.lastRecorded.Payload["bot_id"] != botID.String() {
+		t.Fatalf("registered long connection route = %#v", store.lastRecorded)
+	}
+	if _, err := service.Handle(ctx, feishu.Request{Body: event("default-token", "")}); err != nil {
+		t.Fatal(err)
+	}
+	if store.lastRecorded.AppID != "cli_default" || store.lastRecorded.Payload["default_route"] != true {
+		t.Fatalf("default route app = %q", store.lastRecorded.AppID)
+	}
+	if _, err := service.HandleForBot(ctx, botID, feishu.Request{Body: event("bot-token", "cli_default")}); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("registered HTTP app mismatch = %v", err)
+	}
+	if _, err := service.AcceptTrusted(ctx, botID, "", event("", "cli_bot")); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("unscoped long connection = %v", err)
+	}
+	if _, err := service.AcceptTrusted(ctx, botID, "cli_other", event("", "cli_other")); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("long connection app differs from the bot registration = %v", err)
+	}
+	if _, err := service.Handle(ctx, feishu.Request{Body: event("default-token", "cli_bot")}); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("default HTTP app mismatch = %v", err)
+	}
+	if store.recorded != 3 || len(enqueuer.enqueued) != 3 {
+		t.Fatalf("recorded=%d enqueued=%v", store.recorded, enqueuer.enqueued)
+	}
+}
+
+func TestFeishuEventWorkerDoesNotFallBackToDefaultForOtherApp(t *testing.T) {
+	for _, appID := range []string{"cli_other", ""} {
+		t.Run("app="+appID, func(t *testing.T) {
+			record := biz.FeishuEventRecord{
+				EventID: "evt", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant", AppID: appID,
+				Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1"})}, Status: biz.FeishuEventReceived,
+			}
+			fixture := newFeishuWorkerFixture(t, record, feishuJob("evt", 1, 3), biz.FeishuEventWorkerConfig{DefaultAppID: "cli_default"})
+			if _, err := fixture.worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if fixture.runs.calls != 0 || fixture.events.statuses["evt"] != biz.FeishuEventIgnored {
+				t.Fatalf("runs=%d status=%q", fixture.runs.calls, fixture.events.statuses["evt"])
+			}
+		})
+	}
+}
+
+func TestFeishuEventWorkerDoesNotRerouteRecordedBot(t *testing.T) {
+	botID := uuid.New()
+	for _, test := range []struct {
+		name       string
+		currentBot uuid.UUID
+		wantRuns   int
+	}{
+		{name: "deleted"},
+		{name: "recreated with same app", currentBot: uuid.New()},
+		{name: "still registered", currentBot: botID, wantRuns: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := biz.FeishuEventRecord{
+				EventID: "evt", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant", AppID: "cli_shared",
+				Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1"}), "bot_id": botID.String()},
+				Status:  biz.FeishuEventReceived,
+			}
+			fixture := newFeishuWorkerFixture(t, record, feishuJob("evt", 1, 3), biz.FeishuEventWorkerConfig{DefaultAppID: "cli_shared"})
+			fixture.bots.botFound = test.currentBot != uuid.Nil
+			fixture.bots.bot = biz.FeishuBot{ID: test.currentBot, AppID: "cli_shared", Status: biz.FeishuBotEnabled}
+			fixture.bots.bindingFound = true
+			fixture.bots.binding = biz.FeishuBotBinding{
+				BotID: test.currentBot, UserID: fixture.userID, AgentID: uuid.New(), AgentVersion: 1,
+				AgentStatus: biz.AgentPublished, AgentMode: biz.AgentModeReact,
+			}
+			if _, err := fixture.worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if fixture.runs.calls != test.wantRuns {
+				t.Fatalf("runs=%d, want %d", fixture.runs.calls, test.wantRuns)
+			}
+		})
+	}
+}
+
+func TestFeishuEventWorkerPreservesVerifiedDefaultRoute(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		record := biz.FeishuEventRecord{
+			EventID: "evt-default", TenantKey: "tenant", AppID: "cli_shared",
+			Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1"})},
+		}
+		if verified {
+			record.Payload["default_route"] = true
+		}
+		fixture := newFeishuWorkerFixture(t, record, feishuJob(record.EventID, 1, 3), biz.FeishuEventWorkerConfig{DefaultAppID: record.AppID})
+		fixture.bots.botFound = true
+		fixture.bots.bot = biz.FeishuBot{ID: uuid.New(), AppID: record.AppID, Status: biz.FeishuBotEnabled}
+		if _, err := fixture.worker.ProcessOne(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		outbound := fixture.outbound.created
+		if verified {
+			if outbound == nil || !outbound.DefaultRoute || outbound.BotID != uuid.Nil || outbound.AppID != record.AppID {
+				t.Fatalf("verified default produced route %+v", outbound)
+			}
+		} else if outbound != nil {
+			t.Fatalf("unverified event produced route %+v", outbound)
+		}
+	}
+}
+
 // TestFeishuIngestLimitsAndInvalidBody 覆盖请求体上限读取、空体、非法信封与入库失败。
 func TestFeishuIngestLimitsAndInvalidBody(t *testing.T) {
 	verifier, err := feishu.NewVerifier(feishu.VerifierConfig{VerificationToken: "verify-token"})
@@ -1089,7 +1231,7 @@ func TestFeishuEventWorkerRetryAndDeadLetter(t *testing.T) {
 	body := buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1", messageID: "om_1"})
 	record := biz.FeishuEventRecord{
 		EventID: "evt-om_1", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
-		Payload: map[string]any{"body": body}, Status: biz.FeishuEventReceived,
+		Payload: map[string]any{"default_route": true, "body": body}, Status: biz.FeishuEventReceived,
 	}
 	// 可重试失败：身份解析错误写入 failed 并按预算退避。
 	retry := newFeishuWorkerFixture(t, record, feishuJob("evt-om_1", 1, 3), biz.FeishuEventWorkerConfig{})
@@ -1162,50 +1304,50 @@ func TestFeishuEventWorkerTerminalAndIgnoredBranches(t *testing.T) {
 	}{
 		{
 			name: "recalled message",
-			event: biz.FeishuEventRecord{EventID: "evt-recalled", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-recalled", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				eventType: feishu.EventTypeMessageRecalled, chatID: "oc_1", messageID: "om_recalled",
 			})}},
 		},
 		{
 			name: "updated message",
-			event: biz.FeishuEventRecord{EventID: "evt-updated", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-updated", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				eventType: feishu.EventTypeMessageUpdated, chatID: "oc_1", messageID: "om_updated",
 			})}},
 		},
 		{
 			name: "unknown event type",
-			event: biz.FeishuEventRecord{EventID: "evt-unknown", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-unknown", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				eventType: "im.unknown", chatID: "oc_1", messageID: "om_unknown",
 			})}},
 		},
 		{
 			name: "application sender",
-			event: biz.FeishuEventRecord{EventID: "evt-app", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-app", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				senderType: "app", chatID: "oc_1", messageID: "om_app",
 			})}},
 		},
 		{
 			name: "image message",
-			event: biz.FeishuEventRecord{EventID: "evt-image", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-image", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				messageType: "image", content: `{"image_key":"img"}`, chatID: "oc_1", messageID: "om_image",
 			})}},
 		},
 		{
 			name: "missing sender open id",
-			event: biz.FeishuEventRecord{EventID: "evt-nosender", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-nosender", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				senderOpenID: &emptyOpenID, chatID: "oc_1", messageID: "om_nosender",
 			})}},
 		},
 		{
 			name: "group without mention",
-			event: biz.FeishuEventRecord{EventID: "evt-nomention", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-nomention", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: "om_nomention",
 			})}},
 			config: biz.FeishuEventWorkerConfig{BotOpenID: "ou_bot"},
 		},
 		{
 			name: "group without topic",
-			event: biz.FeishuEventRecord{EventID: "evt-notopic", Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+			event: biz.FeishuEventRecord{EventID: "evt-notopic", Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 				chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: "om_notopic", mentions: mentions,
 			})}},
 			config: biz.FeishuEventWorkerConfig{BotOpenID: "ou_bot", RequireTopic: true},
@@ -1229,7 +1371,7 @@ func TestFeishuEventWorkerBindingAndPersistenceFailures(t *testing.T) {
 	body := buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1", messageID: "om_1"})
 	record := biz.FeishuEventRecord{
 		EventID: "evt-om_1", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
-		Payload: map[string]any{"body": body}, Status: biz.FeishuEventReceived,
+		Payload: map[string]any{"default_route": true, "body": body}, Status: biz.FeishuEventReceived,
 	}
 	// 绑定已关闭时忽略消息，不再写入会话。
 	closed := newFeishuWorkerFixture(t, record, feishuJob("evt-om_1", 1, 3), biz.FeishuEventWorkerConfig{})
@@ -1293,11 +1435,11 @@ func TestFeishuEventWorkerBindingAndPersistenceFailures(t *testing.T) {
 // TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent 验证机器人绑定路由、所有者限制与停用/未绑定忽略。
 func TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent(t *testing.T) {
 	body := buildFeishuBody(t, feishuBodyOptions{chatID: "oc_1", messageID: "om_bound"})
+	botID, boundAgentID := uuid.New(), uuid.New()
 	record := biz.FeishuEventRecord{
 		EventID: "evt-bound", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant", AppID: "app_bot",
-		Payload: map[string]any{"body": body}, Status: biz.FeishuEventReceived,
+		Payload: map[string]any{"bot_id": botID.String(), "body": body}, Status: biz.FeishuEventReceived,
 	}
-	botID, boundAgentID := uuid.New(), uuid.New()
 	boundVersion := 7
 	newFixture := func() *feishuWorkerFixture {
 		fixture := newFeishuWorkerFixture(t, record, feishuJob("evt-bound", 1, 3), biz.FeishuEventWorkerConfig{})
@@ -1319,7 +1461,8 @@ func TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent(t *testing.T) {
 		bound.runs.input.AgentVersion == nil || *bound.runs.input.AgentVersion != boundVersion || bound.runs.input.Mode != biz.AgentModePlan {
 		t.Fatalf("bound route input = %#v", bound.runs.input)
 	}
-	if bound.outbound.created == nil || bound.outbound.created.AppID != "app_bot" {
+	if bound.outbound.created == nil || bound.outbound.created.AppID != "app_bot" ||
+		bound.outbound.created.BotID != botID || bound.outbound.created.DefaultRoute {
 		t.Fatalf("outbound app = %#v", bound.outbound.created)
 	}
 
@@ -1370,7 +1513,7 @@ func TestFeishuEventWorkerThreadFallbackAndTruncation(t *testing.T) {
 	// 允许根消息回退时，用消息 ID 同时作为话题键与过渡别名。
 	fallback := newFeishuWorkerFixture(t, biz.FeishuEventRecord{
 		EventID: "evt-fallback", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 			chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: "om_root", mentions: mentions,
 		})},
 	}, feishuJob("evt-fallback", 1, 3), biz.FeishuEventWorkerConfig{BotOpenID: "ou_bot", AllowRootReplyFallback: true})
@@ -1383,7 +1526,7 @@ func TestFeishuEventWorkerThreadFallbackAndTruncation(t *testing.T) {
 	// parent_id 作为话题键时必须同时记录 root_message_id 便于后续合并。
 	parent := newFeishuWorkerFixture(t, biz.FeishuEventRecord{
 		EventID: "evt-parent", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 			chatType: feishu.ChatTypeGroup, chatID: "oc_group", messageID: "om_child", parentID: "om_parent", mentions: mentions,
 		})},
 	}, feishuJob("evt-parent", 1, 3), biz.FeishuEventWorkerConfig{BotOpenID: "ou_bot"})
@@ -1396,7 +1539,7 @@ func TestFeishuEventWorkerThreadFallbackAndTruncation(t *testing.T) {
 	// 超长正文按配置上限截断后再入库。
 	truncated := newFeishuWorkerFixture(t, biz.FeishuEventRecord{
 		EventID: "evt-truncate", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 			chatID: "oc_1", messageID: "om_truncate", content: `{"text":"abcdefgh"}`,
 		})},
 	}, feishuJob("evt-truncate", 1, 3), biz.FeishuEventWorkerConfig{MaxMessageBytes: 4})
@@ -1409,7 +1552,7 @@ func TestFeishuEventWorkerThreadFallbackAndTruncation(t *testing.T) {
 	// 超长 chat_id 生成标题时截断，避免标题无限膨胀。
 	titleFixture := newFeishuWorkerFixture(t, biz.FeishuEventRecord{
 		EventID: "evt-title", TenantKey: "tenant",
-		Payload: map[string]any{"body": buildFeishuBody(t, feishuBodyOptions{
+		Payload: map[string]any{"default_route": true, "body": buildFeishuBody(t, feishuBodyOptions{
 			chatID: strings.Repeat("c", 70), messageID: "om_title",
 		})},
 	}, feishuJob("evt-title", 1, 3), biz.FeishuEventWorkerConfig{})
@@ -1424,11 +1567,10 @@ func TestFeishuEventWorkerThreadFallbackAndTruncation(t *testing.T) {
 
 // feishuReplyFixture 聚合外发 Worker 测试桩。
 type feishuReplyFixture struct {
-	worker        *biz.FeishuReplyWorker
-	outbound      *feishuOutboundStub
-	runs          *feishuRunsStub
-	sender        *feishuSenderStub
-	conversations *feishuConversationStub
+	worker   *biz.FeishuReplyWorker
+	outbound *feishuOutboundStub
+	runs     *feishuRunsStub
+	sender   *feishuSenderStub
 }
 
 // newFeishuReplyFixture 构造外发 Worker 与桩依赖，时钟固定便于断言退避。
@@ -1437,18 +1579,93 @@ func newFeishuReplyFixture(t *testing.T, outbound biz.FeishuOutbound, run biz.Ru
 	if config.WorkerID == "" {
 		config.WorkerID = "reply-1"
 	}
+	config.DefaultAppID = "cli_default"
+	outbound.AppID, outbound.DefaultRoute = config.DefaultAppID, true
 	outboundStub := &feishuOutboundStub{claimed: outbound, hasClaim: true}
 	runs := &feishuRunsStub{run: run}
 	sender := &feishuSenderStub{}
-	conversations := &feishuConversationStub{}
 	worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
-		Outbound: outboundStub, Runs: runs, Sender: sender, Conversations: conversations,
+		Outbound: outboundStub, Runs: runs, Sender: sender,
 		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, config)
 	if err != nil {
 		t.Fatalf("new reply worker: %v", err)
 	}
-	return &feishuReplyFixture{worker: worker, outbound: outboundStub, runs: runs, sender: sender, conversations: conversations}
+	return &feishuReplyFixture{worker: worker, outbound: outboundStub, runs: runs, sender: sender}
+}
+
+type feishuSenderResolverFunc func(context.Context, uuid.UUID, string) (biz.FeishuReplySender, error)
+
+func (f feishuSenderResolverFunc) ResolveSender(ctx context.Context, botID uuid.UUID, appID string) (biz.FeishuReplySender, error) {
+	return f(ctx, botID, appID)
+}
+
+func TestFeishuReplyWorkerDispatchesOnlyThroughVerifiedRoute(t *testing.T) {
+	const defaultApp = "cli_default"
+	botID := uuid.New()
+	for _, scenario := range []struct {
+		name         string
+		appID        string
+		botID        uuid.UUID
+		defaultRoute bool
+		wantDefault  int
+		wantBot      int
+	}{
+		{name: "explicit default", appID: defaultApp, defaultRoute: true, wantDefault: 1},
+		{name: "default app changed", appID: "cli_previous", defaultRoute: true},
+		{name: "legacy app matches default", appID: defaultApp},
+		{name: "legacy blank app"},
+		{name: "registered bot shares default app ID", appID: defaultApp, botID: botID, wantBot: 1},
+		{name: "registered bot unavailable", appID: defaultApp, botID: uuid.New()},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			defaultSender, registeredSender := &feishuSenderStub{}, &feishuSenderStub{}
+			store := &feishuOutboundStub{hasClaim: true, claimed: biz.FeishuOutbound{
+				ID: uuid.New(), AppID: scenario.appID, BotID: scenario.botID, DefaultRoute: scenario.defaultRoute,
+				ReplyToMessageID: "om_message", Attempts: 1,
+			}}
+			worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
+				Outbound: store, Runs: &feishuRunsStub{run: biz.Run{Status: biz.RunCompleted}}, Sender: defaultSender,
+				Senders: feishuSenderResolverFunc(func(_ context.Context, id uuid.UUID, appID string) (biz.FeishuReplySender, error) {
+					if id != botID || appID != defaultApp {
+						return nil, biz.ErrResourceNotFound
+					}
+					return registeredSender, nil
+				}),
+			}, biz.FeishuReplyWorkerConfig{WorkerID: "worker", DefaultAppID: defaultApp})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if defaultSender.cardCalls != scenario.wantDefault || registeredSender.cardCalls != scenario.wantBot ||
+				defaultSender.textCalls != 0 || registeredSender.textCalls != 0 || store.completed != scenario.wantDefault+scenario.wantBot {
+				t.Fatalf("dispatched default=%d bot=%d completed=%d", defaultSender.cardCalls, registeredSender.cardCalls, store.completed)
+			}
+		})
+	}
+}
+
+func TestFeishuReplyWorkerChecksClaimBeforeFallback(t *testing.T) {
+	fixture := newFeishuReplyFixture(t, biz.FeishuOutbound{
+		ID: uuid.New(), ThreadID: "om_root", ReplyToMessageID: "om_root", Attempts: 1,
+	}, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
+	fixture.sender.threadErr = errors.New("topic creation failed")
+	fixture.outbound.checkClaim = func() error {
+		if fixture.sender.threadCalls != 0 {
+			return biz.ErrFeishuOutboundClaimLost
+		}
+		return nil
+	}
+	if _, err := fixture.worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.sender.threadCalls != 1 || fixture.sender.cardCalls != 1 || fixture.sender.textCalls != 0 ||
+		fixture.sender.textThreadCalls != 0 || fixture.outbound.completed != 0 || fixture.outbound.failed != 0 {
+		t.Fatalf("stale claim sent cards=%d texts=%d, completed=%d failed=%d",
+			fixture.sender.cardCalls, fixture.sender.textCalls, fixture.outbound.completed, fixture.outbound.failed)
+	}
 }
 
 // TestFeishuReplyWorkerRunStatesAndLookupFailure 覆盖 Run 读取失败与各终态卡片。
@@ -1562,6 +1779,103 @@ func TestFeishuReplyWorkerWaitTimeoutAndApproval(t *testing.T) {
 	}
 }
 
+func TestFeishuReplyWorkerDeliversAfterLongApproval(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	deadline := now.Add(time.Minute)
+	fixture := newFeishuReplyFixture(t, biz.FeishuOutbound{
+		ID: uuid.New(), UserID: uuid.New(), RunID: uuid.New(), MessageID: "om_card",
+		ReplyToMessageID: "om_question", CreatedAt: now.Add(-time.Hour),
+	}, biz.Run{Status: biz.RunWaitingApproval}, biz.FeishuReplyWorkerConfig{})
+	process := func() {
+		t.Helper()
+		if _, err := fixture.worker.ProcessOne(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	process()
+	fixture.runs.run.Status, fixture.runs.run.DeadlineAt = biz.RunRunning, &deadline
+	process()
+	if fixture.outbound.completed != 0 || fixture.outbound.deferred != 2 {
+		t.Fatalf("resumed run completed=%d deferred=%d before its deadline", fixture.outbound.completed, fixture.outbound.deferred)
+	}
+	fixture.runs.run.Status = biz.RunCompleted
+	fixture.outbound.assistant = biz.Message{Content: "approved result"}
+	process()
+	if fixture.outbound.completed != 1 || fixture.sender.updateCalls != 3 {
+		t.Fatalf("completed=%d updates=%d", fixture.outbound.completed, fixture.sender.updateCalls)
+	}
+}
+
+func TestFeishuReplyWorkerRecoversPostedCardWithoutDuplicate(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	store := &feishuOutboundStub{hasClaim: true, claimed: biz.FeishuOutbound{
+		ID: uuid.New(), AppID: "cli_default", DefaultRoute: true, ReplyToMessageID: "om_question", CreatedAt: now,
+	}, saveMessageErr: errors.New("database unavailable after Feishu accepted reply")}
+	runs := &feishuRunsStub{run: biz.Run{Status: biz.RunRunning}}
+	type reply struct {
+		UUID    string `json:"uuid"`
+		Content string `json:"content"`
+	}
+	requests := make(chan reply, 3)
+	patches := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case req.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			fmt.Fprint(w, `{"code":0,"tenant_access_token":"fake-token","expire":7200}`)
+		case req.Method == http.MethodPost && req.URL.Path == "/open-apis/im/v1/messages/om_question/reply":
+			var post reply
+			if err := json.NewDecoder(req.Body).Decode(&post); err != nil {
+				t.Errorf("decode reply: %v", err)
+			}
+			requests <- post
+			fmt.Fprint(w, `{"code":0,"data":{"message_id":"om_card"}}`)
+		case req.Method == http.MethodPatch && req.URL.Path == "/open-apis/im/v1/messages/om_card":
+			var patch reply
+			if err := json.NewDecoder(req.Body).Decode(&patch); err != nil {
+				t.Errorf("decode patch: %v", err)
+			}
+			patches <- patch.Content
+			fmt.Fprint(w, `{"code":0}`)
+		default:
+			t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client, err := feishu.NewClient(feishu.ClientConfig{BaseURL: server.URL, AppID: "cli_default", AppSecret: "fake-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := func(workerID string) {
+		t.Helper()
+		worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
+			Outbound: store, Runs: runs, Sender: client, Clock: func() time.Time { return now },
+		}, biz.FeishuReplyWorkerConfig{WorkerID: workerID, DefaultAppID: "cli_default"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := worker.ProcessOne(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	process("first-worker")
+	store.saveMessageErr = nil
+	store.assistant = biz.Message{Content: "approved result"}
+	runs.run.Status = biz.RunCompleted
+	now = now.Add(time.Minute)
+	process("replacement-worker")
+	if len(requests) != 2 {
+		t.Fatalf("POST count=%d, want initial and recovery", len(requests))
+	}
+	first, retry := <-requests, <-requests
+	if first.UUID == "" || retry != first {
+		t.Fatalf("reply changed across worker restart: first=%+v retry=%+v", first, retry)
+	}
+	if len(patches) != 1 || !strings.Contains(<-patches, "approved result") || store.completed != 1 {
+		t.Fatalf("final answer was not applied to the recovered card, completed=%d", store.completed)
+	}
+}
+
 // TestFeishuReplyWorkerThreadReplyPromotionAndFallback 覆盖话题内回复、过渡别名升级与降级策略。
 func TestFeishuReplyWorkerThreadReplyPromotionAndFallback(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
@@ -1582,10 +1896,10 @@ func TestFeishuReplyWorkerThreadReplyPromotionAndFallback(t *testing.T) {
 	if bootstrap.sender.threadCalls != 1 || bootstrap.outbound.completed != 1 {
 		t.Fatalf("bootstrap threads=%d completed=%d", bootstrap.sender.threadCalls, bootstrap.outbound.completed)
 	}
-	if bootstrap.conversations.promoteCalls != 1 || bootstrap.conversations.promoteLegacyThreadID != "om_root" ||
-		bootstrap.conversations.promoteThreadID != "omt_real" {
-		t.Fatalf("promote calls=%d legacy=%q thread=%q", bootstrap.conversations.promoteCalls,
-			bootstrap.conversations.promoteLegacyThreadID, bootstrap.conversations.promoteThreadID)
+	if bootstrap.outbound.promoteCalls != 1 || bootstrap.outbound.promotedOutbound.ThreadID != "om_root" ||
+		bootstrap.outbound.promotedThread != "omt_real" {
+		t.Fatalf("promote calls=%d legacy=%q thread=%q", bootstrap.outbound.promoteCalls,
+			bootstrap.outbound.promotedOutbound.ThreadID, bootstrap.outbound.promotedThread)
 	}
 
 	// 真实话题内追问：直接复用话题回复，不再触发别名升级。
@@ -1593,8 +1907,8 @@ func TestFeishuReplyWorkerThreadReplyPromotionAndFallback(t *testing.T) {
 	if _, err := existing.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("existing thread process: %v", err)
 	}
-	if existing.sender.threadCalls != 1 || existing.conversations.promoteCalls != 0 {
-		t.Fatalf("existing threads=%d promote=%d", existing.sender.threadCalls, existing.conversations.promoteCalls)
+	if existing.sender.threadCalls != 1 || existing.outbound.promoteCalls != 0 {
+		t.Fatalf("existing threads=%d promote=%d", existing.sender.threadCalls, existing.outbound.promoteCalls)
 	}
 
 	// 普通群不支持话题：过渡别名回复失败时降级为主时间线文本，保证至少送达一次。
@@ -1759,36 +2073,42 @@ type blockingFeishuOutboundStore struct {
 }
 
 // ClaimOutbound 依次弹出一条外发记录，模拟多个 Worker 竞争同一会话。
-func (s *blockingFeishuOutboundStore) ClaimOutbound(_ context.Context, _ string, _ time.Duration, _ time.Time) (biz.FeishuOutbound, bool, error) {
+func (s *blockingFeishuOutboundStore) ClaimOutbound(_ context.Context, worker string, lease time.Duration, now time.Time) (biz.FeishuOutbound, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.queue) == 0 {
 		return biz.FeishuOutbound{}, false, nil
 	}
 	outbound := s.queue[0]
+	outbound.LeaseOwner, outbound.FencingToken = worker, 1
+	outbound.LeaseExpiresAt = now.Add(lease)
 	s.queue = s.queue[1:]
 	return outbound, true, nil
 }
 
+func (s *blockingFeishuOutboundStore) CheckOutboundClaim(_ context.Context, _ biz.FeishuOutbound, _ time.Time) error {
+	return nil
+}
+
 // DeferOutbound 记录并发限制导致的延后。
-func (s *blockingFeishuOutboundStore) DeferOutbound(_ context.Context, _ uuid.UUID, _ time.Time, _ time.Time) error {
+func (s *blockingFeishuOutboundStore) DeferOutbound(_ context.Context, _ biz.FeishuOutbound, _ time.Time, _ time.Time) error {
 	s.deferred.Add(1)
 	return nil
 }
 
-func (s *blockingFeishuOutboundStore) UpdateOutboundMessageID(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+func (s *blockingFeishuOutboundStore) UpdateOutboundMessageID(_ context.Context, _ biz.FeishuOutbound, _ string, _ time.Time) error {
 	return nil
 }
 
-func (s *blockingFeishuOutboundStore) MarkOutboundCardUpdated(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+func (s *blockingFeishuOutboundStore) MarkOutboundCardUpdated(_ context.Context, _ biz.FeishuOutbound, _ string, _ time.Time) error {
 	return nil
 }
 
-func (s *blockingFeishuOutboundStore) CompleteOutbound(_ context.Context, _ uuid.UUID, _ time.Time) error {
+func (s *blockingFeishuOutboundStore) CompleteOutbound(_ context.Context, _ biz.FeishuOutbound, _ time.Time) error {
 	return nil
 }
 
-func (s *blockingFeishuOutboundStore) FailOutbound(_ context.Context, _ uuid.UUID, _ string, _ time.Time, _ time.Time) error {
+func (s *blockingFeishuOutboundStore) FailOutbound(_ context.Context, _ biz.FeishuOutbound, _ string, _ time.Time, _ time.Time) error {
 	return nil
 }
 
@@ -1811,7 +2131,7 @@ func TestFeishuReplyWorkerLimitsPerChatConcurrency(t *testing.T) {
 	newOutbound := func(chatID string) biz.FeishuOutbound {
 		return biz.FeishuOutbound{
 			ID: uuid.New(), UserID: uuid.New(), RunID: uuid.New(), ChatID: chatID,
-			ReplyToMessageID: "om_" + chatID, Status: "sending", Attempts: 1, CreatedAt: now,
+			ReplyToMessageID: "om_" + chatID, AppID: "cli_default", DefaultRoute: true, Status: "sending", Attempts: 1, CreatedAt: now,
 		}
 	}
 	first := newOutbound("oc_same")
@@ -1822,7 +2142,7 @@ func TestFeishuReplyWorkerLimitsPerChatConcurrency(t *testing.T) {
 	worker, err := biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
 		Outbound: store, Runs: &feishuRunsStub{run: biz.Run{Status: biz.RunRunning}}, Sender: sender,
 		Clock: func() time.Time { return now },
-	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-limit", MaxConcurrentPerChat: 1, MaxConcurrentPerUser: 4})
+	}, biz.FeishuReplyWorkerConfig{WorkerID: "reply-limit", DefaultAppID: "cli_default", MaxConcurrentPerChat: 1, MaxConcurrentPerUser: 4})
 	if err != nil {
 		t.Fatalf("new worker: %v", err)
 	}

@@ -132,22 +132,17 @@ func TestRunServiceResolveReconciliation(t *testing.T) {
 	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
 	runID := uuid.New()
 	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).
-		Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunReconciliationRequired}, nil)
-	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, runID,
-		biz.RunReconciliationRequired, biz.RunCompleted, gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, _, to biz.RunStatus, fields map[string]any) (biz.Run, error) {
+		Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunReconciliationRequired, FencingToken: 4}, nil)
+	runRepo.EXPECT().FinishRunWithEvent(gomock.Any(), principal.UserID, runID,
+		biz.RunReconciliationRequired, biz.RunCompleted, gomock.Any(), gomock.Any(), biz.RunFence{Token: 4}, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, _, to biz.RunStatus, fields map[string]any, event biz.RunEvent, _ biz.RunFence, _ time.Time) (biz.Run, error) {
 			if to != biz.RunCompleted || fields["error_code"] != "reconciliation_completed" {
 				t.Fatalf("unexpected reconciliation fields: %#v", fields)
 			}
-			return biz.Run{ID: runID, Status: biz.RunCompleted}, nil
-		},
-	)
-	runRepo.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, event biz.RunEvent) (biz.RunEvent, error) {
 			if event.EventType != "run.reconciliation.resolved" {
 				t.Fatalf("event type = %q", event.EventType)
 			}
-			return event, nil
+			return biz.Run{ID: runID, Status: biz.RunCompleted}, nil
 		},
 	)
 	resolved, err := service.ResolveReconciliation(context.Background(), principal, runID, "completed", "已确认下游执行成功")

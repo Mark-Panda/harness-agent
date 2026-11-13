@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/google/uuid"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -24,7 +25,9 @@ var ErrToolBusiness = errors.New("MCP tool returned business error")
 
 // Server 是注册到执行层的单个 MCP 服务；风险等级决定是否需要人工审批。
 type Server struct {
-	// Name 服务展示名称，用于生成稳定工具前缀。
+	// ID 服务在 MCP 目录中的标识，用于绑定审批目标。
+	ID uuid.UUID
+	// Name 服务展示名称，用于生成模型侧工具前缀。
 	Name string
 	// RiskLevel 风险等级；low 可自动执行，medium/high 必须审批。
 	RiskLevel string
@@ -38,6 +41,21 @@ type Server struct {
 	ToolTimeouts map[string]time.Duration
 }
 
+// ToolIdentity identifies the MCP target independently of the model-facing alias.
+type ToolIdentity struct {
+	ServerID            uuid.UUID
+	OriginalName        string
+	EndpointFingerprint string
+}
+
+// IdentityOf returns the MCP target carried by a tool, or a zero identity if none is available.
+func IdentityOf(tool react.Tool) ToolIdentity {
+	if identified, ok := tool.(interface{ MCPIdentity() ToolIdentity }); ok {
+		return identified.MCPIdentity()
+	}
+	return ToolIdentity{}
+}
+
 // binding 是规范工具名到原始服务与工具的映射。
 type binding struct {
 	// server 所属服务。
@@ -46,6 +64,8 @@ type binding struct {
 	tool Tool
 	// spec 暴露给模型的工具定义。
 	spec react.ToolSpec
+	// identity 持久审批目标。
+	identity ToolIdentity
 	// schema 本地参数校验 Schema；为空表示远端未提供或无法编译，退化为由 MCP 服务端校验。
 	schema *jsonschema.Schema
 }
@@ -118,7 +138,12 @@ func (r *Registry) Prepare(ctx context.Context) error {
 			tools = discovered
 		}
 		r.preparedServers++
+		endpointDigest := sha256.Sum256([]byte(server.Client.endpoint))
+		endpointFingerprint := hex.EncodeToString(endpointDigest[:])
 		for _, tool := range tools {
+			if tool.Name == "" {
+				continue
+			}
 			canonical := canonicalToolName(server.Name, tool.Name)
 			if _, exists := seen[canonical]; exists {
 				// 同名工具来自不同服务时追加短哈希，保证模型侧名称唯一。
@@ -135,7 +160,10 @@ func (r *Registry) Prepare(ctx context.Context) error {
 			}
 			// 提前编译参数 Schema；编译失败时保留工具，退化为由 MCP 服务端校验，避免因个别 Schema 特性不可用而丢失工具。
 			compiled, _ := compileToolSchema(tool.InputSchema)
-			r.bindings[canonical] = binding{server: server, tool: tool, spec: spec, schema: compiled}
+			r.bindings[canonical] = binding{
+				server: server, tool: tool, spec: spec, schema: compiled,
+				identity: ToolIdentity{ServerID: server.ID, OriginalName: tool.Name, EndpointFingerprint: endpointFingerprint},
+			}
 			r.specs = append(r.specs, spec)
 		}
 	}
@@ -165,6 +193,9 @@ func (r *Registry) List() []react.ToolSpec {
 
 // Spec 返回工具定义。
 func (b binding) Spec() react.ToolSpec { return b.spec }
+
+// MCPIdentity 返回与工具别名无关的审批目标。
+func (b binding) MCPIdentity() ToolIdentity { return b.identity }
 
 // RiskLevel 返回服务风险等级，供上层审批门禁判断是否需要人工确认。
 func (b binding) RiskLevel() string { return b.server.RiskLevel }

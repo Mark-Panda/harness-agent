@@ -5,13 +5,19 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // 错误分类，供上层决定失败回填或人工对账。
@@ -22,12 +28,24 @@ var (
 	ErrSandboxUnavailable = fmt.Errorf("sandbox runner is unavailable")
 	// ErrResponseTooLarge Sandbox 响应超过允许大小。
 	ErrResponseTooLarge = fmt.Errorf("sandbox response exceeds the size limit")
+	// ErrToolOutcomeUnknown 表示 Runner 可能已经执行工具，但客户端没有拿到结果。
+	ErrToolOutcomeUnknown = fmt.Errorf("sandbox tool outcome unknown")
 )
 
-// Request 是一次 Sandbox 工具执行请求，只包含工具名、参数、风险等级与超时。
+// MCPTarget identifies a user-scoped MCP tool independently of its display alias.
+type MCPTarget struct {
+	UserID              uuid.UUID `json:"user_id"`
+	ServerID            uuid.UUID `json:"server_id"`
+	OriginalName        string    `json:"original_name"`
+	EndpointFingerprint string    `json:"endpoint_fingerprint"`
+}
+
+// Request 是一次 Sandbox 工具执行请求，通过工具名或 MCP 目标定位。
 type Request struct {
 	// Tool 工具名称。
-	Tool string `json:"tool"`
+	Tool string `json:"tool,omitempty"`
+	// MCP requests use the identity-aware endpoint.
+	MCP *MCPTarget `json:"mcp,omitempty"`
 	// Arguments 工具参数 JSON。
 	Arguments json.RawMessage `json:"arguments"`
 	// RiskLevel 工具风险等级。
@@ -115,8 +133,19 @@ func (c *Client) Execute(ctx context.Context, request Request) (Response, error)
 	if c == nil {
 		return Response{}, fmt.Errorf("%w: client is nil", ErrInvalidConfig)
 	}
-	if strings.TrimSpace(request.Tool) == "" || !json.Valid(request.Arguments) {
-		return Response{}, fmt.Errorf("%w: tool and valid arguments are required", ErrInvalidConfig)
+	if !json.Valid(request.Arguments) {
+		return Response{}, fmt.Errorf("%w: valid arguments are required", ErrInvalidConfig)
+	}
+	path := "/execute"
+	if target := request.MCP; target != nil {
+		fingerprint, err := hex.DecodeString(target.EndpointFingerprint)
+		if request.Tool != "" || target.UserID == uuid.Nil || target.ServerID == uuid.Nil ||
+			strings.TrimSpace(target.OriginalName) == "" || err != nil || len(fingerprint) != sha256.Size {
+			return Response{}, fmt.Errorf("%w: a complete MCP target is required", ErrInvalidConfig)
+		}
+		path = "/execute/mcp"
+	} else if strings.TrimSpace(request.Tool) == "" {
+		return Response{}, fmt.Errorf("%w: tool is required", ErrInvalidConfig)
 	}
 	timeout := c.timeout
 	if request.TimeoutMS > 0 {
@@ -127,11 +156,15 @@ func (c *Client) Execute(ctx context.Context, request Request) (Response, error)
 	}
 	callContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var connected atomic.Bool
+	callContext = httptrace.WithClientTrace(callContext, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	})
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: encode request", ErrInvalidConfig)
 	}
-	httpRequest, err := http.NewRequestWithContext(callContext, http.MethodPost, c.endpoint+"/execute", bytes.NewReader(payload))
+	httpRequest, err := http.NewRequestWithContext(callContext, http.MethodPost, c.endpoint+path, bytes.NewReader(payload))
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: build request", ErrInvalidConfig)
 	}
@@ -139,25 +172,31 @@ func (c *Client) Execute(ctx context.Context, request Request) (Response, error)
 	httpRequest.Header.Set("Authorization", "Bearer "+c.token)
 	response, err := c.httpClient.Do(httpRequest)
 	if err != nil {
+		if connected.Load() {
+			return Response{}, fmt.Errorf("%w: %w: %v", ErrToolOutcomeUnknown, ErrSandboxUnavailable, err)
+		}
 		return Response{}, fmt.Errorf("%w: %v", ErrSandboxUnavailable, err)
 	}
 	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode >= 500 || response.StatusCode == http.StatusRequestTimeout {
+			return Response{}, fmt.Errorf("%w: %w: status %d", ErrToolOutcomeUnknown, ErrSandboxUnavailable, response.StatusCode)
+		}
+		return Response{}, fmt.Errorf("%w: status %d", ErrSandboxUnavailable, response.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
 	if err != nil {
-		return Response{}, fmt.Errorf("%w: read response", ErrSandboxUnavailable)
+		return Response{}, fmt.Errorf("%w: %w: read response", ErrToolOutcomeUnknown, ErrSandboxUnavailable)
 	}
 	if int64(len(body)) > c.maxResponseBytes {
-		return Response{}, ErrResponseTooLarge
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("%w: status %d", ErrSandboxUnavailable, response.StatusCode)
+		return Response{}, fmt.Errorf("%w: %w", ErrToolOutcomeUnknown, ErrResponseTooLarge)
 	}
 	var decoded Response
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return Response{}, fmt.Errorf("%w: decode response", ErrSandboxUnavailable)
+		return Response{}, fmt.Errorf("%w: %w: decode response", ErrToolOutcomeUnknown, ErrSandboxUnavailable)
 	}
 	if decoded.ErrorCode == "" && !json.Valid(decoded.Output) {
-		return Response{}, fmt.Errorf("%w: invalid output json", ErrSandboxUnavailable)
+		return Response{}, fmt.Errorf("%w: %w: invalid output json", ErrToolOutcomeUnknown, ErrSandboxUnavailable)
 	}
 	return decoded, nil
 }

@@ -238,6 +238,63 @@ func TestExecutePlanEinoReplan(t *testing.T) {
 	}
 }
 
+func TestExecutePlanEinoReplanReusesRenamedToolOperation(t *testing.T) {
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
+	worker, plans, router := einoPlanFixture(t, func(body string, w http.ResponseWriter) {
+		if strings.Contains(body, "最终汇总器") {
+			writeCompletion(t, w, "summary", http.StatusOK)
+			return
+		}
+		writeCompletion(t, w, `{"goal":"g","steps":[{"step_no":1,"title":"Renamed operation","tool_name":"tool","arguments":{"id":1}}]}`, http.StatusOK)
+	})
+	plans.seedPlan(Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID,
+		Version: 1, Status: PlanExecuting, Goal: "g", MaxSteps: 5, Steps: []PlanStep{
+			{ID: uuid.New(), StepNo: 1, Title: "Original operation", Status: PlanStepCompleted, ToolName: "tool",
+				Arguments: map[string]any{"id": float64(1)}, Result: map[string]any{"content": "already applied"}},
+			{ID: uuid.New(), StepNo: 2, Title: "Failed follow-up", Status: PlanStepFailed, Attempts: 1, MaxAttempts: 1},
+		},
+	})
+	tool := &fakeRuntimeTool{name: "tool", risk: "low", output: json.RawMessage(`{"ok":true}`)}
+	if _, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
+		[]react.Message{{Role: react.RoleUser, Content: "task"}}, fakePlanRegistry{tool: tool}); err != nil {
+		t.Fatal(err)
+	}
+	if tool.calls != 0 {
+		t.Fatalf("completed operation invoked %d more time(s)", tool.calls)
+	}
+}
+
+func TestExecutePlanEinoHonorsPauseDuringFinalSummary(t *testing.T) {
+	ctx := context.Background()
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
+	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID,
+		Version: 1, Status: PlanExecuting, Goal: "g", MaxSteps: 5, Steps: []PlanStep{
+			{ID: uuid.New(), StepNo: 1, Title: "Completed", Status: PlanStepCompleted, Result: map[string]any{"content": "ok"}},
+		},
+	}
+	var repo *memoryPlanRepo
+	worker, plans, router := einoPlanFixture(t, func(_ string, w http.ResponseWriter) {
+		latest, err := repo.GetPlan(ctx, run.UserID, plan.ID)
+		if err == nil {
+			_, err = repo.UpdatePlan(ctx, run.UserID, plan.ID, PlanExecuting, PlanPaused, latest.Revision, PlanFence{}, PlanUpdate{})
+		}
+		if err != nil {
+			t.Errorf("pause failed: %v", err)
+		}
+		writeCompletion(t, w, "summary", http.StatusOK)
+	})
+	repo = plans
+	repo.seedPlan(plan)
+	if _, _, err := worker.executePlan(ctx, run, RunFence{Owner: "plan-worker", Token: 1}, router,
+		[]react.Message{{Role: react.RoleUser, Content: "task"}}, emptyToolRegistry{}); !errors.Is(err, ErrPlanPaused) {
+		t.Fatalf("finalization missed the pause signal: %v", err)
+	}
+	stored, err := repo.GetPlan(ctx, run.UserID, plan.ID)
+	if err != nil || stored.Status != PlanPaused {
+		t.Fatalf("plan after pause = %s, %v", stored.Status, err)
+	}
+}
+
 // TestExecutePlanEinoBudgetGuard 验证 Eino 图的守卫节点会阻断超预算计划。
 func TestExecutePlanEinoBudgetGuard(t *testing.T) {
 	worker, plans, router := einoPlanFixture(t, func(_ string, w http.ResponseWriter) {

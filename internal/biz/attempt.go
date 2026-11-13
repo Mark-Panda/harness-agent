@@ -58,6 +58,9 @@ type ModelCall struct {
 	OutputTokens int64
 	// EstimatedCost 估算费用，单位与价格配置一致。
 	EstimatedCost float64
+	// PlanMaxTokens 与 PlanMaxCost 仅用于原子预留计划用量，零表示无上限。
+	PlanMaxTokens int64
+	PlanMaxCost   float64
 	// FinishReason 模型结束原因。
 	FinishReason string
 	// SwitchReason 切换到下一候选的原因，仅由路由层填写。

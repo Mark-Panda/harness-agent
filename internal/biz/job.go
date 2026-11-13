@@ -29,13 +29,25 @@ type Job struct {
 	AvailableAt time.Time
 	// CreatedAt 创建时间（UTC）。
 	CreatedAt time.Time
+	// RunSettlementOnly 表示本次领取仅用于收敛 Run，未占用新的执行次数。
+	RunSettlementOnly bool
+	// RunSettlement 是先前写入失败的 Run 状态与事件。
+	RunSettlement *RunJobSettlement
+}
+
+// RunJobSettlement 保存终态重试所需的信息，避免重新执行模型或工具。
+type RunJobSettlement struct {
+	Status  RunStatus      `json:"status"`
+	Code    string         `json:"code,omitempty"`
+	Message string         `json:"message,omitempty"`
+	Payload map[string]any `json:"payload,omitempty"`
 }
 
 // JobQueue 定义持久化任务队列契约，所有操作均为至少一次语义。
 type JobQueue interface {
 	// EnqueueRun 幂等入队 Run 执行任务；同一 Run 重复入队不产生重复任务。
 	EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error
-	// Claim 领取一个指定类型的到期任务并递增 attempt 与 fencing token；无任务时返回 false。
+	// Claim 领取一个指定类型的到期任务并递增 fencing token；只收敛 Run 时不增加 attempts。
 	Claim(ctx context.Context, workerID string, jobType string, lease time.Duration, now time.Time) (Job, bool, error)
 	// Renew 续约任务租约；栅栏失效时返回冲突。
 	Renew(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, lease time.Duration, now time.Time) error
@@ -45,6 +57,13 @@ type JobQueue interface {
 	Complete(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64) error
 	// Fail 记录失败并在预算内退避重试，超出预算进入死信。
 	Fail(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, retryAt time.Time, reason string, now time.Time) error
+}
+
+// RunExecutionQueue 支持独立于执行预算重试 Run 的终态写入。
+type RunExecutionQueue interface {
+	JobQueue
+	// DeferRunSettlement 退回 Run 收敛任务而不更改执行计数。settlement 为空时保留已有信息。
+	DeferRunSettlement(ctx context.Context, job Job, settlement *RunJobSettlement, retryAt, now time.Time) error
 }
 
 // RunJobReplayer 是可选的任务重放能力：把同一 Run 的 failed/dead 任务重置为 pending。

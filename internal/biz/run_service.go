@@ -142,6 +142,10 @@ type RunRepository interface {
 	ClaimRun(ctx context.Context, userID, runID uuid.UUID, owner string, lease time.Duration, now time.Time) (Run, RunFence, error)
 	// RenewRunLease 续约执行租约；栅栏失效时返回冲突。
 	RenewRunLease(ctx context.Context, userID, runID uuid.UUID, fence RunFence, lease time.Duration, now time.Time) error
+	// AuthorizeToolDispatch checks a live Run lease and marks the pending tool step as dispatched.
+	AuthorizeToolDispatch(ctx context.Context, userID, runID uuid.UUID, stepID *uuid.UUID, fence RunFence, now time.Time) error
+	// RequeuePausedRun releases the current worker's lease after a Plan pause.
+	RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, deadline *time.Time, now time.Time) error
 	// PauseRun 在栅栏有效时把运行中的 Run 推进到 waiting_approval，并清空租约。
 	PauseRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) (Run, error)
 	// ResumeRun 在无待决策审批时把 waiting_approval 推进到 running，并清空租约。
@@ -895,23 +899,16 @@ func (s *RunService) ResolveReconciliation(
 		errorCode = "reconciliation_failed"
 	}
 	now := s.clock()
-	fields := map[string]any{
-		"error_code": errorCode, "error_message": reason, "finished_at": now,
-	}
-	resolved, err := s.repo.TransitionRun(ctx, principal.UserID, runID, RunReconciliationRequired, outcome, fields)
-	if err != nil {
-		return Run{}, err
-	}
-	// 与审批决策保持一致：审计事件写入失败时向调用方报错，避免出现无审计的结案。
-	if _, err := s.repo.AppendEvent(ctx, RunEvent{
+	fields := map[string]any{"error_code": errorCode, "error_message": reason}
+	event := RunEvent{
 		RunID: runID, UserID: principal.UserID, EventType: "run.reconciliation.resolved",
 		Payload: map[string]any{
 			"outcome": string(outcome), "reason": reason, "actor_user_id": principal.UserID.String(),
 		},
-	}); err != nil {
-		return Run{}, err
 	}
-	return resolved, nil
+	// 对账状态已释放执行租约，原栅栏序号仍用于 CAS。审计事件写入失败时一并回滚。
+	fence := RunFence{Owner: run.LeaseOwner, Token: run.FencingToken}
+	return s.repo.FinishRunWithEvent(ctx, principal.UserID, runID, RunReconciliationRequired, outcome, fields, event, fence, now)
 }
 
 // Cancel 取消排队、执行中或等待审批的 Run；终态 Run 返回冲突。

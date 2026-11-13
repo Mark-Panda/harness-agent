@@ -52,6 +52,10 @@ func (f *fakeFactRepository) SaveFact(_ context.Context, fact biz.MemoryFact, _ 
 	return fact, f.applied, nil
 }
 
+func (f *fakeFactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, _ biz.FactTask) (biz.MemoryFact, bool, error) {
+	return f.SaveFact(ctx, fact, expectedVersion)
+}
+
 // ListFactVersions 返回已保存版本。
 func (f *fakeFactRepository) ListFactVersions(context.Context, uuid.UUID, string, int) ([]biz.MemoryFact, error) {
 	return f.saved, nil

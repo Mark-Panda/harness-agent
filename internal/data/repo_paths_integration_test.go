@@ -93,6 +93,39 @@ func TestExecutionStepListAndPayloads(t *testing.T) {
 		t.Fatalf("cross-user ListPayloads = %#v, %v", payloads, err)
 	}
 
+	t.Run("audit redaction on write and legacy reads", func(t *testing.T) {
+		written, err := steps.SavePayload(ctx, biz.ExecutionPayload{
+			RunID: run.ID, StepID: &step.ID, UserID: owner.ID, Type: biz.PayloadToolInput,
+			ContentJSON: map[string]any{"password": "new-credential", "query": "visible"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stored string
+		if err := adminDB.Raw("SELECT content_json::text FROM execution_payloads WHERE id = ?", written.ID).Scan(&stored).Error; err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(stored, "new-credential") || !strings.Contains(stored, "visible") || written.RedactionVersion != biz.ExecutionRedactionVersion {
+			t.Fatalf("new audit payload was not redacted before persistence: %s", stored)
+		}
+		legacyID := uuid.New()
+		if err := adminDB.Exec(`INSERT INTO execution_payloads
+(id, user_id, run_id, step_id, payload_type, capture_mode, content_text)
+VALUES (?, ?, ?, ?, 'tool_output', 'redacted', ?)`, legacyID, owner.ID, run.ID, step.ID,
+			`{"access_token":"legacy-credential","status":"ok"}`).Error; err != nil {
+			t.Fatal(err)
+		}
+		payloads, err := steps.ListPayloads(ctx, owner.ID, run.ID, &step.ID, 10)
+		if err != nil || len(payloads) != 3 {
+			t.Fatalf("ListPayloads() = %d records, %v", len(payloads), err)
+		}
+		for _, payload := range payloads {
+			if payload.ID == legacyID && (strings.Contains(payload.ContentText, "legacy-credential") || !strings.Contains(payload.ContentText, "ok")) {
+				t.Fatalf("legacy audit payload was not redacted on read: %s", payload.ContentText)
+			}
+		}
+	})
+
 	// ListModelCalls：按运行列出调用尝试，跨用户不可见。
 	calls := NewModelCallRepository(appDB)
 	if _, err := calls.CreateModelCall(ctx, biz.ModelCall{

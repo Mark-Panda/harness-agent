@@ -17,7 +17,7 @@ func TestCarryCompletedPlanSteps(t *testing.T) {
 		{StepNo: 1, Title: "查询", Description: "查询数据", ToolName: "mcp_lookup", Status: PlanStepPending},
 		{StepNo: 2, Title: "写入", Description: "用户修改了说明", ToolName: "mcp_write", Status: PlanStepPending},
 	}
-	carried := carryCompletedPlanSteps(steps, previous, true)
+	carried := CarryCompletedPlanSteps(steps, previous, true)
 	if carried[0].Status != PlanStepCompleted || carried[0].Result["content"] != "ok" {
 		t.Fatalf("matching completed step was not carried: %#v", carried[0])
 	}
@@ -25,7 +25,7 @@ func TestCarryCompletedPlanSteps(t *testing.T) {
 		t.Fatalf("modified step must re-run: %#v", carried[1])
 	}
 	// 重规划只按标题与工具匹配，描述变化不应阻断结果继承。
-	replanned := carryCompletedPlanSteps([]PlanStep{
+	replanned := CarryCompletedPlanSteps([]PlanStep{
 		{StepNo: 2, Title: "写入", Description: "重新生成的说明", ToolName: "mcp_write", Status: PlanStepPending},
 	}, previous, false)
 	if replanned[0].Status != PlanStepCompleted {
@@ -119,7 +119,7 @@ func TestCarryCompletedPlanStepsChecksEffectiveArgumentsAndDependencies(t *testi
 		{StepNo: 4, Title: "removed dependency", ToolName: "other", DependsOn: []int{3}, Status: PlanStepCompleted},
 	}}
 	for _, matchDescription := range []bool{true, false} {
-		steps := carryCompletedPlanSteps([]PlanStep{
+		steps := CarryCompletedPlanSteps([]PlanStep{
 			{StepNo: 1, Title: "fetch", ToolName: "get", Arguments: map[string]any{"id": "new"}, Status: PlanStepPending},
 			{StepNo: 2, Title: "process", ToolName: "process", DependsOn: []int{1}, Status: PlanStepPending},
 			{StepNo: 3, Title: "keep", ToolName: "keep", Arguments: map[string]any{}, Status: PlanStepPending},

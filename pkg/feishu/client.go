@@ -51,7 +51,32 @@ func IsRateLimited(err error) bool {
 	if !errors.As(err, &apiError) {
 		return false
 	}
-	return apiError.Code == 99991400 || apiError.Code == 99991401 || apiError.StatusCode == http.StatusTooManyRequests
+	return apiError.Code == 99991400 || apiError.Code == 99991401 || apiError.Code == 230020 || apiError.StatusCode == http.StatusTooManyRequests
+}
+
+// IsMessageRejected reports whether Feishu definitively declined the message mutation.
+// In particular, 230049 ("being sent") and transport/response failures are ambiguous.
+func IsMessageRejected(err error) bool {
+	if IsRateLimited(err) || IsTokenInvalid(err) {
+		return true
+	}
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
+		return false
+	}
+	switch apiError.Code {
+	case 230001, 230002, 230006, 230011, 230013, 230015, 230017, 230018, 230019,
+		230022, 230025, 230027, 230028, 230031, 230035, 230038, 230050, 230054, 230055,
+		230071, 230072, 230075, 230099, 230110, 230111, 232009:
+		return true
+	}
+	return false
+}
+
+// IsThreadReplyUnsupported identifies the documented reasons to drop reply_in_thread.
+func IsThreadReplyUnsupported(err error) bool {
+	var apiError *APIError
+	return errors.As(err, &apiError) && (apiError.Code == 230071 || apiError.Code == 230072)
 }
 
 // ClientConfig 是飞书 HTTP 客户端配置。
@@ -146,6 +171,14 @@ type ThreadReply struct {
 	ThreadID string
 }
 
+// ReplyRequest is the Feishu reply body. Keep the body unchanged when reusing UUID.
+type ReplyRequest struct {
+	Content  string `json:"content"`
+	Type     string `json:"msg_type"`
+	InThread bool   `json:"reply_in_thread,omitempty"`
+	UUID     string `json:"uuid,omitempty"`
+}
+
 // ReplyCard 以可更新卡片回复指定消息，返回飞书消息 ID。
 func (c *Client) ReplyCard(ctx context.Context, replyTo string, card any) (string, error) {
 	result, err := c.reply(ctx, replyTo, "interactive", card, false)
@@ -193,11 +226,11 @@ func (c *Client) reply(ctx context.Context, replyTo, messageType string, content
 	if err != nil {
 		return ThreadReply{}, err
 	}
-	payload := map[string]string{"msg_type": messageType, "content": encoded}
-	if inThread {
-		// 飞书要求字符串形式的布尔值，显式传 "true" 才能让根消息成为话题起点。
-		payload["reply_in_thread"] = "true"
-	}
+	return c.Reply(ctx, replyTo, ReplyRequest{Content: encoded, Type: messageType, InThread: inThread})
+}
+
+// Reply sends an immutable reply request, optionally deduplicated by Feishu using UUID.
+func (c *Client) Reply(ctx context.Context, replyTo string, payload ReplyRequest) (ThreadReply, error) {
 	var response struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -206,7 +239,7 @@ func (c *Client) reply(ctx context.Context, replyTo, messageType string, content
 			ThreadID  string `json:"thread_id"`
 		} `json:"data"`
 	}
-	err = c.callWithTokenRetry(ctx, func() error {
+	err := c.callWithTokenRetry(ctx, func() error {
 		response.Code, response.Msg = 0, ""
 		response.Data.MessageID, response.Data.ThreadID = "", ""
 		if err := c.authenticated(ctx, http.MethodPost, "/open-apis/im/v1/messages/"+url.PathEscape(replyTo)+"/reply", payload, &response); err != nil {

@@ -78,35 +78,68 @@ func TestFeishuGroupProjectionSeparatesSpeakersAndTrustsOnlySharedHistory(t *tes
 	}
 	runID := createFeishuTestRun(t, adminDB, speaker, projected.SessionID)
 	firstReply := biz.FeishuOutbound{
-		ID: uuid.New(), UserID: speaker, SessionID: projected.SessionID, RunID: runID, AppID: binding.AppID,
+		ID: uuid.New(), UserID: speaker, SessionID: projected.SessionID, RunID: runID, AppID: binding.AppID, DefaultRoute: true,
 		ChatID: binding.ChatID, ThreadID: binding.ThreadID, ReplyToMessageID: "msg-a", Kind: "card",
 		DedupeKey: "test.group.reply:" + runID.String(),
 	}
 	wrongApp := firstReply
-	wrongApp.AppID = "cli_wrong"
-	if n, err := bindings.PromoteGroupConversationThread(ctx, wrongApp, "thread"); err != nil || n != 0 {
+	wrongApp.ID, wrongApp.DedupeKey, wrongApp.AppID = uuid.New(), firstReply.DedupeKey+":wrong-app", "cli_wrong"
+	if err := outbound.CreateOutbound(ctx, wrongApp); err != nil {
+		t.Fatal(err)
+	}
+	claimAt := time.Now().UTC()
+	wrongClaim, found, err := outbound.ClaimOutbound(ctx, "group-test", time.Minute, claimAt)
+	if err != nil || !found || wrongClaim.ID != wrongApp.ID {
+		t.Fatalf("claim mismatched group reply = %+v, %t, %v", wrongClaim, found, err)
+	}
+	if n, err := outbound.PromoteOutboundThread(ctx, wrongClaim, "thread", claimAt); err != nil || n != 0 {
 		t.Fatalf("promote cross-app binding = %d, %v", n, err)
 	}
-	if n, err := bindings.PromoteGroupConversationThread(ctx, firstReply, "thread"); err != nil || n != 1 {
+	if err := outbound.CompleteOutbound(ctx, wrongClaim, claimAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := outbound.CreateOutbound(ctx, firstReply); err != nil {
+		t.Fatal(err)
+	}
+	claimAt = time.Now().UTC()
+	claimed, found, err := outbound.ClaimOutbound(ctx, "group-test", time.Minute, claimAt)
+	if err != nil || !found || claimed.ID != firstReply.ID {
+		t.Fatalf("claim group reply = %+v, %t, %v", claimed, found, err)
+	}
+	if err := adminDB.Exec("UPDATE feishu_outbound_messages SET lease_expires_at = ? WHERE id = ?", now, claimed.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	takeover, found, err := outbound.ClaimOutbound(ctx, "group-test", time.Minute, claimAt)
+	if err != nil || !found || takeover.ID != claimed.ID {
+		t.Fatalf("reclaim group reply = %+v, %t, %v", takeover, found, err)
+	}
+	if n, err := outbound.PromoteOutboundThread(ctx, claimed, "stale-thread", claimAt); n != 0 || !errors.Is(err, biz.ErrFeishuOutboundClaimLost) {
+		t.Fatalf("stale group topic promotion = %d, %v", n, err)
+	}
+	if err := outbound.CompleteGroupReply(ctx, claimed, "stale answer", claimAt); !errors.Is(err, biz.ErrFeishuOutboundClaimLost) {
+		t.Fatalf("stale group reply completion = %v", err)
+	}
+	if record := readFeishuOutbound(t, adminDB, claimed.ID); record.Status != "sending" {
+		t.Fatalf("stale group reply changed status to %q", record.Status)
+	}
+	var source feishuGroupMessageModel
+	if err := adminDB.Where("projection_session_id = ?", projected.SessionID).First(&source).Error; err != nil || source.ReplyText != "" {
+		t.Fatalf("stale group reply was projected: %q, %v", source.ReplyText, err)
+	}
+	if n, err := outbound.PromoteOutboundThread(ctx, takeover, "thread", claimAt); err != nil || n != 1 {
 		t.Fatalf("promote canonical binding = %d, %v", n, err)
 	}
 	promoted, found, err := bindings.FindConversationForApp(ctx, binding.AppID, tenant, binding.ChatID, "thread", "")
 	if err != nil || !found || promoted.ID != binding.ID {
 		t.Fatalf("canonical thread lookup = %+v, %t, %v", promoted, found, err)
 	}
-	if err := outbound.CreateOutbound(ctx, firstReply); err != nil {
-		t.Fatal(err)
-	}
-	claimed, found, err := outbound.ClaimOutbound(ctx, "group-test", time.Minute, now.Add(time.Second))
-	if err != nil || !found {
-		t.Fatalf("claim group reply = %t, %v", found, err)
-	}
-	if err := outbound.CompleteGroupReply(ctx, claimed, "group-test", "visible answer", now.Add(time.Second)); err != nil {
+	if err := outbound.CompleteGroupReply(ctx, takeover, "visible answer", claimAt); err != nil {
 		t.Fatal(err)
 	}
 	second, err := messages.ProjectGroupMessage(ctx, promoted, biz.Message{
 		UserID: owner, Role: biz.MessageUser, ExternalMessageID: "msg-b",
-		SpeakerOpenID: "ou_owner", Content: "follow-up", CreatedAt: now.Add(2 * time.Second),
+		SpeakerOpenID: "ou_owner", Content: "follow-up", CreatedAt: claimAt.Add(time.Second),
 	})
 	if err != nil || second.SessionID == projected.SessionID || second.UserID != owner {
 		t.Fatalf("second speaker projection = %+v, %v", second, err)

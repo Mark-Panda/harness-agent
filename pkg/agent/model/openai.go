@@ -34,14 +34,14 @@ var (
 	ErrPermanent = errors.New("model call failed permanently")
 )
 
-// ResponseError 是供应商非 2xx 响应的结构化错误，保留状态码与 Retry-After 供路由层决策。
+// ResponseError 是供应商响应中的结构化错误，保留状态码与 Retry-After 供路由层决策。
 // 通过 Unwrap 暴露底层分类，调用方仍可使用 errors.Is 判断错误类别。
 type ResponseError struct {
 	// StatusCode 供应商 HTTP 状态码。
 	StatusCode int
 	// RetryAfter 供应商建议的等待时长，仅 429 等场景携带。
 	RetryAfter time.Duration
-	// Class 错误分类，指向 ErrRateLimited、ErrRetryable、ErrAuthentication 或 ErrPermanent。
+	// Class 错误分类，供路由层决定是否重试或切换模型。
 	Class error
 	// Message 已脱敏的响应摘要，禁止包含凭证或用户正文。
 	Message string
@@ -150,8 +150,6 @@ type ToolCall struct {
 type ChatResponse struct {
 	// Content 最终文本。
 	Content string
-	// ReasoningContent 供应商返回的推理内容，仅用于判断空回答，不写入上下文也不持久化。
-	ReasoningContent string
 	// ToolCalls 工具调用列表。
 	ToolCalls []ToolCall
 	// FinishReason 结束原因。
@@ -254,15 +252,28 @@ func (c *Client) Models(ctx context.Context) ([]RemoteModel, error) {
 // EstimateTextTokens 以保守口径估算文本 Token：ASCII 字符约 4 字符/Token，
 // 非 ASCII（如中文）按 1 字符/Token 计算，避免按字节估算时低估中文输入。
 func EstimateTextTokens(text string) int64 {
-	var ascii, nonASCII int64
+	var estimate textTokenEstimate
+	estimate.add(text)
+	return estimate.tokens()
+}
+
+// textTokenEstimate 累积字符计数，避免逐帧取整或保留隐藏推理原文。
+type textTokenEstimate struct {
+	ascii, nonASCII int64
+}
+
+func (e *textTokenEstimate) add(text string) {
 	for _, r := range text {
 		if r < 128 {
-			ascii++
+			e.ascii++
 		} else {
-			nonASCII++
+			e.nonASCII++
 		}
 	}
-	return (ascii+3)/4 + nonASCII
+}
+
+func (e textTokenEstimate) tokens() int64 {
+	return (e.ascii+3)/4 + e.nonASCII
 }
 
 // EstimateTokens 估算消息 Token（不含工具定义）；usage 缺失时的回退口径。
@@ -380,7 +391,7 @@ func (c *Client) doChat(ctx context.Context, request ChatRequest, onDelta func(s
 		// 供应商可能忽略 stream 参数并直接返回 JSON；此时回退为非流式解析，
 		// 仍把完整文本作为一次增量回调，避免静默丢失回答。
 		if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-			return c.decodeStream(response, onDelta, EstimateRequestTokens(request.Messages, request.Tools))
+			return c.decodeStream(response, onDelta, inputTokens)
 		}
 		result, err := c.decodeResponse(response, request)
 		if err == nil && result.Content != "" {
@@ -416,10 +427,55 @@ func (c *Client) statusError(response *http.Response) error {
 	}
 }
 
+func hasProviderBodyError(raw json.RawMessage) bool {
+	return len(raw) > 0 && !bytes.Equal(raw, []byte("null"))
+}
+
+// providerBodyError 对 HTTP 成功响应中的错误分类。供应商原文可能回显请求内容或凭证。
+func providerBodyError(response *http.Response, raw json.RawMessage) error {
+	var details struct {
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(raw, &details)
+	class := providerBodyErrorClass(details.Code)
+	if class == nil {
+		class = providerBodyErrorClass(details.Type)
+	}
+	if class == nil {
+		class = ErrRetryable
+	}
+	result := &ResponseError{
+		StatusCode: response.StatusCode, Class: class, Message: "provider reported an error",
+	}
+	if class == ErrRateLimited {
+		result.RetryAfter = RetryAfter(response.Header.Get("Retry-After"), 0)
+	}
+	return result
+}
+
+func providerBodyErrorClass(code string) error {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "context_length_exceeded":
+		return ErrContextExceeded
+	case "rate_limit_exceeded", "rate_limit_error", "insufficient_quota":
+		return ErrRateLimited
+	case "invalid_api_key", "authentication_error", "permission_denied", "permission_error":
+		return ErrAuthentication
+	case "invalid_request_error", "content_filter", "content_policy_violation":
+		return ErrPermanent
+	case "server_error", "internal_server_error", "overloaded_error":
+		return ErrRetryable
+	default:
+		return nil
+	}
+}
+
 // decodeResponse 解析非流式响应体。
 func (c *Client) decodeResponse(response *http.Response, request ChatRequest) (ChatResponse, error) {
 	var payload struct {
-		ID      string `json:"id"`
+		ID      string          `json:"id"`
+		Error   json.RawMessage `json:"error"`
 		Choices []struct {
 			Message struct {
 				Content          string `json:"content"`
@@ -439,19 +495,25 @@ func (c *Client) decodeResponse(response *http.Response, request ChatRequest) (C
 			CompletionTokens int `json:"completion_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload); err != nil {
-		return ChatResponse{}, fmt.Errorf("%w: decode response: %v", ErrRetryable, err)
+	decodeErr := json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(&payload)
+	result := ChatResponse{
+		InputTokens:       payload.Usage.PromptTokens,
+		OutputTokens:      payload.Usage.CompletionTokens,
+		ProviderRequestID: payload.ID,
+	}
+	if hasProviderBodyError(payload.Error) {
+		return result, providerBodyError(response, payload.Error)
+	}
+	if decodeErr != nil {
+		return ChatResponse{}, fmt.Errorf("%w: decode response: %v", ErrRetryable, decodeErr)
 	}
 	if len(payload.Choices) == 0 {
 		return ChatResponse{}, fmt.Errorf("%w: provider returned no choices", ErrRetryable)
 	}
 	choice := payload.Choices[0]
-	result := ChatResponse{
-		Content: choice.Message.Content, ReasoningContent: choice.Message.ReasoningContent,
-		FinishReason: choice.FinishReason,
-		InputTokens:  payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens,
-		ProviderRequestID: payload.ID, ToolCalls: make([]ToolCall, 0, len(choice.Message.ToolCalls)),
-	}
+	result.Content = choice.Message.Content
+	result.FinishReason = choice.FinishReason
+	result.ToolCalls = make([]ToolCall, 0, len(choice.Message.ToolCalls))
 	for _, call := range choice.Message.ToolCalls {
 		result.ToolCalls = append(result.ToolCalls, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
 	}
@@ -460,15 +522,15 @@ func (c *Client) decodeResponse(response *http.Response, request ChatRequest) (C
 		result.InputTokens = int(EstimateRequestTokens(request.Messages, request.Tools))
 	}
 	if result.OutputTokens == 0 {
-		result.OutputTokens = estimateChatResponseOutput(result)
+		result.OutputTokens = estimateChatResponseOutput(result, EstimateTextTokens(choice.Message.ReasoningContent))
 	}
 	return result, nil
 }
 
-// estimateChatResponseOutput 在供应商未返回 usage 时估算输出，包含正文与工具调用参数。
-func estimateChatResponseOutput(response ChatResponse) int {
+// estimateChatResponseOutput 在供应商未返回 usage 时估算正文、工具调用与推理 Token。
+func estimateChatResponseOutput(response ChatResponse, reasoningTokens int64) int {
 	if response.Content == "" && len(response.ToolCalls) == 0 {
-		return 0
+		return int(reasoningTokens)
 	}
 	message := ChatMessage{Role: "assistant", Content: response.Content}
 	for _, call := range response.ToolCalls {
@@ -476,7 +538,7 @@ func estimateChatResponseOutput(response ChatResponse) int {
 			ID: call.ID, Type: "function", Function: ChatFunction{Name: call.Name, Arguments: call.Arguments},
 		})
 	}
-	return int(EstimateTokens([]ChatMessage{message}))
+	return int(EstimateTokens([]ChatMessage{message}) + reasoningTokens)
 }
 
 // streamToolCall 累积流式响应中逐步下发的工具调用片段。
@@ -489,27 +551,49 @@ type streamToolCall struct {
 // decodeStream 解析 OpenAI SSE 流，累计文本、工具调用与用量。
 // 读取中断时返回已收到的部分结果与错误，调用方据此避免把半截回答当作成功。
 func (c *Client) decodeStream(response *http.Response, onDelta func(string), fallbackInputTokens int64) (ChatResponse, error) {
+	const maxEventBytes = 1 << 20
 	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
+	var event bytes.Buffer
 	var content strings.Builder
-	var reasoning strings.Builder
+	var reasoning textTokenEstimate
 	calls := map[int]*streamToolCall{}
 	result := ChatResponse{}
 	var readErr error
+	done := false
+	errorEvent := false
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || !strings.HasPrefix(line, "data:") {
+		line := scanner.Bytes()
+		if len(line) != 0 {
+			field, data, _ := bytes.Cut(line, []byte(":"))
+			data, _ = bytes.CutPrefix(data, []byte(" "))
+			if bytes.Equal(field, []byte("event")) {
+				errorEvent = bytes.Equal(data, []byte("error"))
+			} else if bytes.Equal(field, []byte("data")) {
+				if event.Len()+len(data)+1 > maxEventBytes {
+					readErr = fmt.Errorf("%w: stream event exceeds size limit", ErrRetryable)
+					break
+				}
+				event.Write(data)
+				event.WriteByte('\n')
+			}
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" {
+		// 空行结束一个 SSE 事件；EOF 时尚未结束的事件不能提供完成信号。
+		data := bytes.TrimSpace(event.Bytes())
+		event.Reset()
+		namedError := errorEvent
+		errorEvent = false
+		if !namedError && len(data) == 0 {
 			continue
 		}
-		if data == "[DONE]" {
+		if !namedError && bytes.Equal(data, []byte("[DONE]")) {
+			done = true
 			break
 		}
 		var chunk struct {
-			ID      string `json:"id"`
+			ID      string          `json:"id"`
+			Error   json.RawMessage `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content          string `json:"content"`
@@ -530,10 +614,13 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 				CompletionTokens int `json:"completion_tokens"`
 			} `json:"usage"`
 		}
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		decodeErr := json.Unmarshal(data, &chunk)
+		bodyError := hasProviderBodyError(chunk.Error)
+		if decodeErr != nil && !namedError && !bodyError {
 			// 损坏帧可能已经丢失正文或工具参数片段，必须显式失败；
 			// 静默继续会把不完整回答或工具调用当作成功结果执行。
-			return ChatResponse{}, fmt.Errorf("%w: decode stream event: %v", ErrRetryable, err)
+			readErr = fmt.Errorf("%w: decode stream event: %v", ErrRetryable, decodeErr)
+			break
 		}
 		if chunk.ID != "" {
 			result.ProviderRequestID = chunk.ID
@@ -542,14 +629,19 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 			result.InputTokens = chunk.Usage.PromptTokens
 			result.OutputTokens = chunk.Usage.CompletionTokens
 		}
+		if bodyError {
+			readErr = providerBodyError(response, chunk.Error)
+			break
+		}
+		if namedError {
+			readErr = providerBodyError(response, data)
+			break
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 		choice := chunk.Choices[0]
-		if choice.Delta.ReasoningContent != "" {
-			// 推理内容只用于判断“只有推理没有回答”，不回调给前端，也不进入上下文。
-			reasoning.WriteString(choice.Delta.ReasoningContent)
-		}
+		reasoning.add(choice.Delta.ReasoningContent)
 		if choice.Delta.Content != "" {
 			content.WriteString(choice.Delta.Content)
 			onDelta(choice.Delta.Content)
@@ -570,19 +662,16 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 				item.Arguments.WriteString(call.Function.Arguments)
 			}
 		}
-		if choice.FinishReason != "" {
-			result.FinishReason = choice.FinishReason
+		if finishReason := strings.TrimSpace(choice.FinishReason); finishReason != "" {
+			result.FinishReason = finishReason
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		readErr = fmt.Errorf("%w: stream read failed: %v", ErrRetryable, err)
+	} else if readErr == nil && errorEvent {
+		readErr = providerBodyError(response, nil)
 	}
 	result.Content = content.String()
-	result.ReasoningContent = reasoning.String()
-	if result.OutputTokens == 0 {
-		// 供应商未返回 usage 时使用保守估算，正文与工具调用参数都计入输出。
-		result.OutputTokens = estimateChatResponseOutput(result)
-	}
 	if result.InputTokens == 0 && fallbackInputTokens > 0 {
 		// 流式响应常省略 usage：用请求侧估算回填输入 Token，避免预算与成本统计恒为零。
 		result.InputTokens = int(fallbackInputTokens)
@@ -598,6 +687,26 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 			item := calls[index]
 			result.ToolCalls = append(result.ToolCalls, ToolCall{ID: item.ID, Name: item.Name, Arguments: item.Arguments.String()})
 		}
+	}
+	if result.OutputTokens == 0 {
+		result.OutputTokens = estimateChatResponseOutput(result, reasoning.tokens())
+	}
+	if readErr == nil {
+		switch strings.ToLower(result.FinishReason) {
+		case "length", "content_filter":
+			if len(result.ToolCalls) > 0 {
+				readErr = fmt.Errorf("%w: stream truncated tool calls (%s)", ErrRetryable, result.FinishReason)
+			}
+		case "stop", "tool_calls", "function_call":
+			// 兼容发送明确结束原因后直接关闭流的供应商。
+		default:
+			if !done {
+				readErr = fmt.Errorf("%w: stream ended before completion", ErrRetryable)
+			}
+		}
+	}
+	if readErr != nil {
+		result.ToolCalls = nil
 	}
 	return result, readErr
 }

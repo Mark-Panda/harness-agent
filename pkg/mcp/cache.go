@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // 默认缓存时长与条目上限；工具清单变化低频，60 秒足以吸收同批次重复发现。
@@ -51,10 +53,12 @@ func NewClientCache(ttl time.Duration) *ClientCache {
 	return &ClientCache{ttl: ttl, maxEntries: defaultClientCacheMaxEntries, entries: map[string]*clientCacheEntry{}}
 }
 
-// CacheKey 生成稳定的缓存键；鉴权头按名称排序后哈希，避免凭证原文进入内存键。
-func CacheKey(endpoint string, headers http.Header, allowPrivate bool, timeout time.Duration) string {
+// CacheKey 按用户和服务隔离远端会话；鉴权头按名称排序后哈希，避免凭证原文进入内存键。
+func CacheKey(userID, serverID uuid.UUID, endpoint string, headers http.Header, allowPrivate bool, timeout time.Duration) string {
 	digest := sha256.Sum256([]byte(canonicalHeaders(headers)))
 	return strings.Join([]string{
+		userID.String(),
+		serverID.String(),
 		strings.TrimSpace(endpoint),
 		hex.EncodeToString(digest[:]),
 		strconv.FormatBool(allowPrivate),

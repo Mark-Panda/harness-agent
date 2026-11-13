@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
 
@@ -140,12 +141,16 @@ func TestToolApprovalRepositoryLifecycle(t *testing.T) {
 	if _, err := approvals.DecideApproval(ctx, userA.ID, created.ID, biz.ApprovalDecisionDeny, userA.ID, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("reverse decision error = %v", err)
 	}
-	executing, err := approvals.ClaimApprovalExecution(ctx, userA.ID, created.ID, time.Now().UTC())
+	_, fence, err := runs.ClaimRun(ctx, userA.ID, runID, "approval-worker", time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	executing, err := approvals.ClaimApprovalExecution(ctx, userA.ID, runID, created.ID, fence, time.Now().UTC())
 	if err != nil || executing.Status != biz.ApprovalExecuting {
 		t.Fatalf("ClaimApprovalExecution() = %#v, %v", executing, err)
 	}
 	// 已进入执行态后再次认领必须冲突，避免重复副作用。
-	if _, err := approvals.ClaimApprovalExecution(ctx, userA.ID, created.ID, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := approvals.ClaimApprovalExecution(ctx, userA.ID, runID, created.ID, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("second claim error = %v", err)
 	}
 	executed, err := approvals.FinishApprovalExecution(ctx, userA.ID, created.ID, biz.ApprovalExecuted,
@@ -168,6 +173,36 @@ func TestToolApprovalRepositoryLifecycle(t *testing.T) {
 	if err := adminDB.Raw("SELECT COUNT(*) FROM tool_approvals WHERE run_id = ?", runID).Scan(&rowCount).Error; err != nil || rowCount != 1 {
 		t.Fatalf("approval rows = %d, %v", rowCount, err)
 	}
+	t.Run("persist and deduplicate only the same MCP target", func(t *testing.T) {
+		target := mcp.ToolIdentity{ServerID: uuid.New(), OriginalName: "delete", EndpointFingerprint: strings.Repeat("a", 64)}
+		request := biz.ToolApproval{
+			RunID: runID, UserID: userA.ID, ToolCallID: "bound-call", ToolName: "mcp_admin_delete",
+			Arguments: json.RawMessage(`{}`), RiskLevel: "high", IdempotencyKey: "bound-idem", MCPBinding: target,
+		}
+		first, err := approvals.CreateApproval(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := approvals.GetApproval(ctx, userA.ID, first.ID)
+		if err != nil || loaded.MCPBinding != target {
+			t.Fatalf("loaded target = %#v, %v, want %#v", loaded.MCPBinding, err, target)
+		}
+		repeated, err := approvals.CreateApproval(ctx, request)
+		if err != nil || repeated.ID != first.ID {
+			t.Fatalf("replayed approval = %s, %v, want %s", repeated.ID, err, first.ID)
+		}
+		for _, different := range []mcp.ToolIdentity{
+			{},
+			{ServerID: uuid.New(), OriginalName: target.OriginalName, EndpointFingerprint: target.EndpointFingerprint},
+			{ServerID: target.ServerID, OriginalName: "DELETE", EndpointFingerprint: target.EndpointFingerprint},
+			{ServerID: target.ServerID, OriginalName: target.OriginalName, EndpointFingerprint: strings.Repeat("b", 64)},
+		} {
+			request.MCPBinding = different
+			if _, err := approvals.CreateApproval(ctx, request); !errors.Is(err, biz.ErrResourceConflict) {
+				t.Fatalf("reused tool call with binding %#v returned %v, want conflict", different, err)
+			}
+		}
+	})
 }
 
 // TestRunApprovalStateTransitions 验证 Run 的真实暂停、恢复与人工对账状态及事件。

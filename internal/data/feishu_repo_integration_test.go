@@ -562,8 +562,8 @@ func TestFeishuOutboundIdempotencyAndClaim(t *testing.T) {
 	firstID := uuid.New()
 	secondID := uuid.New()
 	for _, outbound := range []biz.FeishuOutbound{
-		{ID: firstID, UserID: userID, SessionID: sessionID, RunID: runID, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "card", DedupeKey: "feishu_it_out_" + suffix + "_1"},
-		{ID: secondID, UserID: userID, SessionID: sessionID, RunID: runID, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "text", DedupeKey: "feishu_it_out_" + suffix + "_2"},
+		{ID: firstID, UserID: userID, SessionID: sessionID, RunID: runID, AppID: "cli_default", DefaultRoute: true, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "card", DedupeKey: "feishu_it_out_" + suffix + "_1"},
+		{ID: secondID, UserID: userID, SessionID: sessionID, RunID: runID, AppID: "cli_default", DefaultRoute: true, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "text", DedupeKey: "feishu_it_out_" + suffix + "_2"},
 	} {
 		if err := repository.CreateOutbound(ctx, outbound); err != nil {
 			t.Fatalf("create outbound: %v", err)
@@ -595,7 +595,8 @@ func TestFeishuOutboundIdempotencyAndClaim(t *testing.T) {
 	if claimed.ID != firstID && claimed.ID != secondID {
 		t.Fatalf("claimed unexpected outbound %s", claimed.ID)
 	}
-	if claimed.Status != "sending" || claimed.Attempts != 1 {
+	if claimed.Status != "sending" || claimed.Attempts != 1 || claimed.FencingToken != 1 ||
+		!claimed.DefaultRoute || claimed.BotID != uuid.Nil || claimed.AppID != "cli_default" {
 		t.Fatalf("claimed outbound = %#v", claimed)
 	}
 	second, ok, err := repository.ClaimOutbound(ctx, "worker-it", time.Minute, now)
@@ -609,35 +610,42 @@ func TestFeishuOutboundIdempotencyAndClaim(t *testing.T) {
 	if _, ok, err := repository.ClaimOutbound(ctx, "worker-it", time.Minute, now); err != nil || ok {
 		t.Fatalf("empty claim ok=%t err=%v", ok, err)
 	}
+	if err := repository.CompleteOutbound(ctx, second, now); err != nil {
+		t.Fatalf("complete second outbound: %v", err)
+	}
 
 	// 等待 Run 期间延后检查必须回退领取计数，避免轮询耗尽失败预算。
 	retryAt := now.Add(time.Minute)
-	if err := repository.DeferOutbound(ctx, claimed.ID, retryAt, now); err != nil {
+	if err := repository.DeferOutbound(ctx, claimed, retryAt, now); err != nil {
 		t.Fatalf("defer outbound: %v", err)
 	}
 	deferred := readFeishuOutbound(t, adminDB, claimed.ID)
 	if deferred.Status != "pending" || deferred.Attempts != 0 {
 		t.Fatalf("deferred outbound = %#v", deferred)
 	}
-	if _, ok, err := repository.ClaimOutbound(ctx, "worker-it", time.Minute, retryAt); err != nil || !ok {
-		t.Fatalf("re-claim deferred ok=%t err=%v", ok, err)
+	reclaimed, ok, err := repository.ClaimOutbound(ctx, "worker-it", time.Minute, retryAt)
+	if err != nil || !ok || reclaimed.ID != claimed.ID || reclaimed.Attempts != 1 || reclaimed.FencingToken != claimed.FencingToken+1 {
+		t.Fatalf("re-claim deferred = %+v, ok=%t err=%v", reclaimed, ok, err)
+	}
+	if err := repository.CompleteOutbound(ctx, claimed, retryAt); !errors.Is(err, biz.ErrFeishuOutboundClaimLost) {
+		t.Fatalf("completion from before defer = %v", err)
 	}
 	// 保存飞书消息 ID 后标记完成。
-	if err := repository.UpdateOutboundMessageID(ctx, claimed.ID, "om_reply_"+suffix, retryAt); err != nil {
+	if err := repository.UpdateOutboundMessageID(ctx, reclaimed, "om_reply_"+suffix, retryAt); err != nil {
 		t.Fatalf("update outbound message id: %v", err)
 	}
 	// 卡片成功更新必须持久化更新时间与内容指纹，供跨副本节流与去重。
 	fingerprint := "fp_" + suffix
-	if err := repository.MarkOutboundCardUpdated(ctx, claimed.ID, fingerprint, retryAt); err != nil {
+	if err := repository.MarkOutboundCardUpdated(ctx, reclaimed, fingerprint, retryAt); err != nil {
 		t.Fatalf("mark outbound card updated: %v", err)
 	}
 	if marked := readFeishuOutbound(t, adminDB, claimed.ID); marked.CardFingerprint != fingerprint || marked.CardUpdatedAt == nil {
 		t.Fatalf("marked outbound = %#v", marked)
 	}
-	if err := repository.MarkOutboundCardUpdated(ctx, claimed.ID, "", retryAt); !errors.Is(err, biz.ErrInvalidConfig) {
+	if err := repository.MarkOutboundCardUpdated(ctx, reclaimed, "", retryAt); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("empty fingerprint error = %v", err)
 	}
-	if err := repository.CompleteOutbound(ctx, claimed.ID, retryAt); err != nil {
+	if err := repository.CompleteOutbound(ctx, reclaimed, retryAt); err != nil {
 		t.Fatalf("complete outbound: %v", err)
 	}
 	completed := readFeishuOutbound(t, adminDB, claimed.ID)
@@ -676,8 +684,8 @@ func TestFeishuOutboundFailureAndLeaseRecovery(t *testing.T) {
 	leaseID := uuid.New()
 	deadID := uuid.New()
 	for _, outbound := range []biz.FeishuOutbound{
-		{ID: leaseID, UserID: userID, SessionID: sessionID, RunID: runID, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "card", DedupeKey: "feishu_it_fail_" + suffix + "_lease"},
-		{ID: deadID, UserID: userID, SessionID: sessionID, RunID: runID, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "text", DedupeKey: "feishu_it_fail_" + suffix + "_dead"},
+		{ID: leaseID, UserID: userID, SessionID: sessionID, RunID: runID, AppID: "cli_default", DefaultRoute: true, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "card", DedupeKey: "feishu_it_fail_" + suffix + "_lease"},
+		{ID: deadID, UserID: userID, SessionID: sessionID, RunID: runID, AppID: "cli_default", DefaultRoute: true, ChatID: binding.ChatID, ThreadID: binding.ThreadID, Kind: "text", DedupeKey: "feishu_it_fail_" + suffix + "_dead"},
 	} {
 		if err := repository.CreateOutbound(ctx, outbound); err != nil {
 			t.Fatalf("create outbound: %v", err)
@@ -687,28 +695,50 @@ func TestFeishuOutboundFailureAndLeaseRecovery(t *testing.T) {
 	if err := adminDB.Exec("UPDATE feishu_outbound_messages SET max_attempts = 1 WHERE id = ?", deadID).Error; err != nil {
 		t.Fatalf("shrink dead budget: %v", err)
 	}
+	if err := adminDB.Exec("UPDATE feishu_outbound_messages SET available_at = available_at - interval '1 second' WHERE id = ?", leaseID).Error; err != nil {
+		t.Fatalf("prioritize recoverable reply: %v", err)
+	}
 
 	now := time.Now().UTC()
 	claimed, ok, err := repository.ClaimOutbound(ctx, "worker-it", 10*time.Second, now)
 	if err != nil || !ok {
 		t.Fatalf("claim lease outbound ok=%t err=%v", ok, err)
 	}
-	if claimed.ID != leaseID && claimed.ID != deadID {
+	if claimed.ID != leaseID {
 		t.Fatalf("claimed unexpected outbound %s", claimed.ID)
 	}
 	// 领取一条后立即把租约置为过期，模拟 Worker 崩溃后的恢复路径。
 	if err := adminDB.Exec("UPDATE feishu_outbound_messages SET lease_expires_at = now() - interval '1 second' WHERE id = ?", claimed.ID).Error; err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
-	recovered, ok, err := repository.ClaimOutbound(ctx, "worker-recover", 10*time.Second, now)
+	recovered, ok, err := repository.ClaimOutbound(ctx, "worker-it", 10*time.Second, now)
 	if err != nil || !ok {
 		t.Fatalf("claim expired lease ok=%t err=%v", ok, err)
 	}
-	if recovered.ID != claimed.ID || recovered.Attempts != claimed.Attempts+1 {
+	if recovered.ID != claimed.ID || recovered.Attempts != claimed.Attempts+1 || recovered.FencingToken != claimed.FencingToken+1 {
 		t.Fatalf("recovered outbound = %#v, first = %#v", recovered, claimed)
 	}
+	for op, apply := range map[string]func() error{
+		"dispatch":    func() error { return repository.CheckOutboundClaim(ctx, claimed, now) },
+		"message":     func() error { return repository.UpdateOutboundMessageID(ctx, claimed, "stale-card", now) },
+		"fingerprint": func() error { return repository.MarkOutboundCardUpdated(ctx, claimed, "stale", now) },
+		"defer":       func() error { return repository.DeferOutbound(ctx, claimed, now, now) },
+		"complete":    func() error { return repository.CompleteOutbound(ctx, claimed, now) },
+		"fail":        func() error { return repository.FailOutbound(ctx, claimed, "stale failure", now, now) },
+	} {
+		if err := apply(); !errors.Is(err, biz.ErrFeishuOutboundClaimLost) {
+			t.Fatalf("stale %s returned %v", op, err)
+		}
+	}
+	if row := readFeishuOutbound(t, adminDB, recovered.ID); row.Status != "sending" || row.Attempts != recovered.Attempts ||
+		row.MessageID != "" || row.CardFingerprint != "" || row.LastError != "" {
+		t.Fatalf("stale updates changed active claim: %+v", row)
+	}
+	if err := repository.CheckOutboundClaim(ctx, recovered, now); err != nil {
+		t.Fatalf("dispatch with current claim: %v", err)
+	}
 	// 未超过预算的失败进入退避重试，并且错误文本截断为 1024 字节。
-	if err := repository.FailOutbound(ctx, claimed.ID, strings.Repeat("y", 1100), now.Add(time.Minute), now); err != nil {
+	if err := repository.FailOutbound(ctx, recovered, strings.Repeat("y", 1100), now.Add(time.Minute), now); err != nil {
 		t.Fatalf("fail outbound: %v", err)
 	}
 	retried := readFeishuOutbound(t, adminDB, claimed.ID)
@@ -724,7 +754,7 @@ func TestFeishuOutboundFailureAndLeaseRecovery(t *testing.T) {
 	if deadClaim.Attempts != 1 || deadClaim.MaxAttempts != 1 {
 		t.Fatalf("dead candidate = %#v", deadClaim)
 	}
-	if err := repository.FailOutbound(ctx, deadID, "permanent failure", now, now); err != nil {
+	if err := repository.FailOutbound(ctx, deadClaim, "permanent failure", now, now); err != nil {
 		t.Fatalf("fail dead outbound: %v", err)
 	}
 	dead := readFeishuOutbound(t, adminDB, deadID)
@@ -829,7 +859,22 @@ func TestFeishuConversationLifecycleAndPromotion(t *testing.T) {
 	}
 
 	// 话题升级后按真实话题 ID 命中，旧过渡别名不再命中。
-	promoted, err := repository.PromoteConversationThread(ctx, userID, sessionID, legacyThreadID, realThreadID)
+	runID := createFeishuTestRun(t, adminDB, userID, sessionID)
+	outbound := NewFeishuOutboundRepository(appDB)
+	reply := biz.FeishuOutbound{
+		ID: uuid.New(), UserID: userID, SessionID: sessionID, RunID: runID, AppID: "cli_default", DefaultRoute: true,
+		ChatID: chatID, ThreadID: legacyThreadID, ReplyToMessageID: rootMessageID, Kind: "card", DedupeKey: runID.String(),
+	}
+	if err := outbound.CreateOutbound(ctx, reply); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claim, found, err := outbound.ClaimOutbound(ctx, "lifecycle-test", time.Minute, now)
+	if err != nil || !found || claim.ID != reply.ID {
+		t.Fatalf("claim lifecycle reply = %+v, %t, %v", claim, found, err)
+	}
+	t.Cleanup(func() { _ = outbound.CompleteOutbound(ctx, claim, now) })
+	promoted, err := outbound.PromoteOutboundThread(ctx, claim, realThreadID, now)
 	if err != nil || promoted != 1 {
 		t.Fatalf("promote affected=%d err=%v", promoted, err)
 	}

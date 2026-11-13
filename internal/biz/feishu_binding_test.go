@@ -86,11 +86,6 @@ func (s *feishuBindingConversationStub) RestoreConversation(_ context.Context, u
 	return s.restored, nil
 }
 
-// PromoteConversationThread 在绑定生命周期测试中不做实际升级，返回 0。
-func (s *feishuBindingConversationStub) PromoteConversationThread(_ context.Context, _, _ uuid.UUID, _, _ string) (int, error) {
-	return 0, nil
-}
-
 // TestNewFeishuBindingServiceRequiresDependencies 验证依赖缺失时拒绝构造服务。
 func TestNewFeishuBindingServiceRequiresDependencies(t *testing.T) {
 	if _, err := biz.NewFeishuBindingService(nil, &feishuBindingSessionStub{}); err == nil {

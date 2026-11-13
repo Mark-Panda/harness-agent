@@ -455,8 +455,8 @@ type FeishuBotCredentialReader interface {
 	GetFeishuBotCredential(ctx context.Context, botID uuid.UUID) (FeishuBot, ProviderCredential, error)
 }
 
-// FeishuReplySenderResolver 按 App ID 解析外发回复使用的飞书客户端。
+// FeishuReplySenderResolver 解析接收事件的注册机器人使用的飞书客户端。
 type FeishuReplySenderResolver interface {
-	// ResolveSender 返回指定应用对应的回复发送端口；未登记时返回默认客户端。
-	ResolveSender(ctx context.Context, appID string) (FeishuReplySender, error)
+	// ResolveSender 校验机器人当前身份和状态，并使用其最新凭据。
+	ResolveSender(ctx context.Context, botID uuid.UUID, appID string) (FeishuReplySender, error)
 }

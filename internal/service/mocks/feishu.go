@@ -312,21 +312,6 @@ func (mr *MockFeishuConversationRepositoryMockRecorder) FindConversation(ctx, te
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindConversation", reflect.TypeOf((*MockFeishuConversationRepository)(nil).FindConversation), ctx, tenantKey, chatID, threadID, rootMessageID)
 }
 
-// PromoteConversationThread mocks base method.
-func (m *MockFeishuConversationRepository) PromoteConversationThread(ctx context.Context, userID, sessionID uuid.UUID, legacyThreadID, threadID string) (int, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PromoteConversationThread", ctx, userID, sessionID, legacyThreadID, threadID)
-	ret0, _ := ret[0].(int)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// PromoteConversationThread indicates an expected call of PromoteConversationThread.
-func (mr *MockFeishuConversationRepositoryMockRecorder) PromoteConversationThread(ctx, userID, sessionID, legacyThreadID, threadID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteConversationThread", reflect.TypeOf((*MockFeishuConversationRepository)(nil).PromoteConversationThread), ctx, userID, sessionID, legacyThreadID, threadID)
-}
-
 // ReleaseConversation mocks base method.
 func (m *MockFeishuConversationRepository) ReleaseConversation(ctx context.Context, userID, sessionID uuid.UUID, status string, event biz.OutboxEvent) (int, error) {
 	m.ctrl.T.Helper()
@@ -421,6 +406,20 @@ func (m *MockFeishuOutboundStore) EXPECT() *MockFeishuOutboundStoreMockRecorder 
 	return m.recorder
 }
 
+// CheckOutboundClaim mocks base method.
+func (m *MockFeishuOutboundStore) CheckOutboundClaim(ctx context.Context, outbound biz.FeishuOutbound, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckOutboundClaim", ctx, outbound, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CheckOutboundClaim indicates an expected call of CheckOutboundClaim.
+func (mr *MockFeishuOutboundStoreMockRecorder) CheckOutboundClaim(ctx, outbound, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckOutboundClaim", reflect.TypeOf((*MockFeishuOutboundStore)(nil).CheckOutboundClaim), ctx, outbound, now)
+}
+
 // ClaimOutbound mocks base method.
 func (m *MockFeishuOutboundStore) ClaimOutbound(ctx context.Context, workerID string, lease time.Duration, now time.Time) (biz.FeishuOutbound, bool, error) {
 	m.ctrl.T.Helper()
@@ -437,18 +436,32 @@ func (mr *MockFeishuOutboundStoreMockRecorder) ClaimOutbound(ctx, workerID, leas
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClaimOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).ClaimOutbound), ctx, workerID, lease, now)
 }
 
-// CompleteOutbound mocks base method.
-func (m *MockFeishuOutboundStore) CompleteOutbound(ctx context.Context, id uuid.UUID, now time.Time) error {
+// CompleteGroupReply mocks base method.
+func (m *MockFeishuOutboundStore) CompleteGroupReply(ctx context.Context, outbound biz.FeishuOutbound, text string, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CompleteOutbound", ctx, id, now)
+	ret := m.ctrl.Call(m, "CompleteGroupReply", ctx, outbound, text, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CompleteGroupReply indicates an expected call of CompleteGroupReply.
+func (mr *MockFeishuOutboundStoreMockRecorder) CompleteGroupReply(ctx, outbound, text, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CompleteGroupReply", reflect.TypeOf((*MockFeishuOutboundStore)(nil).CompleteGroupReply), ctx, outbound, text, now)
+}
+
+// CompleteOutbound mocks base method.
+func (m *MockFeishuOutboundStore) CompleteOutbound(ctx context.Context, outbound biz.FeishuOutbound, now time.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CompleteOutbound", ctx, outbound, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // CompleteOutbound indicates an expected call of CompleteOutbound.
-func (mr *MockFeishuOutboundStoreMockRecorder) CompleteOutbound(ctx, id, now any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) CompleteOutbound(ctx, outbound, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CompleteOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).CompleteOutbound), ctx, id, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CompleteOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).CompleteOutbound), ctx, outbound, now)
 }
 
 // CreateOutbound mocks base method.
@@ -466,31 +479,31 @@ func (mr *MockFeishuOutboundStoreMockRecorder) CreateOutbound(ctx, outbound any)
 }
 
 // DeferOutbound mocks base method.
-func (m *MockFeishuOutboundStore) DeferOutbound(ctx context.Context, id uuid.UUID, retryAt, now time.Time) error {
+func (m *MockFeishuOutboundStore) DeferOutbound(ctx context.Context, outbound biz.FeishuOutbound, retryAt, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeferOutbound", ctx, id, retryAt, now)
+	ret := m.ctrl.Call(m, "DeferOutbound", ctx, outbound, retryAt, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DeferOutbound indicates an expected call of DeferOutbound.
-func (mr *MockFeishuOutboundStoreMockRecorder) DeferOutbound(ctx, id, retryAt, now any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) DeferOutbound(ctx, outbound, retryAt, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeferOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).DeferOutbound), ctx, id, retryAt, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeferOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).DeferOutbound), ctx, outbound, retryAt, now)
 }
 
 // FailOutbound mocks base method.
-func (m *MockFeishuOutboundStore) FailOutbound(ctx context.Context, id uuid.UUID, reason string, retryAt, now time.Time) error {
+func (m *MockFeishuOutboundStore) FailOutbound(ctx context.Context, outbound biz.FeishuOutbound, reason string, retryAt, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "FailOutbound", ctx, id, reason, retryAt, now)
+	ret := m.ctrl.Call(m, "FailOutbound", ctx, outbound, reason, retryAt, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // FailOutbound indicates an expected call of FailOutbound.
-func (mr *MockFeishuOutboundStoreMockRecorder) FailOutbound(ctx, id, reason, retryAt, now any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) FailOutbound(ctx, outbound, reason, retryAt, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FailOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).FailOutbound), ctx, id, reason, retryAt, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FailOutbound", reflect.TypeOf((*MockFeishuOutboundStore)(nil).FailOutbound), ctx, outbound, reason, retryAt, now)
 }
 
 // LatestAssistantMessage mocks base method.
@@ -509,31 +522,46 @@ func (mr *MockFeishuOutboundStoreMockRecorder) LatestAssistantMessage(ctx, userI
 }
 
 // MarkOutboundCardUpdated mocks base method.
-func (m *MockFeishuOutboundStore) MarkOutboundCardUpdated(ctx context.Context, id uuid.UUID, fingerprint string, now time.Time) error {
+func (m *MockFeishuOutboundStore) MarkOutboundCardUpdated(ctx context.Context, outbound biz.FeishuOutbound, fingerprint string, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "MarkOutboundCardUpdated", ctx, id, fingerprint, now)
+	ret := m.ctrl.Call(m, "MarkOutboundCardUpdated", ctx, outbound, fingerprint, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // MarkOutboundCardUpdated indicates an expected call of MarkOutboundCardUpdated.
-func (mr *MockFeishuOutboundStoreMockRecorder) MarkOutboundCardUpdated(ctx, id, fingerprint, now any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) MarkOutboundCardUpdated(ctx, outbound, fingerprint, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MarkOutboundCardUpdated", reflect.TypeOf((*MockFeishuOutboundStore)(nil).MarkOutboundCardUpdated), ctx, id, fingerprint, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MarkOutboundCardUpdated", reflect.TypeOf((*MockFeishuOutboundStore)(nil).MarkOutboundCardUpdated), ctx, outbound, fingerprint, now)
+}
+
+// PromoteOutboundThread mocks base method.
+func (m *MockFeishuOutboundStore) PromoteOutboundThread(ctx context.Context, outbound biz.FeishuOutbound, threadID string, now time.Time) (int, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PromoteOutboundThread", ctx, outbound, threadID, now)
+	ret0, _ := ret[0].(int)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// PromoteOutboundThread indicates an expected call of PromoteOutboundThread.
+func (mr *MockFeishuOutboundStoreMockRecorder) PromoteOutboundThread(ctx, outbound, threadID, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteOutboundThread", reflect.TypeOf((*MockFeishuOutboundStore)(nil).PromoteOutboundThread), ctx, outbound, threadID, now)
 }
 
 // UpdateOutboundMessageID mocks base method.
-func (m *MockFeishuOutboundStore) UpdateOutboundMessageID(ctx context.Context, id uuid.UUID, messageID string, now time.Time) error {
+func (m *MockFeishuOutboundStore) UpdateOutboundMessageID(ctx context.Context, outbound biz.FeishuOutbound, messageID string, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateOutboundMessageID", ctx, id, messageID, now)
+	ret := m.ctrl.Call(m, "UpdateOutboundMessageID", ctx, outbound, messageID, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // UpdateOutboundMessageID indicates an expected call of UpdateOutboundMessageID.
-func (mr *MockFeishuOutboundStoreMockRecorder) UpdateOutboundMessageID(ctx, id, messageID, now any) *gomock.Call {
+func (mr *MockFeishuOutboundStoreMockRecorder) UpdateOutboundMessageID(ctx, outbound, messageID, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateOutboundMessageID", reflect.TypeOf((*MockFeishuOutboundStore)(nil).UpdateOutboundMessageID), ctx, id, messageID, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateOutboundMessageID", reflect.TypeOf((*MockFeishuOutboundStore)(nil).UpdateOutboundMessageID), ctx, outbound, messageID, now)
 }
 
 // MockFeishuReplySender is a mock of FeishuReplySender interface.

@@ -197,31 +197,20 @@ func (s *PlanService) Revise(ctx context.Context, principal Principal, runID uui
 		})
 	}
 	parentID := latest.ID
-	steps = carryCompletedPlanSteps(steps, latest, true)
-	latest, err = s.extendForPause(ctx, principal, latest)
-	if err != nil {
-		return Plan{}, err
-	}
-	created, err := s.plans.CreatePlan(ctx, principal.UserID, Plan{
+	created, err := s.plans.ReplacePlan(ctx, principal.UserID, Plan{
 		ID: planID, UserID: principal.UserID, RunID: latest.RunID, SessionID: latest.SessionID,
 		Version: latest.Version + 1, ParentPlanID: &parentID, Status: PlanExecuting, Goal: draft.Goal,
 		ConfigSnapshot: latest.ConfigSnapshot, MaxSteps: limits.MaxSteps, DeadlineAt: latest.DeadlineAt,
 		CreatedAt: now, UpdatedAt: now, Steps: steps,
-	}, OutboxEvent{
+	}, latest.Revision, PlanFence{}, OutboxEvent{
 		UserID: principal.UserID, EventType: "plan.revised", AggregateType: "plan", AggregateID: planID.String(),
 		DedupeKey: "plan.revised:" + planID.String(),
 		Payload:   map[string]any{"run_id": latest.RunID.String(), "version": latest.Version + 1, "parent_plan_id": parentID.String()},
 	})
 	if err != nil {
-		return Plan{}, err
-	}
-	// 旧版本必须退出 paused 生命周期，否则后续“继续”可能重新绑定已修订的旧计划。
-	if _, err := s.plans.UpdatePlan(ctx, principal.UserID, latest.ID, PlanPaused, PlanCancelled, latest.Revision, PlanFence{}, PlanUpdate{
-		ErrorCode: "plan_superseded", ErrorMessage: "计划已由人工修订版本替代", FinishedAt: ptrTime(now),
-	}); err != nil {
-		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanFailed, created.Revision, PlanFence{}, PlanUpdate{
-			ErrorCode: "plan_supersede_failed", ErrorMessage: "旧计划版本无法关闭，已终止新版本", FinishedAt: ptrTime(now),
-		})
+		if errors.Is(err, ErrPlanRevisionConflict) {
+			return Plan{}, fmt.Errorf("%w: %w", ErrResourceConflict, err)
+		}
 		return Plan{}, err
 	}
 	run, err := s.runs.ResumeAfterPause(ctx, principal, runID)

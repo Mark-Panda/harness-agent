@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -104,6 +105,20 @@ func (r *FactRepository) GetActiveFact(ctx context.Context, userID uuid.UUID, ke
 
 // SaveFact 以期望版本守卫写入新版本并关闭旧版本；版本冲突时 applied=false。
 func (r *FactRepository) SaveFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64) (biz.MemoryFact, bool, error) {
+	return r.saveFact(ctx, fact, expectedVersion, nil)
+}
+
+// SaveExtractedFact revalidates all messages provided to the model under the
+// source owner's scope before writing under the receiving user's scope.
+func (r *FactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, source biz.FactTask) (biz.MemoryFact, bool, error) {
+	if fact.UserID != source.Owner() || fact.SessionID == nil || *fact.SessionID != source.SessionID ||
+		(fact.SourceMessageID != nil && !slices.Contains(source.MessageIDs, *fact.SourceMessageID)) {
+		return biz.MemoryFact{}, false, biz.ErrFactSourceInvalid
+	}
+	return r.saveFact(ctx, fact, expectedVersion, &source)
+}
+
+func (r *FactRepository) saveFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, source *biz.FactTask) (biz.MemoryFact, bool, error) {
 	if fact.UserID == uuid.Nil || fact.Key == "" || fact.ID == uuid.Nil {
 		return biz.MemoryFact{}, false, fmt.Errorf("%w: fact identity is required", biz.ErrInvalidConfig)
 	}
@@ -133,7 +148,16 @@ func (r *FactRepository) SaveFact(ctx context.Context, fact biz.MemoryFact, expe
 	}
 	applied := false
 	conflict := false
-	err = WithScope(ctx, r.db, Scope{UserID: fact.UserID}, func(tx *gorm.DB) error {
+	scope := Scope{UserID: fact.UserID}
+	if source != nil {
+		scope.UserID = source.UserID
+	}
+	err = WithScope(ctx, r.db, scope, func(tx *gorm.DB) error {
+		if source != nil {
+			if _, err := loadFactSourceMessages(tx, *source); err != nil {
+				return err
+			}
+		}
 		var active memoryFactModel
 		lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("user_id = ? AND fact_key = ? AND valid_to IS NULL", fact.UserID, fact.Key).First(&active).Error

@@ -26,11 +26,11 @@ func (t toolWithErrorOutput) Invoke(context.Context, json.RawMessage) (json.RawM
 	return t.output, t.err
 }
 
-func (r approvalExecutionFaults) ClaimApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, at time.Time) (ToolApproval, error) {
+func (r approvalExecutionFaults) ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence RunFence, at time.Time) (ToolApproval, error) {
 	if r.claimErr != nil {
 		return ToolApproval{}, r.claimErr
 	}
-	return r.fakeApprovalRepository.ClaimApprovalExecution(ctx, userID, approvalID, at)
+	return r.fakeApprovalRepository.ClaimApprovalExecution(ctx, userID, runID, approvalID, fence, at)
 }
 
 func (r approvalExecutionFaults) GetApproval(ctx context.Context, userID, approvalID uuid.UUID) (ToolApproval, error) {
@@ -73,8 +73,9 @@ func TestApprovedToolRecoveryNeverRepeatsAnUncertainInvocation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
 			stepID := uuid.New()
+			target := mcp.ToolIdentity{ServerID: uuid.New(), OriginalName: "write", EndpointFingerprint: "endpoint"}
 			approval := ToolApproval{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, StepID: &stepID,
-				ToolName: "write", ToolCallID: "call_write", Status: tc.status, Arguments: json.RawMessage(`{}`)}
+				ToolName: "write", ToolCallID: "call_write", Status: tc.status, Arguments: json.RawMessage(`{}`), MCPBinding: target}
 			if tc.delivered {
 				approval.DeliveredAt = &now
 			}
@@ -84,7 +85,7 @@ func TestApprovedToolRecoveryNeverRepeatsAnUncertainInvocation(t *testing.T) {
 			worker.runs = stubRunRepository{}
 			worker.approvals = approvalExecutionFaults{base, tc.claimErr, tc.readErr, tc.finishErr}
 			tool := &fakeRuntimeTool{name: "write", err: tc.toolErr, output: json.RawMessage(`{"detail":"remote"}`)}
-			var registry react.Registry = singleToolRegistry{tool: toolWithErrorOutput{tool}}
+			var registry react.Registry = singleToolRegistry{tool: approvalBoundTestTool{Tool: toolWithErrorOutput{tool}, target: target}}
 			if tc.missing {
 				registry = emptyToolRegistry{}
 			}
@@ -101,7 +102,7 @@ func TestApprovedToolRecoveryNeverRepeatsAnUncertainInvocation(t *testing.T) {
 
 type failedMessageWriter struct{ SessionRepository }
 
-func (failedMessageWriter) AppendMessageIdempotent(context.Context, Message, OutboxEvent) (Message, error) {
+func (failedMessageWriter) AppendMessageIdempotent(context.Context, Message, OutboxEvent, RunFence) (Message, error) {
 	return Message{}, errors.New("message write failed")
 }
 

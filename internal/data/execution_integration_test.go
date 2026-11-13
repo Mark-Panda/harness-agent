@@ -76,6 +76,9 @@ func TestJobAndRunLeaseFencing(t *testing.T) {
 		t.Fatalf("second claim should be empty: %t, %v", claimed, err)
 	}
 	time.Sleep(150 * time.Millisecond)
+	if err := jobs.Renew(ctx, job.ID, "worker-a", job.FencingToken, time.Minute, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired renew before takeover error = %v", err)
+	}
 	reclaimed, claimed, err := jobs.Claim(ctx, "worker-b", "agent.run.test", time.Minute, time.Now().UTC())
 	if err != nil || !claimed {
 		t.Fatalf("expired lease was not reclaimed: %t, %v", claimed, err)
@@ -103,6 +106,27 @@ func TestJobAndRunLeaseFencing(t *testing.T) {
 		t.Fatalf("ClaimRun() = %#v, %#v, %v", claimedRun, fence, err)
 	}
 	time.Sleep(150 * time.Millisecond)
+	// The original fence must stop authorizing work at expiry, even before takeover.
+	if _, err := runs.AppendEventFenced(ctx, biz.RunEvent{RunID: run.ID, UserID: user.ID, EventType: "tool.started"}, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Errorf("expired fence appended a tool event: %v", err)
+	}
+	if err := runs.SetRunAttempt(ctx, user.ID, run.ID, 1, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Errorf("expired fence authorized a model attempt: %v", err)
+	}
+	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunFailed, nil, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired fence submitted a terminal outcome: %v", err)
+	}
+	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, nil, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired fence requeued a run: %v", err)
+	}
+	steps := NewExecutionStepRepository(appDB)
+	tool, err := steps.StartStep(ctx, biz.ExecutionStep{UserID: user.ID, RunID: run.ID, Kind: biz.StepKindTool, Status: biz.StepPending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runs.AuthorizeToolDispatch(ctx, user.ID, run.ID, &tool.ID, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired fence authorized tool dispatch: %v", err)
+	}
 	recovered, fenceB, err := runs.ClaimRun(ctx, user.ID, run.ID, "worker-b", time.Minute, time.Now().UTC())
 	if err != nil || fenceB.Token != 2 || recovered.Status != biz.RunRunning {
 		t.Fatalf("recover ClaimRun() = %#v, %#v, %v", recovered, fenceB, err)
@@ -113,6 +137,16 @@ func TestJobAndRunLeaseFencing(t *testing.T) {
 	}
 	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunCompleted, nil, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("stale finish error = %v", err)
+	}
+	if err := runs.AuthorizeToolDispatch(ctx, user.ID, run.ID, &tool.ID, fenceB, time.Now().UTC()); err != nil {
+		t.Fatalf("new fence did not authorize pending tool: %v", err)
+	}
+	if err := runs.AuthorizeToolDispatch(ctx, user.ID, run.ID, &tool.ID, fenceB, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("tool dispatched twice: %v", err)
+	}
+	if listed, err := steps.ListSteps(ctx, user.ID, run.ID, 5); err != nil || len(listed) != 1 ||
+		listed[0].ID != tool.ID || listed[0].Status != biz.StepRunning || listed[0].StartedAt == nil {
+		t.Fatalf("dispatched tool was not durably recorded: %+v, %v", listed, err)
 	}
 	event, err := runs.AppendEventFenced(ctx, biz.RunEvent{RunID: run.ID, UserID: user.ID, EventType: "step.completed"}, fenceB)
 	if err != nil || event.Seq != 1 {
@@ -227,17 +261,38 @@ func TestAppendMessageIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runs := NewRunRepository(appDB)
+	run, err := runs.CreateRun(ctx, biz.Run{
+		ID: uuid.New(), UserID: user.ID, SessionID: session.ID, Mode: biz.AgentModeReact, Status: biz.RunQueued,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, staleFence, err := runs.ClaimRun(ctx, user.ID, run.ID, "stale", time.Second, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
 	message := biz.Message{
 		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Role: biz.MessageAssistant,
-		Content: "同一条回答", ToolCallID: "call-1", ToolName: "search",
+		Content: "同一条回答", ToolCallID: "call-1", ToolName: "search", RunID: &run.ID,
 	}
 	event := biz.OutboxEvent{
 		UserID: user.ID, EventType: "message.created.agent", AggregateType: "message",
 		AggregateID: message.ID.String(), DedupeKey: "message.created.agent:" + message.ID.String(),
-		Payload: map[string]any{"run_id": uuid.NewString()},
+		Payload: map[string]any{"run_id": run.ID.String()},
+	}
+	if _, err := sessions.AppendMessageIdempotent(ctx, message, event, staleFence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired lease must not write: %v (fence %v)", err, staleFence)
+	}
+	_, fence, err := runs.ClaimRun(ctx, user.ID, run.ID, "current", time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.AppendMessageIdempotent(ctx, message, event, staleFence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("previous lease must not write after takeover: %v (current fence %v)", err, fence)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := sessions.AppendMessageIdempotent(ctx, message, event); err != nil {
+		if _, err := sessions.AppendMessageIdempotent(ctx, message, event, fence); err != nil {
 			t.Fatalf("append attempt %d: %v", i, err)
 		}
 	}
@@ -251,6 +306,33 @@ func TestAppendMessageIdempotent(t *testing.T) {
 	stored, err := sessions.ListMessages(ctx, user.ID, session.ID, 10, "")
 	if err != nil || len(stored.Items) != 1 || stored.Items[0].ToolCallID != "call-1" || stored.Items[0].ToolName != "search" {
 		t.Fatalf("stored message = %#v, %v", stored.Items, err)
+	}
+	now := time.Now()
+	reconciling, err := runs.MarkRunReconciliationRequired(ctx, user.ID, run.ID, fence, "tool_execution_unknown", "tool response lost", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidEvent := biz.RunEvent{EventType: "run.reconciliation.resolved", Payload: map[string]any{"invalid": func() {}}}
+	reconciliationFence := biz.RunFence{Token: reconciling.FencingToken}
+	if _, err := runs.FinishRunWithEvent(ctx, user.ID, run.ID, biz.RunReconciliationRequired, biz.RunCompleted,
+		nil, invalidEvent, reconciliationFence, now); err == nil {
+		t.Fatal("expected reconciliation event encoding to fail")
+	}
+	status, err := runs.GetRunStatus(ctx, user.ID, run.ID)
+	if err != nil || status != biz.RunReconciliationRequired {
+		t.Fatalf("run status after failed event: %s, %v", status, err)
+	}
+	service, err := biz.NewRunService(runs, sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := service.ResolveReconciliation(ctx, biz.Principal{UserID: user.ID}, run.ID, "completed", "confirmed externally")
+	if err != nil || resolved.Status != biz.RunCompleted {
+		t.Fatalf("retry reconciliation: %s, %v", resolved.Status, err)
+	}
+	events, err := runs.ListEvents(ctx, user.ID, run.ID, 0, 10)
+	if err != nil || len(events) != 2 || events[1].EventType != "run.reconciliation.resolved" {
+		t.Fatalf("reconciliation events: %#v, %v", events, err)
 	}
 }
 

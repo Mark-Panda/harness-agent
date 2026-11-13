@@ -18,9 +18,9 @@ import (
 )
 
 // newWorkerWithProviders 构造可注入供应商错误的 Worker。
-func newWorkerWithProviders(t *testing.T, ctrl *gomock.Controller, cancelPoll time.Duration, providers biz.ProviderCredentialRepository) (*biz.ExecutionWorker, *mocks.MockJobQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockModelCallRepository) {
+func newWorkerWithProviders(t *testing.T, ctrl *gomock.Controller, cancelPoll time.Duration, providers biz.ProviderCredentialRepository) (*biz.ExecutionWorker, *mocks.MockRunExecutionQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockModelCallRepository) {
 	t.Helper()
-	jobs := mocks.NewMockJobQueue(ctrl)
+	jobs := mocks.NewMockRunExecutionQueue(ctrl)
 	runs := mocks.NewMockRunRepository(ctrl)
 	sessions := mocks.NewMockSessionRepository(ctrl)
 	attempts := mocks.NewMockModelCallRepository(ctrl)
@@ -297,7 +297,7 @@ func TestWorkerEmitsModelSwitchEvent(t *testing.T) {
 			return event, nil
 		},
 	).AnyTimes()
-	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Message{}, nil)
+	sessions.EXPECT().AppendMessageIdempotent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Message{}, nil)
 	runs.EXPECT().FinishRunWithEvent(gomock.Any(), userID, runID, biz.RunRunning, biz.RunCompleted, gomock.Any(), gomock.Any(), fence, gomock.Any()).Return(
 		biz.Run{ID: runID, Status: biz.RunCompleted}, nil,
 	)
@@ -348,7 +348,7 @@ func TestWorkerPreservesQueueOnRunReadOrClaimFailure(t *testing.T) {
 				if tc.name == "queue failure must not panic" {
 					writeErr = fault
 				}
-				jobs.EXPECT().Fail(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any(), gomock.Any()).Return(writeErr)
+				jobs.EXPECT().Release(gomock.Any(), job.ID, "worker-1", job.FencingToken, gomock.Any(), gomock.Any()).Return(writeErr)
 			}
 			if claimed, err := worker.ProcessOne(context.Background()); err != nil || !claimed {
 				t.Fatalf("ProcessOne() = %t, %v", claimed, err)

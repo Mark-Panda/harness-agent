@@ -77,6 +77,10 @@ func (f *fakeMemoryIndexes) CountVectors(_ context.Context, version string) (int
 	return f.vectors[version], f.err
 }
 
+func (f *fakeMemoryIndexes) CountIndexedMessages(ctx context.Context, version string) (int64, error) {
+	return f.CountVectors(ctx, version)
+}
+
 // CountEligibleMessages 返回预置候选消息数。
 func (f *fakeMemoryIndexes) CountEligibleMessages(context.Context) (int64, error) {
 	return f.eligible, f.err
@@ -385,6 +389,10 @@ func newMemoryWorkerTest(t *testing.T, job biz.Job) (*biz.MemoryEmbedWorker, *fa
 		t.Fatal(err)
 	}
 	return worker, jobs, indexes, vectors, generator, reader
+}
+
+func (f *fakeSummaryReader) ListEmbeddableMessages(ctx context.Context, userID, sessionID uuid.UUID, ids []uuid.UUID) ([]biz.Message, error) {
+	return f.ListMessagesByIDs(ctx, userID, sessionID, ids)
 }
 
 // TestMemoryEmbedWorkerWritesVectors 验证消息读取、跳过未变更内容并写入向量。

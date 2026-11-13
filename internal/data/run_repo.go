@@ -441,25 +441,93 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 	return run, biz.RunFence{Owner: record.LeaseOwner, Token: record.FencingToken}, nil
 }
 
-// RenewRunLease 续约执行租约；仅租约持有者且 token 匹配时成功。
+// RenewRunLease 串行化同会话的续约和认领，禁止已到期的租约恢复。
 func (r *RunRepository) RenewRunLease(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, lease time.Duration, now time.Time) error {
 	if fence.Owner == "" || fence.Token <= 0 || lease <= 0 {
 		return fmt.Errorf("%w: valid fence and positive lease are required", biz.ErrInvalidConfig)
 	}
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		result := tx.Model(&runModel{}).
-			Where("id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?",
-				runID, userID, string(biz.RunRunning), fence.Owner, fence.Token).
-			Updates(map[string]any{"lease_expires_at": now.Add(lease), "updated_at": now})
+		var run runModel
+		if err := tx.Select("session_id").Take(&run, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+			}
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-session:"+run.SessionID.String()).Error; err != nil {
+			return err
+		}
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			return err
+		}
+		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).
+			Updates(map[string]any{"lease_expires_at": now.Add(lease), "updated_at": now}).Error
+	})
+	return catalogError("renew run lease", err)
+}
+
+// lockRunningRunLease holds the Run through the caller's transaction and checks expiry after the lock.
+func lockRunningRunLease(tx *gorm.DB, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) (biz.AgentMode, error) {
+	var run struct{ Mode biz.AgentMode }
+	result := tx.Raw(`
+WITH locked_run AS MATERIALIZED (
+  SELECT mode, lease_expires_at FROM agent_runs
+  WHERE id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?
+  FOR UPDATE
+)
+SELECT mode FROM locked_run WHERE lease_expires_at > GREATEST(?::timestamptz, clock_timestamp())`,
+		runID, userID, biz.RunRunning, fence.Owner, fence.Token, now).Scan(&run)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	if result.RowsAffected != 1 {
+		return "", fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+	}
+	return run.Mode, nil
+}
+
+// AuthorizeToolDispatch validates dispatch and records possible external effects atomically.
+func (r *RunRepository) AuthorizeToolDispatch(ctx context.Context, userID, runID uuid.UUID, stepID *uuid.UUID, fence biz.RunFence, now time.Time) error {
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		mode, err := lockRunningRunLease(tx, userID, runID, fence, now)
+		if err != nil {
+			return err
+		}
+		if mode == biz.AgentModePlan {
+			if _, err := lockExecutingPlan(tx, userID, runID, biz.PlanFence(fence), now); err != nil {
+				return err
+			}
+		}
+		if stepID == nil {
+			return nil
+		}
+		result := tx.Model(&executionStepModel{}).
+			Where("id = ? AND user_id = ? AND run_id = ? AND kind = ? AND status = ?", *stepID, userID, runID, biz.StepKindTool, biz.StepPending).
+			Updates(map[string]any{"status": biz.StepRunning, "started_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
-			return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+			return fmt.Errorf("%w: tool step is no longer pending", biz.ErrResourceConflict)
 		}
 		return nil
 	})
-	return catalogError("renew run lease", err)
+	return catalogError("authorize tool dispatch", err)
+}
+
+// RequeuePausedRun clears only the live lease held by the worker that observed the pause.
+func (r *RunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, deadline *time.Time, now time.Time) error {
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			return err
+		}
+		fields := map[string]any{"status": biz.RunQueued, "lease_owner": "", "lease_expires_at": nil, "updated_at": now}
+		if deadline != nil {
+			fields["deadline_at"] = *deadline
+		}
+		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).Updates(fields).Error
+	})
+	return catalogError("requeue paused run", err)
 }
 
 // PauseRun 在栅栏有效时把 running 推进到 waiting_approval，清空租约并在同一事务写入 run.paused 事件。
@@ -470,24 +538,24 @@ func (r *RunRepository) PauseRun(ctx context.Context, userID, runID uuid.UUID, f
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			if errors.Is(err, biz.ErrResourceConflict) {
+				if lookupErr := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; lookupErr != nil {
+					return lookupErr
+				}
+				if biz.RunStatus(record.Status) == biz.RunWaitingApproval {
+					return nil
+				}
+			}
+			return err
+		}
 		result := tx.Model(&runModel{}).
-			Where("id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?",
-				runID, userID, string(biz.RunRunning), fence.Owner, fence.Token).
+			Where("id = ? AND user_id = ?", runID, userID).
 			Updates(map[string]any{
 				"status": string(biz.RunWaitingApproval), "lease_owner": "", "lease_expires_at": nil, "updated_at": now,
 			})
 		if result.Error != nil {
 			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			// 并发暂停或审批已决策时读取最新状态：已是等待审批则幂等成功。
-			if err := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
-				return err
-			}
-			if biz.RunStatus(record.Status) == biz.RunWaitingApproval {
-				return nil
-			}
-			return fmt.Errorf("%w: run cannot be paused from its current state", biz.ErrResourceConflict)
 		}
 		if _, err := appendRunEvent(tx, biz.RunEvent{
 			RunID: runID, UserID: userID, EventType: "run.paused",
@@ -555,24 +623,25 @@ func (r *RunRepository) MarkRunReconciliationRequired(ctx context.Context, userI
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			if errors.Is(err, biz.ErrResourceConflict) {
+				if lookupErr := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; lookupErr != nil {
+					return lookupErr
+				}
+				if biz.RunStatus(record.Status) == biz.RunReconciliationRequired {
+					return nil
+				}
+			}
+			return err
+		}
 		result := tx.Model(&runModel{}).
-			Where("id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?",
-				runID, userID, string(biz.RunRunning), fence.Owner, fence.Token).
+			Where("id = ? AND user_id = ?", runID, userID).
 			Updates(map[string]any{
 				"status": string(biz.RunReconciliationRequired), "error_code": code, "error_message": message,
 				"lease_owner": "", "lease_expires_at": nil, "updated_at": now,
 			})
 		if result.Error != nil {
 			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			if err := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
-				return err
-			}
-			if biz.RunStatus(record.Status) == biz.RunReconciliationRequired {
-				return nil
-			}
-			return fmt.Errorf("%w: run cannot enter reconciliation from its current state", biz.ErrResourceConflict)
 		}
 		if _, err := appendRunEvent(tx, biz.RunEvent{
 			RunID: runID, UserID: userID, EventType: "run.reconciliation_required",
@@ -608,6 +677,11 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if from == biz.RunRunning {
+			if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+				return err
+			}
+		}
 		updates := map[string]any{"status": string(to), "finished_at": now, "updated_at": now, "lease_owner": "", "lease_expires_at": nil}
 		for key, value := range fields {
 			updates[key] = value
@@ -644,18 +718,13 @@ func (r *RunRepository) SetRunAttempt(ctx context.Context, userID, runID uuid.UU
 		return fmt.Errorf("%w: attempt number cannot be negative", biz.ErrInvalidConfig)
 	}
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		result := tx.Model(&runModel{}).
-			Where("id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?",
-				runID, userID, string(biz.RunRunning), fence.Owner, fence.Token).
-			// Supervisor 并发 Worker 的 AttemptStarted 顺序不固定，数据库只能前进不能回退。
-			Updates(map[string]any{"attempt_no": gorm.Expr("GREATEST(attempt_no, ?)", attemptNo), "updated_at": time.Now().UTC()})
-		if result.Error != nil {
-			return result.Error
+		now := time.Now().UTC()
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			return err
 		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
-		}
-		return nil
+		// Supervisor attempts can start out of order, so the sequence never decreases.
+		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).
+			Updates(map[string]any{"attempt_no": gorm.Expr("GREATEST(attempt_no, ?)", attemptNo), "updated_at": now}).Error
 	})
 	return catalogError("set run attempt", err)
 }
@@ -679,15 +748,13 @@ func (r *RunRepository) AppendEvent(ctx context.Context, event biz.RunEvent) (bi
 func (r *RunRepository) AppendEventFenced(ctx context.Context, event biz.RunEvent, fence biz.RunFence) (biz.RunEvent, error) {
 	var record runEventModel
 	err := WithScope(ctx, r.db, Scope{UserID: event.UserID}, func(tx *gorm.DB) error {
-		result := tx.Model(&runModel{}).
-			Where("id = ? AND user_id = ? AND lease_owner = ? AND fencing_token = ? AND status IN ?",
-				event.RunID, event.UserID, fence.Owner, fence.Token, []string{string(biz.RunRunning), string(biz.RunWaitingApproval)}).
-			Update("updated_at", time.Now().UTC())
-		if result.Error != nil {
-			return result.Error
+		now := time.Now().UTC()
+		if _, err := lockRunningRunLease(tx, event.UserID, event.RunID, fence, now); err != nil {
+			return err
 		}
-		if result.RowsAffected != 1 {
-			return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+		if err := tx.Model(&runModel{}).Where("id = ? AND user_id = ?", event.RunID, event.UserID).
+			Update("updated_at", now).Error; err != nil {
+			return err
 		}
 		var err error
 		record, err = appendRunEvent(tx, event)

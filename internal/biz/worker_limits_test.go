@@ -56,9 +56,9 @@ func (f *fakeLimiter) Acquire(ctx context.Context, key string) (func(), error) {
 }
 
 // newWorkerWithLimiters 构造带舱壁的 Worker。
-func newWorkerWithLimiters(t *testing.T, ctrl *gomock.Controller, global, user model.ConcurrencyLimiter) (*biz.ExecutionWorker, *mocks.MockJobQueue, *mocks.MockRunRepository) {
+func newWorkerWithLimiters(t *testing.T, ctrl *gomock.Controller, global, user model.ConcurrencyLimiter) (*biz.ExecutionWorker, *mocks.MockRunExecutionQueue, *mocks.MockRunRepository) {
 	t.Helper()
-	jobs := mocks.NewMockJobQueue(ctrl)
+	jobs := mocks.NewMockRunExecutionQueue(ctrl)
 	runs := mocks.NewMockRunRepository(ctrl)
 	worker, err := biz.NewExecutionWorker(biz.ExecutionWorkerDependencies{
 		Jobs: jobs, Runs: runs, Sessions: mocks.NewMockSessionRepository(ctrl),

@@ -223,13 +223,48 @@ func (r *MemoryRepository) CountVectors(ctx context.Context, version string) (in
 	return count, nil
 }
 
+// This predicate is shared by backfill, the live worker and retrieval of old vectors.
+// Archived private history remains eligible. A historical Feishu group binding is
+// authoritative even when the stored session policy was previously set to private.
+const privateMemorySession = `
+s.memory_policy = 'private' AND s.status <> 'deleted' AND NOT s.feishu_group_projection
+AND NOT EXISTS (
+  SELECT 1 FROM external_conversation_bindings b
+  WHERE b.session_id = s.id AND b.user_id = s.user_id AND b.thread_id <> 'p2p'
+)`
+
+const embeddableMessage = `
+m.deleted_at IS NULL AND m.role = 'user' AND m.content ~ '[^[:space:]]'
+AND m.feishu_group_message_id IS NULL
+AND EXISTS (
+  SELECT 1 FROM sessions s WHERE s.id = m.session_id AND s.user_id = m.user_id
+  AND ` + privateMemorySession + `
+)`
+
+const indexedMessage = `
+v.user_id = m.user_id AND v.source_type = 'message' AND v.source_id = m.id
+AND (v.session_id IS NULL OR v.session_id = m.session_id)
+AND v.embedding_version = ? AND v.deleted_at IS NULL`
+
+// CountIndexedMessages 统计指定版本中仍符合回填条件的已索引消息。
+func (r *MemoryRepository) CountIndexedMessages(ctx context.Context, version string) (int64, error) {
+	var count int64
+	query := `SELECT count(*) FROM messages m WHERE ` + embeddableMessage + `
+AND EXISTS (SELECT 1 FROM memory_vectors v WHERE ` + indexedMessage + `)`
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return tx.Raw(query, version).Scan(&count).Error
+	})
+	if err != nil {
+		return 0, catalogError("count indexed messages", err)
+	}
+	return count, nil
+}
+
 // CountEligibleMessages 统计可向量化消息总数。
 func (r *MemoryRepository) CountEligibleMessages(ctx context.Context) (int64, error) {
 	var count int64
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Model(&messageModel{}).
-			Where("deleted_at IS NULL AND role = ?", string(biz.MessageUser)).
-			Count(&count).Error
+		return tx.Table("messages m").Where(embeddableMessage).Count(&count).Error
 	})
 	if err != nil {
 		return 0, catalogError("count eligible messages", err)
@@ -246,14 +281,8 @@ func (r *MemoryRepository) ListUnembeddedMessages(ctx context.Context, version s
 		limit = 1000
 	}
 	var records []messageModel
-	query := `
-SELECT m.* FROM messages m
-WHERE m.deleted_at IS NULL AND m.role = 'user'
-AND NOT EXISTS (
-  SELECT 1 FROM memory_vectors v
-  WHERE v.user_id = m.user_id AND v.source_type = 'message' AND v.source_id = m.id
-    AND v.embedding_version = ? AND v.deleted_at IS NULL
-)
+	query := `SELECT m.* FROM messages m WHERE ` + embeddableMessage + `
+AND NOT EXISTS (SELECT 1 FROM memory_vectors v WHERE ` + indexedMessage + `)
 ORDER BY m.created_at ASC, m.id ASC
 LIMIT ?`
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
@@ -261,6 +290,24 @@ LIMIT ?`
 	})
 	if err != nil {
 		return nil, catalogError("list unembedded messages", err)
+	}
+	return toBizMessages(records)
+}
+
+// ListEmbeddableMessages rechecks the current session policy for queued message IDs.
+func (r *MemoryRepository) ListEmbeddableMessages(ctx context.Context, userID, sessionID uuid.UUID, ids []uuid.UUID) ([]biz.Message, error) {
+	if userID == uuid.Nil || sessionID == uuid.Nil || len(ids) == 0 || len(ids) > 64 {
+		return nil, fmt.Errorf("%w: user, session and up to 64 message ids are required", biz.ErrInvalidConfig)
+	}
+	var records []messageModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Table("messages m").
+			Where("m.user_id = ? AND m.session_id = ? AND m.id IN ?", userID, sessionID, ids).
+			Where(embeddableMessage).
+			Order("m.created_at ASC, m.id ASC").Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list embeddable messages", err)
 	}
 	return toBizMessages(records)
 }
@@ -276,12 +323,29 @@ INSERT INTO memory_vectors (id, user_id, session_id, content, embedding, metadat
 VALUES (?, ?, ?, ?, ?::vector, ?::jsonb, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (user_id, source_type, source_id, embedding_version)
   WHERE deleted_at IS NULL AND source_id IS NOT NULL
-DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding, metadata = EXCLUDED.metadata,
+DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, embedding = EXCLUDED.embedding, metadata = EXCLUDED.metadata,
   content_hash = EXCLUDED.content_hash`
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		eligibleSessions := make(map[uuid.UUID]bool)
 		for _, vector := range vectors {
 			if vector.Dimension != biz.EmbeddingDimension || len(vector.Embedding) != vector.Dimension {
 				return fmt.Errorf("%w: invalid vector dimension", biz.ErrInvalidConfig)
+			}
+			if vector.SessionID != nil {
+				sessionID := *vector.SessionID
+				eligible, checked := eligibleSessions[sessionID]
+				if !checked {
+					// Serialize persistence with memory-policy changes during the provider request.
+					result := tx.Raw(`SELECT true FROM sessions s WHERE s.id = ? AND s.user_id = ? AND `+
+						privateMemorySession+` FOR SHARE OF s`, sessionID, userID).Scan(&eligible)
+					if result.Error != nil {
+						return result.Error
+					}
+					eligibleSessions[sessionID] = eligible
+				}
+				if !eligible {
+					continue
+				}
 			}
 			metadata, err := json.Marshal(nonNilMap(vector.Metadata))
 			if err != nil {
@@ -316,10 +380,30 @@ func (r *MemoryRepository) SearchVectors(ctx context.Context, userID uuid.UUID, 
 	text := formatVector(query)
 	var rows []memorySearchRow
 	sql := `
-SELECT id, session_id, source_type, source_id, content, metadata,
+SELECT v.id, v.session_id, v.source_type, v.source_id, v.content, v.metadata,
   1 - (embedding <=> ?::vector) AS score, embedding::text AS embedding_text
-FROM memory_vectors
-WHERE user_id = ? AND embedding_version = ? AND deleted_at IS NULL
+FROM memory_vectors v
+WHERE v.user_id = ? AND v.embedding_version = ? AND v.deleted_at IS NULL
+AND (v.session_id IS NULL OR EXISTS (
+  SELECT 1 FROM sessions s WHERE s.id = v.session_id AND s.user_id = v.user_id
+  AND ` + privateMemorySession + `
+))
+AND NOT EXISTS (
+  SELECT 1 FROM (
+    SELECT m.session_id, (m.deleted_at IS NOT NULL OR m.feishu_group_message_id IS NOT NULL) AS restricted
+    FROM messages m WHERE v.source_type = 'message' AND m.id = v.source_id AND m.user_id = v.user_id
+    UNION ALL
+    SELECT ss.session_id, false FROM session_summaries ss
+    WHERE v.source_type = 'summary' AND ss.id = v.source_id AND ss.user_id = v.user_id
+    UNION ALL
+    SELECT f.session_id, false FROM memory_facts f
+    WHERE v.source_type = 'fact' AND f.id = v.source_id AND f.user_id = v.user_id
+  ) AS source
+  WHERE source.restricted OR (source.session_id IS NOT NULL AND source.session_id IS DISTINCT FROM v.session_id AND NOT EXISTS (
+    SELECT 1 FROM sessions s WHERE s.id = source.session_id AND s.user_id = v.user_id
+    AND ` + privateMemorySession + `
+  ))
+)
 ORDER BY embedding <=> ?::vector
 LIMIT ?`
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
@@ -359,9 +443,10 @@ func (r *MemoryRepository) ListSourceHashes(ctx context.Context, userID uuid.UUI
 	}
 	var rows []hashRow
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		return tx.Model(&memoryVectorModel{}).
-			Select("source_id, content_hash").
-			Where("user_id = ? AND embedding_version = ? AND source_type = ? AND deleted_at IS NULL AND source_id IN ?",
+		return tx.Table("memory_vectors v").
+			Select("v.source_id, v.content_hash").
+			Joins("JOIN messages m ON m.id = v.source_id AND m.user_id = v.user_id AND (v.session_id IS NULL OR v.session_id = m.session_id)").
+			Where("v.user_id = ? AND v.embedding_version = ? AND v.source_type = ? AND v.deleted_at IS NULL AND v.source_id IN ?",
 				userID, version, biz.MemorySourceMessage, sourceIDs).
 			Scan(&rows).Error
 	})

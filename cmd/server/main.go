@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,40 +59,36 @@ func (remoteModelLister) ListModels(ctx context.Context, baseURL, apiKey string)
 	return items, nil
 }
 
-// feishuBotSenderResolver 按飞书应用 App ID 构造并缓存机器人客户端，避免每条回复重复换取 Token。
+// feishuBotSenderResolver 校验登记状态并复用同一凭证版本的客户端。
 type feishuBotSenderResolver struct {
-	router        biz.FeishuBotRouter
-	credentials   biz.FeishuBotCredentialReader
-	opener        biz.CredentialOpener
-	defaultSender biz.FeishuReplySender
-	mu            sync.Mutex
-	senders       map[string]biz.FeishuReplySender
+	credentials biz.FeishuBotCredentialReader
+	opener      biz.CredentialOpener
+	mu          sync.Mutex
+	senders     map[uuid.UUID]feishuBotSender
 }
 
-// ResolveSender 返回指定应用对应的回复客户端；未登记的应用回退默认客户端。
-func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, appID string) (biz.FeishuReplySender, error) {
-	if strings.TrimSpace(appID) == "" {
-		return r.defaultSender, nil
+type feishuBotSender struct {
+	appID      string
+	keyVersion string
+	digest     [sha256.Size]byte
+	client     *feishu.Client
+}
+
+// ResolveSender 使用收到入站事件的机器人 UUID 读取当前身份、状态与凭据。
+func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, botID uuid.UUID, appID string) (biz.FeishuReplySender, error) {
+	bot, credential, err := r.credentials.GetFeishuBotCredential(ctx, botID)
+	if err != nil {
+		return nil, err
 	}
+	if bot.ID != botID || botID == uuid.Nil || bot.AppID != appID || bot.Status != biz.FeishuBotEnabled {
+		return nil, fmt.Errorf("feishu outbound bot route is unavailable: %s", botID)
+	}
+	digest := sha256.Sum256(credential.Encrypted)
 	r.mu.Lock()
-	if sender, exists := r.senders[appID]; exists {
-		r.mu.Unlock()
-		return sender, nil
-	}
-	r.mu.Unlock()
-	bot, found, err := r.router.LookupFeishuBot(ctx, appID)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return r.defaultSender, nil
-	}
-	if bot.Status != biz.FeishuBotEnabled {
-		return nil, fmt.Errorf("feishu bot %s is disabled", bot.ID)
-	}
-	_, credential, err := r.credentials.GetFeishuBotCredential(ctx, bot.ID)
-	if err != nil {
-		return nil, err
+	defer r.mu.Unlock()
+	cached := r.senders[botID]
+	if cached.client != nil && cached.appID == appID && cached.keyVersion == credential.KeyVersion && cached.digest == digest {
+		return cached.client, nil
 	}
 	plaintext, err := r.opener.Open(credential.KeyVersion, credential.Encrypted)
 	if err != nil {
@@ -101,46 +98,15 @@ func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, appID strin
 	if err := json.Unmarshal(plaintext, &secret); err != nil {
 		return nil, fmt.Errorf("decode feishu bot credentials: %w", err)
 	}
-	client, err := feishu.NewClient(feishu.ClientConfig{AppID: bot.AppID, AppSecret: secret.AppSecret})
+	client, err := feishu.NewClient(feishu.ClientConfig{AppID: appID, AppSecret: secret.AppSecret})
 	if err != nil {
 		return nil, err
 	}
-	r.mu.Lock()
-	if sender, exists := r.senders[appID]; exists {
-		r.mu.Unlock()
-		return sender, nil
+	if r.senders == nil {
+		r.senders = make(map[uuid.UUID]feishuBotSender)
 	}
-	r.senders[appID] = client
-	r.mu.Unlock()
+	r.senders[botID] = feishuBotSender{appID: appID, keyVersion: credential.KeyVersion, digest: digest, client: client}
 	return client, nil
-}
-
-// unconfiguredFeishuSender 只使用已登记机器人时作为默认应用占位，调用即返回明确错误。
-type unconfiguredFeishuSender struct{}
-
-// ReplyCard 没有默认应用时不允许发送。
-func (unconfiguredFeishuSender) ReplyCard(context.Context, string, any) (string, error) {
-	return "", fmt.Errorf("feishu default app is not configured")
-}
-
-// ReplyCardInThread 没有默认应用时不允许发送。
-func (unconfiguredFeishuSender) ReplyCardInThread(context.Context, string, any) (biz.FeishuThreadedMessage, error) {
-	return biz.FeishuThreadedMessage{}, fmt.Errorf("feishu default app is not configured")
-}
-
-// UpdateCard 没有默认应用时不允许更新。
-func (unconfiguredFeishuSender) UpdateCard(context.Context, string, any) error {
-	return fmt.Errorf("feishu default app is not configured")
-}
-
-// ReplyText 没有默认应用时不允许发送。
-func (unconfiguredFeishuSender) ReplyText(context.Context, string, string) (string, error) {
-	return "", fmt.Errorf("feishu default app is not configured")
-}
-
-// ReplyTextInThread 没有默认应用时不允许发送。
-func (unconfiguredFeishuSender) ReplyTextInThread(context.Context, string, string) (biz.FeishuThreadedMessage, error) {
-	return biz.FeishuThreadedMessage{}, fmt.Errorf("feishu default app is not configured")
 }
 
 // loadFeishuLongConnectionBots 读取启用机器人的应用凭据，用于建立长连接。
@@ -604,13 +570,14 @@ func run() error {
 		platformService.WithFeishuBindings(feishuBindingService)
 		// 默认应用仅在使用全局应用凭据时创建；长连接模式可只依赖已登记机器人。
 		var feishuClient *feishu.Client
-		if strings.TrimSpace(cfg.Feishu.AppID) != "" && strings.TrimSpace(cfg.Feishu.AppSecret) != "" {
-			feishuClient, err = feishu.NewClient(feishu.ClientConfig{AppID: cfg.Feishu.AppID, AppSecret: cfg.Feishu.AppSecret})
+		defaultAppID := strings.TrimSpace(cfg.Feishu.AppID)
+		if defaultAppID != "" && strings.TrimSpace(cfg.Feishu.AppSecret) != "" {
+			feishuClient, err = feishu.NewClient(feishu.ClientConfig{AppID: defaultAppID, AppSecret: cfg.Feishu.AppSecret})
 			if err != nil {
 				return fmt.Errorf("configure feishu client: %w", err)
 			}
 		}
-		var defaultFeishuSender biz.FeishuReplySender = unconfiguredFeishuSender{}
+		var defaultFeishuSender biz.FeishuReplySender
 		if feishuClient != nil {
 			defaultFeishuSender = feishuClient
 		}
@@ -685,7 +652,7 @@ func run() error {
 			PollInterval: cfg.Feishu.Worker.PollInterval.Duration, Lease: cfg.Feishu.Worker.Lease.Duration,
 			DefaultAgentID: defaultAgentID, DefaultAgentVersion: defaultVersion,
 			DefaultAgentOwnerID: defaultAgentOwnerID,
-			DefaultAppID:        strings.TrimSpace(cfg.Feishu.AppID), SharedChats: sharedChats,
+			DefaultAppID:        defaultAppID, SharedChats: sharedChats,
 			Mode: biz.AgentMode(cfg.Feishu.Mode), BotOpenID: cfg.Feishu.BotOpenID, BotName: cfg.Feishu.BotName,
 			RequireTopic: cfg.Feishu.Group.RequireTopic, AllowRootReplyFallback: cfg.Feishu.Group.AllowRootReplyFallback,
 		})
@@ -696,15 +663,11 @@ func run() error {
 			Outbound: data.NewFeishuOutboundRepository(appDB),
 			Runs:     runRepository,
 			Sender:   defaultFeishuSender,
-			// 已登记机器人按 App ID 使用各自的客户端，避免回复串到默认应用。
-			Senders: &feishuBotSenderResolver{
-				router: feishuBotRepository, credentials: feishuBotRepository,
-				opener: credentialKeys, defaultSender: defaultFeishuSender, senders: make(map[string]biz.FeishuReplySender),
-			},
-			Conversations: data.NewFeishuConversationRepository(appDB),
-			Logger:        slog.Default(),
+			Senders:  &feishuBotSenderResolver{credentials: feishuBotRepository, opener: credentialKeys},
+			Logger:   slog.Default(),
 		}, biz.FeishuReplyWorkerConfig{
-			WorkerID: workerID, Concurrency: cfg.Feishu.Reply.Concurrency,
+			DefaultAppID: defaultAppID,
+			WorkerID:     workerID, Concurrency: cfg.Feishu.Reply.Concurrency,
 			PollInterval: cfg.Feishu.Reply.PollInterval.Duration, Lease: cfg.Feishu.Reply.Lease.Duration,
 			PollRunInterval: cfg.Feishu.Reply.PollRunInterval.Duration, RunWaitTimeout: cfg.Feishu.Reply.RunWaitTimeout.Duration,
 			MaxTextBytes:         cfg.Feishu.Reply.MaxTextBytes,
@@ -899,7 +862,7 @@ func run() error {
 	}
 	if cfg.Agent.Memory.Vector.Enabled {
 		memoryEmbedWorker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
-			Jobs: jobRepository, Messages: sessionRepository, Indexes: memoryRepository,
+			Jobs: jobRepository, Messages: memoryRepository, Indexes: memoryRepository,
 			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Logger: slog.Default(),
 		}, biz.MemoryEmbedWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Vector.Concurrency,

@@ -398,13 +398,22 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 				return react.Completion{}, budgetErr
 			}
 			return react.Completion{
-				Content: response.Content, ReasoningContent: response.ReasoningContent, FinishReason: response.FinishReason,
+				Content: response.Content, FinishReason: response.FinishReason,
 				Usage:         react.Usage{InputTokens: response.InputTokens, OutputTokens: response.OutputTokens},
 				EstimatedCost: record.EstimatedCost,
 				ToolCalls:     toReactToolCalls(response.ToolCalls),
 			}, nil
 		}
 
+		if response.InputTokens > 0 || response.OutputTokens > 0 {
+			// An interrupted stream can still have billable input and partial output.
+			if response.InputTokens > 0 {
+				record.InputTokens = response.InputTokens
+			}
+			record.OutputTokens = response.OutputTokens
+			record.ProviderRequestID = response.ProviderRequestID
+		}
+		record.EstimatedCost = estimateCost(candidate, record.InputTokens, record.OutputTokens)
 		// 用户取消与 Deadline 是控制流错误，不进入重试/切换决策。
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			record.Status = "cancelled"

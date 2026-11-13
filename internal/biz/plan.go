@@ -205,8 +205,10 @@ type PlanDeadlineExtender interface {
 
 // PlanRepository 定义计划持久化契约；所有查询与写入强制携带 user_id。
 type PlanRepository interface {
-	// CreatePlan 在同一事务内创建计划与全部步骤，并写入审计事件。
+	// CreatePlan 在同一事务内创建初始计划与全部步骤，并写入审计事件。
 	CreatePlan(ctx context.Context, userID uuid.UUID, plan Plan, event OutboxEvent) (Plan, error)
+	// ReplacePlan 原子地关闭最新父版本并发布后继版本。空 fence 用于人工修订，非空 fence 用于重规划。
+	ReplacePlan(ctx context.Context, userID uuid.UUID, plan Plan, parentRevision int64, fence PlanFence, event OutboxEvent) (Plan, error)
 	// GetPlanByRun 读取 Run 的最新版本计划。
 	GetPlanByRun(ctx context.Context, userID, runID uuid.UUID) (Plan, error)
 	// GetPlan 按 ID 读取计划及步骤。
@@ -276,7 +278,7 @@ func TransitionPlanStepStatus(from, to PlanStepStatus) error {
 	allowed := map[PlanStepStatus][]PlanStepStatus{
 		PlanStepPending:         {PlanStepRunning, PlanStepSkipped, PlanStepCancelled},
 		PlanStepRunning:         {PlanStepWaitingApproval, PlanStepCompleted, PlanStepFailed, PlanStepUnknown, PlanStepCancelled},
-		PlanStepWaitingApproval: {PlanStepRunning, PlanStepCompleted, PlanStepFailed, PlanStepCancelled},
+		PlanStepWaitingApproval: {PlanStepRunning, PlanStepCompleted, PlanStepFailed, PlanStepUnknown, PlanStepCancelled},
 		PlanStepFailed:          {PlanStepRunning, PlanStepCancelled},
 		PlanStepUnknown:         {PlanStepFailed, PlanStepCancelled},
 	}

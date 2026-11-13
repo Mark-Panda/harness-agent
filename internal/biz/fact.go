@@ -22,6 +22,8 @@ var (
 	ErrFactExtractionUnavailable = errors.New("fact extraction model is unavailable")
 	// ErrFactPermanent 事实提取请求被永久拒绝，重试无意义。
 	ErrFactPermanent = errors.New("fact extraction failed permanently")
+	// ErrFactSourceInvalid indicates the queued source is no longer eligible for extraction.
+	ErrFactSourceInvalid = errors.New("fact source is invalid")
 	// FactExtractJobType 异步事实提取任务类型。
 	FactExtractJobType = "memory.fact.extract"
 	// FactSourceUser 用户明确陈述。
@@ -74,6 +76,8 @@ type FactRepository interface {
 	GetActiveFact(ctx context.Context, userID uuid.UUID, key string) (MemoryFact, bool, error)
 	// SaveFact 以期望版本守卫写入新版本并关闭旧版本；版本冲突时 applied=false。
 	SaveFact(ctx context.Context, fact MemoryFact, expectedVersion int64) (MemoryFact, bool, error)
+	// SaveExtractedFact also verifies the source and its current policy in the write transaction.
+	SaveExtractedFact(ctx context.Context, fact MemoryFact, expectedVersion int64, source FactTask) (MemoryFact, bool, error)
 	// ListFactVersions 按版本倒序列出事实历史。
 	ListFactVersions(ctx context.Context, userID uuid.UUID, key string, limit int) ([]MemoryFact, error)
 	// ListFacts 按更新时间倒序列出用户全部事实版本，供导出与审计。
@@ -166,6 +170,16 @@ func NewFactService(repo FactRepository, policy FactPolicy, clock func() time.Ti
 
 // Apply 按冲突策略写入候选事实；低置信度候选不得覆盖高置信度或显式纠正事实。
 func (s *FactService) Apply(ctx context.Context, userID, sessionID uuid.UUID, candidates []FactCandidate) (FactApplyResult, error) {
+	return s.apply(ctx, userID, sessionID, candidates, s.repo.SaveFact)
+}
+
+func (s *FactService) applyExtracted(ctx context.Context, source FactTask, candidates []FactCandidate) (FactApplyResult, error) {
+	return s.apply(ctx, source.Owner(), source.SessionID, candidates, func(ctx context.Context, fact MemoryFact, expected int64) (MemoryFact, bool, error) {
+		return s.repo.SaveExtractedFact(ctx, fact, expected, source)
+	})
+}
+
+func (s *FactService) apply(ctx context.Context, userID, sessionID uuid.UUID, candidates []FactCandidate, save func(context.Context, MemoryFact, int64) (MemoryFact, bool, error)) (FactApplyResult, error) {
 	result := FactApplyResult{}
 	if userID == uuid.Nil {
 		return result, ErrForbidden
@@ -231,7 +245,7 @@ func (s *FactService) Apply(ctx context.Context, userID, sessionID uuid.UUID, ca
 			SourceMessageID: candidate.SourceMessageID, Metadata: map[string]any{"extracted_at": now.Format(time.RFC3339Nano)},
 			ValidFrom: now, Version: expected + 1, CreatedAt: now, UpdatedAt: now,
 		}
-		_, applied, err := s.repo.SaveFact(ctx, fact, expected)
+		_, applied, err := save(ctx, fact, expected)
 		if err != nil {
 			return result, err
 		}
@@ -283,6 +297,19 @@ type FactTask struct {
 	Fingerprint string
 	// SourceIndex 映射用消息 ID 顺序，与任务消息一一对应。
 	SourceIDs []uuid.UUID
+}
+
+// Owner is the user who may receive facts from the task.
+func (t FactTask) Owner() uuid.UUID {
+	if t.FactOwnerID != uuid.Nil {
+		return t.FactOwnerID
+	}
+	return t.UserID
+}
+
+// FactSourceReader reads sources whose current policy permits extraction.
+type FactSourceReader interface {
+	ListFactSourceMessages(ctx context.Context, task FactTask) ([]Message, error)
 }
 
 // FactJobQueue 是事实提取任务入队端口。
@@ -452,8 +479,8 @@ func (c FactExtractionWorkerConfig) normalize() FactExtractionWorkerConfig {
 type FactExtractionWorkerDependencies struct {
 	// Jobs 持久化任务队列。
 	Jobs JobQueue
-	// Messages 消息读取端口。
-	Messages SummaryMessageReader
+	// Messages 读取执行时仍允许提取事实的来源消息。
+	Messages FactSourceReader
 	// Facts 事实冲突策略服务。
 	Facts *FactService
 	// Extractor 事实提取器。
@@ -467,7 +494,7 @@ type FactExtractionWorkerDependencies struct {
 // FactExtractionWorker 认领事实提取任务并写入结构化事实。
 type FactExtractionWorker struct {
 	jobs      JobQueue
-	messages  SummaryMessageReader
+	messages  FactSourceReader
 	facts     *FactService
 	extractor FactExtractor
 	config    FactExtractionWorkerConfig
@@ -565,8 +592,12 @@ func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
-	messages, err := w.messages.ListMessagesByIDs(ctx, task.UserID, task.SessionID, task.MessageIDs)
+	messages, err := w.messages.ListFactSourceMessages(ctx, task)
 	if err != nil {
+		if errors.Is(err, ErrFactSourceInvalid) {
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
 		w.failJob(ctx, job, err)
 		return
 	}
@@ -588,17 +619,16 @@ func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
 	if len(candidates) > w.config.MaxFacts {
 		candidates = candidates[:w.config.MaxFacts]
 	}
-	// 群聊话题的事实只能写入发言人本人：FactOwnerID 非空时覆盖任务归属用户。
-	factUserID := task.FactOwnerID
-	if factUserID == uuid.Nil {
-		factUserID = task.UserID
-	}
-	result, err := w.facts.Apply(ctx, factUserID, task.SessionID, candidates)
+	result, err := w.facts.applyExtracted(ctx, task, candidates)
 	if err != nil {
+		if errors.Is(err, ErrFactSourceInvalid) {
+			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			return
+		}
 		w.failJob(ctx, job, err)
 		return
 	}
-	w.logger.Info("facts applied", "session_id", task.SessionID, "fact_user_id", factUserID,
+	w.logger.Info("facts applied", "session_id", task.SessionID, "fact_user_id", task.Owner(),
 		"speaker_open_id", task.SpeakerOpenID, "applied", result.Applied,
 		"skipped", result.Skipped, "conflicts", result.Conflicts)
 	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)

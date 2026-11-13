@@ -59,11 +59,45 @@ func TestPlanRepositoryResumePaths(t *testing.T) {
 	modelStep := biz.PlanStep{ID: uuid.New(), PlanID: planID, UserID: user.ID, StepNo: 1, Title: "模型步骤", Status: biz.PlanStepRunning, Attempts: 1, MaxAttempts: 3, LeaseOwner: "worker-a", FenceToken: 3, IdempotencyKey: "s1", CreatedAt: now, UpdatedAt: now}
 	approvalStep := biz.PlanStep{ID: uuid.New(), PlanID: planID, UserID: user.ID, StepNo: 2, Title: "审批步骤", Status: biz.PlanStepWaitingApproval, MaxAttempts: 3, ToolName: "shell", IdempotencyKey: "s2", CreatedAt: now, UpdatedAt: now}
 	completedStep := biz.PlanStep{ID: uuid.New(), PlanID: planID, UserID: user.ID, StepNo: 3, Title: "已完成", Status: biz.PlanStepCompleted, MaxAttempts: 3, IdempotencyKey: "s3", CreatedAt: now, UpdatedAt: now, FinishedAt: &now}
+	planSteps := []biz.PlanStep{modelStep, approvalStep, completedStep}
+	execution := NewExecutionStepRepository(appDB)
+	for _, status := range []biz.StepStatus{biz.StepRunning, biz.StepCompleted, biz.StepReconciliationRequired} {
+		parent, err := execution.StartStep(ctx, biz.ExecutionStep{RunID: run.ID, UserID: user.ID, Kind: biz.StepKindPlan})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := execution.StartStep(ctx, biz.ExecutionStep{
+			RunID: run.ID, UserID: user.ID, ParentStepID: &parent.ID, Kind: biz.StepKindTool, Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		step := modelStep
+		step.ID, step.StepNo, step.ExecutionStepID, step.IdempotencyKey = uuid.New(), len(planSteps)+1, &parent.ID, string(status)
+		planSteps = append(planSteps, step)
+	}
+	approvals := NewToolApprovalRepository(appDB)
+	var executedStepNo int
+	for _, status := range []biz.ApprovalStatus{biz.ApprovalExecuting, biz.ApprovalExecuted, biz.ApprovalFailed} {
+		step := approvalStep
+		step.ID, step.StepNo, step.IdempotencyKey = uuid.New(), len(planSteps)+1, string(status)
+		approval := biz.ToolApproval{
+			RunID: run.ID, UserID: user.ID, ToolCallID: "plan-step-" + step.ID.String(), ToolName: step.ToolName,
+			Status: status, Arguments: []byte(`{}`), IdempotencyKey: step.IdempotencyKey,
+		}
+		if status == biz.ApprovalExecuted {
+			executedStepNo = step.StepNo
+			approval.ResultJSON = []byte(`{"result":"saved"}`)
+		}
+		if _, err := approvals.CreateApproval(ctx, approval); err != nil {
+			t.Fatal(err)
+		}
+		planSteps = append(planSteps, step)
+	}
 	plan, err := repo.CreatePlan(ctx, user.ID, biz.Plan{
 		ID: planID, UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 1,
 		Status: biz.PlanPaused, Goal: "恢复计划", ConfigSnapshot: map[string]any{"mode": "plan"},
 		MaxSteps: 50, Revision: 2, CreatedAt: now, UpdatedAt: now,
-		Steps: []biz.PlanStep{modelStep, approvalStep, completedStep},
+		Steps: planSteps,
 	}, testOutboxEvent(user.ID, "plan.created"))
 	if err != nil {
 		t.Fatal(err)
@@ -75,16 +109,8 @@ func TestPlanRepositoryResumePaths(t *testing.T) {
 	if err != nil || extended.DeadlineAt == nil || !extended.DeadlineAt.Equal(deadline) || extended.Revision != plan.Revision {
 		t.Fatalf("ExtendPlanDeadline() = %#v, %v", extended, err)
 	}
-	// 另一版本（同 Run v2）用于版本列表。
-	if _, err := repo.CreatePlan(ctx, user.ID, biz.Plan{
-		ID: uuid.New(), UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 2, ParentPlanID: &planID,
-		Status: biz.PlanExecuting, Goal: "恢复计划-v2", ConfigSnapshot: map[string]any{"mode": "plan"},
-		MaxSteps: 50, CreatedAt: now, UpdatedAt: now,
-	}, testOutboxEvent(user.ID, "plan.created")); err != nil {
-		t.Fatal(err)
-	}
 	versions, err := repo.ListPlanVersions(ctx, user.ID, run.ID)
-	if err != nil || len(versions) != 2 || versions[0].Version != 2 || versions[1].Version != 1 {
+	if err != nil || len(versions) != 1 || versions[0].Version != 1 {
 		t.Fatalf("ListPlanVersions() = %#v, %v", versions, err)
 	}
 	if len(versions[0].Steps) != 0 {
@@ -112,6 +138,53 @@ func TestPlanRepositoryResumePaths(t *testing.T) {
 	if rebound.RunID != newRun.ID || rebound.Status != biz.PlanExecuting || rebound.Revision != paused.Revision+1 {
 		t.Fatalf("rebound plan = %#v", rebound)
 	}
+	// Simulate call records written before Plan counters were updated atomically.
+	attempts := NewModelCallRepository(appDB)
+	for _, runID := range []uuid.UUID{run.ID, newRun.ID} {
+		call, err := attempts.CreateModelCall(ctx, biz.ModelCall{
+			RunID: runID, UserID: user.ID, AttemptNo: 1, InputTokens: 12, OutputTokens: 6, EstimatedCost: 0.125,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := attempts.FinishModelCall(ctx, user.ID, call.ID, biz.ModelCallUpdate{
+			Status: biz.ModelCallSucceeded, InputTokens: 12, OutputTokens: 6, EstimatedCost: 0.125,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := runs.AppendEvent(ctx, biz.RunEvent{
+		RunID: newRun.ID, UserID: user.ID, EventType: "plan.resumed",
+		Payload: map[string]any{"plan_id": planID.String(), "previous_run_id": run.ID.String()},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		usage, err := repo.RecoverPlanUsage(ctx, user.ID, newRun.ID)
+		if err != nil || usage.InputTokens != 24 || usage.OutputTokens != 12 || usage.EstimatedCost != 0.25 {
+			t.Fatalf("recovered usage = %+v, %v", usage, err)
+		}
+	}
+	recovered, err := repo.GetPlan(ctx, user.ID, planID)
+	if err != nil || recovered.TotalInputTokens != 24 || recovered.Revision != rebound.Revision {
+		t.Fatalf("stored Plan usage after recovery = %+v, %v", recovered, err)
+	}
+	for _, call := range []biz.ModelCall{
+		{InputTokens: 1, OutputTokens: 1, PlanMaxTokens: 37},
+		{EstimatedCost: 0.02, PlanMaxCost: 0.26},
+	} {
+		call.RunID, call.UserID, call.AttemptNo = newRun.ID, user.ID, 2
+		call.RequestManifest = map[string]any{"plan_usage": true}
+		if _, err := attempts.CreateModelCall(ctx, call); !errors.Is(err, biz.ErrPlanBudget) {
+			t.Fatalf("reservation above durable usage limit = %v", err)
+		}
+	}
+	if _, err := attempts.CreateModelCall(ctx, biz.ModelCall{
+		RunID: newRun.ID, UserID: user.ID, AttemptNo: 2, RequestManifest: map[string]any{"plan_usage": true},
+		InputTokens: 1, OutputTokens: 1, PlanMaxTokens: 38,
+	}); err != nil {
+		t.Fatalf("reservation within durable usage limit = %v", err)
+	}
 	steps := map[int]biz.PlanStep{}
 	for _, step := range rebound.Steps {
 		steps[step.StepNo] = step
@@ -124,6 +197,19 @@ func TestPlanRepositoryResumePaths(t *testing.T) {
 	}
 	if steps[3].Status != biz.PlanStepCompleted {
 		t.Fatalf("completed step was touched: %#v", steps[3])
+	}
+	for _, original := range planSteps[3:] {
+		step := steps[original.StepNo]
+		if step.StepNo == executedStepNo {
+			content, _ := step.Result["content"].(string)
+			if step.Status != biz.PlanStepCompleted || !strings.Contains(content, "saved") {
+				t.Errorf("executed approval result not preserved: %+v", step)
+			}
+			continue
+		}
+		if step.Status != biz.PlanStepUnknown || step.ErrorCode != "tool_execution_unknown" {
+			t.Errorf("step %d with prior dispatch evidence reset to %s (%s)", step.StepNo, step.Status, step.ErrorCode)
+		}
 	}
 	// 旧 revision 重复迁移必须冲突。
 	if _, err := repo.RebindPlanRun(ctx, user.ID, planID, newRun.ID, paused.Revision, &newDeadline, now); !errors.Is(err, biz.ErrPlanRevisionConflict) {

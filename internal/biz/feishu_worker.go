@@ -331,31 +331,42 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	if messageEvent.SenderOpenID == "" {
 		return FeishuEventIgnored, nil
 	}
-	// 已登记的机器人按应用 App ID 解析；未登记时保持原有默认应用行为。
+	// 使用验签后的回执路由。注册机器人被删除或重建后，旧事件不能由其他机器人执行。
+	if envelope.Header.AppID != "" && envelope.Header.AppID != record.AppID {
+		return FeishuEventIgnored, nil
+	}
+	registeredBotID, registeredRoute := record.Payload["bot_id"]
+	defaultRoute, _ := record.Payload["default_route"].(bool)
 	botOpenID := w.config.BotOpenID
 	botName := w.config.BotName
 	var routedBot *FeishuBot
-	if w.bots != nil && record.AppID != "" {
+	if registeredRoute {
+		if defaultRoute || w.bots == nil || record.AppID == "" {
+			return FeishuEventIgnored, nil
+		}
 		bot, found, err := w.bots.LookupFeishuBot(ctx, record.AppID)
 		if err != nil {
 			return "", err
 		}
-		if found {
-			if bot.Status != FeishuBotEnabled {
-				return FeishuEventIgnored, nil
-			}
-			routedBot = &bot
-			botOpenID = bot.BotOpenID
-			botName = bot.Name
+		if !found || bot.ID == uuid.Nil || bot.AppID != record.AppID || bot.Status != FeishuBotEnabled || registeredBotID != bot.ID.String() {
+			return FeishuEventIgnored, nil
 		}
+		routedBot = &bot
+		botOpenID = bot.BotOpenID
+		botName = bot.Name
+	} else if !defaultRoute || record.AppID != w.config.DefaultAppID {
+		return FeishuEventIgnored, nil
+	}
+	botID := uuid.Nil
+	if routedBot != nil {
+		botID = routedBot.ID
 	}
 	groupPolicyID := uuid.Nil
 	if messageEvent.ChatType == feishu.ChatTypeGroup {
 		groupPolicyID = w.sharedChats[feishuChatScope{record.AppID, record.TenantKey, messageEvent.ChatID}]
 		if groupPolicyID != uuid.Nil {
 			// 共享群聊只信任准确的机器人标识，拒绝未知应用和同名 mention。
-			if (routedBot == nil && record.AppID != w.config.DefaultAppID) ||
-				botOpenID == "" || !messageEvent.Triggered(botOpenID, "") {
+			if botOpenID == "" || !messageEvent.Triggered(botOpenID, "") {
 				return FeishuEventIgnored, nil
 			}
 		} else if !messageEvent.Triggered(botOpenID, botName) {
@@ -423,7 +434,7 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		return FeishuEventIgnored, nil
 	}
 	if groupPolicyID != uuid.Nil {
-		return w.processSharedChat(ctx, record, messageEvent, identity.UserID, routeOwnerID, groupPolicyID, text, threadID, rootMessageID, routedBot == nil)
+		return w.processSharedChat(ctx, record, messageEvent, identity.UserID, routeOwnerID, groupPolicyID, text, threadID, rootMessageID, botID)
 	}
 	// 未登记机器人使用默认应用，沿用迁移前的空 app_id 绑定，避免历史会话被拆成新话题。
 	conversationAppID := record.AppID
@@ -516,12 +527,12 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	}
 	ctx = logging.WithRunID(ctx, run.ID.String())
 	// 先创建外发记录占位，Run 完成后由回复 Worker 增量更新卡片。
-	return w.createReply(ctx, record.AppID, messageEvent, threadID, binding.UserID, session.ID, run.ID)
+	return w.createReply(ctx, record.AppID, botID, messageEvent, threadID, binding.UserID, session.ID, run.ID)
 }
 
-func (w *FeishuEventWorker) createReply(ctx context.Context, appID string, messageEvent feishu.MessageEvent, threadID string, userID, sessionID, runID uuid.UUID) (string, error) {
+func (w *FeishuEventWorker) createReply(ctx context.Context, appID string, botID uuid.UUID, messageEvent feishu.MessageEvent, threadID string, userID, sessionID, runID uuid.UUID) (string, error) {
 	err := w.outbound.CreateOutbound(ctx, FeishuOutbound{
-		ID: uuid.New(), UserID: userID, SessionID: sessionID, RunID: runID, AppID: appID,
+		ID: uuid.New(), UserID: userID, SessionID: sessionID, RunID: runID, AppID: appID, BotID: botID, DefaultRoute: botID == uuid.Nil,
 		ChatID: messageEvent.ChatID, ThreadID: threadID, ReplyToMessageID: messageEvent.MessageID,
 		Kind: "card", Status: "pending", DedupeKey: "feishu.run:" + runID.String(),
 	})

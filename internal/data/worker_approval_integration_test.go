@@ -140,7 +140,7 @@ func TestExecutionWorkerApprovalRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, err := biz.NewExecutionWorker(biz.ExecutionWorkerDependencies{
-		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{}, Opener: integrationOpener{},
+		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{baseURL: modelServer.URL}, Opener: integrationOpener{},
 		Attempts: calls, Steps: steps, Approvals: approvals,
 		MCPs: fakeApprovalMCPCredentials{endpoint: mcpServer.URL},
 		MCPClientFactory: func(endpoint string, authHeaders http.Header, timeout time.Duration, _ bool) (*mcp.Client, error) {

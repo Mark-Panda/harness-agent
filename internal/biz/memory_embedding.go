@@ -266,12 +266,17 @@ func (c MemoryEmbedWorkerConfig) normalize() MemoryEmbedWorkerConfig {
 	return c
 }
 
+// MemoryEmbeddingMessageReader 只读取当前允许进入个人长期记忆的消息。
+type MemoryEmbeddingMessageReader interface {
+	ListEmbeddableMessages(ctx context.Context, userID, sessionID uuid.UUID, ids []uuid.UUID) ([]Message, error)
+}
+
 // MemoryEmbedWorkerDependencies 聚合向量化 Worker 依赖。
 type MemoryEmbedWorkerDependencies struct {
 	// Jobs 持久化任务队列。
 	Jobs JobQueue
 	// Messages 消息读取端口。
-	Messages SummaryMessageReader
+	Messages MemoryEmbeddingMessageReader
 	// Indexes 索引版本仓储。
 	Indexes EmbeddingIndexRepository
 	// Vectors 用户向量仓储。
@@ -289,7 +294,7 @@ type MemoryEmbedWorkerDependencies struct {
 // MemoryEmbedWorker 认领向量化任务并幂等写入向量。
 type MemoryEmbedWorker struct {
 	jobs      JobQueue
-	messages  SummaryMessageReader
+	messages  MemoryEmbeddingMessageReader
 	indexes   EmbeddingIndexRepository
 	vectors   MemoryVectorRepository
 	generator EmbeddingGenerator
@@ -397,21 +402,6 @@ func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
-	messages, err := w.messages.ListMessagesByIDs(ctx, task.UserID, task.SessionID, task.MessageIDs)
-	if err != nil {
-		w.failJob(ctx, job, err)
-		return
-	}
-	eligible := make([]Message, 0, len(messages))
-	for _, message := range messages {
-		if embeddableRole(message.Role) && strings.TrimSpace(message.Content) != "" {
-			eligible = append(eligible, message)
-		}
-	}
-	if len(eligible) == 0 {
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
-		return
-	}
 	for _, version := range task.Versions {
 		index, err := w.indexes.GetIndex(ctx, version)
 		if err != nil {
@@ -425,7 +415,7 @@ func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
 		if index.Status == EmbeddingIndexRetired {
 			continue
 		}
-		if err := w.embedMessages(ctx, task.UserID, task.SessionID, index, eligible); err != nil {
+		if err := w.embedMessages(ctx, task.UserID, task.SessionID, index, task.MessageIDs); err != nil {
 			if errors.Is(err, ErrEmbeddingModelUnavailable) {
 				w.logger.Warn("embedding model unavailable; completing job", "job_id", job.ID, "version", version, "error", err)
 				_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
@@ -439,32 +429,31 @@ func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
 }
 
 // embedMessages 跳过未变更内容后分批生成向量并写入。
-func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID uuid.UUID, index EmbeddingIndex, messages []Message) error {
-	ids := make([]uuid.UUID, 0, len(messages))
-	for _, message := range messages {
-		ids = append(ids, message.ID)
-	}
+func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID uuid.UUID, index EmbeddingIndex, ids []uuid.UUID) error {
 	hashes, err := w.vectors.ListSourceHashes(ctx, userID, index.Version, ids)
 	if err != nil {
 		return err
 	}
-	pending := make([]Message, 0, len(messages))
-	for _, message := range messages {
-		if hashes[message.ID] == MemoryContentHash(message.Content) {
+	now := w.clock()
+	written := 0
+	for start := 0; start < len(ids); start += w.config.BatchSize {
+		end := min(start+w.config.BatchSize, len(ids))
+		// Read each batch just before embedding so jobs queued under an earlier
+		// policy, including later batches of the same job, honor current policy.
+		messages, err := w.messages.ListEmbeddableMessages(ctx, userID, sessionID, ids[start:end])
+		if err != nil {
+			return err
+		}
+		batch := make([]Message, 0, len(messages))
+		for _, message := range messages {
+			if embeddableRole(message.Role) && strings.TrimSpace(message.Content) != "" &&
+				hashes[message.ID] != MemoryContentHash(message.Content) {
+				batch = append(batch, message)
+			}
+		}
+		if len(batch) == 0 {
 			continue
 		}
-		pending = append(pending, message)
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	now := w.clock()
-	for start := 0; start < len(pending); start += w.config.BatchSize {
-		end := start + w.config.BatchSize
-		if end > len(pending) {
-			end = len(pending)
-		}
-		batch := pending[start:end]
 		inputs := make([]string, 0, len(batch))
 		for _, message := range batch {
 			inputs = append(inputs, message.Content)
@@ -504,8 +493,11 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 		if err := w.vectors.UpsertVectors(ctx, userID, vectors); err != nil {
 			return err
 		}
+		written += len(vectors)
 	}
-	w.logger.Info("memory vectors written", "session_id", sessionID, "version", index.Version, "messages", len(pending))
+	if written > 0 {
+		w.logger.Info("memory vectors processed", "session_id", sessionID, "version", index.Version, "messages", written)
+	}
 	return nil
 }
 
@@ -672,7 +664,7 @@ func (s *MemoryIndexService) Maintain(ctx context.Context) (MaintainResult, erro
 		return result, err
 	}
 	if staging != nil {
-		vectors, err := s.indexes.CountVectors(ctx, staging.Version)
+		vectors, err := s.indexes.CountIndexedMessages(ctx, staging.Version)
 		if err != nil {
 			return result, err
 		}

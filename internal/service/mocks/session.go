@@ -136,18 +136,18 @@ func (mr *MockSessionRepositoryMockRecorder) AppendMessage(ctx, message, event a
 }
 
 // AppendMessageIdempotent mocks base method.
-func (m *MockSessionRepository) AppendMessageIdempotent(ctx context.Context, message biz.Message, event biz.OutboxEvent) (biz.Message, error) {
+func (m *MockSessionRepository) AppendMessageIdempotent(ctx context.Context, message biz.Message, event biz.OutboxEvent, fence biz.RunFence) (biz.Message, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "AppendMessageIdempotent", ctx, message, event)
+	ret := m.ctrl.Call(m, "AppendMessageIdempotent", ctx, message, event, fence)
 	ret0, _ := ret[0].(biz.Message)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // AppendMessageIdempotent indicates an expected call of AppendMessageIdempotent.
-func (mr *MockSessionRepositoryMockRecorder) AppendMessageIdempotent(ctx, message, event any) *gomock.Call {
+func (mr *MockSessionRepositoryMockRecorder) AppendMessageIdempotent(ctx, message, event, fence any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AppendMessageIdempotent", reflect.TypeOf((*MockSessionRepository)(nil).AppendMessageIdempotent), ctx, message, event)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AppendMessageIdempotent", reflect.TypeOf((*MockSessionRepository)(nil).AppendMessageIdempotent), ctx, message, event, fence)
 }
 
 // ArchiveSession mocks base method.

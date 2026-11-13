@@ -36,6 +36,14 @@ func (f *fakeSummaryReader) ListMessagesByIDs(context.Context, uuid.UUID, uuid.U
 	return f.byIDs, f.err
 }
 
+func (f *fakeSummaryReader) ListSummarizableMessages(ctx context.Context, userID, sessionID uuid.UUID, ids []uuid.UUID) ([]biz.Message, error) {
+	return f.ListMessagesByIDs(ctx, userID, sessionID, ids)
+}
+
+func (f *fakeSummaryReader) ListFactSourceMessages(ctx context.Context, task biz.FactTask) ([]biz.Message, error) {
+	return f.ListMessagesByIDs(ctx, task.UserID, task.SessionID, task.MessageIDs)
+}
+
 // CountMessagesThrough 返回预置计数。
 func (f *fakeSummaryReader) CountMessagesThrough(context.Context, uuid.UUID, uuid.UUID, biz.MessagePosition) (int64, error) {
 	return int64(len(f.byIDs)), f.err

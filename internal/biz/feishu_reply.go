@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,10 +15,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
+	"github.com/google/uuid"
 )
 
 // FeishuReplyWorkerConfig 是外发回复 Worker 的轮询、租约与限流配置。
 type FeishuReplyWorkerConfig struct {
+	// DefaultAppID 标识默认客户端所使用的应用。
+	DefaultAppID string
 	// WorkerID 实例标识。
 	WorkerID string
 	// Concurrency 单实例并发投递数。
@@ -28,7 +32,7 @@ type FeishuReplyWorkerConfig struct {
 	Lease time.Duration
 	// PollRunInterval Run 未结束时再次检查的间隔，避免高频调用飞书。
 	PollRunInterval time.Duration
-	// RunWaitTimeout Run 长时间未完成时降级为超时提示。
+	// RunWaitTimeout 在没有生效的执行截止时间时，限制外发等待时长。
 	RunWaitTimeout time.Duration
 	// MaxTextBytes 单条回复文本上限，按 UTF-8 边界截断。
 	MaxTextBytes int
@@ -117,12 +121,10 @@ type FeishuReplyWorkerDependencies struct {
 	Outbound FeishuOutboundStore
 	// Runs Run 读取端口，用于判断执行状态。
 	Runs RunRepository
-	// Sender 飞书回复发送端口，作为未登记机器人的默认客户端。
+	// Sender 只处理由默认应用验证的事件。
 	Sender FeishuReplySender
-	// Senders 按 App ID 解析机器人客户端；为空时全部使用默认客户端。
+	// Senders 校验注册机器人的身份及凭据并解析客户端。
 	Senders FeishuReplySenderResolver
-	// Conversations 话题绑定仓储，用于把主时间线根消息别名升级为真实话题 ID；为空时跳过升级。
-	Conversations FeishuConversationRepository
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -131,21 +133,20 @@ type FeishuReplyWorkerDependencies struct {
 
 // FeishuReplyWorker 将 Run 结果通过可更新卡片回复到飞书，失败时降级为文本。
 type FeishuReplyWorker struct {
-	outbound      FeishuOutboundStore
-	runs          RunRepository
-	sender        FeishuReplySender
-	senders       FeishuReplySenderResolver
-	conversations FeishuConversationRepository
-	config        FeishuReplyWorkerConfig
-	clock         func() time.Time
-	logger        *slog.Logger
-	chatLimiter   *keyedLimiter
-	userLimiter   *keyedLimiter
+	outbound    FeishuOutboundStore
+	runs        RunRepository
+	sender      FeishuReplySender
+	senders     FeishuReplySenderResolver
+	config      FeishuReplyWorkerConfig
+	clock       func() time.Time
+	logger      *slog.Logger
+	chatLimiter *keyedLimiter
+	userLimiter *keyedLimiter
 }
 
 // NewFeishuReplyWorker 构造外发 Worker。
 func NewFeishuReplyWorker(dependencies FeishuReplyWorkerDependencies, config FeishuReplyWorkerConfig) (*FeishuReplyWorker, error) {
-	if dependencies.Outbound == nil || dependencies.Runs == nil || dependencies.Sender == nil {
+	if dependencies.Outbound == nil || dependencies.Runs == nil || (dependencies.Sender == nil && dependencies.Senders == nil) {
 		return nil, invalid("feishu reply worker requires outbound, runs and sender")
 	}
 	if strings.TrimSpace(config.WorkerID) == "" {
@@ -161,8 +162,7 @@ func NewFeishuReplyWorker(dependencies FeishuReplyWorkerDependencies, config Fei
 	}
 	return &FeishuReplyWorker{
 		outbound: dependencies.Outbound, runs: dependencies.Runs, sender: dependencies.Sender, senders: dependencies.Senders,
-		conversations: dependencies.Conversations,
-		config:        config.normalize(), clock: clock, logger: logger,
+		config: config.normalize(), clock: clock, logger: logger,
 		chatLimiter: newKeyedLimiter(), userLimiter: newKeyedLimiter(),
 	}, nil
 }
@@ -227,13 +227,15 @@ func (w *FeishuReplyWorker) ProcessOne(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	defer w.userLimiter.release(outbound.UserID.String())
-	w.handle(ctx, outbound)
+	leaseCtx, cancel := context.WithTimeout(ctx, outbound.LeaseExpiresAt.Sub(w.clock()))
+	defer cancel()
+	w.handle(leaseCtx, outbound)
 	return true, nil
 }
 
 // deferOutbound 延后外发记录且不消耗失败预算。
 func (w *FeishuReplyWorker) deferOutbound(ctx context.Context, outbound FeishuOutbound, retryAt time.Time) {
-	if err := w.outbound.DeferOutbound(context.WithoutCancel(ctx), outbound.ID, retryAt, w.clock()); err != nil {
+	if err := w.outbound.DeferOutbound(context.WithoutCancel(ctx), outbound, retryAt, w.clock()); err != nil && !errors.Is(err, ErrFeishuOutboundClaimLost) {
 		w.logger.Warn("defer feishu outbound failed", "outbound_id", outbound.ID, "error", err)
 	}
 }
@@ -249,84 +251,108 @@ func isBootstrapAlias(outbound FeishuOutbound) bool {
 	return outbound.ThreadID != "" && outbound.ThreadID == outbound.ReplyToMessageID
 }
 
-// senderFor 选择外发记录所属机器人的客户端；未登记时回退默认应用客户端。
+// senderFor 在每次飞书调用前校验当前机器人路由与领取凭证。
 func (w *FeishuReplyWorker) senderFor(ctx context.Context, outbound FeishuOutbound) (FeishuReplySender, error) {
-	if w.senders == nil || outbound.AppID == "" {
-		return w.sender, nil
-	}
-	sender, err := w.senders.ResolveSender(ctx, outbound.AppID)
-	if err != nil {
-		return nil, err
+	var sender FeishuReplySender
+	switch {
+	case outbound.DefaultRoute && outbound.BotID == uuid.Nil && outbound.AppID != "" && outbound.AppID == w.config.DefaultAppID:
+		sender = w.sender
+	case !outbound.DefaultRoute && outbound.BotID != uuid.Nil && outbound.AppID != "" && w.senders != nil:
+		var err error
+		sender, err = w.senders.ResolveSender(ctx, outbound.BotID, outbound.AppID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if sender == nil {
-		return w.sender, nil
+		return nil, invalid("feishu outbound sender route is unavailable")
+	}
+	if err := w.outbound.CheckOutboundClaim(ctx, outbound, w.clock()); err != nil {
+		return nil, err
 	}
 	return sender, nil
 }
 
-// sendCard 统一发送卡片：群聊话题内优先创建/复用话题，普通群不支持话题时降级为主时间线回复。
-func (w *FeishuReplyWorker) sendCard(ctx context.Context, outbound FeishuOutbound, card any) (string, error) {
-	sender, err := w.senderFor(ctx, outbound)
-	if err != nil {
-		return "", err
+// postReply reserves the exact request before invoking the external POST. Only a
+// confirmed rejection of the first request may enable a different reply.
+func (w *FeishuReplyWorker) postReply(ctx context.Context, outbound *FeishuOutbound, request feishu.ReplyRequest, fingerprint string, groupText *string) (bool, error) {
+	for {
+		sender, err := w.senderFor(ctx, *outbound)
+		if err != nil {
+			return false, err
+		}
+		request.UUID = uuid.NewString()
+		post := &FeishuOutboundPost{Request: request, StartedAt: w.clock(), CardFingerprint: fingerprint, GroupText: groupText}
+		if err := w.outbound.SetOutboundPost(ctx, *outbound, post, post.StartedAt); err != nil {
+			return false, err
+		}
+		outbound.Post = post
+		err = w.deliverPost(ctx, outbound, sender)
+		if err == nil || !feishu.IsMessageRejected(err) {
+			return false, err
+		}
+		if err := w.outbound.SetOutboundPost(ctx, *outbound, nil, w.clock()); err != nil {
+			return false, err
+		}
+		outbound.Post = nil
+		if !request.InThread || !isBootstrapAlias(*outbound) || !feishu.IsThreadReplyUnsupported(err) {
+			return !feishu.IsRateLimited(err) && !feishu.IsTokenInvalid(err), err
+		}
+		request.InThread = false
 	}
-	if !shouldReplyInThread(outbound) {
-		return sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
-	}
-	threaded, err := sender.ReplyCardInThread(ctx, outbound.ReplyToMessageID, card)
-	if err == nil {
-		// 主时间线首条回复由飞书创建话题，记录真实话题 ID 供后续追问复用同一 Session。
-		w.promoteThread(ctx, outbound, threaded.ThreadID)
-		return threaded.MessageID, nil
-	}
-	if feishu.IsRateLimited(err) {
-		return "", err
-	}
-	if !isBootstrapAlias(outbound) {
-		// 话题已存在时不能把答案降级到主时间线，避免不同话题的上下文串台；交给失败退避重试。
-		return "", err
-	}
-	// 普通群不支持话题能力：降级为主时间线普通回复，保证至少送达一次最终结果。
-	w.logger.Warn("create feishu thread failed, fallback to plain reply", "outbound_id", outbound.ID, "error", err)
-	return sender.ReplyCard(ctx, outbound.ReplyToMessageID, card)
 }
 
-// sendText 统一发送纯文本：话题内优先保持话题上下文，普通群不支持话题时降级为主时间线回复。
-func (w *FeishuReplyWorker) sendText(ctx context.Context, outbound FeishuOutbound, text string) (string, error) {
-	sender, err := w.senderFor(ctx, outbound)
+// deliverPost retries within Feishu's one-hour UUID window, allowing one minute
+// for a request to reach Feishu before that window can expire.
+func (w *FeishuReplyWorker) deliverPost(ctx context.Context, outbound *FeishuOutbound, sender FeishuReplySender) error {
+	post := outbound.Post
+	replayFor := post.StartedAt.Add(time.Hour - time.Minute).Sub(w.clock())
+	if replayFor <= 0 {
+		return errors.New("feishu reply outcome is unknown and its deduplication window has expired")
+	}
+	postCtx, cancel := context.WithTimeout(ctx, replayFor)
+	defer cancel()
+	result, err := sender.Reply(postCtx, outbound.ReplyToMessageID, post.Request)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if !shouldReplyInThread(outbound) {
-		return sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
+	if result.MessageID == "" {
+		return errors.New("feishu reply response is missing message id")
 	}
-	threaded, err := sender.ReplyTextInThread(ctx, outbound.ReplyToMessageID, text)
-	if err == nil {
-		w.promoteThread(ctx, outbound, threaded.ThreadID)
-		return threaded.MessageID, nil
+	if post.Request.InThread {
+		w.promoteThread(ctx, *outbound, result.ThreadID)
 	}
-	if feishu.IsRateLimited(err) {
-		return "", err
+	now := w.clock()
+	if err := w.outbound.UpdateOutboundMessageID(ctx, *outbound, result.MessageID, now); err != nil {
+		// Do not let persistence errors be mistaken for a Feishu rejection.
+		return fmt.Errorf("persist feishu reply message id: %w", err)
 	}
-	if !isBootstrapAlias(outbound) {
-		return "", err
+	outbound.MessageID = result.MessageID
+	if post.Request.Type == "text" {
+		outbound.Kind = "text"
+	} else {
+		outbound.Kind = "card"
+		outbound.CardUpdatedAt, outbound.CardFingerprint = now, post.CardFingerprint
+		outbound.Post = nil
 	}
-	w.logger.Warn("reply feishu thread text failed, fallback to plain reply", "outbound_id", outbound.ID, "error", err)
-	return sender.ReplyText(ctx, outbound.ReplyToMessageID, text)
+	return nil
+}
+
+func (w *FeishuReplyWorker) postCard(ctx context.Context, outbound *FeishuOutbound, title, text string) (bool, error) {
+	card, err := json.Marshal(buildFeishuCard(title, text, w.config.MaxTextBytes))
+	if err != nil {
+		return false, err
+	}
+	request := feishu.ReplyRequest{Type: "interactive", Content: string(card), InThread: shouldReplyInThread(*outbound)}
+	return w.postReply(ctx, outbound, request, cardFingerprint(title, text, w.config.MaxTextBytes), nil)
 }
 
 // promoteThread 把根消息过渡别名升级为飞书真实话题 ID，失败只记录日志不影响回复送达。
 func (w *FeishuReplyWorker) promoteThread(ctx context.Context, outbound FeishuOutbound, threadID string) {
-	if w.conversations == nil || threadID == "" || !isBootstrapAlias(outbound) {
+	if threadID == "" || !isBootstrapAlias(outbound) {
 		return
 	}
-	updated, err := w.conversations.PromoteConversationThread(ctx, outbound.UserID, outbound.SessionID, outbound.ThreadID, threadID)
-	if err == nil && updated == 0 {
-		if promoter, ok := w.conversations.(feishuGroupThreadPromoter); ok {
-			_, err = promoter.PromoteGroupConversationThread(ctx, outbound, threadID)
-		}
-	}
-	if err != nil {
+	if _, err := w.outbound.PromoteOutboundThread(ctx, outbound, threadID, w.clock()); err != nil && !errors.Is(err, ErrFeishuOutboundClaimLost) {
 		w.logger.Warn("promote feishu thread failed", "outbound_id", outbound.ID, "thread_id", threadID, "error", err)
 	}
 }
@@ -345,11 +371,31 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 			w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollInterval))
 		}
 	}()
+	if outbound.Post != nil {
+		if outbound.MessageID == "" || outbound.Kind != "text" {
+			sender, err := w.senderFor(ctx, outbound)
+			if err == nil {
+				err = w.deliverPost(ctx, &outbound, sender)
+			}
+			if err != nil {
+				jobOutcome = "failure"
+				w.failOutbound(ctx, outbound, err)
+				return
+			}
+		}
+		if outbound.Kind == "text" {
+			if err := w.completeReply(ctx, outbound, outbound.Post.GroupText); err != nil {
+				jobOutcome = "failure"
+				w.failOutbound(ctx, outbound, err)
+			}
+			return
+		}
+	}
 	run, err := w.runs.GetRun(ctx, outbound.UserID, outbound.RunID)
 	if err != nil {
 		if errors.Is(err, ErrResourceNotFound) {
 			// Run 已被删除时直接结束外发，避免永久重试。
-			_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
+			_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound, w.clock())
 			return
 		}
 		// 瞬时故障不能当作 Run 已删除：否则用户永远收不到最终答复。
@@ -368,23 +414,28 @@ func (w *FeishuReplyWorker) handle(ctx context.Context, outbound FeishuOutbound)
 		w.waitRun(ctx, outbound, run, title, text)
 		return
 	}
-	if err := w.sendFinal(ctx, outbound, title, text); err != nil {
+	var groupText *string
+	if isFeishuSharedGroup(run) && run.Status == RunCompleted {
+		// 卡片与文本降级的共同可见正文，避免后续发言人读取投递时被截掉的答案。
+		visible := truncateUTF8Bytes(text, max(0, w.config.MaxTextBytes-len(title)-1-len("…")))
+		groupText = &visible
+	}
+	if err := w.sendOrUpdate(ctx, &outbound, title, text, groupText); err != nil {
 		jobOutcome = "failure"
 		w.failOutbound(ctx, outbound, err)
 		return
 	}
-	if isFeishuSharedGroup(run) && run.Status == RunCompleted {
-		if completer, ok := w.outbound.(feishuGroupReplyCompleter); ok {
-			// 卡片与文本降级的共同可见正文，避免后续发言人读取投递时被截掉的答案。
-			visible := truncateUTF8Bytes(text, max(0, w.config.MaxTextBytes-len(title)-1-len("…")))
-			if err := completer.CompleteGroupReply(context.WithoutCancel(ctx), outbound, w.config.WorkerID, visible, w.clock()); err != nil {
-				jobOutcome = "failure"
-				w.failOutbound(ctx, outbound, err)
-			}
-			return
-		}
+	if err := w.completeReply(ctx, outbound, groupText); err != nil {
+		jobOutcome = "failure"
+		w.failOutbound(ctx, outbound, err)
 	}
-	_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
+}
+
+func (w *FeishuReplyWorker) completeReply(ctx context.Context, outbound FeishuOutbound, groupText *string) error {
+	if groupText != nil {
+		return w.outbound.CompleteGroupReply(context.WithoutCancel(ctx), outbound, *groupText, w.clock())
+	}
+	return w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound, w.clock())
 }
 
 // render 把 Run 状态映射为卡片标题与正文；终态返回 true。
@@ -416,33 +467,27 @@ func (w *FeishuReplyWorker) render(ctx context.Context, run Run) (bool, string, 
 
 // waitRun 在 Run 未结束时发送或增量更新占位卡片，并延后再次检查。
 func (w *FeishuReplyWorker) waitRun(ctx context.Context, outbound FeishuOutbound, run Run, title, text string) {
-	// 等待人工审批是外部输入决定的暂停，不适用于执行超时：
-	// 若按 RunWaitTimeout 结束外发，审批通过后的最终答案将无法再推送。
-	if run.Status != RunWaitingApproval && w.clock().Sub(outbound.CreatedAt) > w.config.RunWaitTimeout {
+	deadline := outbound.CreatedAt.Add(w.config.RunWaitTimeout)
+	if run.DeadlineAt != nil && !run.DeadlineAt.IsZero() && (run.Status != RunQueued || run.StartedAt != nil) {
+		// 审批恢复会顺延执行截止时间，首次领取也会补回排队时长。
+		deadline = *run.DeadlineAt
+	}
+	if run.Status != RunWaitingApproval && !w.clock().Before(deadline) {
 		final := "任务执行超时，请稍后在 Web 端查看结果。"
-		if err := w.sendOrUpdate(ctx, outbound, "执行超时", final); err != nil {
+		if err := w.sendOrUpdate(ctx, &outbound, "执行超时", final, nil); err != nil {
 			w.failOutbound(ctx, outbound, err)
 			return
 		}
-		_ = w.outbound.CompleteOutbound(context.WithoutCancel(ctx), outbound.ID, w.clock())
+		if err := w.completeReply(ctx, outbound, nil); err != nil {
+			w.failOutbound(ctx, outbound, err)
+		}
 		return
 	}
 	card := buildFeishuCard(title, text, w.config.MaxTextBytes)
 	fingerprint := cardFingerprint(title, text, w.config.MaxTextBytes)
 	if outbound.MessageID == "" {
-		messageID, err := w.sendCard(ctx, outbound, card)
-		if err != nil {
-			// 占位卡片失败不消耗预算，直接降级为最终文本等待下一次。
+		if _, err := w.postCard(ctx, &outbound, title, text); err != nil {
 			w.logger.Warn("send feishu placeholder card failed", "outbound_id", outbound.ID, "error", err)
-			w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
-			return
-		}
-		if err := w.outbound.UpdateOutboundMessageID(ctx, outbound.ID, messageID, w.clock()); err != nil {
-			w.logger.Warn("persist feishu card message id failed", "outbound_id", outbound.ID, "error", err)
-		}
-		// 首次卡片内容即视为一次更新，后续按最小间隔节流。
-		if err := w.outbound.MarkOutboundCardUpdated(ctx, outbound.ID, fingerprint, w.clock()); err != nil {
-			w.logger.Warn("persist feishu card fingerprint failed", "outbound_id", outbound.ID, "error", err)
 		}
 		w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
 		return
@@ -471,62 +516,50 @@ func (w *FeishuReplyWorker) waitRun(ctx context.Context, outbound FeishuOutbound
 		w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
 		return
 	}
-	if err := w.outbound.MarkOutboundCardUpdated(ctx, outbound.ID, fingerprint, w.clock()); err != nil {
+	if err := w.outbound.MarkOutboundCardUpdated(ctx, outbound, fingerprint, w.clock()); err != nil {
 		w.logger.Warn("persist feishu card fingerprint failed", "outbound_id", outbound.ID, "error", err)
 	}
 	w.deferOutbound(ctx, outbound, w.clock().Add(w.config.PollRunInterval))
 }
 
-// sendFinal 发送最终结果：已有卡片则更新，否则发送新卡片；卡片失败时降级为文本。
-func (w *FeishuReplyWorker) sendFinal(ctx context.Context, outbound FeishuOutbound, title, text string) error {
-	return w.sendOrUpdate(ctx, outbound, title, text)
-}
-
-// sendOrUpdate 统一处理卡片更新与文本降级。
-func (w *FeishuReplyWorker) sendOrUpdate(ctx context.Context, outbound FeishuOutbound, title, text string) error {
+// sendOrUpdate delivers terminal content, using text only after a definite card rejection.
+func (w *FeishuReplyWorker) sendOrUpdate(ctx context.Context, outbound *FeishuOutbound, title, text string, groupText *string) error {
 	if outbound.MessageID != "" {
-		sender, err := w.senderFor(ctx, outbound)
+		fingerprint := cardFingerprint(title, text, w.config.MaxTextBytes)
+		if fingerprint == outbound.CardFingerprint {
+			return nil
+		}
+		sender, err := w.senderFor(ctx, *outbound)
 		if err != nil {
 			return err
 		}
 		err = sender.UpdateCard(ctx, outbound.MessageID, buildFeishuCard(title, text, w.config.MaxTextBytes))
 		if err == nil {
-			// 终态卡片更新不受节流限制，但仍记录指纹与时间，便于排查重复投递。
-			if markErr := w.outbound.MarkOutboundCardUpdated(ctx, outbound.ID, cardFingerprint(title, text, w.config.MaxTextBytes), w.clock()); markErr != nil {
-				w.logger.Warn("persist feishu final card fingerprint failed", "outbound_id", outbound.ID, "error", markErr)
-			}
-			return nil
+			return w.outbound.MarkOutboundCardUpdated(ctx, *outbound, fingerprint, w.clock())
 		}
-		if feishu.IsRateLimited(err) {
+		if !feishu.IsMessageRejected(err) || feishu.IsRateLimited(err) || feishu.IsTokenInvalid(err) {
 			return err
 		}
-		return w.sendTextFallback(ctx, outbound, title, text)
-	}
-	messageID, err := w.sendCard(ctx, outbound, buildFeishuCard(title, text, w.config.MaxTextBytes))
-	if err == nil {
-		if saveErr := w.outbound.UpdateOutboundMessageID(ctx, outbound.ID, messageID, w.clock()); saveErr != nil {
-			w.logger.Warn("persist feishu final message id failed", "outbound_id", outbound.ID, "error", saveErr)
+	} else {
+		rejected, err := w.postCard(ctx, outbound, title, text)
+		if !rejected {
+			return err
 		}
-		if markErr := w.outbound.MarkOutboundCardUpdated(ctx, outbound.ID, cardFingerprint(title, text, w.config.MaxTextBytes), w.clock()); markErr != nil {
-			w.logger.Warn("persist feishu final card fingerprint failed", "outbound_id", outbound.ID, "error", markErr)
-		}
-		return nil
 	}
-	if feishu.IsRateLimited(err) {
+	content, err := json.Marshal(map[string]string{"text": truncateFeishuText(title+"\n"+text, w.config.MaxTextBytes)})
+	if err != nil {
 		return err
 	}
-	return w.sendTextFallback(ctx, outbound, title, text)
-}
-
-// sendTextFallback 在卡片发送或更新失败时发送纯文本，保证用户至少收到最终结果。
-func (w *FeishuReplyWorker) sendTextFallback(ctx context.Context, outbound FeishuOutbound, title, text string) error {
-	content := truncateFeishuText(title+"\n"+text, w.config.MaxTextBytes)
-	_, err := w.sendText(ctx, outbound, content)
+	request := feishu.ReplyRequest{Type: "text", Content: string(content), InThread: shouldReplyInThread(*outbound)}
+	_, err = w.postReply(ctx, outbound, request, "", groupText)
 	return err
 }
 
 // failOutbound 记录失败并按飞书限流建议退避，超出预算进入死信。
 func (w *FeishuReplyWorker) failOutbound(ctx context.Context, outbound FeishuOutbound, err error) {
+	if errors.Is(err, ErrFeishuOutboundClaimLost) {
+		return
+	}
 	retryAt := w.clock().Add(feishuBackoff(outbound.Attempts))
 	var apiError *feishu.APIError
 	if errorsAsAPI(err, &apiError) && apiError.RetryAfter > 0 {
@@ -534,7 +567,7 @@ func (w *FeishuReplyWorker) failOutbound(ctx context.Context, outbound FeishuOut
 	}
 	reason := feishuErrorCode(err)
 	w.logger.Warn("feishu outbound failed", "outbound_id", outbound.ID, "attempts", outbound.Attempts, "error", reason)
-	_ = w.outbound.FailOutbound(context.WithoutCancel(ctx), outbound.ID, reason, retryAt, w.clock())
+	_ = w.outbound.FailOutbound(context.WithoutCancel(ctx), outbound, reason, retryAt, w.clock())
 }
 
 // errorsAsAPI 统一用 errors.As 识别包装后的飞书业务错误，避免降级路径漏判限流。

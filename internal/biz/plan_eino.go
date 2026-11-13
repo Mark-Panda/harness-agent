@@ -91,6 +91,9 @@ func (w *ExecutionWorker) buildPlanGraph(
 			state.Finalized = true
 			return state, nil
 		case PlanFailed:
+			if plan.ErrorCode == planToolOutcomeUnknownCode || plan.ErrorCode == "side_effect_unknown" {
+				return nil, fmt.Errorf("%w: %w: %s", ErrToolResultPersistence, ErrPlanStepUnknown, plan.ErrorMessage)
+			}
 			return nil, fmt.Errorf("%w: %s", ErrPlanFailed, plan.ErrorMessage)
 		}
 		if plan.Status == PlanPlanning {
@@ -129,11 +132,8 @@ func (w *ExecutionWorker) buildPlanGraph(
 			return nil, w.failPlan(ctx, plan, planFence, "plan_step_limit", "计划执行轮次超过上限")
 		}
 		// 计划级 Token 与费用上限在执行过程中持续校验，超限立即终止而不是继续放大成本。
-		if w.config.PlanMaxTokens > 0 && plan.TotalInputTokens+plan.TotalOutputTokens > w.config.PlanMaxTokens {
-			return nil, w.failPlan(ctx, plan, planFence, "plan_budget_exceeded", "计划 Token 用量超过上限")
-		}
-		if w.config.PlanMaxCost > 0 && plan.EstimatedCost > w.config.PlanMaxCost {
-			return nil, w.failPlan(ctx, plan, planFence, "plan_budget_exceeded", "计划费用超过上限")
+		if err := w.checkPlanBudget(ctx, plan, planFence); err != nil {
+			return nil, err
 		}
 		if plan.DeadlineAt != nil && !w.clock().Before(*plan.DeadlineAt) {
 			return nil, w.failPlan(ctx, plan, planFence, "plan_deadline_exceeded", "计划执行超过截止时间")
@@ -203,8 +203,7 @@ func (w *ExecutionWorker) buildPlanGraph(
 		state.NeedsReplan = false
 		updated, err := w.replanPlan(ctx, run, fence, router, messages, tools, state.Plan)
 		if err != nil {
-			w.logger.Warn("replan failed; terminating plan", "run_id", run.ID, "plan_id", state.Plan.ID, "error", err)
-			return nil, w.failPlan(ctx, state.Plan, planFence, "plan_step_failed", "计划步骤失败或依赖无法满足")
+			return nil, err
 		}
 		state.Plan = updated
 		return state, nil

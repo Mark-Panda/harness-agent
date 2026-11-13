@@ -89,7 +89,7 @@ func TestExecutionWorkerSupervisorMode(t *testing.T) {
 	approvals := NewToolApprovalRepository(appDB)
 	supRepo := NewSupervisorTaskRepository(appDB)
 	worker, err := biz.NewExecutionWorker(biz.ExecutionWorkerDependencies{
-		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{}, Opener: integrationOpener{},
+		Jobs: jobs, Runs: runs, Sessions: sessions, Providers: integrationCredentials{baseURL: server.URL}, Opener: integrationOpener{},
 		Attempts: calls, Steps: steps, Approvals: approvals, SupervisorTasks: supRepo,
 	}, biz.WorkerConfig{
 		WorkerID: "supervisor-worker", JobType: "agent.run.test", Concurrency: 1, PollInterval: time.Millisecond,
