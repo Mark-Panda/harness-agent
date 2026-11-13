@@ -5,10 +5,11 @@ import { useAuth } from "../lib/auth";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { useRemote } from "../lib/hooks";
+import { MultiSelect } from "../components/MultiSelect";
 import { Icon } from "../components/Icon";
 import { useToast } from "../components/Toast";
 import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill } from "../lib/types";
-import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
+import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea, cn } from "../components/ui";
 
 const modes: Array<{ value: AgentMode; title: string; description: string; badge?: string }> = [
   {
@@ -156,8 +157,6 @@ function AgentWizard({ agentId }: { agentId?: string }) {
     return index < 3 || canLeaveModel;
   };
 
-  const toggle = (values: string[], id: string) => (values.includes(id) ? values.filter((value) => value !== id) : [...values, id]);
-
   const submit = async (publish: boolean) => {
     if (busy) return;
     if (!canLeaveBasics) {
@@ -301,96 +300,57 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       ) : null}
 
       {step === 2 ? (
-        <div className="flex flex-col gap-5">
-          <Card title="用哪套模型规则？" description="规则里已经安排了主选与替补模型。你只需要选一套，不需要填写 API 地址。">
-            {publishedPolicies.length === 0 ? (
-              <Callout tone="warning" title="还没有可用的选模规则">
-                {user?.role === "admin" ? (
-                  <span>
-                    你是管理员，可以先到 <Link to="/admin/policies" className="text-accent underline">选模规则</Link> 创建并发布一套规则，再回来创建助手。
-                  </span>
-                ) : (
-                  <span>请联系管理员完成模型接入与选模规则配置。配置完成后刷新本页即可继续。</span>
-                )}
-              </Callout>
-            ) : (
-              <div role="radiogroup" aria-label="选模规则" className="flex flex-col gap-3">
+        <div className="grid max-w-3xl gap-4 rounded-xl border border-line bg-paper-raised p-4 sm:grid-cols-2 sm:p-5">
+          <div className="min-w-0 sm:col-span-2">
+            <Field
+              label="选模规则"
+              hint={selectedPolicy ? `${selectedPolicy.candidates.length} 个候选模型 · 最低上下文 ${selectedPolicy.min_context_tokens.toLocaleString("zh-CN")} Token` : undefined}
+            >
+              <Select required value={selectedPolicy?.id ?? ""} onChange={(event) => setPolicyID(event.target.value)} disabled={!publishedPolicies.length}>
+                <option value="" disabled>{publishedPolicies.length ? "请选择已发布的规则" : "暂无可用规则"}</option>
                 {publishedPolicies.map((policy) => (
-                  <ChoiceCard
-                    key={policy.id}
-                    name="agent-policy"
-                    selected={policyID === policy.id}
-                    title={policy.name}
-                    description={`版本 v${policy.version} · ${policy.candidates.length} 个候选模型 · 最低上下文 ${policy.min_context_tokens.toLocaleString("zh-CN")} Token`}
-                    onSelect={() => setPolicyID(policy.id)}
-                  />
+                  <option key={policy.id} value={policy.id}>{policy.name} · v{policy.version}</option>
                 ))}
-              </div>
-            )}
-          </Card>
-
-          <Card title="需要哪些技能？" description="技能是做事说明。不选也能对话，选了会更贴合你的工作习惯。">
-            {activeSkills.length === 0 ? (
-              <p className="text-xs text-muted">暂无已发布技能。可以跳过，之后再添加。</p>
-            ) : (
-              <div className="grid gap-2 md:grid-cols-2">
-                {activeSkills.map((skill) => {
-                  const selected = skillIDs.includes(skill.id);
-                  return (
-                    <button
-                      key={skill.id}
-                      type="button"
-                      aria-pressed={selected}
-                      onClick={() => setSkillIDs(toggle(skillIDs, skill.id))}
-                      className={cn(
-                        "rounded-[3px] border p-3 text-left transition",
-                        selected ? "border-accent bg-accent-soft/40" : "border-line bg-paper-raised hover:border-line-strong",
-                      )}
-                    >
-                      <span className="flex items-center justify-between gap-2">
-                        <span className="text-sm font-medium text-ink">{skill.name}</span>
-                        <Badge tone="neutral">v{skill.version}</Badge>
-                      </span>
-                      <span className="mt-1 block text-xs leading-5 text-muted">{skill.description || "暂无说明"}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </Card>
-
-          <Card title="需要哪些外部工具？" description="外部工具让助手能查资料或操作内部系统。高风险工具执行前会要求你审批。">
-            {activeMCPs.length === 0 ? (
-              <p className="text-xs text-muted">暂无已启用外部工具。可以跳过。</p>
-            ) : (
-              <div className="grid gap-2 md:grid-cols-2">
-                {activeMCPs.map((mcp) => {
-                  const selected = mcpIDs.includes(mcp.id);
-                  const risk = mcp.risk_level === "high" || mcp.risk_level === "critical";
-                  return (
-                    <button
-                      key={mcp.id}
-                      type="button"
-                      aria-pressed={selected}
-                      onClick={() => setMcpIDs(toggle(mcpIDs, mcp.id))}
-                      className={cn(
-                        "rounded-[3px] border p-3 text-left transition",
-                        selected ? "border-accent bg-accent-soft/40" : "border-line bg-paper-raised hover:border-line-strong",
-                      )}
-                    >
-                      <span className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium text-ink">{mcp.name}</span>
-                        <Badge tone={risk ? "danger" : mcp.risk_level === "medium" ? "warning" : "neutral"}>
-                          {risk ? "高风险" : mcp.risk_level === "medium" ? "需留意" : "低风险"}
-                        </Badge>
-                      </span>
-                      <span className="mt-1 block truncate text-xs text-muted">{mcp.endpoint}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </Card>
+              </Select>
+            </Field>
+            {!publishedPolicies.length && !policies.error ? (
+              <p className="mt-2 text-xs leading-5 text-muted">
+                {user?.role === "admin" ? <>请先<Link to="/admin/policies" className="mx-1 text-accent underline underline-offset-2">创建并发布选模规则</Link>。</> : "请联系管理员发布选模规则。"}
+              </p>
+            ) : null}
+          </div>
+          <div className="min-w-0">
+            <MultiSelect
+              label="技能"
+              options={activeSkills.map((skill) => ({
+                id: skill.id, label: skill.name, detail: skill.description,
+                badge: <Badge>v{skill.version}</Badge>,
+              }))}
+              value={skillIDs}
+              onChange={setSkillIDs}
+              empty={skills.error ? "技能加载失败" : "暂无已发布技能"}
+            />
+            {skills.error ? <div className="mt-2"><ErrorBanner message={skills.error} onRetry={skills.reload} /></div> : null}
+          </div>
+          <div className="min-w-0">
+            <MultiSelect
+              label="外部工具"
+              options={activeMCPs.map((tool) => {
+                const highRisk = tool.risk_level === "high" || tool.risk_level === "critical";
+                const mediumRisk = tool.risk_level === "medium";
+                return {
+                  id: tool.id, label: tool.name, detail: tool.endpoint,
+                  badge: <Badge tone={highRisk ? "danger" : mediumRisk ? "warning" : "neutral"}>
+                    {highRisk ? "高风险" : mediumRisk ? "中风险" : "低风险"}
+                  </Badge>,
+                };
+              })}
+              value={mcpIDs}
+              onChange={setMcpIDs}
+              empty={mcps.error ? "工具加载失败" : "暂无已启用工具"}
+            />
+            {mcps.error ? <div className="mt-2"><ErrorBanner message={mcps.error} onRetry={mcps.reload} /></div> : null}
+          </div>
         </div>
       ) : null}
 

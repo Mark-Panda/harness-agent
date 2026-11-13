@@ -43,39 +43,40 @@ const emptyModel: ModelFormState = {
   structuredOutput: false,
 };
 
-// toLocalInput 将 ISO 时间转换为 datetime-local 输入值。
-function toLocalInput(value: string | null): string {
-  if (!value) {
-    return "";
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-  return date.toISOString().slice(0, 16);
+// datetime-local 使用浏览器时区，提交时再转换为 UTC。
+function toLocalInput(date: Date): string {
+  if (!Number.isFinite(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }
 
 function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model | null; providers: Provider[]; onSaved: () => void; onCancel: () => void }) {
-  const initialForm: ModelFormState =
-    initial
-      ? {
-          providerId: initial.provider_id,
-          remoteModelName: initial.remote_model_name,
-          kind: initial.kind,
-          contextWindowTokens: String(initial.context_window_tokens),
-          maxOutputTokens: String(initial.max_output_tokens),
-          inputPrice: String(initial.input_price_per_million),
-          outputPrice: String(initial.output_price_per_million),
-          dataRegion: initial.data_region,
-          verificationSource: initial.verification_source,
-          verifiedAt: toLocalInput(initial.verified_at),
-          status: initial.status,
-          streaming: Boolean(initial.capabilities?.streaming),
-          tools: Boolean(initial.capabilities?.tools),
-          structuredOutput: Boolean(initial.capabilities?.structured_output),
-        }
-      : emptyModel;
+  const [initialForm] = useState<ModelFormState>(() => {
+    const now = toLocalInput(new Date());
+    if (!initial) return { ...emptyModel, verifiedAt: now };
+    const provider = providers.find((item) => item.id === initial.provider_id);
+    const enabled = initial.status === "enabled";
+    return {
+      providerId: initial.provider_id,
+      remoteModelName: initial.remote_model_name,
+      kind: initial.kind,
+      contextWindowTokens: String(initial.context_window_tokens),
+      maxOutputTokens: String(initial.max_output_tokens),
+      inputPrice: String(initial.input_price_per_million),
+      outputPrice: String(initial.output_price_per_million),
+      dataRegion: initial.data_region,
+      verificationSource: initial.verification_source?.trim() ? initial.verification_source : enabled ? provider?.base_url ?? "" : "",
+      verifiedAt: (initial.verified_at && toLocalInput(new Date(initial.verified_at))) || (enabled ? now : ""),
+      status: initial.status,
+      streaming: Boolean(initial.capabilities?.streaming),
+      tools: Boolean(initial.capabilities?.tools),
+      structuredOutput: Boolean(initial.capabilities?.structured_output),
+    };
+  });
   const [form, setForm] = useState(initialForm);
+  const [sourceFollowsProvider, setSourceFollowsProvider] = useState(
+    !initial || (initial.status === "enabled" && !initial.verification_source?.trim()),
+  );
   const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -85,7 +86,9 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
   const remoteRequest = useRef(0);
   const contextTokens = Number(form.contextWindowTokens || 0);
   const contextWarning = form.kind === "chat" && contextTokens < 1_000_000;
-  const verificationWarning = form.kind === "chat" && (!form.verifiedAt || !form.verificationSource.trim());
+  const selectedProvider = providers.find((provider) => provider.id === form.providerId);
+  const verificationSource = sourceFollowsProvider ? selectedProvider?.base_url ?? "" : form.verificationSource;
+  const requiresVerification = form.status === "enabled";
 
   // pullRemoteModels 从供应商站点读取可用模型名称，避免手工抄写出错。
   const pullRemoteModels = async () => {
@@ -127,8 +130,12 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
         input_price_per_million: Number(form.inputPrice || 0),
         output_price_per_million: Number(form.outputPrice || 0),
         data_region: form.dataRegion.trim(),
-        verification_source: form.verificationSource.trim(),
-        verified_at: form.verifiedAt ? new Date(form.verifiedAt).toISOString() : null,
+        verification_source: verificationSource.trim(),
+        verified_at: form.verifiedAt
+          ? initial?.verified_at && form.verifiedAt === toLocalInput(new Date(initial.verified_at))
+            ? initial.verified_at
+            : new Date(form.verifiedAt).toISOString()
+          : null,
         status: form.status,
       };
       if (initial) {
@@ -150,7 +157,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       title={initial ? `编辑模型：${initial.remote_model_name}` : "登记模型"} description="登记后，模型才能被选模规则引用。生成模型需要 1,000,000 以上上下文，并记录核验来源。"
       submitLabel={initial ? "保存修改" : "登记模型"}
       busy={busy}
-      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      dirty={JSON.stringify({ ...form, verificationSource }) !== JSON.stringify(initialForm)}
       error={error}
       onSubmit={submit}
       onCancel={onCancel}
@@ -217,14 +224,32 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       <Field label="输出价格 / 百万 Token">
         <Input type="number" min={0} step="0.01" value={form.outputPrice} onChange={(event) => setForm({ ...form, outputPrice: event.target.value })} required />
       </Field>
-      <Field label="核验来源" hint={verificationWarning ? "生成模型必须填写来源与时间，才能被发布使用。" : "官方文档或内部评测链接。"} error={verificationWarning ? "需要核验来源与核验时间" : null}>
-        <Input required={form.kind === "chat"} value={form.verificationSource} onChange={(event) => setForm({ ...form, verificationSource: event.target.value })} placeholder="https://docs.example.com/models" />
-      </Field>
-      <Field label="核验时间">
-        <Input type="datetime-local" required={form.kind === "chat"} value={form.verifiedAt} onChange={(event) => setForm({ ...form, verifiedAt: event.target.value })} />
-      </Field>
+      <div className="min-w-0">
+        <Field label="核验来源" hint="可使用模型服务地址，也可填写实际核验所用的文档或评测记录。">
+          <Input required={requiresVerification} value={verificationSource} onChange={(event) => {
+            setSourceFollowsProvider(false);
+            setForm({ ...form, verificationSource: event.target.value });
+          }} placeholder={sourceFollowsProvider ? "选择模型服务后自动填入" : "填写核验来源"} />
+        </Field>
+        {!sourceFollowsProvider && selectedProvider?.base_url ? (
+          <Button size="sm" variant="ghost" onClick={() => {
+            setSourceFollowsProvider(true);
+            setForm({ ...form, verificationSource: selectedProvider.base_url });
+          }}>使用服务地址</Button>
+        ) : null}
+      </div>
+      <div className="min-w-0">
+        <Field label="核验时间" hint="按本地时间填写，以实际核验时间为准。">
+          <Input type="datetime-local" required={requiresVerification} value={form.verifiedAt} onChange={(event) => setForm({ ...form, verifiedAt: event.target.value })} />
+        </Field>
+        <Button size="sm" variant="ghost" onClick={() => setForm({ ...form, verifiedAt: toLocalInput(new Date()) })}>使用当前时间</Button>
+      </div>
       <Field label="状态">
-        <Select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ModelFormState["status"] })}>
+        <Select value={form.status} onChange={(event) => {
+          const status = event.target.value as ModelFormState["status"];
+          if (status === "enabled" && !verificationSource.trim()) setSourceFollowsProvider(true);
+          setForm({ ...form, status, verifiedAt: form.verifiedAt || (status === "enabled" ? toLocalInput(new Date()) : "") });
+        }}>
           <option value="enabled">启用</option>
           <option value="disabled">停用</option>
         </Select>

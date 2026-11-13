@@ -2,21 +2,38 @@
 import { useState } from "react";
 import { FormDrawer } from "../../components/FormDrawer";
 import { useToast } from "../../components/Toast";
-import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../../components/ui";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select } from "../../components/ui";
 import { ApiError, mutate, requestJSON } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
 import { useClientPage, useRemote } from "../../lib/hooks";
-import type { Model, ModelPolicy, Page } from "../../lib/types";
+import type { Model, ModelPolicy, Page, PolicyCandidate } from "../../lib/types";
 
 interface PolicyFormState {
   name: string;
   minContextTokens: string;
-  rules: string;
-  candidates: string[];
+  candidates: PolicyCandidate[];
 }
 
-const emptyPolicy: PolicyFormState = { name: "", minContextTokens: "1000000", rules: "{}", candidates: [] };
+const minimumContext = 1_000_000;
+const emptyPolicy: PolicyFormState = { name: "", minContextTokens: String(minimumContext), candidates: [] };
+
+function isEligibleModel(model: Model, minContext: number): boolean {
+  return model.kind === "chat" && model.status === "enabled" && model.context_window_tokens >= minContext
+    && Boolean(model.verified_at && model.verification_source?.trim());
+}
+
+function candidateRegion(candidate: PolicyCandidate): string | null {
+  const region = candidate.constraints?.data_region;
+  return region == null || typeof region === "string" ? (region ?? "").trim() : null;
+}
+
+function withRegion(candidate: PolicyCandidate, region: string): PolicyCandidate {
+  const constraints = { ...candidate.constraints };
+  if (region) constraints.data_region = region;
+  else delete constraints.data_region;
+  return { ...candidate, constraints };
+}
 
 // slotLabel 把候选位置翻译成主选/替补，避免用户理解“优先级数字”。
 function slotLabel(index: number): string {
@@ -40,8 +57,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
       ? {
           name: initial.name,
           minContextTokens: String(initial.min_context_tokens),
-          rules: JSON.stringify(initial.rules ?? {}, null, 2),
-          candidates: initial.candidates.map((candidate) => candidate.model_id),
+          candidates: initial.candidates,
         }
       : emptyPolicy;
   const [form, setForm] = useState(initialForm);
@@ -49,13 +65,21 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [addID, setAddID] = useState("");
-  const [advanced, setAdvanced] = useState(false);
+  const [advanced, setAdvanced] = useState(() => Boolean(initial?.candidates.some((candidate) => candidateRegion(candidate) !== "")));
+  const hasLegacyRules = Boolean(Object.keys(initial?.rules ?? {}).length);
 
   const modelByID = new Map(models.map((model) => [model.id, model]));
-  const minContext = Number(form.minContextTokens || 0);
+  const minContext = Number(form.minContextTokens);
+  const invalidMinContext = !Number.isSafeInteger(minContext) || minContext < minimumContext;
   const eligibleModels = models
-    .filter((model) => model.kind === "chat" && model.context_window_tokens >= minContext && model.verified_at)
-    .filter((model) => !form.candidates.includes(model.id));
+    .filter((model) => isEligibleModel(model, minContext))
+    .filter((model) => !form.candidates.some((candidate) => candidate.model_id === model.id));
+  const pendingModel = eligibleModels.find((model) => model.id === addID);
+  const invalidRegion = form.candidates.some((candidate) => {
+    const region = candidateRegion(candidate);
+    const model = modelByID.get(candidate.model_id);
+    return region === null || (region !== "" && Boolean(model) && model?.data_region !== region);
+  });
 
   const move = (index: number, delta: number) => {
     const next = [...form.candidates];
@@ -72,17 +96,11 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
     setBusy(true);
     setError(null);
     try {
-      let parsedRules: Record<string, unknown>;
-      try {
-        parsedRules = JSON.parse(form.rules || "{}") as Record<string, unknown>;
-      } catch {
-        throw new Error("高级规则不是合法 JSON；如果不需要，请保持 {}。");
-      }
       const body = {
         name: form.name.trim(),
         min_context_tokens: minContext,
-        rules: parsedRules,
-        candidates: form.candidates.map((modelID, index) => ({ model_id: modelID, priority: index + 1 })),
+        rules: initial?.rules ?? {},
+        candidates: form.candidates.map(({ model_id, constraints }, index) => ({ model_id, priority: index + 1, constraints })),
       };
       if (initial) {
         await mutate<ModelPolicy>(`/api/v1/model-policies/${initial.id}`, "PUT", body, crypto.randomUUID());
@@ -92,8 +110,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
       toast.show(initial ? "修改已保存" : "已创建规则", "success");
       onSaved();
     } catch (submitError) {
-      const message = submitError instanceof Error && submitError.message.includes("高级规则") ? submitError.message : describeError(submitError);
-      setError(message);
+      setError(describeError(submitError));
     } finally {
       setBusy(false);
     }
@@ -101,9 +118,9 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
 
   const summary = form.candidates.length === 0
     ? "还没有选择模型。至少加入一个主选模型才能创建规则。"
-    : `优先使用「${modelByID.get(form.candidates[0])?.remote_model_name ?? "主选模型"}」${
+    : `优先使用「${modelByID.get(form.candidates[0].model_id)?.remote_model_name ?? "主选模型"}」${
         form.candidates.length > 1
-          ? `；不可用时依次切换到 ${form.candidates.slice(1).map((id) => `「${modelByID.get(id)?.remote_model_name ?? id}」`).join("、")}`
+          ? `；不可用时依次切换到 ${form.candidates.slice(1).map(({ model_id }) => `「${modelByID.get(model_id)?.remote_model_name ?? model_id}」`).join("、")}`
           : ""
       }。`;
 
@@ -116,7 +133,7 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
       dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
       error={error}
       bodyClassName="grid-cols-1"
-      submitDisabled={form.candidates.length === 0}
+      submitDisabled={form.candidates.length === 0 || invalidMinContext}
       onSubmit={submit}
       onCancel={onCancel}
     >
@@ -128,13 +145,13 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <p className="text-sm font-medium text-ink">模型出场顺序</p>
-            <p className="mt-1 text-xs leading-5 text-muted">第 1 个是主选，其余是替补。拖动不方便时用“上移/下移”调整。</p>
+            <p className="mt-1 text-xs leading-5 text-muted">第 1 个是主选，其余依序替补。用「上移」「下移」调整顺序。</p>
           </div>
           <Badge tone="neutral">{form.candidates.length} 个候选</Badge>
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Select className="min-w-56 flex-1" value={addID} onChange={(event) => setAddID(event.target.value)} aria-label="选择要加入的模型">
+          <Select className="min-w-56 flex-1" value={pendingModel?.id ?? ""} onChange={(event) => setAddID(event.target.value)} aria-label="选择要加入的模型">
             <option value="">选择一个模型加入名单</option>
             {eligibleModels.map((model) => (
               <option key={model.id} value={model.id}>
@@ -145,18 +162,21 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
           <Button
             type="button"
             variant="secondary"
-            disabled={!addID}
+            disabled={!pendingModel || form.candidates.length >= 16}
             onClick={() => {
-              setForm({ ...form, candidates: [...form.candidates, addID] });
+              if (!pendingModel || form.candidates.length >= 16) return;
+              setForm({ ...form, candidates: [...form.candidates, { model_id: pendingModel.id }] });
               setAddID("");
             }}
           >
             加入名单
           </Button>
         </div>
-        {eligibleModels.length === 0 ? (
+        {form.candidates.length >= 16 ? (
+          <p className="mt-2 text-xs text-muted">最多可添加 16 个候选模型。</p>
+        ) : eligibleModels.length === 0 ? (
           <p className="mt-2 text-xs leading-5 text-muted">
-            没有可加入的模型。请先到“可用模型”登记已核验的生成模型，或降低最低上下文要求。
+            请在「可用模型」登记并启用已核验的生成模型，模型须达到当前最低上下文要求。
           </p>
         ) : null}
 
@@ -166,9 +186,9 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
           </div>
         ) : (
           <ol className="mt-3 flex flex-col gap-2">
-            {form.candidates.map((modelID, index) => {
+            {form.candidates.map(({ model_id: modelID }, index) => {
               const model = modelByID.get(modelID);
-              const eligible = model && model.kind === "chat" && model.context_window_tokens >= minContext && model.verified_at && model.status === "enabled";
+              const eligible = model && isEligibleModel(model, minContext);
               return (
                 <li key={modelID} className="flex flex-wrap items-center gap-3 rounded-[3px] border border-line bg-paper-raised px-3 py-2.5">
                   <span className="flex w-14 shrink-0 items-center justify-center rounded-[2px] border border-line-strong px-1 py-1 text-[11px] text-ink-soft">
@@ -203,17 +223,57 @@ function PolicyForm({ initial, models, onSaved, onCancel }: { initial: ModelPoli
         </p>
       </div>
 
-      <details open={advanced} onToggle={(event) => setAdvanced((event.target as HTMLDetailsElement).open)} className="rounded-[3px] border border-line bg-paper-raised px-4 py-3">
-        <summary className="cursor-pointer text-sm font-medium text-ink">高级选项（大多数情况不用改）</summary>
-        <div className="mt-4 grid gap-4 md:grid-cols-2">
-          <Field label="最低上下文 Token" hint="生成模型必须达到这个长度。默认 1,000,000，调低会放宽准入。">
-            <Input type="number" min={1} value={form.minContextTokens} onChange={(event) => setForm({ ...form, minContextTokens: event.target.value })} required />
+      <details open={advanced} onToggle={(event) => setAdvanced(event.currentTarget.open)} className="rounded-lg border border-line bg-paper-raised px-4 py-3">
+        <summary className="cursor-pointer rounded text-sm font-medium text-ink">高级选项</summary>
+        <div className="mt-4 space-y-4">
+          <Field label="最低上下文（Token）" hint="每个候选模型都必须达到此值，最低为 1,000,000。" error={invalidMinContext ? "请输入不小于 1,000,000 的整数。" : null}>
+            <Input type="number" min={minimumContext} value={form.minContextTokens} onChange={(event) => setForm({ ...form, minContextTokens: event.target.value })} required />
           </Field>
-          <Field label="附加规则 JSON（可选）" hint="用于数据区域等特殊约束。不确定就保持 {}。">
-            <Textarea className="min-h-28 font-mono text-xs" value={form.rules} onChange={(event) => setForm({ ...form, rules: event.target.value })} spellCheck={false} />
-          </Field>
+          <section aria-label="候选模型数据区域" className="space-y-3 border-t border-line pt-4">
+            <div>
+              <h3 className="text-sm font-semibold">候选模型数据区域</h3>
+              <p className="mt-1 text-xs leading-5 text-muted">默认不限。选择区域后，模型登记的数据区域必须与之匹配，才能发布和执行。</p>
+            </div>
+            {!form.candidates.length ? <p className="text-xs text-muted">加入候选模型后，可为每个候选设置区域。</p> : null}
+            {form.candidates.map((candidate, index) => {
+              const model = modelByID.get(candidate.model_id);
+              const region = candidateRegion(candidate);
+              const modelRegion = model?.data_region;
+              const mismatch = region === null || (region !== "" && Boolean(model) && region !== modelRegion);
+              return (
+                <Field
+                  key={candidate.model_id}
+                  label={`${slotLabel(index)} · ${model?.remote_model_name ?? candidate.model_id}`}
+                  error={mismatch ? "现有区域约束与模型登记信息不匹配，请重新选择。" : null}
+                >
+                  <Select value={mismatch ? "__invalid__" : region ?? ""} onChange={(event) => {
+                    const nextRegion = event.target.value;
+                    setForm((current) => ({ ...current, candidates: current.candidates.map((item) =>
+                      item.model_id === candidate.model_id ? withRegion(item, nextRegion) : item,
+                    ) }));
+                  }}>
+                    {mismatch ? <option value="__invalid__" disabled>{region || "无效的区域设置"}</option> : null}
+                    <option value="">不限区域</option>
+                    {!model && region ? <option value={region}>仅限 {region}（现有约束）</option> : null}
+                    {modelRegion ? <option value={modelRegion}>仅限 {modelRegion}</option> : null}
+                  </Select>
+                </Field>
+              );
+            })}
+          </section>
+          {hasLegacyRules ? (
+            <details className="rounded-lg border border-line p-3">
+              <summary className="cursor-pointer text-sm text-muted">历史附加规则</summary>
+              <p className="mt-2 text-xs text-muted">以下 JSON 会随策略保存，当前路由不会读取这些字段。</p>
+              <pre className="mt-2 max-h-40 overflow-auto rounded bg-paper p-2 font-mono text-xs">{JSON.stringify(initial?.rules, null, 2)}</pre>
+            </details>
+          ) : null}
         </div>
       </details>
+      {invalidMinContext && !advanced ? (
+        <p role="alert" className="text-sm text-rust">请在高级选项将最低上下文设为不小于 1,000,000 的整数。</p>
+      ) : null}
+      {invalidRegion ? <p className="text-sm text-ochre">可以保存草稿。发布前请修正高级选项中的数据区域约束。</p> : null}
 
     </FormDrawer>
   );
@@ -316,7 +376,7 @@ export default function PoliciesPage() {
   };
 
   const modelNames = new Map((models.data?.items ?? []).map((model) => [model.id, model.remote_model_name]));
-  const hasModels = (models.data?.items ?? []).some((model) => model.kind === "chat" && model.verified_at);
+  const hasModels = (models.data?.items ?? []).some((model) => isEligibleModel(model, minimumContext));
 
   return (
     <div className="flex flex-col gap-6">
@@ -380,17 +440,20 @@ export default function PoliciesPage() {
                   {viewing.candidates.map((candidate, index) => (
                     <li key={candidate.model_id} className="flex items-center justify-between gap-2 rounded-[2px] bg-paper-raised px-2 py-1.5">
                       <span className="text-ink-soft">{slotLabel(index)}</span>
-                      <span className="truncate text-ink">{modelNames.get(candidate.model_id) ?? candidate.model_id}</span>
+                      <span className="min-w-0 truncate text-ink">{modelNames.get(candidate.model_id) ?? candidate.model_id}</span>
+                      <span className="shrink-0 text-muted">{candidateRegion(candidate) === null ? "无效区域" : candidateRegion(candidate) || "不限区域"}</span>
                     </li>
                   ))}
                 </ol>
               )}
             </div>
           </div>
-          <div className="mt-4">
-            <p className="text-xs font-medium text-ink">附加规则 JSON</p>
-            <pre className="mt-1 max-h-64 overflow-auto rounded-[3px] border border-line bg-paper-deep/30 p-3 font-mono text-[11px] text-ink-soft">{JSON.stringify(viewing.rules ?? {}, null, 2)}</pre>
-          </div>
+          {Object.keys(viewing.rules ?? {}).length ? (
+            <details className="mt-4 rounded-lg border border-line p-3">
+              <summary className="cursor-pointer text-xs font-medium text-ink">历史附加规则（当前路由不会读取）</summary>
+              <pre className="mt-2 max-h-64 overflow-auto rounded bg-paper p-3 font-mono text-xs">{JSON.stringify(viewing.rules, null, 2)}</pre>
+            </details>
+          ) : null}
         </Card>
       ) : null}
 

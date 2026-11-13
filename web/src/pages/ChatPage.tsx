@@ -1,14 +1,13 @@
 // 会话对话：发送消息、创建 Run、消费 SSE 增量、审批工具并展示执行时间线。
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Icon } from "../components/Icon";
-import { SafeMarkdown } from "../components/SafeMarkdown";
+import { MessageBubble, formatFileSize } from "../components/ChatMessage";
 import { useToast } from "../components/Toast";
-import { ActionLink, Badge, Button, Card, ErrorBanner, LoadingState, PageHeader, cn } from "../components/ui";
+import { ActionLink, Badge, Button, ConfirmDialog, ErrorBanner, LoadingState, cn } from "../components/ui";
 import { downloadAttachment, mutate, requestJSON, streamRunEvents, uploadAttachment } from "../lib/api";
 import { describeError } from "../lib/errors";
-import { formatDateTime, formatRelative, formatSessionSource, statusLabel, statusTone } from "../lib/format";
+import { formatDateTime, formatSessionSource, statusLabel, statusTone } from "../lib/format";
 import { useRemote } from "../lib/hooks";
 import type { Agent, Attachment, Message, Page, Run, RunEvent, Session, ToolApproval } from "../lib/types";
 
@@ -35,20 +34,6 @@ function modeLabel(mode: string | undefined): string {
 // asString 安全提取事件载荷中的字符串字段。
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-// toolCallNames 从消息的工具调用记录中提取名称，用于气泡内展示。
-function toolCallNames(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.flatMap((item) => {
-    if (!item || typeof item !== "object") {
-      return [];
-    }
-    const name = (item as Record<string, unknown>).name;
-    return typeof name === "string" && name.length > 0 ? [name] : [];
-  });
 }
 
 // approvalFields 把审批参数转成可读的键值对，避免整段 JSON 难以扫读。
@@ -92,17 +77,6 @@ interface PendingAttachment {
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 5;
 
-// formatFileSize 把字节数转换为易读大小。
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 interface TimelineEntry {
   key: string;
   label: string;
@@ -123,52 +97,64 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export default function ChatPage() {
   const { sessionId = "" } = useParams();
+  return <ChatWorkspace key={sessionId} sessionId={sessionId} />;
+}
+
+function ChatWorkspace({ sessionId }: { sessionId: string }) {
   const toast = useToast();
   const session = useRemote(() => requestJSON<Session>(`/api/v1/sessions/${sessionId}`), [sessionId]);
   const messages = useRemote(() => requestJSON<Page<Message>>(`/api/v1/sessions/${sessionId}/messages?limit=100`), [sessionId]);
   // 保留已归档助手，仅用于展示会话绑定的助手名称；发送能力仍要求已发布状态。
   const agents = useRemote(() => requestJSON<Page<Agent>>("/api/v1/agents?limit=100&include_archived=true"), []);
   const messagesReload = messages.reload;
+  const messagesDataRef = useRef<Page<Message> | null>(null);
+  useLayoutEffect(() => { messagesDataRef.current = messages.data; }, [messages.data]);
   // 长会话按游标继续加载更早消息，避免只显示最近 100 条。
   const [olderMessages, setOlderMessages] = useState<Message[]>([]);
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [olderEnded, setOlderEnded] = useState(false);
   const [olderLoading, setOlderLoading] = useState(false);
-  useEffect(() => {
-    setOlderMessages([]);
-    setOlderCursor(null);
-    setOlderEnded(false);
-  }, [sessionId]);
-
   const [runsVersion, setRunsVersion] = useState(0);
   const runs = useRemote(() => requestJSON<Page<Run>>(`/api/v1/sessions/${sessionId}/runs?limit=20`), [sessionId, runsVersion]);
 
   const [draft, setDraft] = useState("");
+  const [replacementDraft, setReplacementDraft] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const sendingRef = useRef(false);
+  const messageRequest = useRef<{ content: string; attachmentIDs: string[]; key: string } | null>(null);
+  const [pendingRun, setPendingRun] = useState<{ messageID: string; key: string } | null>(null);
+  const [sentMessages, setSentMessages] = useState<Message[]>([]);
+  const [liveUntilReload, setLiveUntilReload] = useState<{ page: Page<Message> | null } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   // removedAttachmentKeys 记录上传完成前已被用户移除的文件，用于回收服务端对象。
   const removedAttachmentKeys = useRef<Set<string>>(new Set());
   const [activeRun, setActiveRun] = useState<Run | null>(null);
+  const activeRunID = useRef<string | null>(null);
+  useLayoutEffect(() => { activeRunID.current = activeRun?.id ?? null; }, [activeRun?.id]);
   const [liveMessages, setLiveMessages] = useState<LiveMessage[]>([]);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
   const [connection, setConnection] = useState<"idle" | "connecting" | "streaming" | "reconnecting" | "closed">("idle");
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [streamAttempt, setStreamAttempt] = useState(0);
+  const streamCursor = useRef({ runID: "", seq: 0 });
   const [approvals, setApprovals] = useState<ToolApproval[]>([]);
   const [deciding, setDeciding] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [showJump, setShowJump] = useState(false);
-  // messagesExpanded 控制消息区放大阅读，方便查看长工具结果。
-  const [messagesExpanded, setMessagesExpanded] = useState(false);
-  const readingRef = useRef<HTMLDialogElement>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(() => window.matchMedia?.("(min-width: 1280px)")?.matches ?? false);
-  const inspectorRef = useRef<HTMLElement>(null);
+  const [wideReading, setWideReading] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const inspectorRef = useRef<HTMLDialogElement>(null);
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
+  const inspectorBackdropPress = useRef(false);
+  const [cancelling, setCancelling] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  const messageListRef = useRef<HTMLDivElement | null>(null);
-  const transcriptScrollTopRef = useRef(0);
+  const messageListRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   // stickToBottomRef 记录用户是否停留在底部，避免新内容把正在翻历史的用户拽回去。
   const stickToBottomRef = useRef(true);
 
@@ -191,13 +177,15 @@ export default function ChatPage() {
     return agents.data?.items.find((item) => item.id === target) ?? null;
   }, [agents.data, session.data?.agent_id]);
 
-  const canRun = Boolean(session.data?.agent_id && agent && agent.status === "published");
+  const canRun = session.data?.status === "active" && agent?.status === "published";
+  const canCompose = canRun && !sending && !pendingRun;
+  const canAttach = canCompose && pendingAttachments.length < MAX_ATTACHMENTS_PER_MESSAGE;
   const runActive = activeRun !== null && !isTerminal(activeRun.status);
 
   const refreshApprovals = useCallback(async (runID: string) => {
     try {
       const page = await requestJSON<{ items: ToolApproval[] }>(`/api/v1/runs/${runID}/approvals`);
-      setApprovals(page.items);
+      if (activeRunID.current === runID) setApprovals(page.items);
     } catch {
       // 审批读取失败不阻断对话，错误由时间线提示。
     }
@@ -212,10 +200,13 @@ export default function ChatPage() {
     const controller = new AbortController();
     abortRef.current = controller;
     let cancelled = false;
-    let lastSeq = 0;
-    setLiveMessages([]);
-    setTimeline([]);
-    setApprovals([]);
+    if (streamCursor.current.runID !== runID) {
+      streamCursor.current = { runID, seq: 0 };
+      setLiveMessages([]);
+      setLiveUntilReload(null);
+      setTimeline([]);
+      setApprovals([]);
+    }
     setStreamError(null);
     setConnection("connecting");
     void refreshApprovals(runID);
@@ -430,14 +421,16 @@ export default function ChatPage() {
         try {
           await streamRunEvents(runID, {
             signal: controller.signal,
-            lastEventId: lastSeq,
-            onOpen: () => setConnection("streaming"),
+            lastEventId: streamCursor.current.seq,
+            onOpen: () => {
+              setConnection("streaming");
+              setStreamError(null);
+            },
             onEvent: (event) => {
+              if (cancelled) return;
               if (event.seq > 0) {
-                if (event.seq <= lastSeq) {
-                  return;
-                }
-                lastSeq = event.seq;
+                if (event.seq <= streamCursor.current.seq) return;
+                streamCursor.current.seq = event.seq;
               }
               handleEvent(event);
             },
@@ -453,13 +446,14 @@ export default function ChatPage() {
         }
         try {
           const current = await requestJSON<Run>(`/api/v1/runs/${runID}`);
+          if (cancelled || controller.signal.aborted) return;
           setActiveRun(current);
           if (isTerminal(current.status)) {
             setConnection("closed");
-            void refreshApprovals(runID);
-            // 无论成功、失败还是取消都重新拉取消息并清空临时流，避免与已落库消息重复。
+            setStreamError(null);
+            // 保留临时流直到持久化消息返回，避免回复在刷新时消失。
+            setLiveUntilReload({ page: messagesDataRef.current });
             messagesReload();
-            setLiveMessages([]);
             setRunsVersion((value) => value + 1);
             return;
           }
@@ -478,62 +472,59 @@ export default function ChatPage() {
       controller.abort();
       abortRef.current = null;
     };
-  }, [activeRun?.id, messagesReload, refreshApprovals]);
+  }, [activeRun?.id, messagesReload, refreshApprovals, streamAttempt]);
 
-  // uploadFiles 逐个上传附件，超限或失败的文件在输入区内提示，不阻塞其它文件。
+  const updateAttachments = (update: (items: PendingAttachment[]) => PendingAttachment[]) => {
+    const next = update(pendingAttachmentsRef.current);
+    pendingAttachmentsRef.current = next;
+    setPendingAttachments(next);
+  };
+
+  // 一次性预留整批附件的名额，文件选择和粘贴并发时也遵守数量限制。
   const uploadFiles = async (files: File[]) => {
-    const room = MAX_ATTACHMENTS_PER_MESSAGE - pendingAttachments.length;
-    if (room <= 0) {
-      setSendError(`每条消息最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件。`);
-      return;
-    }
-    const accepted = files.slice(0, room);
-    if (files.length > room) {
-      setSendError(`超出数量上限，只会上传前 ${room} 个文件。`);
-    }
-    for (const file of accepted) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        setSendError(`${file.name} 超过 20MB，未上传。`);
-        continue;
+    if (!canCompose || sendingRef.current) return;
+    const room = MAX_ATTACHMENTS_PER_MESSAGE - pendingAttachmentsRef.current.length;
+    const rejected: string[] = [];
+    const batch = files.filter((file) => {
+      if (!file.size || file.size > MAX_ATTACHMENT_BYTES) {
+        rejected.push(`${file.name}（${file.size ? "超过 20 MB" : "空文件"}）`);
+        return false;
       }
-      if (file.size === 0) {
-        setSendError(`${file.name} 是空文件，未上传。`);
-        continue;
-      }
-      const key = crypto.randomUUID();
-      setPendingAttachments((current) => [...current, { key, name: file.name, size: file.size, status: "uploading" }]);
+      return true;
+    }).slice(0, room).map((file) => ({ file, key: crypto.randomUUID() }));
+
+    const countExceeded = files.length - rejected.length > room;
+    setSendError([
+      rejected.length ? `未上传：${rejected.join("、")}` : null,
+      countExceeded ? `每条消息最多添加 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件。` : null,
+    ].filter(Boolean).join(" ") || null);
+
+    updateAttachments((current) => [...current, ...batch.map(({ file, key }) => ({
+      key, name: file.name, size: file.size, status: "uploading" as const,
+    }))]);
+    for (const { file, key } of batch) {
+      if (removedAttachmentKeys.current.delete(key)) continue;
       try {
         const attachment = await uploadAttachment<Attachment>(`/api/v1/sessions/${sessionId}/attachments`, file);
-        if (removedAttachmentKeys.current.has(key)) {
-          removedAttachmentKeys.current.delete(key);
-          // 上传完成前用户已移除该文件：立即删除服务端对象，避免占用未绑定附件配额。
-          try {
-            await requestJSON<void>(`/api/v1/attachments/${encodeURIComponent(attachment.id)}`, { method: "DELETE" });
-          } catch {
-            // 删除失败由服务端配额回收兜底，不阻塞其它附件。
-          }
+        if (removedAttachmentKeys.current.delete(key)) {
+          await requestJSON<void>(`/api/v1/attachments/${encodeURIComponent(attachment.id)}`, { method: "DELETE" });
         } else {
-          setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "ready", id: attachment.id } : item)));
+          updateAttachments((current) => current.map((item) => item.key === key ? { ...item, status: "ready", id: attachment.id } : item));
         }
       } catch (failure) {
-        const message = describeError(failure);
-        setPendingAttachments((current) => current.map((item) => (item.key === key ? { ...item, status: "failed", error: message } : item)));
+        updateAttachments((current) => current.map((item) => item.key === key ? { ...item, status: "failed", error: describeError(failure) } : item));
       }
     }
   };
 
-  // removePendingAttachment 从输入区移除附件，并回收已上传但未发送的服务端文件。
   const removePendingAttachment = async (key: string) => {
-    const target = pendingAttachments.find((item) => item.key === key);
-    if (target?.status === "uploading") {
-      removedAttachmentKeys.current.add(key);
-    }
-    setPendingAttachments((current) => current.filter((item) => item.key !== key));
+    const target = pendingAttachmentsRef.current.find((item) => item.key === key);
+    if (target?.status === "uploading") removedAttachmentKeys.current.add(key);
+    updateAttachments((current) => current.filter((item) => item.key !== key));
     if (target?.id) {
       try {
         await requestJSON<void>(`/api/v1/attachments/${encodeURIComponent(target.id)}`, { method: "DELETE" });
       } catch (failure) {
-        // 附件已从输入区移除；服务端删除失败不阻塞继续编辑，错误由页面提示。
         setSendError(describeError(failure));
       }
     }
@@ -549,77 +540,91 @@ export default function ChatPage() {
     }
   };
 
-  const send = async (contentOverride?: string) => {
-    const content = (contentOverride ?? draft).trim();
-    const readyAttachments = pendingAttachments.filter((item) => item.status === "ready" && item.id);
-    if (pendingAttachments.some((item) => item.status === "uploading")) {
-      setSendError("附件仍在上传，请稍候再发送。");
+  const send = async () => {
+    if (sendingRef.current || runActive || !canRun) return;
+    const attachments = pendingAttachmentsRef.current;
+    const attachmentIDs = attachments.flatMap((item) => item.status === "ready" && item.id ? [item.id] : []);
+    const content = draft.trim();
+    if (!pendingRun && !content && attachments.length === 0) return;
+    if (!pendingRun && attachments.some((item) => item.status !== "ready")) {
+      setSendError("请等待上传完成，或移除上传失败的附件。");
       return;
     }
-    if ((!content && readyAttachments.length === 0) || sending || runActive) {
-      return;
-    }
-    if (!canRun) {
-      setSendError("这个对话没有绑定可用助手。请先在助手页发布一个助手，再新建对话。");
-      return;
-    }
+    sendingRef.current = true;
     setSending(true);
     setSendError(null);
     setActionError(null);
-    // 发送后强制跟随新消息，即使之前正在向上翻阅历史。
     stickToBottomRef.current = true;
     setShowJump(false);
     try {
-      const message = await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", {
-        // 仅附件时补一句正文，保证消息可读且执行器有明确任务描述。
-        content: content || "我上传了附件，请结合附件内容回答。",
-        attachment_ids: readyAttachments.map((item) => item.id),
-      }, crypto.randomUUID());
-      // 重试上一轮时保留输入框内容，避免用户正在编辑的新内容被清空。
-      if (contentOverride === undefined) {
+      let runRequest = pendingRun;
+      if (!runRequest) {
+        const messageContent = content || "我上传了附件，请结合附件内容回答。";
+        let request = messageRequest.current;
+        if (!request || request.content !== messageContent || request.attachmentIDs.join() !== attachmentIDs.join()) {
+          request = { content: messageContent, attachmentIDs, key: crypto.randomUUID() };
+          messageRequest.current = request;
+        }
+        const message = await mutate<Message>(`/api/v1/sessions/${sessionId}/messages`, "POST", {
+          content: request.content,
+          attachment_ids: request.attachmentIDs,
+        }, request.key);
+        messageRequest.current = null;
+        setSentMessages((current) => [...current, message]);
         setDraft("");
+        updateAttachments(() => []);
+        runRequest = { messageID: message.id, key: crypto.randomUUID() };
+        setPendingRun(runRequest);
+        messagesReload();
       }
-      setPendingAttachments([]);
-      messagesReload();
+
       const run = await mutate<Run>(`/api/v1/sessions/${sessionId}/runs`, "POST", {
         agent_id: agent?.id ?? null,
         agent_version: agent?.version ?? null,
         mode: agent?.mode ?? "react",
-        trigger_message_id: message.id,
-      }, crypto.randomUUID());
+        trigger_message_id: runRequest.messageID,
+      }, runRequest.key);
+      setPendingRun(null);
       setActiveRun(run);
     } catch (failure) {
       setSendError(describeError(failure));
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
 
   const cancel = async () => {
-    if (!activeRun) {
-      return;
-    }
+    if (!activeRun || cancelling) return;
+    setCancelling(true);
     setActionError(null);
     try {
       const updated = await mutate<Run>(`/api/v1/runs/${activeRun.id}/cancel`, "POST", undefined, crypto.randomUUID());
       setActiveRun(updated);
-      abortRef.current?.abort();
-      messagesReload();
+      if (isTerminal(updated.status)) {
+        abortRef.current?.abort();
+        setConnection("closed");
+        setStreamError(null);
+        setLiveUntilReload({ page: messagesDataRef.current });
+        messagesReload();
+        setRunsVersion((value) => value + 1);
+      }
     } catch (failure) {
       setActionError(describeError(failure));
+    } finally {
+      setCancelling(false);
     }
   };
 
   const decide = async (approval: ToolApproval, decision: "approve" | "deny") => {
-    if (!activeRun) {
-      return;
-    }
+    if (!activeRun || deciding) return;
     setDeciding(approval.id);
     setActionError(null);
     try {
       await mutate<ToolApproval>(`/api/v1/runs/${activeRun.id}/approvals/${approval.id}`, "POST", { decision }, crypto.randomUUID());
       await refreshApprovals(activeRun.id);
       const current = await requestJSON<Run>(`/api/v1/runs/${activeRun.id}`);
+      if (activeRunID.current !== activeRun.id) return;
       setActiveRun(current);
       toast.show(decision === "approve" ? "已批准，助手继续执行" : "已拒绝该工具调用", decision === "approve" ? "success" : "info");
     } catch (failure) {
@@ -652,81 +657,93 @@ export default function ChatPage() {
     }
   };
 
-  const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
-  const persistedMessages = [...olderMessages, ...(messages.data?.items ?? []).slice().reverse()];
-
-  // 最近一条用户消息用于失败后的“重试本轮”和“编辑后重发”。
-  const lastUserContent = useMemo(() => {
-    for (let index = persistedMessages.length - 1; index >= 0; index -= 1) {
-      if (persistedMessages[index].role === "user") {
-        return persistedMessages[index].content;
-      }
+  const pendingApprovals = runActive ? approvals.filter((approval) => approval.status === "pending") : [];
+  const persistedMessages = useMemo(() => {
+    const unique = new Map<string, Message>();
+    for (const message of [...olderMessages, ...(messages.data?.items ?? []).slice().reverse()]) {
+      unique.set(message.id, message);
     }
-    return null;
-  }, [persistedMessages]);
+    for (const message of sentMessages) {
+      if (!unique.has(message.id)) unique.set(message.id, message);
+    }
+    return [...unique.values()];
+  }, [olderMessages, messages.data, sentMessages]);
 
+  useEffect(() => {
+    if (!messages.data) return;
+    const savedIDs = new Set(messages.data.items.map((message) => message.id));
+    setSentMessages((current) => current.some((message) => savedIDs.has(message.id))
+      ? current.filter((message) => !savedIDs.has(message.id))
+      : current);
+  }, [messages.data]);
+  const liveVisible = liveUntilReload === null || liveUntilReload.page === messages.data ? liveMessages : [];
+  const hasMessages = persistedMessages.length + liveVisible.length > 0;
+  const lastUserContent = persistedMessages.slice().reverse().find((message) => message.role === "user")?.content;
   const latestRun = runs.data?.items[0] ?? null;
-  // 当前没有运行中的任务时，才把失败结果展示在主对话区；优先使用本轮状态，避免历史列表短暂滞后。
-  const failedRun = runActive
-    ? null
-    : activeRun
-      ? (activeRun.status === "failed" ? activeRun : null)
-      : (latestRun?.status === "failed" ? latestRun : null);
+  const failedRun = !runActive && (activeRun ?? latestRun)?.status === "failed" ? (activeRun ?? latestRun) : null;
 
-  useEffect(() => {
-    if (messagesExpanded && !readingRef.current?.open) {
-      readingRef.current?.showModal();
-    }
-    const log = messageListRef.current;
-    if (log) {
-      log.scrollTop = stickToBottomRef.current ? log.scrollHeight : transcriptScrollTopRef.current;
-    }
-  }, [messagesExpanded]);
+  useLayoutEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) return;
+    composer.style.height = "auto";
+    composer.style.height = `${composer.scrollHeight}px`;
+  }, [draft]);
 
-  useEffect(() => {
-    if (inspectorOpen && window.matchMedia?.("(max-width: 1279px)")?.matches) {
-      inspectorRef.current?.focus();
-    }
+  // 内容变化、窗口缩放和输入框增高都只在贴近底部时继续跟随。
+  useLayoutEffect(() => {
+    const list = messageListRef.current;
+    const transcript = transcriptRef.current;
+    if (!list || !transcript) return;
+    const keepAtBottom = () => {
+      if (stickToBottomRef.current) list.scrollTop = list.scrollHeight;
+    };
+    keepAtBottom();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(keepAtBottom);
+    observer.observe(list);
+    observer.observe(transcript);
+    return () => observer.disconnect();
+  }, []);
+
+  useLayoutEffect(() => {
+    const list = messageListRef.current;
+    if (list && stickToBottomRef.current) list.scrollTop = list.scrollHeight;
+  }, [persistedMessages, liveMessages, runActive, pendingApprovals.length]);
+
+  useLayoutEffect(() => {
+    const inspector = inspectorRef.current;
+    if (!inspectorOpen || !inspector) return;
+    inspector.showModal();
+    return () => {
+      inspector.close();
+      inspectorToggleRef.current?.focus({ preventScroll: true });
+    };
   }, [inspectorOpen]);
 
-  // 新内容到达时只在用户停留在底部才自动滚动，向上翻阅历史时不打断阅读。
-  useEffect(() => {
-    const element = messageListRef.current;
-    if (!element) {
-      return;
-    }
-    if (stickToBottomRef.current) {
-      element.scrollTop = element.scrollHeight;
-      setShowJump(false);
-      return;
-    }
-    if (persistedMessages.length + liveMessages.length > 0) {
-      setShowJump(true);
-    }
-  }, [persistedMessages.length, liveMessages, runActive]);
-
-  // scrollToLatest 主动回到底部，并恢复自动跟随。
   const scrollToLatest = () => {
-    const element = messageListRef.current;
-    if (!element) {
-      return;
-    }
-    element.scrollTop = element.scrollHeight;
+    const list = messageListRef.current;
+    if (!list) return;
     stickToBottomRef.current = true;
+    list.scrollTop = list.scrollHeight;
     setShowJump(false);
+    list.focus({ preventScroll: true });
   };
 
-  // onMessageScroll 根据距底部距离切换自动跟随状态。
   const onMessageScroll = () => {
-    const element = messageListRef.current;
-    if (!element) {
+    const list = messageListRef.current;
+    if (!list) return;
+    const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight <= 56;
+    stickToBottomRef.current = nearBottom;
+    setShowJump(!nearBottom && hasMessages);
+  };
+
+  const editMessage = (content: string) => {
+    if (draft.trim() && draft !== content) {
+      setReplacementDraft(content);
       return;
     }
-    transcriptScrollTopRef.current = element.scrollTop;
-    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    const nearBottom = distance <= 48;
-    stickToBottomRef.current = nearBottom;
-    setShowJump(!nearBottom && persistedMessages.length + liveMessages.length > 0);
+    setDraft(content);
+    composerRef.current?.focus({ preventScroll: true });
   };
 
   const copyMessage = async (key: string, content: string) => {
@@ -739,606 +756,372 @@ export default function ChatPage() {
     }
   };
 
-  return (
-    <div className="flex flex-col gap-6">
-      <div>
-        <ActionLink to="/sessions" variant="ghost" size="sm" className="-ml-2 mb-2">
-          <Icon name="back" className="size-4" /> 返回对话
-        </ActionLink>
-        <PageHeader
-          title={session.data?.title ?? (session.loading ? "加载对话…" : "对话")}
-          description={session.data ? `${statusLabel(session.data.status)} · 来自${formatSessionSource(session.data.source)} · 最近消息 ${formatRelative(session.data.last_message_at)}` : undefined}
-          actions={
-            <Button ref={inspectorToggleRef} variant="secondary" aria-expanded={inspectorOpen} aria-controls="chat-inspector" onClick={() => setInspectorOpen((open) => !open)}>
-              <Icon name="panel" />
-              {inspectorOpen ? "收起运行详情" : "运行详情"}
-            </Button>
-          }
-        />
-      </div>
-      {session.error ? <ErrorBanner message={session.error} onRetry={session.reload} /> : null}
-      {sendError ? <ErrorBanner message={sendError} /> : null}
-      {actionError ? <ErrorBanner message={actionError} /> : null}
-      {streamError ? <ErrorBanner message={`事件流中断：${streamError}`} /> : null}
+  const threadWidth = wideReading ? "max-w-[92rem]" : "max-w-[70rem]";
+  const approvalNeeded = pendingApprovals.length > 0;
+  const sendDisabled = !canRun || sending || (!pendingRun && (
+    pendingAttachments.some((item) => item.status !== "ready")
+    || (!draft.trim() && pendingAttachments.length === 0)
+  ));
+  const composerPlaceholder = session.loading || agents.loading
+    ? "正在加载对话…"
+    : session.data?.status === "archived"
+      ? "此对话已归档"
+      : !canRun
+        ? "当前没有可用的助手"
+        : pendingRun
+          ? "消息已保存，重试启动后可继续"
+          : "给助手发消息…";
 
-      <div className={cn("grid gap-4 xl:items-start", inspectorOpen && "xl:grid-cols-[minmax(0,1fr)_minmax(0,320px)]")}>
-      <Card
-        title={agent?.name ?? "对话"}
-        description={canRun ? modeLabel(agent?.mode) : session.loading ? undefined : "没有可用助手，当前仅可查看消息。"}
-        actions={
-          <>
-            {runActive ? <Badge tone="warning">正在处理</Badge> : null}
-            <Button
-              size="sm"
-              variant="secondary"
-              aria-haspopup="dialog"
-              onClick={() => setMessagesExpanded(true)}
-            >
-              <Icon name="expand" className="size-4" /> 放大阅读
-            </Button>
-          </>
-        }
-      >
-        {(() => {
-          // 普通和放大视图共享消息渲染，避免同时维护两份日志。
-          const log = (
-            <div
-              ref={messageListRef}
-              className={cn(
-                "flex flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5",
-                messagesExpanded
-                  ? "min-h-0 flex-1 overscroll-contain bg-paper"
-                  : "max-h-[max(21rem,calc(100dvh-25rem))] min-h-[19rem] rounded-xl border border-line bg-paper/65 sm:min-h-[22rem]",
-              )}
-              role="log"
-              aria-label="消息记录"
-              aria-live="polite"
-              tabIndex={0}
-              onScroll={onMessageScroll}
-            >
-          {messages.error ? (
-            <ErrorBanner message={messages.error} onRetry={messages.reload} />
-          ) : messages.loading ? (
-            <LoadingState label="加载消息" />
-          ) : persistedMessages.length === 0 && liveMessages.length === 0 ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-5 py-8 text-center">
-              <span className="grid size-14 place-items-center rounded-2xl border border-accent/30 bg-accent-soft text-accent">
-                <Icon name="agent" className="size-7" />
-              </span>
-              <div>
-                <p className="break-words text-lg font-semibold text-ink">{canRun ? "你想完成什么？" : "还没有消息"}</p>
-              </div>
-              {canRun ? (
-                <div className="flex w-full max-w-xl flex-wrap justify-center gap-2">
-                  {["帮我梳理这段需求", "把材料拆成待办", "解释一下这个报错"].map((prompt) => (
-                    <button
-                      key={prompt}
-                      type="button"
-                      onClick={() => {
-                        setDraft(prompt);
-                        document.getElementById("chat-composer")?.focus();
-                      }}
-                      className="inline-flex items-center gap-2 rounded-lg border border-line bg-paper-raised px-3 py-2.5 text-left text-xs leading-5 text-ink-soft transition-colors hover:border-accent/60 hover:text-accent"
-                    >
-                      {prompt} <Icon name="arrow" className="size-3.5 shrink-0 text-accent" />
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-xs leading-5 text-muted">请先在助手页发布一个助手，再新建绑定该助手的对话。</p>
-              )}
-            </div>
-          ) : (
-            <>
-              {!olderEnded && (olderCursor || messages.data?.next_cursor) ? (
-                <div className="flex justify-center py-2">
-                  <Button size="sm" variant="secondary" loading={olderLoading} onClick={() => void loadOlderMessages()}>
-                    加载更早消息
-                  </Button>
-                </div>
-              ) : null}
-              {persistedMessages.map((message) => (
-                <MessageBubble
-                  key={message.id}
-                  messageKey={message.id}
-                  role={message.role}
-                  content={message.content}
-                  toolCalls={message.tool_calls}
-                  attachments={message.attachments}
-                  onDownloadAttachment={downloadMessageAttachment}
-                  createdAt={message.created_at}
-                  copied={copiedKey === message.id}
-                  onCopy={copyMessage}
-                />
-              ))}
-              {liveMessages.map((message) => (
-                <MessageBubble
-                  key={message.key}
-                  messageKey={message.key}
-                  role={message.role}
-                  content={message.content}
-                  toolCalls={message.toolCalls}
-                  name={message.name}
-                  live
-                  copied={copiedKey === message.key}
-                  onCopy={copyMessage}
-                />
-              ))}
-            </>
-          )}
-          {failedRun ? (
-            <div role="alert" className="rounded-[3px] border border-rust bg-rust-soft/60 px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-sm font-medium text-rust">本轮处理失败</p>
-                <Link to={`/runs/${failedRun.id}`} className="text-xs text-accent underline underline-offset-2">
-                  查看完整过程
-                </Link>
-              </div>
-              <p className="mt-1 break-all text-xs leading-5 text-rust">
-                {failedRun.error_code ? `${failedRun.error_code}：` : ""}{failedRun.error_message || "未返回具体原因，可打开运行详情查看执行步骤。"}
-              </p>
-              {lastUserContent ? (
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button size="sm" onClick={() => void send(lastUserContent)} disabled={!canRun || runActive || sending}>
-                    重试本轮
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => {
-                      setDraft(lastUserContent);
-                      document.getElementById("chat-composer")?.focus();
-                    }}
-                  >
-                    编辑后重发
-                  </Button>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-          {runActive ? (
-            <p className="flex items-center gap-2 text-xs text-muted" role="status">
-              <span className="flex gap-1" aria-hidden>
-                <span className="size-1.5 animate-bounce rounded-full bg-accent [animation-delay:-0.2s]" />
-                <span className="size-1.5 animate-bounce rounded-full bg-accent [animation-delay:-0.1s]" />
-                <span className="size-1.5 animate-bounce rounded-full bg-accent" />
-              </span>
-              助手正在处理第 {activeRun?.current_step_seq || 1} 步…
+  return (
+    <section className="flex min-h-0 flex-1 flex-col" aria-label="会话">
+      <header className="flex min-h-14 shrink-0 items-center gap-2 border-b border-line/80 px-3 py-1.5 sm:gap-3 sm:px-6">
+        <ActionLink to="/sessions" variant="ghost" size="sm" aria-label="返回对话列表" title="返回对话列表" className="size-10 shrink-0 px-0">
+          <Icon name="back" />
+        </ActionLink>
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate text-base tracking-tight text-ink sm:text-lg">{session.data?.title ?? (session.loading ? "加载对话…" : "对话")}</h1>
+          {session.data ? (
+            <p className="truncate text-xs text-muted">
+              {[agent?.name, agent ? modeLabel(agent.mode) : null, formatSessionSource(session.data.source),
+                session.data.status !== "active" ? statusLabel(session.data.status) : null].filter(Boolean).join(" · ")}
             </p>
           ) : null}
-          {showJump ? (
-            <button
-              type="button"
-              onClick={scrollToLatest}
-              className="sticky bottom-0 z-10 mx-auto rounded-lg border border-line-strong bg-paper-raised px-3 py-1.5 text-xs text-ink shadow-lg transition hover:border-accent hover:text-accent"
-            >
-              有新内容，回到底部
-            </button>
-          ) : null}
-            </div>
-          );
-          if (!messagesExpanded) {
-            return log;
-          }
-          return createPortal(
-            <dialog
-              ref={readingRef}
-              aria-label="放大阅读"
-              className="fixed inset-0 m-auto h-[calc(100dvh-2rem)] max-h-none w-[calc(100%_-_2rem)] max-w-5xl overflow-hidden rounded-2xl border border-line-strong bg-paper-raised text-ink shadow-2xl"
-              onClose={() => setMessagesExpanded(false)}
-            >
-              <div className="flex h-full flex-col">
-                <div className="flex items-center justify-between gap-2 border-b border-line px-4 py-2">
-                  <h2 className="text-sm">放大阅读</h2>
-                  <Button size="sm" variant="secondary" autoFocus onClick={() => readingRef.current?.close()}>恢复窗口</Button>
-                </div>
-                {log}
-              </div>
-            </dialog>,
-            document.body,
-          );
-        })()}
+        </div>
+        <Button size="sm" variant="ghost" className="shrink-0 max-md:hidden" aria-pressed={wideReading} onClick={() => setWideReading((wide) => !wide)}>
+          <Icon name={wideReading ? "shrink" : "expand"} className="size-4" />
+          {wideReading ? "恢复宽度" : "宽屏阅读"}
+        </Button>
+        <Button ref={inspectorToggleRef} size="sm" variant="secondary" className="shrink-0 gap-1.5 px-2.5" aria-haspopup="dialog" aria-expanded={inspectorOpen} onClick={() => setInspectorOpen(true)}>
+          <Icon name="panel" className="size-4" />
+          <span className="sr-only sm:not-sr-only">运行详情</span>
+          {runs.data?.items.length ? <span aria-hidden className="rounded bg-paper-deep px-1.5 text-xs tabular-nums text-muted">{runs.data.items.length}</span> : null}
+        </Button>
+      </header>
 
-        {pendingApprovals.length > 0 ? (
-          <div className="mt-4 rounded-[3px] border border-ochre bg-ochre-soft/60 p-3">
-            <div className="flex flex-wrap items-baseline gap-2">
-              <p className="text-sm font-medium text-ochre">需要你确认（{pendingApprovals.length}）</p>
-              <p className="text-xs text-muted">高风险工具在继续执行前需要你的批准。</p>
-            </div>
-            <div className="mt-3 flex flex-col gap-2">
-              {pendingApprovals.map((approval) => {
-                const fields = approvalFields(approval.arguments);
-                return (
-                  <div key={approval.id} className="rounded-[3px] border border-ochre/60 bg-paper-raised p-3 text-xs">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="font-medium text-ink">{approval.tool_name}</p>
-                      <Badge tone={approval.risk_level === "high" ? "danger" : "warning"}>{approval.risk_level === "high" ? "高风险" : approval.risk_level === "medium" ? "需留意" : "低风险"}</Badge>
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          ref={messageListRef}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/60"
+          role="log"
+          aria-label="消息记录"
+          tabIndex={0}
+          onScroll={onMessageScroll}
+        >
+          <div ref={transcriptRef} className={cn("mx-auto flex min-h-full w-full min-w-0 flex-col gap-6 px-4 py-5 sm:gap-8 sm:px-8 sm:py-8", threadWidth)}>
+            {session.error ? <ErrorBanner message={session.error} onRetry={session.reload} /> : null}
+            {agents.error ? <ErrorBanner message={agents.error} onRetry={agents.reload} /> : null}
+            {messages.error ? <ErrorBanner message={messages.error} onRetry={messages.reload} /> : null}
+            {!hasMessages && !messages.error && !session.error ? (
+              messages.loading || session.loading ? <LoadingState label="加载消息" /> : (
+                <div className="my-auto flex flex-col items-center gap-4 py-5 text-center sm:gap-5">
+                  <span className="grid size-14 place-items-center rounded-2xl border border-accent/25 bg-accent-soft text-accent">
+                    <Icon name="agent" className="size-7" />
+                  </span>
+                  <h2 className="text-2xl tracking-tight sm:text-3xl">{canRun ? "你想完成什么？" : "还没有消息"}</h2>
+                  {canRun ? (
+                    <div className="flex max-w-lg flex-wrap justify-center gap-2">
+                      {["帮我梳理这段需求", "把材料拆成待办", "解释一下这个报错"].map((prompt) => (
+                        <Button key={prompt} size="sm" variant="secondary" onClick={() => editMessage(prompt)}>
+                          {prompt}<Icon name="arrow" className="size-3.5 text-muted" />
+                        </Button>
+                      ))}
                     </div>
-                    {fields.length > 0 ? (
-                      <div className="mt-2 max-h-40 overflow-auto rounded bg-paper-deep/40 p-2">
-                        <div className="flex flex-col gap-1">
-                          {fields.map(([key, value]) => (
-                            <div key={key} className="grid grid-cols-[110px_1fr] gap-2 text-[11px]">
-                              <span className="font-mono text-muted">{key}</span>
-                              <span className="break-all font-mono text-ink-soft">{value}</span>
-                            </div>
-                          ))}
+                  ) : !agents.loading ? (
+                    <p className="text-sm text-muted">{session.data?.status === "archived" ? "已归档的对话仅供查看。" : "选择已发布的助手后，即可开始对话。"}</p>
+                  ) : null}
+                </div>
+              )
+            ) : null}
+
+            {!olderEnded && (olderCursor || messages.data?.next_cursor) ? (
+              <div className="flex justify-center">
+                <Button size="sm" variant="secondary" loading={olderLoading} onClick={() => void loadOlderMessages()}>
+                  加载更早消息
+                </Button>
+              </div>
+            ) : null}
+            {persistedMessages.map((message) => (
+              <MessageBubble
+                key={message.id}
+                messageKey={message.id}
+                role={message.role}
+                content={message.content}
+                toolCalls={message.tool_calls}
+                attachments={message.attachments}
+                onDownloadAttachment={downloadMessageAttachment}
+                createdAt={message.created_at}
+                copied={copiedKey === message.id}
+                onCopy={copyMessage}
+                onEdit={canCompose && message.role === "user" && message.content ? () => editMessage(message.content) : undefined}
+              />
+            ))}
+            {liveVisible.map((message) => (
+              <MessageBubble
+                key={message.key}
+                messageKey={message.key}
+                role={message.role}
+                content={message.content}
+                toolCalls={message.toolCalls}
+                name={message.name}
+                live={runActive && message.key.startsWith("delta:")}
+                copied={copiedKey === message.key}
+                onCopy={copyMessage}
+              />
+            ))}
+
+            {failedRun ? (
+              <div role="alert" className="rounded-xl border border-rust/40 bg-rust-soft/65 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="font-medium text-rust">本轮处理失败</p>
+                  <Link to={`/runs/${failedRun.id}`} className="rounded text-sm text-accent underline underline-offset-2">查看完整过程</Link>
+                </div>
+                <p className="mt-1.5 break-words text-sm leading-6 text-rust">
+                  {failedRun.error_code ? `${failedRun.error_code} · ` : ""}{failedRun.error_message || "可以打开运行详情查看执行步骤。"}
+                </p>
+                {lastUserContent ? (
+                  <Button size="sm" variant="secondary" className="mt-3" onClick={() => editMessage(lastUserContent)} disabled={!canCompose}>
+                    编辑上条消息
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+
+            {approvalNeeded ? (
+              <section aria-label="待审批操作" className="rounded-xl border border-ochre/35 bg-ochre-soft/45 p-4">
+                <h2 className="text-sm font-semibold text-ochre">需要确认的操作（{pendingApprovals.length}）</h2>
+                <div className="mt-3 space-y-3">
+                  {pendingApprovals.map((approval) => {
+                    const fields = approvalFields(approval.arguments);
+                    return (
+                      <div key={approval.id} className="rounded-lg border border-line bg-paper-raised p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="break-all text-sm font-medium">{approval.tool_name}</p>
+                          <Badge tone={approval.risk_level === "high" ? "danger" : "warning"}>{approval.risk_level === "high" ? "高风险" : approval.risk_level === "medium" ? "需留意" : "低风险"}</Badge>
+                        </div>
+                        {fields.length ? (
+                          <dl className="mt-3 max-h-40 space-y-2 overflow-auto rounded-lg bg-paper p-3 font-mono text-xs leading-5">
+                            {fields.map(([key, value]) => (
+                              <div key={key} className="grid gap-0.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,3fr)] sm:gap-3">
+                                <dt className="break-all text-muted">{key}</dt>
+                                <dd className="break-all text-ink-soft">{value}</dd>
+                              </div>
+                            ))}
+                          </dl>
+                        ) : null}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <Button size="sm" loading={deciding === approval.id} disabled={Boolean(deciding)} onClick={() => void decide(approval, "approve")}>批准并继续</Button>
+                          <Button size="sm" variant="danger" disabled={Boolean(deciding)} onClick={() => void decide(approval, "deny")}>拒绝</Button>
+                          {approval.arguments ? (
+                            <Button size="sm" variant="ghost" onClick={() => void copyMessage(`approval-${approval.id}`, JSON.stringify(approval.arguments, null, 2))}>
+                              {copiedKey === `approval-${approval.id}` ? "已复制" : "复制参数"}
+                            </Button>
+                          ) : null}
                         </div>
                       </div>
-                    ) : (
-                      <p className="mt-2 text-[11px] text-muted">这个工具没有参数。</p>
-                    )}
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      <Button size="sm" loading={deciding === approval.id} onClick={() => void decide(approval, "approve")}>批准并继续</Button>
-                      <Button size="sm" variant="danger" loading={deciding === approval.id} onClick={() => void decide(approval, "deny")}>拒绝</Button>
-                      {approval.arguments ? (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => void copyMessage(`approval-${approval.id}`, JSON.stringify(approval.arguments, null, 2))}
-                        >
-                          {copiedKey === `approval-${approval.id}` ? "已复制" : "复制参数"}
-                        </Button>
-                      ) : null}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ) : null}
-
-        <div className="sticky bottom-3 z-10 mt-4 rounded-xl border border-line-strong bg-paper-raised p-3 shadow-lg focus-within:border-accent/70">
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            aria-label="选择附件"
-            onChange={(event) => {
-              const files = Array.from(event.target.files ?? []);
-              event.target.value = "";
-              if (files.length > 0) {
-                void uploadFiles(files);
-              }
-            }}
-          />
-          {pendingAttachments.length > 0 ? (
-            <div className="mb-2 flex flex-col gap-1.5 rounded-[3px] border border-line bg-paper-deep/40 p-2">
-              {pendingAttachments.map((item) => (
-                <div key={item.key} className={cn("flex items-center gap-2 text-xs", item.status === "failed" ? "text-rust" : "text-ink-soft")}>
-                  <span className="shrink-0" aria-hidden>📎</span>
-                  <span className="min-w-0 flex-1 truncate">{item.name}</span>
-                  <span className="shrink-0 text-[11px] text-muted">{formatFileSize(item.size)}</span>
-                  <span className="shrink-0 text-[11px]">
-                    {item.status === "uploading" ? "上传中…" : item.status === "failed" ? item.error ?? "上传失败" : "待发送"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void removePendingAttachment(item.key)}
-                    className="shrink-0 rounded-[2px] px-1 text-muted transition hover:text-rust"
-                    aria-label={`移除附件 ${item.name}`}
-                  >
-                    ×
-                  </button>
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
-          ) : null}
-          <textarea
-            id="chat-composer"
-            rows={2}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder={canRun ? "说说你想完成什么…" : "这个对话没有绑定可用助手，暂时不能发送"}
-            disabled={!canRun || runActive || sending}
-            className="block min-h-16 w-full resize-y bg-transparent px-1 py-1 text-sm leading-6 text-ink placeholder:text-muted focus:outline-none disabled:opacity-60"
-            aria-label="消息内容"
-            onKeyDown={(event) => {
-              // 输入法组合阶段按 Enter 只用于确认候选词，不触发发送。
-              if (event.nativeEvent.isComposing) {
-                return;
-              }
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void send();
-              }
-            }}
-          />
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => fileInputRef.current?.click()}
-                title="最多 5 个附件，每个文件不超过 20 MB"
-                disabled={!canRun || runActive || sending || pendingAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE}
-              >
-                <Icon name="attach" className="size-4" /> 添加附件
-              </Button>
-              <span className="hidden text-xs text-muted sm:inline">{runActive ? "助手正在处理" : "Enter 发送 · Shift + Enter 换行"}</span>
-            </div>
-            <div className="ml-auto flex items-center gap-2">
-              {runActive ? (
-                <Button size="sm" variant="secondary" onClick={() => void cancel()}>停止本轮</Button>
-              ) : null}
-              <Button
-                size="sm"
-                onClick={() => void send()}
-                loading={sending}
-                disabled={!canRun || runActive || (draft.trim() === "" && pendingAttachments.filter((item) => item.status === "ready").length === 0) || pendingAttachments.some((item) => item.status === "uploading")}
-              >
-                发送 <Icon name="send" className="size-4" />
-              </Button>
-            </div>
+              </section>
+            ) : null}
           </div>
         </div>
-      </Card>
+        {showJump ? (
+          <Button size="sm" variant="secondary" onClick={scrollToLatest} className="absolute inset-x-0 bottom-3 z-10 mx-auto w-fit rounded-full shadow-lg">
+            <Icon name="down" className="size-4" /> 回到最新消息
+          </Button>
+        ) : null}
+      </div>
 
-        <aside
+      <footer className={cn("chat-composer mx-auto flex w-full shrink-0 bg-paper px-3 pt-1 sm:px-8", threadWidth)}>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!sendDisabled && !runActive) void send();
+          }}
+          className="flex min-h-0 w-full flex-col rounded-2xl border border-line-strong bg-paper-raised p-2.5 shadow-lg transition-[border-color,box-shadow] focus-within:border-accent/55 focus-within:ring-2 focus-within:ring-accent/10 sm:p-3"
+        >
+          <div className="min-h-0 overflow-y-auto overscroll-contain px-0.5">
+            {pendingRun && !sending ? (
+              <div role="status" className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-ochre/30 bg-ochre-soft/50 px-3 py-1.5 text-sm text-ochre">
+                <span className="min-w-0 flex-1">消息已保存，尚未启动执行。</span>
+                <Button size="sm" variant="ghost" onClick={() => {
+                  setPendingRun(null);
+                  setSendError(null);
+                  composerRef.current?.focus({ preventScroll: true });
+                }}>继续编辑</Button>
+              </div>
+            ) : null}
+            {sendError || actionError || streamError ? (
+              <div role="alert" className="mb-2 flex max-h-24 items-start gap-2 overflow-auto rounded-lg border border-rust/30 bg-rust-soft px-3 py-2 text-sm text-rust">
+                <span className="min-w-0 flex-1 break-words">{sendError || actionError || `连接中断 · ${streamError}`}</span>
+                <button type="button" aria-label="关闭提示" onClick={() => { setSendError(null); setActionError(null); setStreamError(null); }} className="grid size-6 shrink-0 place-items-center rounded hover:bg-paper-deep">
+                  <Icon name="close" className="size-4" />
+                </button>
+              </div>
+            ) : null}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              aria-label="选择附件"
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? []);
+                event.target.value = "";
+                if (files.length) void uploadFiles(files);
+              }}
+            />
+            {pendingAttachments.length ? (
+              <ul className="mb-1 flex max-h-[14dvh] flex-wrap gap-1.5 overflow-y-auto px-1 py-0.5" aria-label="待发送附件">
+                {pendingAttachments.map((item) => (
+                  <li key={item.key} className={cn("flex max-w-full items-center gap-1.5 rounded-lg border px-2 text-xs", item.status === "failed" ? "border-rust/30 bg-rust-soft text-rust" : "border-line bg-paper-deep text-ink-soft")}>
+                    <Icon name="attach" className="size-4 shrink-0" />
+                    <span className="max-w-40 truncate" title={item.name}>{item.name}</span>
+                    <span className="shrink-0" role={item.status === "ready" ? undefined : "status"} title={item.error}>
+                      {item.status === "uploading" ? "上传中…" : item.status === "failed" ? "上传失败" : formatFileSize(item.size)}
+                    </span>
+                    <Button size="sm" variant="ghost" disabled={sending} onClick={() => void removePendingAttachment(item.key)} className="min-h-9 px-1" aria-label={`移除附件 ${item.name}`}>
+                      <Icon name="close" className="size-3.5" />
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <textarea
+              ref={composerRef}
+              rows={1}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder={composerPlaceholder}
+              disabled={!canRun}
+              readOnly={sending || Boolean(pendingRun)}
+              className="block max-h-[min(12rem,24dvh)] min-h-10 w-full resize-none overflow-y-auto bg-transparent px-2 py-2 text-base leading-6 text-ink placeholder:text-muted focus:outline-none disabled:opacity-70"
+              aria-label="消息内容"
+              onPaste={(event) => {
+                const files = Array.from(event.clipboardData.files);
+                if (!files.length || !canCompose) return;
+                if (!event.clipboardData.getData("text/plain")) event.preventDefault();
+                void uploadFiles(files);
+              }}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                // 触屏键盘保留 Enter 换行，发送使用右侧按钮。
+                if (event.key !== "Enter" || event.shiftKey || runActive || window.matchMedia("(pointer: coarse)").matches) return;
+                event.preventDefault();
+                if (!sendDisabled) void send();
+              }}
+            />
+          </div>
+          <div className="mt-1 flex min-h-10 shrink-0 items-center gap-2 px-0.5">
+            <Button size="sm" variant="ghost" className="size-10 shrink-0 px-0" aria-label="添加附件" title="添加附件 · 每个文件不超过 20 MB" disabled={!canAttach} onClick={() => fileInputRef.current?.click()}>
+              <Icon name="plus" className="size-5" />
+            </Button>
+            {runActive ? (
+              <p role="status" className="flex min-w-0 items-center gap-2 text-xs text-muted sm:text-sm">
+                <span aria-hidden className="size-1.5 shrink-0 animate-pulse rounded-full bg-accent" />
+                <span className="truncate">{approvalNeeded ? "等待审批" : connection === "reconnecting" ? "正在重连…" : connection === "closed" ? "执行中 · 实时连接已关闭" : "助手正在处理…"}</span>
+              </p>
+            ) : (
+              <span className="hidden min-w-0 truncate text-xs text-muted sm:inline">{pendingRun ? "消息已保存" : "Enter 发送 · Shift + Enter 换行"}</span>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              {runActive && connection === "closed" ? (
+                <Button size="sm" variant="ghost" onClick={() => setStreamAttempt((value) => value + 1)}>重连</Button>
+              ) : null}
+              {runActive ? (
+                <Button size="sm" variant="secondary" loading={cancelling} aria-label="停止本轮" title="停止本轮" className="size-10 rounded-xl px-0" onClick={() => void cancel()}>
+                  {cancelling ? null : <Icon name="stop" className="size-5" />}
+                </Button>
+              ) : (
+                <Button size="sm" type="submit" loading={sending} disabled={sendDisabled} aria-label={pendingRun ? "重试启动" : "发送"} title={pendingRun ? "重试启动" : "发送"} className={cn("h-10 rounded-xl", !pendingRun && "w-10 px-0")}>
+                  {pendingRun ? "重试启动" : sending ? null : <Icon name="send" className="size-5" />}
+                </Button>
+              )}
+            </div>
+          </div>
+        </form>
+      </footer>
+
+      {inspectorOpen ? (
+        <dialog
           id="chat-inspector"
           ref={inspectorRef}
-          aria-label="运行详情"
-          hidden={!inspectorOpen}
-          tabIndex={-1}
-          className="order-first space-y-4 rounded-xl xl:sticky xl:top-20 xl:order-none"
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              setInspectorOpen(false);
-              inspectorToggleRef.current?.focus();
-            }
+          aria-labelledby="chat-inspector-title"
+          className="editor-drawer fixed inset-y-0 right-0 left-auto m-0 h-dvh max-h-none w-full max-w-md overflow-hidden border-line bg-paper text-ink shadow-2xl sm:border-l"
+          onCancel={(event) => { event.preventDefault(); setInspectorOpen(false); }}
+          onPointerDown={(event) => { inspectorBackdropPress.current = event.target === event.currentTarget; }}
+          onClick={(event) => {
+            if (inspectorBackdropPress.current && event.target === event.currentTarget) setInspectorOpen(false);
+            inspectorBackdropPress.current = false;
           }}
         >
-        <Card title="处理过程">
-          {activeRun ? (
-            <details className="group rounded-[3px] border border-line bg-paper-raised">
-              <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[3px] px-3 py-2 text-xs transition hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
-                <Badge tone={statusTone(activeRun.status)}>{statusLabel(activeRun.status)}</Badge>
-                {runActive ? (
-                  <span className="flex items-center gap-1.5 text-accent">
-                    <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-accent" />
-                    第 {activeRun.current_step_seq || 1} 步
-                  </span>
-                ) : (
-                  <span className="text-ink">共 {activeRun.current_step_seq || 0} 步</span>
-                )}
-                <span className="text-muted">{timeline.length} 条过程记录</span>
-                <span className="ml-auto text-accent group-open:hidden">展开</span>
-                <span className="ml-auto hidden text-accent group-open:inline">收起</span>
-              </summary>
-              <div className="flex flex-col gap-3 border-t border-line p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-muted">{{ idle: "未开始", connecting: "连接中", streaming: "实时接收", reconnecting: "重连中", closed: "已结束" }[connection]}</span>
-                  <span className="text-xs text-muted">{modeLabel(activeRun.mode)} · 尝试 {activeRun.attempt_no} 次</span>
-                </div>
-                {activeRun.error_message ? <p className="rounded-[3px] border border-rust bg-rust-soft px-2 py-1 text-xs text-rust">{activeRun.error_code}: {activeRun.error_message}</p> : null}
-                {timeline.length > 0 ? (
-                  <ol className="flex max-h-72 flex-col gap-2 overflow-y-auto" aria-label="处理时间线">
-                    {timeline.map((entry) => (
-                      <li key={entry.key} className="flex items-start gap-2 text-xs">
-                        <span className={cn("mt-1 size-1.5 shrink-0 rounded-full", entry.tone === "success" ? "bg-accent" : entry.tone === "danger" ? "bg-rust" : entry.tone === "warning" ? "bg-ochre" : "bg-jade")} />
-                        <div>
-                          <p className="text-ink">
-                            <Link to={`/runs/${activeRun.id}`} className="underline-offset-2 hover:text-accent hover:underline">
-                              {entry.label}
-                            </Link>
-                          </p>
-                          {entry.detail ? <p className="break-all text-[11px] text-muted">{entry.detail}</p> : null}
-                        </div>
+          <div className="flex h-full min-h-0 flex-col">
+            <header className="flex shrink-0 items-center justify-between gap-3 border-b border-line px-5 py-3">
+              <h2 id="chat-inspector-title" className="text-lg">运行详情</h2>
+              <Button size="sm" variant="ghost" className="size-10 px-0" aria-label="关闭运行详情" autoFocus onClick={() => setInspectorOpen(false)}>
+                <Icon name="close" />
+              </Button>
+            </header>
+            <div className="min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-contain p-5">
+              {activeRun ? (
+                <section aria-label="处理过程" className="space-y-3">
+                  <h3 className="text-sm font-semibold">处理过程</h3>
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <Badge tone={statusTone(activeRun.status)}>{statusLabel(activeRun.status)}</Badge>
+                    <span className="text-muted">{modeLabel(activeRun.mode)} · 第 {activeRun.attempt_no} 次尝试</span>
+                    <Link to={`/runs/${activeRun.id}`} className="ml-auto rounded text-xs text-accent underline underline-offset-2">查看完整过程</Link>
+                  </div>
+                  {activeRun.error_message ? <ErrorBanner message={activeRun.error_message} /> : null}
+                  {timeline.length > 0 ? (
+                    <ol className="space-y-3 border-l border-line pl-4" aria-label="处理时间线">
+                      {timeline.map((entry) => (
+                        <li key={entry.key} className="relative">
+                          <span aria-hidden className={cn("absolute top-2 -left-[1.3rem] size-2 rounded-full ring-4 ring-paper", entry.tone === "danger" ? "bg-rust" : entry.tone === "warning" ? "bg-ochre" : "bg-accent")} />
+                          <p className="break-words text-sm">{entry.label}</p>
+                          {entry.detail ? <p className="mt-1 break-all text-xs leading-5 text-muted">{entry.detail}</p> : null}
+                        </li>
+                      ))}
+                    </ol>
+                  ) : <p className="text-sm text-muted">暂无过程事件</p>}
+                </section>
+              ) : null}
+              <section aria-label="历史处理记录">
+                <h3 className="mb-2 text-sm font-semibold">历史处理记录</h3>
+                {runs.error ? <ErrorBanner message={runs.error} onRetry={runs.reload} /> : runs.loading && !runs.data ? <LoadingState /> : runs.data?.items.length ? (
+                  <ul className="divide-y divide-line">
+                    {runs.data.items.map((run) => (
+                      <li key={run.id}>
+                        <Link to={`/runs/${run.id}`} className="flex items-center gap-3 rounded-lg px-2 py-3 transition-colors hover:bg-paper-deep">
+                          <Icon name="activity" className="size-4 shrink-0 text-muted" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-sm">{modeLabel(run.mode)}</span>
+                            <span className="block text-xs text-muted">{formatDateTime(run.created_at)}</span>
+                          </span>
+                          <Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge>
+                          <Icon name="chevron" className="size-4 shrink-0 text-muted" />
+                        </Link>
                       </li>
                     ))}
-                  </ol>
-                ) : (
-                  <p className="text-xs text-muted">等待执行事件…</p>
-                )}
-              </div>
-            </details>
-          ) : (
-            <p className="flex items-center gap-2 text-sm text-muted"><Icon name="activity" /> 暂无正在处理的任务</p>
-          )}
-        </Card>
-
-        <Card title="历史处理记录">
-          {runs.loading ? (
-            <LoadingState />
-          ) : runs.data && runs.data.items.length > 0 ? (
-            <details className="group rounded-[3px] border border-line bg-paper-raised">
-              <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[3px] px-3 py-2 text-xs transition hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
-                <span className="text-ink">最近 {runs.data.items.length} 次处理</span>
-                <span className="text-muted">展开查看</span>
-                <span className="ml-auto text-accent group-open:hidden">展开</span>
-                <span className="ml-auto hidden text-accent group-open:inline">收起</span>
-              </summary>
-              <div className="flex flex-col divide-y divide-line border-t border-line px-3">
-                {runs.data.items.map((run) => (
-                  <div key={run.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
-                    <div className="flex items-center gap-2">
-                      <Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge>
-                      <span className="text-xs text-muted">{modeLabel(run.mode)} · {formatDateTime(run.created_at)}</span>
-                    </div>
-                    <Link to={`/runs/${run.id}`} className="text-xs text-accent underline underline-offset-2">查看过程</Link>
-                  </div>
-                ))}
-              </div>
-            </details>
-          ) : (
-            <p className="text-sm text-muted">还没有处理记录</p>
-          )}
-        </Card>
-        </aside>
-      </div>
-    </div>
-  );
-}
-
-// MessageBubble 渲染单条消息；助手内容使用安全 Markdown，并支持一键复制。
-function MessageBubble({
-  messageKey,
-  role,
-  content,
-  toolCalls,
-  name,
-  createdAt,
-  attachments,
-  onDownloadAttachment,
-  live = false,
-  copied,
-  onCopy,
-}: {
-  messageKey: string;
-  role: string;
-  content: string;
-  toolCalls?: unknown;
-  name?: string;
-  createdAt?: string;
-  attachments?: Attachment[];
-  onDownloadAttachment?: (attachment: Attachment) => void;
-  live?: boolean;
-  copied: boolean;
-  onCopy: (key: string, content: string) => Promise<void>;
-}) {
-  const toolNames = toolCallNames(toolCalls);
-  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
-  if (role === "system") {
-    return <div className="mx-auto max-w-[90%] rounded-[3px] border border-line bg-paper-deep/40 px-3 py-2 text-center text-[11px] leading-5 text-muted">{content}</div>;
-  }
-  if (role === "user") {
-    return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%]">
-          <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-accent/25 bg-accent-soft px-4 py-3 text-sm leading-6 text-ink">{content}</div>
-          {attachments && attachments.length > 0 ? (
-            <div className="mt-2 flex flex-col gap-1">
-              {attachments.map((attachment) => (
-                <button
-                  key={attachment.id}
-                  type="button"
-                  onClick={() => onDownloadAttachment?.(attachment)}
-                  className="flex items-center gap-2 rounded-[3px] border border-line bg-paper-raised px-2 py-1 text-left text-[11px] text-ink-soft transition hover:border-accent hover:text-accent"
-                  aria-label={`下载附件 ${attachment.file_name}`}
-                >
-                  <span aria-hidden>📎</span>
-                  <span className="min-w-0 flex-1 truncate">{attachment.file_name}</span>
-                  <span className="shrink-0 text-muted">{formatFileSize(attachment.size_bytes)}</span>
-                  <span className="shrink-0 text-muted">
-                    {attachment.text_extracted ? (attachment.text_truncated ? "已读取（截断）" : "已读取内容") : "仅保存原件"}
-                  </span>
-                </button>
-              ))}
+                  </ul>
+                ) : <p className="text-sm text-muted">还没有处理记录</p>}
+              </section>
             </div>
-          ) : null}
-          {createdAt ? <p className="mt-1 text-right text-[11px] text-muted">{formatDateTime(createdAt)}</p> : null}
-        </div>
-      </div>
-    );
-  }
-  if (role === "tool") {
-    return (
-      <div className="ml-11 max-w-[85%]">
-        <details className="rounded-[3px] border border-line bg-paper-deep/50 px-3 py-2 text-xs text-muted">
-          <summary className="cursor-pointer text-muted">工具结果{name ? ` · ${name}` : ""}{toolCalls ? "（含调用记录）" : ""}</summary>
-          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]">{content}</pre>
-        </details>
-      </div>
-    );
-  }
-  // 带工具调用的助手消息属于中间思考过程，默认折叠，只保留最终回答展开。
-  if (hasToolCalls) {
-    return (
-      <div className="flex gap-3">
-        <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent-soft text-accent">
-          <Icon name="agent" className="size-4" />
-        </span>
-        <details className="group min-w-0 max-w-[85%] flex-1 rounded-[4px] border border-line bg-paper-raised">
-          <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 rounded-[4px] px-4 py-3 text-[11px] text-muted [&::-webkit-details-marker]:hidden">
-            <span className="text-sm font-medium text-ink-soft">助手思考</span>
-            {live ? (
-              <span className="flex items-center gap-1 text-accent">
-                <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-accent" />
-                实时接收
-              </span>
-            ) : null}
-            <span>调用 {toolNames.length} 个工具</span>
-            {createdAt ? <span>{formatDateTime(createdAt)}</span> : null}
-            <span className="ml-auto text-accent group-open:hidden">展开</span>
-            <span className="ml-auto hidden text-accent group-open:inline">收起</span>
-          </summary>
-          <div className="border-t border-line px-4 py-3 text-sm leading-6">
-            {content ? (
-              <SafeMarkdown content={content} />
-            ) : (
-              <p className="text-xs text-muted">正在调用工具，等待结果…</p>
-            )}
-            {toolNames.length > 0 ? (
-              <p className="mt-2 flex flex-wrap items-center gap-1 text-[11px] text-muted">
-                调用工具：
-                {toolNames.map((toolName, index) => (
-                  <span key={`${toolName}-${index}`} className="rounded-[2px] border border-line bg-paper-deep/50 px-1.5 py-0.5 font-mono">
-                    {toolName}
-                  </span>
-                ))}
-              </p>
-            ) : null}
-            {hasToolCalls ? (
-              <details className="mt-2 text-[11px] text-muted">
-                <summary className="cursor-pointer">工具调用记录（{toolCalls.length}）</summary>
-                <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-paper-deep/40 p-2 font-mono">{JSON.stringify(toolCalls, null, 2)}</pre>
-              </details>
-            ) : null}
           </div>
-        </details>
-      </div>
-    );
-  }
-  return (
-    <div className="flex gap-3">
-      <span aria-hidden className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-lg border border-accent/25 bg-accent-soft text-accent">
-        <Icon name="agent" className="size-4" />
-      </span>
-      <div className="min-w-0 max-w-[85%] flex-1">
-        <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-muted">
-          <span className="font-medium text-ink-soft">助手</span>
-          {live ? (
-            <span className="flex items-center gap-1 text-accent">
-              <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-accent" />
-              实时接收
-            </span>
-          ) : null}
-          {createdAt ? <span>{formatDateTime(createdAt)}</span> : null}
-          {content ? (
-            <button
-              type="button"
-              onClick={() => void onCopy(messageKey, content)}
-              className="ml-auto rounded-[2px] border border-line px-1.5 py-0.5 text-[11px] text-muted transition hover:border-accent hover:text-accent"
-            >
-              {copied ? "已复制" : "复制"}
-            </button>
-          ) : null}
-        </div>
-        <div className="rounded-2xl rounded-tl-sm border border-line bg-paper-raised px-4 py-3 text-sm leading-6">
-          {content ? (
-            <SafeMarkdown content={content} />
-          ) : (
-            <p className="text-xs text-muted">{toolNames.length > 0 ? "正在调用工具，等待结果…" : "这一步没有文本输出。"}</p>
-          )}
-          {toolNames.length > 0 ? (
-            <p className="mt-2 flex flex-wrap items-center gap-1 text-[11px] text-muted">
-              调用工具：
-              {toolNames.map((toolName, index) => (
-                <span key={`${toolName}-${index}`} className="rounded-[2px] border border-line bg-paper-deep/50 px-1.5 py-0.5 font-mono">
-                  {toolName}
-                </span>
-              ))}
-            </p>
-          ) : null}
-          {Array.isArray(toolCalls) && toolCalls.length > 0 ? (
-            <details className="mt-2 text-[11px] text-muted">
-              <summary className="cursor-pointer">工具调用记录（{toolCalls.length}）</summary>
-              <pre className="mt-1 overflow-auto whitespace-pre-wrap break-all rounded bg-paper-deep/40 p-2 font-mono">{JSON.stringify(toolCalls, null, 2)}</pre>
-            </details>
-          ) : null}
-        </div>
-      </div>
-    </div>
+        </dialog>
+      ) : null}
+      <ConfirmDialog
+        open={replacementDraft !== null}
+        title="替换输入框中的草稿？"
+        description="选中的消息会载入输入框，你可以修改后再发送。"
+        confirmLabel="替换草稿"
+        tone="primary"
+        onCancel={() => setReplacementDraft(null)}
+        onConfirm={() => {
+          if (replacementDraft !== null) setDraft(replacementDraft);
+          setReplacementDraft(null);
+          requestAnimationFrame(() => composerRef.current?.focus({ preventScroll: true }));
+        }}
+      />
+    </section>
   );
 }

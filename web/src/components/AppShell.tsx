@@ -103,8 +103,10 @@ export function AppShell() {
   const { user, logout, logoutAll } = useAuth();
   const { pathname, search } = useLocation();
   const navigationType = useNavigationType();
+  const chatLayout = /^\/sessions\/[^/]+\/?$/.test(pathname);
   const lastPath = useRef(pathname);
   const mainRef = useRef<HTMLElement>(null);
+  const shellRef = useRef<HTMLDivElement>(null);
   const [confirmLogoutAll, setConfirmLogoutAll] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -124,6 +126,25 @@ export function AppShell() {
       main?.focus({ preventScroll: true });
     }
   }, [pathname, navigationType]);
+
+  useLayoutEffect(() => {
+    const viewport = window.visualViewport;
+    const shell = shellRef.current;
+    if (!chatLayout || !viewport || !shell) return;
+    const resize = () => {
+      // 放大页面时保留正常文档缩放；软键盘弹出时缩短工作区高度。
+      if (viewport.scale === 1) shell.style.setProperty("--chat-viewport", `${viewport.height}px`);
+      else shell.style.removeProperty("--chat-viewport");
+    };
+    resize();
+    viewport.addEventListener("resize", resize);
+    window.addEventListener("resize", resize);
+    return () => {
+      viewport.removeEventListener("resize", resize);
+      window.removeEventListener("resize", resize);
+      shell.style.removeProperty("--chat-viewport");
+    };
+  }, [chatLayout]);
 
   useEffect(() => {
     if (navigationRef.current?.open) navigationRef.current.close();
@@ -148,7 +169,7 @@ export function AppShell() {
   };
 
   return (
-    <div className="min-h-screen text-ink lg:grid lg:grid-cols-[228px_minmax(0,1fr)]">
+    <div ref={shellRef} className={cn("text-ink lg:grid lg:grid-cols-[228px_minmax(0,1fr)]", chatLayout ? "h-[var(--chat-viewport,100dvh)] overflow-hidden" : "min-h-screen")}>
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-accent focus:px-3 focus:py-2 focus:text-accent-ink"
@@ -172,8 +193,8 @@ export function AppShell() {
         <WorkspaceNav activePath={navItem?.to} onNavigate={closeNav} onClose={closeNav} onHelp={openHelp} />
       </dialog>
 
-      <div className="min-w-0">
-        <header className="sticky top-0 z-30 flex min-h-16 items-center gap-2 border-b border-line bg-paper/95 px-3 backdrop-blur-sm sm:gap-4 sm:px-6 lg:px-8">
+      <div className={cn("min-w-0", chatLayout && "flex h-full min-h-0 flex-col")}>
+        <header className={cn("sticky top-0 z-30 flex shrink-0 items-center gap-2 border-b border-line bg-paper/95 px-3 backdrop-blur-sm sm:gap-4 sm:px-6 lg:px-8", chatLayout ? "min-h-12" : "min-h-16")}>
           <Button size="sm" variant="ghost" className="size-10 shrink-0 p-0 lg:hidden" aria-label="打开导航" aria-haspopup="dialog" onClick={() => navigationRef.current?.showModal()}>
             <Icon name="menu" />
           </Button>
@@ -243,7 +264,7 @@ export function AppShell() {
           </div>
         </header>
 
-        <main id="main-content" ref={mainRef} tabIndex={-1} className="mx-auto w-full max-w-[1520px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        <main id="main-content" ref={mainRef} tabIndex={-1} className={cn("w-full focus:outline-none", chatLayout ? "flex min-h-0 min-w-0 flex-1 flex-col" : "mx-auto max-w-[1520px] px-4 py-6 sm:px-6 sm:py-8 lg:px-8")}>
           <Outlet />
         </main>
       </div>

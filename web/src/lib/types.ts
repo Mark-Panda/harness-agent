@@ -88,6 +88,7 @@ export interface PolicyCandidate {
   model_id: string;
   priority?: number;
   max_attempts?: number;
+  constraints?: Record<string, unknown>;
 }
 
 export type PolicyStatus = "draft" | "published" | "disabled";

@@ -29,6 +29,10 @@ const paths = {
   panel: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></>,
   expand: <path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5" />,
   attach: <path d="m8 13 5.5-5.5a2 2 0 0 1 2.8 2.8l-7 7a3.5 3.5 0 0 1-5-5l8-8a5 5 0 0 1 7 7l-8 8" />,
+  shrink: <path d="M4 9h5V4m11 5h-5V4M4 15h5v5m11-5h-5v5" />,
+  down: <path d="M12 5v14m-6-6 6 6 6-6" />,
+  stop: <rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none" />,
+  copy: <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 4H6a2 2 0 0 0-2 2v10" /></>,
   send: <path d="M12 19V5m-6 6 6-6 6 6" />,
 } satisfies Record<string, ReactNode>;
 
