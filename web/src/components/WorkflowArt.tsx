@@ -8,7 +8,7 @@ export function WorkflowArt() {
           <Icon name="chat" className="size-5" />
         </span>
         <span className="h-px flex-1 bg-accent/35" />
-        <span className="grid size-18 shrink-0 place-items-center rounded-2xl border border-accent/60 bg-accent-soft shadow-[0_0_30px_rgb(115_239_166/0.15)]">
+        <span className="grid size-18 shrink-0 place-items-center rounded-2xl border border-accent/60 bg-accent-soft shadow-[0_0_30px_rgb(21_128_61/0.18)]">
           <Icon name="agent" className="size-8" />
         </span>
         <span className="h-px flex-1 bg-accent/35" />

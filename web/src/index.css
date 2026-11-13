@@ -2,24 +2,24 @@
 
 /* 共用语义色保留既有组件的类名，让工作区、管理后台和认证页使用同一套主题。 */
 @theme {
-  --color-paper: #0b0e0d;
-  --color-paper-raised: #121715;
-  --color-paper-deep: #1a211e;
-  --color-ink: #edf3ef;
-  --color-ink-soft: #c5d0c9;
-  --color-muted: #95a69e;
-  --color-line: #26332d;
-  --color-line-strong: #55695e;
-  --color-accent: #73efa6;
-  --color-accent-hover: #9af5bf;
-  --color-accent-ink: #082217;
-  --color-accent-soft: #163427;
-  --color-jade: #7be4b5;
-  --color-jade-soft: #133226;
-  --color-rust: #ffa29a;
-  --color-rust-soft: #39201e;
-  --color-ochre: #f0cb80;
-  --color-ochre-soft: #382c19;
+  --color-paper: #ffffff;
+  --color-paper-raised: #f7f9f6;
+  --color-paper-deep: #edf1ec;
+  --color-ink: #121714;
+  --color-ink-soft: #3b4440;
+  --color-muted: #64746c;
+  --color-line: #e3e8e3;
+  --color-line-strong: #c3ccc4;
+  --color-accent: #15803d;
+  --color-accent-hover: #116b32;
+  --color-accent-ink: #ffffff;
+  --color-accent-soft: #e7f5ec;
+  --color-jade: #0f766e;
+  --color-jade-soft: #e6f5f0;
+  --color-rust: #bf3a1c;
+  --color-rust-soft: #fdeee7;
+  --color-ochre: #b45309;
+  --color-ochre-soft: #fdf3e3;
   --font-sans: Inter, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   --font-display: var(--font-sans);
   --font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
@@ -27,7 +27,7 @@
 
 :root {
   font-family: var(--font-sans);
-  color-scheme: dark;
+  color-scheme: light;
   font-synthesis: none;
   color: var(--color-ink);
   background: var(--color-paper);
@@ -59,18 +59,19 @@ button:not(:disabled), summary {
 }
 
 dialog::backdrop {
-  background: rgb(0 0 0 / 0.65);
+  background: rgb(18 23 20 / 0.45);
 }
 
 /* 工作台与认证页共用节点网格，呼应助手的执行流程。 */
 .workspace-grid {
   background-image:
-    radial-gradient(ellipse at 92% 32%, #173b29 0%, transparent 64%),
-    linear-gradient(110deg, #141b17 0%, #101713 80%);
+    radial-gradient(ellipse at 90% 18%, #dcf3e4 0%, transparent 60%),
+    radial-gradient(ellipse at 5% 90%, #fdeedd 0%, transparent 58%),
+    linear-gradient(115deg, #ffffff 0%, #f5f9f5 80%);
 }
 
 .workflow-art {
-  --grid-line: rgb(115 239 166 / 0.13);
+  --grid-line: rgb(21 128 61 / 0.14);
   background-image:
     linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
     linear-gradient(var(--grid-line) 1px, transparent 1px);
@@ -109,7 +110,7 @@ body:has(dialog:modal) {
   .form-control:focus {
     border-color: var(--color-accent);
     outline: none;
-    box-shadow: 0 0 0 3px rgb(115 239 166 / 0.16);
+    box-shadow: 0 0 0 3px rgb(21 128 61 / 0.16);
   }
 
   .form-control[aria-invalid="true"] {
@@ -117,7 +118,7 @@ body:has(dialog:modal) {
   }
 
   .form-control[aria-invalid="true"]:focus {
-    box-shadow: 0 0 0 3px rgb(255 162 154 / 0.18);
+    box-shadow: 0 0 0 3px rgb(191 58 28 / 0.16);
   }
 
   .form-control:disabled {
@@ -128,7 +129,7 @@ body:has(dialog:modal) {
   .form-select {
     appearance: none;
     padding-right: 2.5rem;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' viewBox='0 0 16 16'%3E%3Cpath stroke='%2395a69e' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' viewBox='0 0 16 16'%3E%3Cpath stroke='%2364746c' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
     background-position: right 0.8rem center;
     background-repeat: no-repeat;
   }

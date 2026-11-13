@@ -16,10 +16,10 @@ const DEFAULT_ROTATION = { yaw: -0.5, pitch: 0.32 };
 
 // 节点类型的中文名称与配色。
 const kindTheme: Record<MemoryGraphNodeKind, { label: string; color: string; dark: string; radius: number }> = {
-  session: { label: "会话", color: "#73efa6", dark: "#226648", radius: 14 },
-  fact: { label: "事实", color: "#53c9c2", dark: "#235d58", radius: 7 },
-  summary: { label: "摘要", color: "#f0cb80", dark: "#7a531c", radius: 8 },
-  vector: { label: "长期记忆", color: "#aab9ff", dark: "#43538f", radius: 6 },
+  session: { label: "会话", color: "#4ec17f", dark: "#15803d", radius: 14 },
+  fact: { label: "事实", color: "#3fb8ae", dark: "#0f766e", radius: 7 },
+  summary: { label: "摘要", color: "#f0a63c", dark: "#b45309", radius: 8 },
+  vector: { label: "长期记忆", color: "#8d97f0", dark: "#4f46a5", radius: 6 },
 };
 
 // edgeTheme 按边类型给出颜色与线型，避免不同关系混在一起。
@@ -27,14 +27,14 @@ function edgeTheme(kind: string): { color: string; dashed: boolean } {
   switch (kind) {
     case "has_fact":
     case "from_fact":
-      return { color: "#53c9c2", dashed: false };
+      return { color: "#2aa79b", dashed: false };
     case "has_summary":
     case "from_summary":
-      return { color: "#f0cb80", dashed: false };
+      return { color: "#d98a1f", dashed: false };
     case "related":
-      return { color: "#73efa6", dashed: true };
+      return { color: "#15803d", dashed: true };
     default:
-      return { color: "#7b9485", dashed: false };
+      return { color: "#8a978f", dashed: false };
   }
 }
 
@@ -443,7 +443,7 @@ export default function MemoryGraphPage() {
       context.fillStyle = gradient;
       context.fill();
       context.lineWidth = isSelected ? 2 : 1;
-      context.strokeStyle = isSelected ? "#edf3ef" : "rgba(190,219,203,0.48)";
+      context.strokeStyle = isSelected ? "#121714" : "rgba(40,70,55,0.32)";
       context.stroke();
 
       if (node.kind === "session") {
@@ -461,7 +461,7 @@ export default function MemoryGraphPage() {
         context.font = `${node.kind === "session" ? 13 : 11}px ui-sans-serif, system-ui, sans-serif`;
         context.textAlign = "center";
         context.textBaseline = "top";
-        context.fillStyle = "#c5d0c9";
+        context.fillStyle = "#3b4440";
         context.fillText(shortLabel(node.label), projected.x, projected.y + radius + 6);
       }
     }
@@ -648,7 +648,7 @@ export default function MemoryGraphPage() {
               })}
               <span className="ml-auto text-[11px] text-muted">拖拽旋转 3D 视角 · 滚轮缩放 · 点击节点查看详情 · 虚线表示同主题关联</span>
             </div>
-            <div className="relative overflow-hidden rounded-[3px] border border-line bg-[radial-gradient(circle_at_center,rgba(82,64,40,0.06),transparent_62%)]">
+            <div className="relative overflow-hidden rounded-[3px] border border-line bg-[radial-gradient(circle_at_center,rgba(21,128,61,0.06),transparent_62%)]">
               <canvas
                 ref={canvasRef}
                 role="img"
