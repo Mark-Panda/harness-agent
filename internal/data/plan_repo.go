@@ -772,8 +772,8 @@ RETURNING *`, string(update.Status), resultJSON, update.ErrorCode, update.ErrorM
 	return toBizPlanStep(record)
 }
 
-// ResolvePlanStep 以当前状态为前置条件推进等待审批或待执行步骤。
-func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from biz.PlanStepStatus, fence biz.PlanFence, update biz.PlanStepUpdate) (biz.PlanStep, error) {
+// ResolvePlanStep 以当前状态为前置条件推进等待审批或待执行步骤，不要求 fencing。
+func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, stepID uuid.UUID, from biz.PlanStepStatus, update biz.PlanStepUpdate) (biz.PlanStep, error) {
 	if err := biz.TransitionPlanStepStatus(from, update.Status); err != nil {
 		return biz.PlanStep{}, err
 	}
@@ -788,11 +788,13 @@ func (r *PlanRepository) ResolvePlanStep(ctx context.Context, userID, planID, st
 	}
 	var record planStepModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		status, err := lockWorkerPlan(tx, userID, planID, fence, now)
-		if err != nil {
+		// 仅加锁 Plan 行检查状态，不要求 Run fence（允许暂停/审批恢复场景）。
+		var plan planModel
+		if err := tx.Model(&planModel{}).Select("status").Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND user_id = ?", planID, userID).Take(&plan).Error; err != nil {
 			return err
 		}
-		if biz.PlanTerminal(status) && (status != biz.PlanFailed || update.Status != biz.PlanStepSkipped) {
+		if biz.PlanTerminal(biz.PlanStatus(plan.Status)) && (biz.PlanStatus(plan.Status) != biz.PlanFailed || update.Status != biz.PlanStepSkipped) {
 			return fmt.Errorf("%w: plan no longer accepts step resolution", biz.ErrResourceConflict)
 		}
 		return tx.Raw(`

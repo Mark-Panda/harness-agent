@@ -676,6 +676,10 @@ type feishuOutboundModel struct {
 	UpdatedAt time.Time
 	// CompletedAt 完成时间。
 	CompletedAt *time.Time
+	// PostRequestJson 持久化 POST 请求意图，跨 Worker 重启恢复时复用。
+	PostRequestJSON json.RawMessage `gorm:"column:post_request_json;type:jsonb"`
+	// GroupText 暂存群聊共享回复正文。
+	GroupText string `gorm:"column:group_text;type:text"`
 }
 
 // TableName 指定外发表名。
@@ -834,6 +838,27 @@ func feishuOutboundCompletion(now time.Time) map[string]any {
 // CompleteOutbound 标记外发成功。
 func (r *FeishuOutboundRepository) CompleteOutbound(ctx context.Context, outbound biz.FeishuOutbound, now time.Time) error {
 	return r.updateOutboundClaim(ctx, "complete feishu outbound", outbound, now, feishuOutboundCompletion(now))
+}
+
+// SetOutboundPost 写入新的 POST 请求意图，或在 post 为 nil 时清除已拒绝的 intent。
+func (r *FeishuOutboundRepository) SetOutboundPost(ctx context.Context, outbound biz.FeishuOutbound, post *biz.FeishuOutboundPost, now time.Time) error {
+	updates := map[string]any{"updated_at": now}
+	if post == nil {
+		updates["post_request_json"] = nil
+		updates["group_text"] = ""
+	} else {
+		data, err := json.Marshal(post)
+		if err != nil {
+			return fmt.Errorf("%w: encode outbound post: %v", biz.ErrInvalidConfig, err)
+		}
+		updates["post_request_json"] = data
+		if post.GroupText != nil {
+			updates["group_text"] = *post.GroupText
+		} else {
+			updates["group_text"] = ""
+		}
+	}
+	return r.updateOutboundClaim(ctx, "set feishu outbound post", outbound, now, updates)
 }
 
 // FailOutbound 记录失败并在预算内退避，超出预算进入死信。
