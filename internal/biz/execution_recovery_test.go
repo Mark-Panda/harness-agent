@@ -84,6 +84,9 @@ func TestApprovedToolRecoveryNeverRepeatsAnUncertainInvocation(t *testing.T) {
 			worker.sessions = fakeSessionRepository{}
 			worker.runs = stubRunRepository{}
 			worker.approvals = approvalExecutionFaults{base, tc.claimErr, tc.readErr, tc.finishErr}
+			worker.approvalDelivery = testAtomicApprovalDelivery{
+				sessions: worker.sessions, runs: worker.runs, steps: worker.steps, approvals: worker.approvals,
+			}
 			tool := &fakeRuntimeTool{name: "write", err: tc.toolErr, output: json.RawMessage(`{"detail":"remote"}`)}
 			var registry react.Registry = singleToolRegistry{tool: approvalBoundTestTool{Tool: toolWithErrorOutput{tool}, target: target}}
 			if tc.missing {

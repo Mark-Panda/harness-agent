@@ -266,11 +266,26 @@ func (r *ExecutionStepRepository) ListToolStepsForRecovery(ctx context.Context, 
 
 // SavePayload 保存脱敏载荷；JSON 与文本互斥，二者都为空时仅保存元数据。
 func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.ExecutionPayload) (biz.ExecutionPayload, error) {
+	record, err := executionPayloadRecord(payload)
+	if err != nil {
+		return biz.ExecutionPayload{}, err
+	}
+	err = WithScope(ctx, r.db, Scope{UserID: payload.UserID}, func(tx *gorm.DB) error {
+		return tx.Create(&record).Error
+	})
+	if err != nil {
+		return biz.ExecutionPayload{}, catalogError("save execution payload", err)
+	}
+	return toBizPayload(record)
+}
+
+// executionPayloadRecord 统一规范化并脱敏载荷，供独立写入与审批原子事务复用。
+func executionPayloadRecord(payload biz.ExecutionPayload) (executionPayloadModel, error) {
 	if payload.ID == uuid.Nil {
 		payload.ID = uuid.New()
 	}
 	if len(payload.PayloadHash) != 0 && len(payload.PayloadHash) != 32 {
-		return biz.ExecutionPayload{}, fmt.Errorf("%w: payload hash must be a SHA-256 digest", biz.ErrInvalidConfig)
+		return executionPayloadModel{}, fmt.Errorf("%w: payload hash must be a SHA-256 digest", biz.ErrInvalidConfig)
 	}
 	if payload.ContentType == "" {
 		payload.ContentType = "application/json"
@@ -300,7 +315,7 @@ func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.E
 	if payload.ContentJSON != nil {
 		encoded, err := json.Marshal(payload.ContentJSON)
 		if err != nil {
-			return biz.ExecutionPayload{}, err
+			return executionPayloadModel{}, err
 		}
 		if payload.CaptureMode == biz.CaptureRedacted {
 			encoded = []byte(biz.RedactExecutionText(string(encoded)))
@@ -316,13 +331,7 @@ func (r *ExecutionStepRepository) SavePayload(ctx context.Context, payload biz.E
 		record.ContentText = &text
 		record.SavedSizeBytes = int64(len(text))
 	}
-	err := WithScope(ctx, r.db, Scope{UserID: payload.UserID}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
-	})
-	if err != nil {
-		return biz.ExecutionPayload{}, catalogError("save execution payload", err)
-	}
-	return toBizPayload(record)
+	return record, nil
 }
 
 // ListPayloads 按创建时间升序返回 Run 或步骤载荷。

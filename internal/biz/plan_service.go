@@ -139,10 +139,13 @@ func (s *PlanService) Resume(ctx context.Context, principal Principal, runID uui
 	run, err := s.runs.ResumeAfterPause(ctx, principal, runID)
 	if err != nil {
 		// 入队或审批状态不满足时回滚计划状态，避免出现“计划执行中但没有 Run”的悬挂状态。
-		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, plan.ID, PlanExecuting, PlanPaused, resumed.Revision, PlanFence{}, PlanUpdate{
-			ErrorCode: "plan_paused", ErrorMessage: "计划恢复失败，已回到暂停状态",
+		paused, pauseErr := s.plans.UpdatePlan(ctx, principal.UserID, plan.ID, PlanExecuting, PlanPaused, resumed.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_resume_failed", ErrorMessage: "计划暂时无法恢复，请重试恢复",
 		})
-		return Plan{}, err
+		if pauseErr != nil {
+			return Plan{}, errors.Join(fmt.Errorf("resume plan: %w", err), fmt.Errorf("roll back plan to paused: %w", pauseErr))
+		}
+		return paused, err
 	}
 	if run.Status == RunWaitingApproval {
 		// 仍有待决策审批：计划保持暂停，等待审批完成后再由用户恢复。
@@ -215,10 +218,16 @@ func (s *PlanService) Revise(ctx context.Context, principal Principal, runID uui
 	}
 	run, err := s.runs.ResumeAfterPause(ctx, principal, runID)
 	if err != nil {
-		_, _ = s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanFailed, created.Revision, PlanFence{}, PlanUpdate{
-			ErrorCode: "plan_resume_failed", ErrorMessage: "修订后的计划无法恢复执行", FinishedAt: ptrTime(now),
+		// 旧版本已被替换为取消态，新版本必须回到 paused 而不是 failed，
+		// 否则公开状态机再也没有恢复入口。补偿失败必须与入队错误一起返回，
+		// 不能静默留下“执行中但没有队列任务”的悬挂计划。
+		paused, pauseErr := s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanPaused, created.Revision, PlanFence{}, PlanUpdate{
+			ErrorCode: "plan_resume_failed", ErrorMessage: "修订后的计划暂时无法恢复，请重试恢复",
 		})
-		return Plan{}, err
+		if pauseErr != nil {
+			return Plan{}, errors.Join(fmt.Errorf("resume revised plan: %w", err), fmt.Errorf("roll back revised plan to paused: %w", pauseErr))
+		}
+		return paused, err
 	}
 	if run.Status == RunWaitingApproval {
 		paused, pauseErr := s.plans.UpdatePlan(ctx, principal.UserID, created.ID, PlanExecuting, PlanPaused, created.Revision, PlanFence{}, PlanUpdate{

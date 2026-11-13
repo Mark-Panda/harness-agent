@@ -154,6 +154,22 @@ func TestLLMRerankerSuccess(t *testing.T) {
 	}
 }
 
+// TestLLMRerankerReturnsUsageOnInvalidResults 验证模型已返回用量时，结果校验失败也不能丢账。
+func TestLLMRerankerReturnsUsageOnInvalidResults(t *testing.T) {
+	providerID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[],"usage":{"prompt_tokens":11}}`)
+	}))
+	defer server.Close()
+	reranker := newReranker(t, gomock.NewController(t), server.URL, providerID, biz.ProviderEnabled,
+		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
+	_, usage, err := reranker.RerankWithUsage(context.Background(), "查询", []string{"a", "b"})
+	if err == nil || usage.InputTokens != 11 || usage.ProviderID != providerID {
+		t.Fatalf("RerankWithUsage() usage=%#v error=%v", usage, err)
+	}
+}
+
 // TestLLMRerankerGuards 验证模型缺失、供应商停用与非法输入。
 func TestLLMRerankerGuards(t *testing.T) {
 	providerID := uuid.New()

@@ -75,7 +75,7 @@ func (f *fakeAccountFactRepository) SaveFact(_ context.Context, fact biz.MemoryF
 	return fact, false, nil
 }
 
-func (f *fakeAccountFactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, _ biz.FactTask) (biz.MemoryFact, bool, error) {
+func (f *fakeAccountFactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, _ biz.FactTask, _ biz.JobWriteFence) (biz.MemoryFact, bool, error) {
 	return f.SaveFact(ctx, fact, expectedVersion)
 }
 

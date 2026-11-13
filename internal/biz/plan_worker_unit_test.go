@@ -84,8 +84,14 @@ type stubOpener struct {
 
 // memoryPlanRepo 是内存计划仓储，用于覆盖 Plan 执行器的成功、失败与暂停路径。
 type memoryPlanRepo struct {
-	mu    sync.Mutex
-	plans map[uuid.UUID]Plan
+	mu                 sync.Mutex
+	plans              map[uuid.UUID]Plan
+	completionMessages map[uuid.UUID]Message
+	completionEvents   map[string]OutboxEvent
+	beforeCompletePlan func()
+	completePlanErr    error
+	updatePlanErrTo    PlanStatus
+	updatePlanErr      error
 }
 
 // newMemoryPlanRepo 构造内存计划仓储。
@@ -198,6 +204,9 @@ func (r *memoryPlanRepo) UpdatePlan(_ context.Context, _ uuid.UUID, planID uuid.
 	if err := TransitionPlanStatus(from, to); err != nil {
 		return Plan{}, err
 	}
+	if to == r.updatePlanErrTo && r.updatePlanErr != nil {
+		return Plan{}, r.updatePlanErr
+	}
 	plan.Status = to
 	plan.Revision++
 	plan.ErrorCode = update.ErrorCode
@@ -210,6 +219,61 @@ func (r *memoryPlanRepo) UpdatePlan(_ context.Context, _ uuid.UUID, planID uuid.
 	}
 	r.plans[planID] = plan
 	return clonePlan(plan), nil
+}
+
+// CompletePlan 模拟生产事务：所有校验通过后才同时发布消息、事件和完成状态。
+func (r *memoryPlanRepo) CompletePlan(_ context.Context, userID uuid.UUID, planID uuid.UUID, completion PlanCompletion) (Plan, Message, error) {
+	if r.beforeCompletePlan != nil {
+		r.beforeCompletePlan()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.completePlanErr != nil {
+		return Plan{}, Message{}, r.completePlanErr
+	}
+	plan, ok := r.plans[planID]
+	if !ok {
+		return Plan{}, Message{}, ErrResourceNotFound
+	}
+	switch plan.Status {
+	case PlanPaused:
+		return Plan{}, Message{}, ErrPlanPaused
+	case PlanCancelled:
+		return Plan{}, Message{}, ErrPlanCancelled
+	case PlanExecuting:
+	default:
+		return Plan{}, Message{}, ErrPlanRevisionConflict
+	}
+	if plan.Revision != completion.ExpectedRevision || plan.UserID != userID {
+		return Plan{}, Message{}, ErrPlanRevisionConflict
+	}
+	message := completion.Message
+	if message.RunID == nil || *message.RunID != plan.RunID || message.SessionID != plan.SessionID || message.UserID != userID {
+		return Plan{}, Message{}, ErrResourceConflict
+	}
+	if r.completionMessages == nil {
+		r.completionMessages = map[uuid.UUID]Message{}
+	}
+	if r.completionEvents == nil {
+		r.completionEvents = map[string]OutboxEvent{}
+	}
+	stored, exists := r.completionMessages[message.ID]
+	if !exists {
+		if _, err := json.Marshal(completion.Event.Payload); err != nil {
+			return Plan{}, Message{}, err
+		}
+		stored = message
+	}
+	plan.Status = PlanCompleted
+	plan.Revision++
+	plan.ErrorCode, plan.ErrorMessage = "", ""
+	plan.FinishedAt = &completion.FinishedAt
+	r.plans[planID] = plan
+	if !exists {
+		r.completionMessages[message.ID] = stored
+		r.completionEvents[completion.Event.DedupeKey] = completion.Event
+	}
+	return clonePlan(plan), stored, nil
 }
 
 // AddPlanUsage 累加计划用量。
@@ -867,8 +931,58 @@ func TestPlanFinalResultRecoveryKeepsStoredSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered.Content != "模型汇总" || len(recovered.Messages) != len(result.Messages) || len(sessions.messages) != 1 {
-		t.Fatalf("recovery duplicated or replaced final answer: %#v, stored=%d", recovered, len(sessions.messages))
+	if recovered.Content != "模型汇总" || len(recovered.Messages) != len(result.Messages) || len(plans.completionMessages) != 1 || len(sessions.messages) != 0 {
+		t.Fatalf("recovery duplicated or replaced final answer: %#v, stored=%d", recovered, len(plans.completionMessages))
+	}
+}
+
+func TestFinishPlanPauseBeforeCommitDoesNotPublish(t *testing.T) {
+	worker, plans, router, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
+		writeCompletion(t, w, "不应发布的答案", http.StatusOK)
+	})
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
+	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
+		Status: PlanExecuting, Goal: "g", MaxSteps: 50,
+		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}}}
+	plans.seedPlan(plan)
+	var pauseErr error
+	plans.beforeCompletePlan = func() {
+		current, err := plans.GetPlan(context.Background(), run.UserID, plan.ID)
+		if err != nil {
+			pauseErr = err
+			return
+		}
+		_, pauseErr = plans.UpdatePlan(context.Background(), run.UserID, plan.ID, PlanExecuting, PlanPaused, current.Revision, PlanFence{}, PlanUpdate{ErrorCode: "plan_paused"})
+	}
+	_, err := worker.finishPlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, plan,
+		[]react.Message{{Role: react.RoleUser, Content: "任务"}})
+	if pauseErr != nil || !errors.Is(err, ErrPlanPaused) {
+		t.Fatalf("finishPlan pause race = %v, pause error = %v", err, pauseErr)
+	}
+	stored, _ := plans.GetPlan(context.Background(), run.UserID, plan.ID)
+	if stored.Status != PlanPaused || len(plans.completionMessages) != 0 || len(plans.completionEvents) != 0 {
+		t.Fatalf("pause race published partial completion: plan=%#v messages=%d events=%d", stored, len(plans.completionMessages), len(plans.completionEvents))
+	}
+}
+
+func TestMemoryCompletePlanFailureHasNoPartialWrites(t *testing.T) {
+	plans := newMemoryPlanRepo()
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
+	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1, Status: PlanExecuting}
+	plans.seedPlan(plan)
+	messageID := uuid.MustParse(deterministicPlanFinalMessageID(plan.ID))
+	_, _, err := plans.CompletePlan(context.Background(), run.UserID, plan.ID, PlanCompletion{
+		Fence: PlanFence{Owner: "worker", Token: 1}, FinishedAt: time.Now().UTC(),
+		Message: Message{ID: messageID, SessionID: run.SessionID, UserID: run.UserID, RunID: &run.ID, Role: MessageAssistant, Content: "答案"},
+		Event: OutboxEvent{UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message", AggregateID: messageID.String(),
+			DedupeKey: "message.created.agent:" + messageID.String(), Payload: map[string]any{"invalid": make(chan int)}},
+	})
+	if err == nil {
+		t.Fatal("invalid outbox payload unexpectedly completed the plan")
+	}
+	stored, _ := plans.GetPlan(context.Background(), run.UserID, plan.ID)
+	if stored.Status != PlanExecuting || stored.Revision != 0 || len(plans.completionMessages) != 0 || len(plans.completionEvents) != 0 {
+		t.Fatalf("failed completion left partial writes: plan=%#v messages=%d events=%d", stored, len(plans.completionMessages), len(plans.completionEvents))
 	}
 }
 

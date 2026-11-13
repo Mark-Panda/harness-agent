@@ -124,6 +124,18 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 	partials := make([]string, 0, len(chunks))
 	inputTokens, outputTokens := 0, 0
 	estimatedCost := 0.0
+	defer func() {
+		// 所有已返回 usage 的调用先进入累计值；即使后续分块、归并或输出校验
+		// 失败，也要记录前序及本次已发生的用量。无 usage 的状态/传输错误不虚构计量。
+		if g.usage == nil || (inputTokens == 0 && outputTokens == 0) {
+			return
+		}
+		providerID := resolved.providerID
+		if err := g.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(inputTokens), int64(outputTokens), estimatedCost, time.Now().UTC()); err != nil {
+			// 用量记录失败不阻断摘要结果或原始错误。
+			_ = err
+		}
+	}()
 	carried := previous
 	for _, chunk := range chunks {
 		system, user, err := memory.BuildSummaryPrompt(carried, chunk, g.config.MaxMessageBytes)
@@ -131,13 +143,13 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
 		}
 		response, err := g.call(ctx, client, resolved, system, user)
+		inputTokens += response.InputTokens
+		outputTokens += response.OutputTokens
+		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
 		if err != nil {
 			return SummaryGeneration{}, err
 		}
 		partials = append(partials, response.Content)
-		inputTokens += response.InputTokens
-		outputTokens += response.OutputTokens
-		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
 		// 后续分块携带上一片段摘要，保持跨分块的指代与事实连续。
 		carried = response.Content
 	}
@@ -148,20 +160,13 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
 		}
 		response, err := g.call(ctx, client, resolved, system, user)
+		inputTokens += response.InputTokens
+		outputTokens += response.OutputTokens
+		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
 		if err != nil {
 			return SummaryGeneration{}, err
 		}
 		finalText = response.Content
-		inputTokens += response.InputTokens
-		outputTokens += response.OutputTokens
-		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
-	}
-	if g.usage != nil {
-		providerID := resolved.providerID
-		if err := g.usage.RecordUsage(ctx, userID, nil, &providerID, int64(inputTokens), int64(outputTokens), estimatedCost, time.Now().UTC()); err != nil {
-			// 用量记录失败不阻断摘要落库，但下一条摘要仍会继续尝试记录。
-			_ = err
-		}
 	}
 	providerID := resolved.providerID
 	return SummaryGeneration{
@@ -190,13 +195,14 @@ func (g *SummaryLLMGenerator) call(ctx context.Context, client *model.Client, re
 	})
 	if err != nil {
 		// 认证失败、参数错误与上下文超限重试无意义；其余错误交给任务退避重试。
+		// 保留 Provider 已返回的 usage，由 Summarize 在错误返回前纳入累计。
 		if errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) || errors.Is(err, model.ErrCapability) || errors.Is(err, model.ErrContextExceeded) {
-			return model.ChatResponse{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
+			return response, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
 		}
-		return model.ChatResponse{}, err
+		return response, err
 	}
 	if strings.TrimSpace(response.Content) == "" || len(response.ToolCalls) > 0 {
-		return model.ChatResponse{}, fmt.Errorf("%w: provider returned an empty or unexpected summary", ErrSummaryPermanent)
+		return response, fmt.Errorf("%w: provider returned an empty or unexpected summary", ErrSummaryPermanent)
 	}
 	return response, nil
 }

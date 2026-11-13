@@ -243,6 +243,79 @@ func TestRouterRetryThenSwitch(t *testing.T) {
 	}
 }
 
+// TestRouterCompleteAggregatesUsageAcrossFailedRetry 验证失败 Attempt 与重试成功的
+// Provider usage 都进入最终 Completion，而每次 Attempt 的落库明细保持独立。
+func TestRouterCompleteAggregatesUsageAcrossFailedRetry(t *testing.T) {
+	server := newChatServer(t, func(call int, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"error":{"code":"server_error"},"usage":{"prompt_tokens":3,"completion_tokens":2}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`))
+	})
+	candidate := candidateFor(server, "p1", "m1", 1_000_000)
+	candidate.InputPricePerMillion = 1_000_000
+	candidate.OutputPricePerMillion = 2_000_000
+	recorder := &attemptRecorder{}
+	router, err := NewRouter([]Candidate{candidate}, newFakeHealth(), testConfig(), recorder,
+		WithSleep(func(context.Context, time.Duration) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := router.Complete(context.Background(), []react.Message{{Role: react.RoleUser, Content: "hi"}}, nil)
+	if err != nil || completion.Content != "recovered" {
+		t.Fatalf("Complete() = %#v, %v", completion, err)
+	}
+	if completion.Usage.InputTokens != 8 || completion.Usage.OutputTokens != 9 || completion.EstimatedCost != 26 {
+		t.Fatalf("aggregated usage = %#v cost=%f, want 8/9 cost=26", completion.Usage, completion.EstimatedCost)
+	}
+	if len(recorder.finished) != 2 || recorder.finished[0].InputTokens != 3 || recorder.finished[0].OutputTokens != 2 ||
+		recorder.finished[0].EstimatedCost != 7 || recorder.finished[1].InputTokens != 5 ||
+		recorder.finished[1].OutputTokens != 7 || recorder.finished[1].EstimatedCost != 19 {
+		t.Fatalf("attempt details changed: %#v", recorder.finished)
+	}
+}
+
+// TestRouterCompleteReturnsUsageOnFailure 验证终止错误也携带已返回 usage；
+// Provider 无法提供 usage 时沿用 Attempt 的请求侧输入估算。
+func TestRouterCompleteReturnsUsageOnFailure(t *testing.T) {
+	t.Run("provider usage", func(t *testing.T) {
+		server := newChatServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"error":{"code":"invalid_request_error"},"usage":{"prompt_tokens":3,"completion_tokens":2}}`))
+		})
+		candidate := candidateFor(server, "p1", "m1", 1_000_000)
+		candidate.InputPricePerMillion = 1_000_000
+		candidate.OutputPricePerMillion = 2_000_000
+		router, err := NewRouter([]Candidate{candidate}, newFakeHealth(), testConfig(), &attemptRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		completion, err := router.Complete(context.Background(), []react.Message{{Role: react.RoleUser, Content: "hi"}}, nil)
+		if !errors.Is(err, ErrPermanent) || completion.Usage.InputTokens != 3 || completion.Usage.OutputTokens != 2 || completion.EstimatedCost != 7 {
+			t.Fatalf("failure completion = %#v, %v", completion, err)
+		}
+	})
+
+	t.Run("missing usage uses request estimate", func(t *testing.T) {
+		server := newChatServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadRequest) })
+		candidate := candidateFor(server, "p1", "m1", 1_000_000)
+		candidate.InputPricePerMillion = 1_000_000
+		candidate.OutputPricePerMillion = 2_000_000
+		router, err := NewRouter([]Candidate{candidate}, newFakeHealth(), testConfig(), &attemptRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		completion, err := router.Complete(context.Background(), []react.Message{{Role: react.RoleUser, Content: "hi"}}, nil)
+		estimatedInput := int(EstimateTokens([]ChatMessage{{Role: "user", Content: "hi"}}))
+		if !errors.Is(err, ErrPermanent) || completion.Usage.InputTokens != estimatedInput || completion.Usage.OutputTokens != 0 ||
+			completion.EstimatedCost != float64(estimatedInput) {
+			t.Fatalf("estimated failure completion = %#v, %v; estimated input=%d", completion, err, estimatedInput)
+		}
+	})
+}
+
 // TestRouterRateLimitRetryAfterSwitchesImmediately 验证超出预算的 Retry-After 直接切换且不等待。
 func TestRouterRateLimitRetryAfterSwitchesImmediately(t *testing.T) {
 	first := newChatServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {

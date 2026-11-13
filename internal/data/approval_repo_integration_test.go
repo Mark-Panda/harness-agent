@@ -205,6 +205,178 @@ func TestToolApprovalRepositoryLifecycle(t *testing.T) {
 	})
 }
 
+// TestToolApprovalRepositoryDeliverAtomicallyRollbackAndRetry 验证审批投递中途失败不留下半提交事实，
+// 旧 Worker 不能写入，修正后重试只提交一次消息、事件、载荷和会话版本。
+func TestToolApprovalRepositoryDeliverAtomicallyRollbackAndRetry(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	user, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "approval_delivery_" + strings.ReplaceAll(uuid.NewString(), "-", ""), PasswordHash: "hash",
+		Role: biz.RoleUser, Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", user.ID).Error }()
+
+	sessions := NewSessionRepository(appDB)
+	runs := NewRunRepository(appDB)
+	steps := NewExecutionStepRepository(appDB)
+	approvals := NewToolApprovalRepository(appDB)
+	sessionID, runID := approvalIntegrationRun(t, ctx, sessions, runs, user.ID)
+	_, fence, err := runs.ClaimRun(ctx, user.ID, runID, "approval-worker-a", time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now().UTC()
+	step, err := steps.StartStep(ctx, biz.ExecutionStep{
+		RunID: runID, UserID: user.ID, Kind: biz.StepKindTool, Name: "delete", ToolName: "mcp_admin_delete",
+		Status: biz.StepRunning, RiskLevel: "high", StartedAt: &startedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := approvals.CreateApproval(ctx, biz.ToolApproval{
+		RunID: runID, StepID: &step.ID, SessionID: sessionID, UserID: user.ID,
+		ToolCallID: "call-atomic", ToolName: "mcp_admin_delete", Arguments: json.RawMessage(`{"id":"x"}`),
+		RiskLevel: "high", IdempotencyKey: "atomic-delivery",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approvals.DecideApproval(ctx, user.ID, approval.ID, biz.ApprovalDecisionApprove, user.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approvals.ClaimApprovalExecution(ctx, user.ID, runID, approval.ID, fence, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	approval, err = approvals.FinishApprovalExecution(ctx, user.ID, approval.ID, biz.ApprovalExecuted,
+		json.RawMessage(`{"ok":true}`), "", "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	messageID, eventID, payloadID := uuid.New(), uuid.New(), uuid.New()
+	delivery := biz.ApprovalDelivery{
+		Approval: approval,
+		Message: biz.Message{
+			ID: messageID, SessionID: sessionID, UserID: user.ID, RunID: &runID, Role: biz.MessageTool,
+			Content: `{"ok":true}`, ToolCallID: approval.ToolCallID, ToolName: approval.ToolName,
+		},
+		Outbox: biz.OutboxEvent{
+			UserID: user.ID, EventType: "message.created.agent", AggregateType: "message", AggregateID: messageID.String(),
+			DedupeKey: "message.created.agent:" + messageID.String(),
+			Payload:   map[string]any{"run_id": runID.String(), "approval_id": approval.ID.String()},
+		},
+		Event: biz.RunEvent{
+			RunID: runID, UserID: user.ID, EventID: eventID, EventType: "tool.completed",
+			Payload: map[string]any{"approval_id": approval.ID.String(), "message_id": messageID.String(), "status": "executed"},
+		},
+		Fence: fence,
+		Now:   time.Now().UTC(),
+		StepPayload: &biz.ExecutionPayload{
+			ID: payloadID, RunID: runID, StepID: &step.ID, UserID: user.ID, Type: biz.PayloadToolOutput,
+			ContentText: `{"ok":true}`, CaptureMode: biz.CaptureRedacted,
+		},
+		StepUpdate: &biz.StepUpdate{Status: biz.StepCompleted, FinishedAt: time.Now().UTC()},
+	}
+
+	counts := func() [4]int64 {
+		t.Helper()
+		var result [4]int64
+		queries := []struct {
+			table  string
+			column string
+			value  any
+		}{
+			{table: "messages", column: "id", value: messageID},
+			{table: "outbox_events", column: "dedupe_key", value: delivery.Outbox.DedupeKey},
+			{table: "run_events", column: "event_id", value: eventID},
+			{table: "execution_payloads", column: "id", value: payloadID},
+		}
+		for index, query := range queries {
+			if err := adminDB.Table(query.table).Where("user_id = ? AND "+query.column+" = ?", user.ID, query.value).
+				Count(&result[index]).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		return result
+	}
+	sessionVersion := func() int64 {
+		t.Helper()
+		var version int64
+		if err := adminDB.Table("sessions").Select("version").Where("id = ?", sessionID).Scan(&version).Error; err != nil {
+			t.Fatal(err)
+		}
+		return version
+	}
+	assertUndelivered := func() {
+		t.Helper()
+		storedApproval, err := approvals.GetApproval(ctx, user.ID, approval.ID)
+		if err != nil || storedApproval.DeliveredAt != nil {
+			t.Fatalf("approval delivery was not rolled back: %#v, %v", storedApproval, err)
+		}
+		storedSteps, err := steps.ListSteps(ctx, user.ID, runID, 10)
+		if err != nil || len(storedSteps) != 1 || storedSteps[0].Status != biz.StepRunning {
+			t.Fatalf("approval step was not rolled back: %#v, %v", storedSteps, err)
+		}
+		if got := counts(); got != ([4]int64{}) || sessionVersion() != 1 {
+			t.Fatalf("partial delivery facts remain: counts=%v session_version=%d", got, sessionVersion())
+		}
+	}
+
+	invalid := delivery
+	invalid.Outbox.Payload = map[string]any{"invalid_json": make(chan int)}
+	if _, err := approvals.DeliverApprovalAtomically(ctx, invalid); err == nil {
+		t.Fatal("delivery with invalid outbox payload succeeded")
+	}
+	assertUndelivered()
+
+	// 租约被新 Worker 接管后，旧 fence 即使携带完全合法的事实也必须失败关闭。
+	if err := adminDB.Exec("UPDATE agent_runs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = ?", runID).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, newFence, err := runs.ClaimRun(ctx, user.ID, runID, "approval-worker-b", time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approvals.DeliverApprovalAtomically(ctx, delivery); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale fence delivery error = %v, want conflict", err)
+	}
+	assertUndelivered()
+
+	delivery.Fence = newFence
+	stored, err := approvals.DeliverApprovalAtomically(ctx, delivery)
+	if err != nil || stored.ID != messageID || stored.Content != delivery.Message.Content {
+		t.Fatalf("DeliverApprovalAtomically() = %#v, %v", stored, err)
+	}
+	if got := counts(); got != ([4]int64{1, 1, 1, 1}) || sessionVersion() != 2 {
+		t.Fatalf("successful delivery counts=%v session_version=%d", got, sessionVersion())
+	}
+	delivered, err := approvals.GetApproval(ctx, user.ID, approval.ID)
+	if err != nil || delivered.DeliveredAt == nil {
+		t.Fatalf("delivered approval = %#v, %v", delivered, err)
+	}
+	storedSteps, err := steps.ListSteps(ctx, user.ID, runID, 10)
+	if err != nil || len(storedSteps) != 1 || storedSteps[0].Status != biz.StepCompleted {
+		t.Fatalf("completed approval step = %#v, %v", storedSteps, err)
+	}
+
+	// 使用相同确定性 ID 重试只返回既有事实，不重复推进会话版本或写入事件。
+	delivery.Now = delivery.Now.Add(time.Second)
+	if _, err := approvals.DeliverApprovalAtomically(ctx, delivery); err != nil {
+		t.Fatalf("idempotent delivery retry: %v", err)
+	}
+	if got := counts(); got != ([4]int64{1, 1, 1, 1}) || sessionVersion() != 2 {
+		t.Fatalf("retry duplicated delivery facts: counts=%v session_version=%d", got, sessionVersion())
+	}
+}
+
 // TestRunApprovalStateTransitions 验证 Run 的真实暂停、恢复与人工对账状态及事件。
 func TestRunApprovalStateTransitions(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {

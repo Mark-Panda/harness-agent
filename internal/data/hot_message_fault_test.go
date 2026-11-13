@@ -2,6 +2,7 @@ package data_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -99,4 +100,151 @@ func TestHotMessageStoreRejectsPartialWindow(t *testing.T) {
 	if err != nil || !hit || len(loaded) != 1 || loaded[0].SpeakerOpenID != "ou_speaker" || !loaded[0].CreatedAt.Equal(userMessage.CreatedAt) {
 		t.Fatalf("speaker round trip = %#v hit=%v err=%v", loaded, hit, err)
 	}
+}
+
+func newHotMessageConcurrencyStore(t *testing.T) (*data.HotMessageRepository, *redis.Client) {
+	t.Helper()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store, err := data.NewHotMessageStore(client, 20, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, client
+}
+
+func hotMessageCacheKeys(userID, sessionID uuid.UUID) (string, string) {
+	key := fmt.Sprintf("session:%s:%s:messages", userID, sessionID)
+	return key, key + ":metadata"
+}
+
+// TestHotMessageStoreSaveDoesNotOverwriteConcurrentAppend 验证旧 PG 快照不能覆盖 Append 推进的高水位。
+func TestHotMessageStoreSaveDoesNotOverwriteConcurrentAppend(t *testing.T) {
+	store, client := newHotMessageConcurrencyStore(t)
+	ctx := context.Background()
+	userID, sessionID := uuid.New(), uuid.New()
+	base := time.Date(2026, 11, 13, 1, 0, 0, 0, time.UTC)
+	first := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "first", CreatedAt: base}
+	second := biz.Message{ID: uuid.New(), Role: biz.MessageAssistant, Content: "second", CreatedAt: base.Add(time.Second)}
+	concurrent := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "concurrent", CreatedAt: base.Add(2 * time.Second)}
+	if err := store.Save(ctx, userID, sessionID, []biz.Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	// PG 已返回 first/second 后、Save 重建前，另一个请求持久化并 Append 了 concurrent。
+	if err := store.Append(ctx, userID, sessionID, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, userID, sessionID, []biz.Message{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, hit, err := store.Load(ctx, userID, sessionID)
+	if err != nil || !hit || len(loaded) != 3 || loaded[2].ID != concurrent.ID {
+		t.Fatalf("concurrent append was lost: loaded=%#v hit=%v err=%v", loaded, hit, err)
+	}
+	_, metadataKey := hotMessageCacheKeys(userID, sessionID)
+	version, err := client.HGet(ctx, metadataKey, "version").Int64()
+	if err != nil || version != 2 {
+		t.Fatalf("stale save advanced cache version: version=%d err=%v", version, err)
+	}
+	// 包含当前高水位的新快照允许重建，并继续推进版本。
+	if err := store.Save(ctx, userID, sessionID, []biz.Message{first, second, concurrent}); err != nil {
+		t.Fatal(err)
+	}
+	version, err = client.HGet(ctx, metadataKey, "version").Int64()
+	if err != nil || version != 3 {
+		t.Fatalf("fresh save did not advance cache version: version=%d err=%v", version, err)
+	}
+}
+
+// TestHotMessageStoreMissingWindowKeepsAppendHighWater 验证空缓存 Append 不会被旧快照伪造成完整窗口。
+func TestHotMessageStoreMissingWindowKeepsAppendHighWater(t *testing.T) {
+	store, client := newHotMessageConcurrencyStore(t)
+	ctx := context.Background()
+	userID, sessionID := uuid.New(), uuid.New()
+	base := time.Now().UTC()
+	stale := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "stale", CreatedAt: base}
+	concurrent := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "new", CreatedAt: base.Add(time.Second)}
+	if err := store.Append(ctx, userID, sessionID, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, userID, sessionID, []biz.Message{stale}); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, err := store.Load(ctx, userID, sessionID); err != nil || hit {
+		t.Fatalf("stale snapshot must stay a cache miss: hit=%v err=%v", hit, err)
+	}
+	listKey, metadataKey := hotMessageCacheKeys(userID, sessionID)
+	if newest, err := client.HGet(ctx, metadataKey, "newest").Result(); err != nil || newest != concurrent.ID.String() {
+		t.Fatalf("append high water was not preserved: newest=%q err=%v", newest, err)
+	}
+	if exists, err := client.Exists(ctx, listKey).Result(); err != nil || exists != 0 {
+		t.Fatalf("partial list was created: exists=%d err=%v", exists, err)
+	}
+	// 下次 PG 回源包含并发消息后，才允许重建并命中完整窗口。
+	if err := store.Save(ctx, userID, sessionID, []biz.Message{stale, concurrent}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, hit, err := store.Load(ctx, userID, sessionID)
+	if err != nil || !hit || len(loaded) != 2 || loaded[1].ID != concurrent.ID {
+		t.Fatalf("fresh postgres snapshot did not recover messages: loaded=%#v hit=%v err=%v", loaded, hit, err)
+	}
+}
+
+// TestHotMessageStoreRejectsInvalidVersionedWindow 验证元数据缺失、重复与乱序窗口全部回源。
+func TestHotMessageStoreRejectsInvalidVersionedWindow(t *testing.T) {
+	base := time.Date(2026, 11, 13, 2, 0, 0, 0, time.UTC)
+	newMessages := func() []biz.Message {
+		return []biz.Message{
+			{ID: uuid.New(), Role: biz.MessageUser, Content: "first", CreatedAt: base},
+			{ID: uuid.New(), Role: biz.MessageAssistant, Content: "second", CreatedAt: base.Add(time.Second)},
+		}
+	}
+	t.Run("missing metadata", func(t *testing.T) {
+		store, client := newHotMessageConcurrencyStore(t)
+		ctx := context.Background()
+		userID, sessionID := uuid.New(), uuid.New()
+		if err := store.Save(ctx, userID, sessionID, newMessages()); err != nil {
+			t.Fatal(err)
+		}
+		_, metadataKey := hotMessageCacheKeys(userID, sessionID)
+		if err := client.Del(ctx, metadataKey).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if _, hit, err := store.Load(ctx, userID, sessionID); err != nil || hit {
+			t.Fatalf("missing metadata must miss: hit=%v err=%v", hit, err)
+		}
+	})
+	t.Run("duplicate message", func(t *testing.T) {
+		store, _ := newHotMessageConcurrencyStore(t)
+		ctx := context.Background()
+		userID, sessionID := uuid.New(), uuid.New()
+		messages := newMessages()
+		if err := store.Save(ctx, userID, sessionID, messages); err != nil {
+			t.Fatal(err)
+		}
+		duplicate := messages[1]
+		duplicate.Content = "different payload with duplicate id"
+		if err := store.Append(ctx, userID, sessionID, duplicate); err != nil {
+			t.Fatal(err)
+		}
+		if _, hit, err := store.Load(ctx, userID, sessionID); err != nil || hit {
+			t.Fatalf("duplicate message must miss: hit=%v err=%v", hit, err)
+		}
+	})
+	t.Run("out of order message", func(t *testing.T) {
+		store, _ := newHotMessageConcurrencyStore(t)
+		ctx := context.Background()
+		userID, sessionID := uuid.New(), uuid.New()
+		if err := store.Save(ctx, userID, sessionID, newMessages()); err != nil {
+			t.Fatal(err)
+		}
+		older := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "older", CreatedAt: base.Add(-time.Second)}
+		if err := store.Append(ctx, userID, sessionID, older); err != nil {
+			t.Fatal(err)
+		}
+		if _, hit, err := store.Load(ctx, userID, sessionID); err != nil || hit {
+			t.Fatalf("out-of-order message must miss: hit=%v err=%v", hit, err)
+		}
+	})
 }

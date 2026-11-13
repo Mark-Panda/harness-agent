@@ -76,8 +76,8 @@ type FactRepository interface {
 	GetActiveFact(ctx context.Context, userID uuid.UUID, key string) (MemoryFact, bool, error)
 	// SaveFact 以期望版本守卫写入新版本并关闭旧版本；版本冲突时 applied=false。
 	SaveFact(ctx context.Context, fact MemoryFact, expectedVersion int64) (MemoryFact, bool, error)
-	// SaveExtractedFact also verifies the source and its current policy in the write transaction.
-	SaveExtractedFact(ctx context.Context, fact MemoryFact, expectedVersion int64, source FactTask) (MemoryFact, bool, error)
+	// SaveExtractedFact 在写事务内复核来源策略与 Job 租约，失租任务不得提交事实。
+	SaveExtractedFact(ctx context.Context, fact MemoryFact, expectedVersion int64, source FactTask, fence JobWriteFence) (MemoryFact, bool, error)
 	// ListFactVersions 按版本倒序列出事实历史。
 	ListFactVersions(ctx context.Context, userID uuid.UUID, key string, limit int) ([]MemoryFact, error)
 	// ListFacts 按更新时间倒序列出用户全部事实版本，供导出与审计。
@@ -173,9 +173,9 @@ func (s *FactService) Apply(ctx context.Context, userID, sessionID uuid.UUID, ca
 	return s.apply(ctx, userID, sessionID, candidates, s.repo.SaveFact)
 }
 
-func (s *FactService) applyExtracted(ctx context.Context, source FactTask, candidates []FactCandidate) (FactApplyResult, error) {
+func (s *FactService) applyExtracted(ctx context.Context, source FactTask, candidates []FactCandidate, fence JobWriteFence) (FactApplyResult, error) {
 	return s.apply(ctx, source.Owner(), source.SessionID, candidates, func(ctx context.Context, fact MemoryFact, expected int64) (MemoryFact, bool, error) {
-		return s.repo.SaveExtractedFact(ctx, fact, expected, source)
+		return s.repo.SaveExtractedFact(ctx, fact, expected, source, fence)
 	})
 }
 
@@ -576,68 +576,111 @@ func (w *FactExtractionWorker) ProcessOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// handle 加载来源消息、提取事实并按策略写入。
+// handle 加载来源消息、提取事实并按策略写入，全程续约并在关键写入前检查 fencing 租约。
 func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
+	runCtx, lease := beginJobLease(ctx, w.jobs, job, w.config.WorkerID, w.config.Lease, w.config.Heartbeat, w.clock)
+	defer lease.stop()
+	logLeaseLost := func(err error) {
+		w.logger.Warn("fact job lease_lost", "job_id", job.ID, "error", err)
+	}
+	stopLease := func() bool {
+		if err := lease.stop(); err != nil {
+			logLeaseLost(err)
+			return true
+		}
+		return false
+	}
+	complete := func() {
+		if stopLease() {
+			return
+		}
+		if err := w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken); err != nil {
+			if errors.Is(err, ErrResourceConflict) {
+				logLeaseLost(err)
+				return
+			}
+			w.logger.Warn("complete fact job failed", "job_id", job.ID, "error", err)
+		}
+	}
+	fail := func(cause error) {
+		if stopLease() {
+			return
+		}
+		w.failJob(ctx, job, cause)
+	}
 	// 单次 panic 不得终止进程：记录堆栈并把任务退回重试，避免任务停留在租约中。
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			w.logger.Error("fact extraction job panicked", "job_id", job.ID,
 				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
-			w.failJob(context.WithoutCancel(ctx), job, fmt.Errorf("fact extraction panicked: %v", recovered))
+			fail(fmt.Errorf("fact extraction panicked: %v", recovered))
 		}
 	}()
 	task, err := decodeFactTask(job)
 	if err != nil {
 		w.logger.Error("invalid fact job payload", "job_id", job.ID, "error", err)
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		complete()
 		return
 	}
-	messages, err := w.messages.ListFactSourceMessages(ctx, task)
+	messages, err := w.messages.ListFactSourceMessages(runCtx, task)
 	if err != nil {
 		if errors.Is(err, ErrFactSourceInvalid) {
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			complete()
 			return
 		}
-		w.failJob(ctx, job, err)
+		fail(err)
 		return
 	}
 	if len(messages) != len(task.MessageIDs) || messageFingerprint(messages) != task.Fingerprint {
 		w.logger.Warn("fact source changed; completing job", "job_id", job.ID)
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		complete()
 		return
 	}
-	candidates, err := w.extractor.Extract(ctx, task.UserID, task.SessionID, messages)
+	if err := lease.check(); err != nil {
+		logLeaseLost(err)
+		return
+	}
+	candidates, err := w.extractor.Extract(runCtx, task.UserID, task.SessionID, messages)
 	if err != nil {
 		if errors.Is(err, ErrFactExtractionUnavailable) || errors.Is(err, ErrFactPermanent) || errors.Is(err, ErrSummaryModelUnavailable) {
 			w.logger.Warn("fact extraction is not retryable; completing job", "job_id", job.ID, "error", err)
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			complete()
 			return
 		}
-		w.failJob(ctx, job, err)
+		fail(err)
 		return
 	}
 	if len(candidates) > w.config.MaxFacts {
 		candidates = candidates[:w.config.MaxFacts]
 	}
-	result, err := w.facts.applyExtracted(ctx, task, candidates)
+	// Provider 可能忽略取消并返回结果；写入前必须再次确认 fencing 租约仍有效。
+	if err := lease.check(); err != nil {
+		logLeaseLost(err)
+		return
+	}
+	result, err := w.facts.applyExtracted(runCtx, task, candidates, newJobWriteFence(job, w.config.WorkerID))
 	if err != nil {
 		if errors.Is(err, ErrFactSourceInvalid) {
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			complete()
 			return
 		}
-		w.failJob(ctx, job, err)
+		fail(err)
 		return
 	}
 	w.logger.Info("facts applied", "session_id", task.SessionID, "fact_user_id", task.Owner(),
 		"speaker_open_id", task.SpeakerOpenID, "applied", result.Applied,
 		"skipped", result.Skipped, "conflicts", result.Conflicts)
-	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+	complete()
 }
 
 // failJob 记录可重试失败并退避。
 func (w *FactExtractionWorker) failJob(ctx context.Context, job Job, cause error) {
 	if err := w.jobs.Fail(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken,
 		w.clock().Add(backoffDelay(job.Attempts)), sanitizeExecutionError(cause), w.clock()); err != nil {
+		if errors.Is(err, ErrResourceConflict) {
+			w.logger.Warn("fact job lease_lost", "job_id", job.ID, "error", err)
+			return
+		}
 		w.logger.Warn("fail fact job failed", "job_id", job.ID, "error", err)
 	}
 }

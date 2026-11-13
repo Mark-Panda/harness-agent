@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/Mark-Panda/harness-agent/pkg/sandbox"
 	"github.com/google/uuid"
 )
@@ -325,11 +326,13 @@ func TestObservedToolReconcilesOnOutputPersistenceFailure(t *testing.T) {
 }
 
 type fakeRuntimeTool struct {
-	name   string
-	risk   string
-	output json.RawMessage
-	err    error
-	calls  int
+	name            string
+	risk            string
+	output          json.RawMessage
+	err             error
+	calls           int
+	arguments       []json.RawMessage
+	idempotencyKeys []string
 }
 
 // Spec 返回固定工具定义。
@@ -346,8 +349,10 @@ func (t *fakeRuntimeTool) RiskLevel() string {
 }
 
 // Invoke 返回预设结果或错误。
-func (t *fakeRuntimeTool) Invoke(context.Context, json.RawMessage) (json.RawMessage, error) {
+func (t *fakeRuntimeTool) Invoke(ctx context.Context, arguments json.RawMessage) (json.RawMessage, error) {
 	t.calls++
+	t.arguments = append(t.arguments, append(json.RawMessage(nil), arguments...))
+	t.idempotencyKeys = append(t.idempotencyKeys, mcp.IdempotencyKeyFromContext(ctx))
 	if t.err != nil {
 		return nil, t.err
 	}
@@ -781,6 +786,84 @@ func TestObservedToolSettlementFailureRequiresReconciliation(t *testing.T) {
 	}
 }
 
+// testAtomicApprovalDelivery 为直接构造 Worker 的内部测试适配既有内存替身。
+type testAtomicApprovalDelivery struct {
+	sessions  SessionRepository
+	runs      RunRepository
+	steps     ExecutionStepRepository
+	approvals ToolApprovalRepository
+}
+
+func (a testAtomicApprovalDelivery) DeliverApprovalAtomically(ctx context.Context, delivery ApprovalDelivery) (Message, error) {
+	stored, err := a.sessions.AppendMessageIdempotent(ctx, delivery.Message, delivery.Outbox, delivery.Fence)
+	if err != nil {
+		return Message{}, err
+	}
+	if _, err := a.runs.AppendEventFenced(ctx, delivery.Event, delivery.Fence); err != nil {
+		return Message{}, err
+	}
+	if delivery.StepPayload != nil {
+		if _, err := a.steps.SavePayload(ctx, *delivery.StepPayload); err != nil {
+			return Message{}, err
+		}
+		if delivery.Approval.StepID == nil || delivery.StepUpdate == nil {
+			return Message{}, fmt.Errorf("approval step outcome is incomplete")
+		}
+		if _, err := a.steps.FinishStep(ctx, delivery.Approval.UserID, *delivery.Approval.StepID, *delivery.StepUpdate); err != nil {
+			return Message{}, err
+		}
+	}
+	if _, err := a.approvals.MarkApprovalDelivered(ctx, delivery.Approval.UserID, delivery.Approval.ID, delivery.Now); err != nil {
+		return Message{}, err
+	}
+	return stored, nil
+}
+
+type failingAtomicApprovalDelivery struct {
+	err   error
+	calls int
+}
+
+func (f *failingAtomicApprovalDelivery) DeliverApprovalAtomically(_ context.Context, _ ApprovalDelivery) (Message, error) {
+	f.calls++
+	return Message{}, f.err
+}
+
+// TestApprovalDeliveryFailureDoesNotUseLegacyWrites 验证原子端口失败后不会退回旧分段写入链。
+func TestApprovalDeliveryFailureDoesNotUseLegacyWrites(t *testing.T) {
+	runID, userID, approvalID := uuid.New(), uuid.New(), uuid.New()
+	approval := ToolApproval{
+		ID: approvalID, RunID: runID, UserID: userID, ToolCallID: "call-1", ToolName: "mcp_admin_delete",
+		Status: ApprovalDenied,
+	}
+	approvals := &fakeApprovalRepository{approvals: []ToolApproval{approval}}
+	injected := errors.New("injected atomic delivery failure")
+	delivery := &failingAtomicApprovalDelivery{err: injected}
+	worker := &ExecutionWorker{
+		approvals: approvals, approvalDelivery: delivery,
+		clock: func() time.Time { return time.Now().UTC() },
+	}
+	err := worker.deliverApprovalResult(context.Background(), Run{ID: runID, UserID: userID, SessionID: uuid.New()}, RunFence{
+		Owner: "worker-1", Token: 1,
+	}, approval)
+	if !errors.Is(err, injected) || delivery.calls != 1 {
+		t.Fatalf("delivery error = %v, calls = %d", err, delivery.calls)
+	}
+	if approvals.approvals[0].DeliveredAt != nil {
+		t.Fatal("legacy MarkApprovalDelivered fallback was used")
+	}
+
+	worker.approvalDelivery = nil
+	if err := worker.deliverApprovalResult(context.Background(), Run{ID: runID, UserID: userID, SessionID: uuid.New()}, RunFence{
+		Owner: "worker-1", Token: 1,
+	}, approval); !errors.Is(err, ErrApprovalDeliveryUnsupported) {
+		t.Fatalf("missing atomic port error = %v", err)
+	}
+	if approvals.approvals[0].DeliveredAt != nil {
+		t.Fatal("missing atomic port used legacy delivery")
+	}
+}
+
 // TestApprovalHelpers 验证审批辅助函数的稳定语义。
 func TestApprovalHelpers(t *testing.T) {
 	if approvalRequired("low") || !approvalRequired("medium") || !approvalRequired("high") || !approvalRequired("unknown") {
@@ -801,6 +884,14 @@ func TestApprovalHelpers(t *testing.T) {
 	}
 	if messageID == deterministicApprovalMessageID(runID, uuid.New()) {
 		t.Fatal("different approvals must have different message ids")
+	}
+	eventID := deterministicApprovalEventID(runID, approvalID)
+	if eventID != deterministicApprovalEventID(runID, approvalID) || eventID == deterministicApprovalEventID(runID, uuid.New()) {
+		t.Fatal("approval event id is not deterministic and distinct")
+	}
+	payloadID := deterministicApprovalPayloadID(approvalID)
+	if payloadID != deterministicApprovalPayloadID(approvalID) || payloadID == deterministicApprovalPayloadID(uuid.New()) {
+		t.Fatal("approval payload id is not deterministic and distinct")
 	}
 	cases := []struct {
 		approval ToolApproval

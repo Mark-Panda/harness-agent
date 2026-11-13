@@ -144,6 +144,12 @@ type EmbeddingIndexRepository interface {
 	ListUnembeddedMessages(ctx context.Context, version string, limit int) ([]Message, error)
 }
 
+// MemoryJobVectorRepository 在向量写事务内复核 Job 租约，防止失租 Worker 与接替者并发写入。
+type MemoryJobVectorRepository interface {
+	MemoryVectorRepository
+	UpsertVectorsForJob(ctx context.Context, userID uuid.UUID, vectors []MemoryVector, fence JobWriteFence) error
+}
+
 // MemoryVectorRepository 定义用户私有向量的写入与检索契约。
 type MemoryVectorRepository interface {
 	// UpsertVectors 幂等写入或更新向量；同一来源与版本只保留一条有效记录。
@@ -237,7 +243,7 @@ func NewMemoryRetriever(indexes EmbeddingIndexRepository, vectors MemoryVectorRe
 	return &MemoryRetriever{indexes: indexes, vectors: vectors, generator: generator, reranker: reranker, config: config.normalize(), logger: logger}, nil
 }
 
-// WithUsageRecorder 注入长期记忆 rerank 用量记录器。
+// WithUsageRecorder 注入长期记忆查询 embedding 与 rerank 用量记录器。
 func (r *MemoryRetriever) WithUsageRecorder(recorder UsageRecorder) *MemoryRetriever {
 	r.usage = recorder
 	return r
@@ -263,6 +269,14 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 		return nil, nil
 	}
 	result, err := r.generator.Embed(ctx, *active, []string{query})
+	// 查询向量与后台索引任务使用同一 UsageRecorder 口径：绑定 active 索引的
+	// Provider，仅记录输入 Token。EmbeddingResponse 不提供价格或费用能力，费用保持为零。
+	if r.usage != nil && result.InputTokens > 0 {
+		providerID := active.ProviderID
+		if recordErr := r.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(result.InputTokens), 0, 0, time.Now().UTC()); recordErr != nil {
+			r.logger.Warn("record query embedding usage failed", "session_id", sessionID, "error", recordErr)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -292,9 +306,10 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 		if scoped, ok := r.reranker.(RerankerWithUsage); ok {
 			var usage RerankUsage
 			scores, usage, rerankErr = scoped.RerankWithUsage(ctx, query, memoryContents(filtered))
-			if rerankErr == nil && r.usage != nil && usage.InputTokens > 0 {
+			// 重排结果校验失败或调用方降级前，Provider 已返回的输入 Token 仍须入账。
+			if r.usage != nil && usage.InputTokens > 0 {
 				providerID := usage.ProviderID
-				if err := r.usage.RecordUsage(ctx, userID, nil, &providerID, int64(usage.InputTokens), 0, 0, time.Now().UTC()); err != nil {
+				if err := r.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(usage.InputTokens), 0, 0, time.Now().UTC()); err != nil {
 					r.logger.Warn("record rerank usage failed", "session_id", sessionID, "error", err)
 				}
 			}

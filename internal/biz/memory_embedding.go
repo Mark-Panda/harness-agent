@@ -279,8 +279,8 @@ type MemoryEmbedWorkerDependencies struct {
 	Messages MemoryEmbeddingMessageReader
 	// Indexes 索引版本仓储。
 	Indexes EmbeddingIndexRepository
-	// Vectors 用户向量仓储。
-	Vectors MemoryVectorRepository
+	// Vectors 支持任务租约复核的用户向量仓储。
+	Vectors MemoryJobVectorRepository
 	// Generator embedding 生成器。
 	Generator EmbeddingGenerator
 	// Usage 后台向量化用量记录器，可为空。
@@ -296,7 +296,7 @@ type MemoryEmbedWorker struct {
 	jobs      JobQueue
 	messages  MemoryEmbeddingMessageReader
 	indexes   EmbeddingIndexRepository
-	vectors   MemoryVectorRepository
+	vectors   MemoryJobVectorRepository
 	generator EmbeddingGenerator
 	usage     UsageRecorder
 	config    MemoryEmbedWorkerConfig
@@ -380,56 +380,93 @@ func (w *MemoryEmbedWorker) ProcessOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// handle 解析任务、读取来源消息并按索引版本批量写入向量。
+// handle 解析任务、读取来源消息并按索引版本批量写入向量，全程续约并遵守 fencing 租约。
 func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
+	runCtx, lease := beginJobLease(ctx, w.jobs, job, w.config.WorkerID, w.config.Lease, w.config.Heartbeat, w.clock)
+	defer lease.stop()
+	logLeaseLost := func(err error) {
+		w.logger.Warn("memory embed job lease_lost", "job_id", job.ID, "error", err)
+	}
+	stopLease := func() bool {
+		if err := lease.stop(); err != nil {
+			logLeaseLost(err)
+			return true
+		}
+		return false
+	}
+	complete := func() {
+		if stopLease() {
+			return
+		}
+		if err := w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken); err != nil {
+			if errors.Is(err, ErrResourceConflict) {
+				logLeaseLost(err)
+				return
+			}
+			w.logger.Warn("complete memory embed job failed", "job_id", job.ID, "error", err)
+		}
+	}
+	fail := func(cause error) {
+		if stopLease() {
+			return
+		}
+		w.failJob(ctx, job, cause)
+	}
 	// 单次 panic 不得终止进程：记录堆栈并把任务退回重试，避免任务停留在租约中。
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			w.logger.Error("memory embed job panicked", "job_id", job.ID,
 				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
-			w.failJob(context.WithoutCancel(ctx), job, fmt.Errorf("memory embed panicked: %v", recovered))
+			fail(fmt.Errorf("memory embed panicked: %v", recovered))
 		}
 	}()
 	task, err := decodeMemoryTask(job)
 	if err != nil {
 		w.logger.Error("invalid memory embed job payload", "job_id", job.ID, "error", err)
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		complete()
 		return
 	}
 	if len(task.MessageIDs) > 64 {
 		// 单任务消息数受限，避免超长请求与租约占用；超限任务直接终止并由后续维护任务补足。
 		w.logger.Warn("memory embed job exceeds message limit", "job_id", job.ID, "messages", len(task.MessageIDs))
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+		complete()
 		return
 	}
 	for _, version := range task.Versions {
-		index, err := w.indexes.GetIndex(ctx, version)
+		if err := lease.check(); err != nil {
+			logLeaseLost(err)
+			return
+		}
+		index, err := w.indexes.GetIndex(runCtx, version)
 		if err != nil {
 			// 索引已删除时跳过；其它错误交给任务重试。
 			if errors.Is(err, ErrResourceNotFound) {
 				continue
 			}
-			w.failJob(ctx, job, err)
+			fail(err)
 			return
 		}
 		if index.Status == EmbeddingIndexRetired {
 			continue
 		}
-		if err := w.embedMessages(ctx, task.UserID, task.SessionID, index, task.MessageIDs); err != nil {
+		if err := w.embedMessages(runCtx, task.UserID, task.SessionID, index, task.MessageIDs, lease, newJobWriteFence(job, w.config.WorkerID)); err != nil {
 			if errors.Is(err, ErrEmbeddingModelUnavailable) {
 				w.logger.Warn("embedding model unavailable; completing job", "job_id", job.ID, "version", version, "error", err)
-				_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+				complete()
 				return
 			}
-			w.failJob(ctx, job, err)
+			fail(err)
 			return
 		}
 	}
-	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+	complete()
 }
 
-// embedMessages 跳过未变更内容后分批生成向量并写入。
-func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID uuid.UUID, index EmbeddingIndex, ids []uuid.UUID) error {
+// embedMessages 跳过未变更内容后分批生成向量并写入；每批及写库前均检查租约。
+func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID uuid.UUID, index EmbeddingIndex, ids []uuid.UUID, lease *jobLeaseGuard, fence JobWriteFence) error {
+	if err := lease.check(); err != nil {
+		return err
+	}
 	hashes, err := w.vectors.ListSourceHashes(ctx, userID, index.Version, ids)
 	if err != nil {
 		return err
@@ -437,6 +474,9 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 	now := w.clock()
 	written := 0
 	for start := 0; start < len(ids); start += w.config.BatchSize {
+		if err := lease.check(); err != nil {
+			return err
+		}
 		end := min(start+w.config.BatchSize, len(ids))
 		// Read each batch just before embedding so jobs queued under an earlier
 		// policy, including later batches of the same job, honor current policy.
@@ -460,6 +500,10 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 		}
 		result, err := w.generator.Embed(ctx, index, inputs)
 		if err != nil {
+			return err
+		}
+		// Provider 可能忽略取消并返回结果；失租后不得记录用量或写入向量。
+		if err := lease.check(); err != nil {
 			return err
 		}
 		if w.usage != nil && result.InputTokens > 0 {
@@ -490,7 +534,10 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 				Version: index.Version, CreatedAt: now,
 			})
 		}
-		if err := w.vectors.UpsertVectors(ctx, userID, vectors); err != nil {
+		if err := lease.check(); err != nil {
+			return err
+		}
+		if err := w.vectors.UpsertVectorsForJob(ctx, userID, vectors, fence); err != nil {
 			return err
 		}
 		written += len(vectors)
@@ -505,6 +552,10 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 func (w *MemoryEmbedWorker) failJob(ctx context.Context, job Job, cause error) {
 	if err := w.jobs.Fail(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken,
 		w.clock().Add(backoffDelay(job.Attempts)), sanitizeExecutionError(cause), w.clock()); err != nil {
+		if errors.Is(err, ErrResourceConflict) {
+			w.logger.Warn("memory embed job lease_lost", "job_id", job.ID, "error", err)
+			return
+		}
 		w.logger.Warn("fail memory embed job failed", "job_id", job.ID, "error", err)
 	}
 }

@@ -19,6 +19,8 @@ var (
 	ErrApprovalExecutionUnknown = errors.New("tool approval execution state is unknown")
 	// ErrToolResultPersistence 工具副作用已执行但结果无法落库，必须人工对账，禁止自动重试导致重复副作用。
 	ErrToolResultPersistence = errors.New("tool result persistence failed")
+	// ErrApprovalDeliveryUnsupported 当前审批仓储不具备原子投递能力，禁止退回非原子写入链。
+	ErrApprovalDeliveryUnsupported = errors.New("atomic approval delivery is unavailable")
 )
 
 // ApprovalStatus 是工具审批的生命周期状态。
@@ -111,6 +113,23 @@ type ToolApprovalRepository interface {
 	FinishApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, status ApprovalStatus, result json.RawMessage, errorCode, errorMessage string, now time.Time) (ToolApproval, error)
 	// MarkApprovalDelivered 记录结果已回填为 tool 消息，重复调用幂等。
 	MarkApprovalDelivered(ctx context.Context, userID, approvalID uuid.UUID, now time.Time) (ToolApproval, error)
+}
+
+// ApprovalDelivery 包含一次审批结果投递的全部持久化事实。
+type ApprovalDelivery struct {
+	Approval    ToolApproval
+	Message     Message
+	Outbox      OutboxEvent
+	Event       RunEvent
+	Fence       RunFence
+	Now         time.Time
+	StepPayload *ExecutionPayload
+	StepUpdate  *StepUpdate
+}
+
+// AtomicApprovalDeliveryRepository 在一个事务中提交审批消息、Outbox、Run 事件、投递时间与步骤结算。
+type AtomicApprovalDeliveryRepository interface {
+	DeliverApprovalAtomically(ctx context.Context, delivery ApprovalDelivery) (Message, error)
 }
 
 // TransitionApprovalStatus 校验审批状态迁移；非法迁移返回 ErrResourceConflict。

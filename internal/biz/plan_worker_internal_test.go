@@ -24,15 +24,36 @@ func TestCarryCompletedPlanSteps(t *testing.T) {
 	if carried[0].Status != PlanStepCompleted || carried[0].Result["content"] != "ok" {
 		t.Fatalf("matching completed step was not carried: %#v", carried[0])
 	}
-	if carried[1].Status != PlanStepPending {
-		t.Fatalf("modified step must re-run: %#v", carried[1])
+	if carried[1].Status != PlanStepCompleted || carried[1].Result["content"] != "written" {
+		t.Fatalf("description-only change must not repeat a completed side effect: %#v", carried[1])
 	}
-	// 重规划只按标题与工具匹配，描述变化不应阻断结果继承。
+	// 自动重规划同样只按工具操作与依赖匹配，允许模型改写步骤标题和说明。
 	replanned := CarryCompletedPlanSteps([]PlanStep{
-		{StepNo: 2, Title: "写入", Description: "重新生成的说明", ToolName: "mcp_write", Status: PlanStepPending},
+		{StepNo: 2, Title: "重新命名", Description: "重新生成的说明", ToolName: "mcp_write", Status: PlanStepPending},
 	}, previous, false)
 	if replanned[0].Status != PlanStepCompleted {
 		t.Fatalf("replanned completed step was not carried: %#v", replanned[0])
+	}
+}
+
+// TestCarryCompletedPlanStepsConsumesEachToolSideEffectOnce 验证相同新步骤不能共享同一个旧副作用。
+func TestCarryCompletedPlanStepsConsumesEachToolSideEffectOnce(t *testing.T) {
+	previous := Plan{Steps: []PlanStep{{
+		StepNo: 1, Title: "写入", Description: "写入同一条数据", ToolName: "mcp_write",
+		Arguments: map[string]any{"id": "same"}, IdempotencyKey: "old-side-effect",
+		Status: PlanStepCompleted, Attempts: 1, Result: map[string]any{"content": "written"},
+	}}}
+	for _, matchDescription := range []bool{true, false} {
+		steps := CarryCompletedPlanSteps([]PlanStep{
+			{StepNo: 1, Title: "写入", Description: "写入同一条数据", ToolName: "mcp_write", Arguments: map[string]any{"id": "same"}, Status: PlanStepPending},
+			{StepNo: 2, Title: "写入", Description: "写入同一条数据", ToolName: "mcp_write", Arguments: map[string]any{"id": "same"}, Status: PlanStepPending},
+		}, previous, matchDescription)
+		if steps[0].Status != PlanStepCompleted || steps[0].IdempotencyKey != "old-side-effect" {
+			t.Fatalf("matchDescription=%t first step did not consume old result: %#v", matchDescription, steps[0])
+		}
+		if steps[1].Status != PlanStepPending || steps[1].Result != nil || steps[1].IdempotencyKey == "old-side-effect" {
+			t.Fatalf("matchDescription=%t second step reused the same side effect: %#v", matchDescription, steps[1])
+		}
 	}
 }
 

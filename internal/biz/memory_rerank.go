@@ -92,24 +92,25 @@ func (r *LLMReranker) RerankWithUsage(ctx context.Context, query string, documen
 	response, err := client.Rerank(ctx, model.RerankRequest{
 		Model: modelName, Query: query, Documents: documents, TopN: len(documents),
 	})
+	usage := RerankUsage{ProviderID: providerID, Model: modelName, InputTokens: response.InputTokens}
 	if err != nil {
-		// 认证、参数与能力错误重试无意义，其余错误交给调用方降级。
+		// 认证、参数与能力错误重试无意义，其余错误交给调用方降级；已解码的 usage 随错误返回。
 		if errors.Is(err, model.ErrAuthentication) || errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrCapability) {
-			return nil, RerankUsage{}, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
+			return nil, usage, fmt.Errorf("%w: %v", ErrRerankModelUnavailable, err)
 		}
-		return nil, RerankUsage{}, err
+		return nil, usage, err
 	}
 	scores := make([]float64, len(documents))
 	scored := 0
 	for _, hit := range response.Results {
 		if hit.Index < 0 || hit.Index >= len(scores) {
-			return nil, RerankUsage{}, fmt.Errorf("%w: rerank index %d is out of range", ErrRerankModelUnavailable, hit.Index)
+			return nil, usage, fmt.Errorf("%w: rerank index %d is out of range", ErrRerankModelUnavailable, hit.Index)
 		}
 		scores[hit.Index] = hit.Score
 		scored++
 	}
 	if scored == 0 {
-		return nil, RerankUsage{}, fmt.Errorf("%w: rerank returned no results", ErrRerankModelUnavailable)
+		return nil, usage, fmt.Errorf("%w: rerank returned no results", ErrRerankModelUnavailable)
 	}
-	return scores, RerankUsage{ProviderID: providerID, Model: modelName, InputTokens: response.InputTokens}, nil
+	return scores, usage, nil
 }

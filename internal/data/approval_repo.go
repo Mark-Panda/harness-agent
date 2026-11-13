@@ -348,6 +348,223 @@ func (r *ToolApprovalRepository) FinishApprovalExecution(ctx context.Context, us
 	return toBizApproval(record)
 }
 
+// DeliverApprovalAtomically 在一个事务中提交审批结果消息、Outbox、Run 事件、投递时间与步骤结算。
+func (r *ToolApprovalRepository) DeliverApprovalAtomically(ctx context.Context, delivery biz.ApprovalDelivery) (biz.Message, error) {
+	approval := delivery.Approval
+	message := delivery.Message
+	event := delivery.Event
+	if approval.ID == uuid.Nil || approval.RunID == uuid.Nil || approval.UserID == uuid.Nil ||
+		message.ID == uuid.Nil || message.SessionID == uuid.Nil || message.RunID == nil ||
+		*message.RunID != approval.RunID || message.UserID != approval.UserID || message.Role != biz.MessageTool ||
+		event.EventID == uuid.Nil || event.RunID != approval.RunID || event.UserID != approval.UserID || event.EventType != "tool.completed" ||
+		delivery.Outbox.UserID != approval.UserID || delivery.Outbox.AggregateID != message.ID.String() ||
+		!biz.ApprovalTerminal(approval.Status) {
+		return biz.Message{}, fmt.Errorf("%w: inconsistent approval delivery", biz.ErrInvalidConfig)
+	}
+	if event.Payload["approval_id"] != approval.ID.String() || event.Payload["message_id"] != message.ID.String() {
+		return biz.Message{}, fmt.Errorf("%w: approval event identity is required", biz.ErrInvalidConfig)
+	}
+	if (delivery.StepPayload == nil) != (delivery.StepUpdate == nil) {
+		return biz.Message{}, fmt.Errorf("%w: approval step payload and update must be provided together", biz.ErrInvalidConfig)
+	}
+	if delivery.StepPayload != nil {
+		payload := delivery.StepPayload
+		if approval.StepID == nil || payload.ID == uuid.Nil || payload.RunID != approval.RunID || payload.UserID != approval.UserID ||
+			payload.StepID == nil || *payload.StepID != *approval.StepID ||
+			(delivery.StepUpdate.Status != biz.StepCompleted && delivery.StepUpdate.Status != biz.StepFailed) {
+			return biz.Message{}, fmt.Errorf("%w: inconsistent approval step outcome", biz.ErrInvalidConfig)
+		}
+	}
+	now := delivery.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	toolCalls, err := json.Marshal(message.ToolCalls)
+	if message.ToolCalls == nil {
+		toolCalls = []byte("[]")
+	} else if err != nil {
+		return biz.Message{}, err
+	}
+	record := messageModel{
+		ID: message.ID, SessionID: message.SessionID, UserID: message.UserID, Role: string(message.Role),
+		Content: message.Content, ToolCalls: datatypes.JSON(toolCalls), ToolCallID: message.ToolCallID,
+		ToolName: message.ToolName, TokenCount: message.TokenCount, ExternalMessageID: message.ExternalMessageID,
+		SpeakerOpenID: message.SpeakerOpenID, RunID: message.RunID, CreatedAt: now,
+	}
+	var payloadRecord executionPayloadModel
+	if delivery.StepPayload != nil {
+		payloadRecord, err = executionPayloadRecord(*delivery.StepPayload)
+		if err != nil {
+			return biz.Message{}, err
+		}
+	}
+	stored := record
+	err = WithScope(ctx, r.db, Scope{UserID: approval.UserID}, func(tx *gorm.DB) error {
+		mode, err := lockRunningRunLease(tx, approval.UserID, approval.RunID, delivery.Fence, now)
+		if err != nil {
+			return err
+		}
+		if mode == biz.AgentModePlan {
+			plan, err := lockLatestRunPlan(tx, approval.UserID, approval.RunID)
+			if err != nil {
+				return err
+			}
+			switch biz.PlanStatus(plan.Status) {
+			case biz.PlanPaused:
+				return biz.ErrPlanPaused
+			case biz.PlanCancelled:
+				return biz.ErrPlanCancelled
+			case biz.PlanExecuting, biz.PlanWaitingApproval:
+			default:
+				return fmt.Errorf("%w: plan is not accepting approval delivery", biz.ErrResourceConflict)
+			}
+		}
+
+		var runSessionIDText string
+		if err := tx.Raw("SELECT session_id::text FROM agent_runs WHERE id = ? AND user_id = ?", approval.RunID, approval.UserID).
+			Scan(&runSessionIDText).Error; err != nil {
+			return err
+		}
+		runSessionID, err := uuid.Parse(runSessionIDText)
+		if err != nil {
+			return fmt.Errorf("parse run session id: %w", err)
+		}
+		var current toolApprovalModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&current, "id = ? AND user_id = ? AND run_id = ?", approval.ID, approval.UserID, approval.RunID).Error; err != nil {
+			return err
+		}
+		expectedSessionID := runSessionID
+		if current.SessionID != nil {
+			expectedSessionID = *current.SessionID
+		}
+		if current.Status != string(approval.Status) || current.ToolCallID != message.ToolCallID || current.ToolName != message.ToolName ||
+			message.SessionID != expectedSessionID {
+			return fmt.Errorf("%w: approval delivery no longer matches its stored result", biz.ErrResourceConflict)
+		}
+		var validSession bool
+		if err := tx.Raw(`SELECT EXISTS (
+			SELECT 1 FROM agent_runs AS ar
+			WHERE ar.id = ? AND ar.user_id = ? AND (ar.session_id = ? OR EXISTS (
+				SELECT 1 FROM supervisor_tasks AS st
+				WHERE st.parent_run_id = ar.id AND st.user_id = ar.user_id AND st.child_session_id = ?
+			))
+		)`, approval.RunID, approval.UserID, message.SessionID, message.SessionID).Scan(&validSession).Error; err != nil {
+			return err
+		}
+		if !validSession {
+			return fmt.Errorf("%w: approval message session is no longer valid", biz.ErrResourceConflict)
+		}
+		var session sessionModel
+		if err := tx.First(&session, "id = ? AND user_id = ?", message.SessionID, message.UserID).Error; err != nil {
+			return err
+		}
+		if biz.SessionStatus(session.Status) != biz.SessionActive {
+			return fmt.Errorf("%w: session is not active", biz.ErrResourceConflict)
+		}
+
+		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoNothing: true}).Create(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.First(&stored, "id = ? AND user_id = ?", message.ID, message.UserID).Error; err != nil {
+				return err
+			}
+			if stored.SessionID != message.SessionID || stored.RunID == nil || *stored.RunID != approval.RunID ||
+				stored.Role != string(biz.MessageTool) || stored.ToolCallID != message.ToolCallID ||
+				stored.ToolName != message.ToolName || stored.Content != message.Content {
+				return fmt.Errorf("%w: approval message id was reused with different content", biz.ErrResourceConflict)
+			}
+		} else {
+			update := tx.Model(&sessionModel{}).Where("id = ? AND user_id = ?", message.SessionID, message.UserID).
+				Updates(map[string]any{"last_message_at": now, "updated_at": now, "version": gorm.Expr("version + 1")})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return fmt.Errorf("%w: session is missing", biz.ErrResourceConflict)
+			}
+		}
+		if err := appendOutbox(tx, delivery.Outbox); err != nil {
+			return err
+		}
+		if err := tx.Model(&runModel{}).Where("id = ? AND user_id = ?", approval.RunID, approval.UserID).
+			Update("updated_at", now).Error; err != nil {
+			return err
+		}
+
+		var eventCount int64
+		if err := tx.Model(&runEventModel{}).
+			Where("user_id = ? AND run_id = ? AND event_type = ?", approval.UserID, approval.RunID, "tool.completed").
+			Where("(payload->>'approval_id' = ? OR payload->>'message_id' = ?)", approval.ID.String(), message.ID.String()).
+			Count(&eventCount).Error; err != nil {
+			return err
+		}
+		if eventCount == 0 {
+			if _, err := appendRunEvent(tx, event); err != nil {
+				return err
+			}
+		}
+		if current.DeliveredAt == nil {
+			result := tx.Model(&toolApprovalModel{}).
+				Where("id = ? AND user_id = ? AND run_id = ? AND delivered_at IS NULL AND status IN ?", approval.ID, approval.UserID, approval.RunID,
+					[]string{string(biz.ApprovalExecuted), string(biz.ApprovalFailed), string(biz.ApprovalDenied)}).
+				Updates(map[string]any{"delivered_at": now, "updated_at": now})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("%w: approval delivery changed concurrently", biz.ErrResourceConflict)
+			}
+		}
+
+		if delivery.StepPayload != nil {
+			result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoNothing: true}).Create(&payloadRecord)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				var existing executionPayloadModel
+				if err := tx.First(&existing, "id = ? AND user_id = ?", payloadRecord.ID, approval.UserID).Error; err != nil {
+					return err
+				}
+				if existing.RunID != approval.RunID || existing.StepID == nil || *existing.StepID != *approval.StepID ||
+					existing.PayloadType != payloadRecord.PayloadType {
+					return fmt.Errorf("%w: approval payload id was reused with different content", biz.ErrResourceConflict)
+				}
+			}
+			stepUpdate := *delivery.StepUpdate
+			if stepUpdate.FinishedAt.IsZero() {
+				stepUpdate.FinishedAt = now
+			}
+			var step executionStepModel
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&step, "id = ? AND user_id = ? AND run_id = ?", *approval.StepID, approval.UserID, approval.RunID).Error; err != nil {
+				return err
+			}
+			if biz.StepStatus(step.Status) != stepUpdate.Status {
+				if step.Status != string(biz.StepRunning) && step.Status != string(biz.StepWaitingApproval) && step.Status != string(biz.StepPending) {
+					return fmt.Errorf("%w: approval execution step is already finished", biz.ErrResourceConflict)
+				}
+				result := tx.Model(&executionStepModel{}).Where("id = ? AND user_id = ? AND status = ?", step.ID, approval.UserID, step.Status).
+					Updates(map[string]any{"status": string(stepUpdate.Status), "error_code": stepUpdate.ErrorCode, "finished_at": stepUpdate.FinishedAt})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("%w: approval execution step changed concurrently", biz.ErrResourceConflict)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return biz.Message{}, catalogError("deliver tool approval atomically", err)
+	}
+	return toBizMessage(stored)
+}
+
 // MarkApprovalDelivered 记录结果已回填为 tool 消息；终态之外的审批不允许标记。
 func (r *ToolApprovalRepository) MarkApprovalDelivered(ctx context.Context, userID, approvalID uuid.UUID, now time.Time) (biz.ToolApproval, error) {
 	var record toolApprovalModel
@@ -402,3 +619,4 @@ func toBizApproval(record toolApprovalModel) (biz.ToolApproval, error) {
 
 // 编译期断言接口实现。
 var _ biz.ToolApprovalRepository = (*ToolApprovalRepository)(nil)
+var _ biz.AtomicApprovalDeliveryRepository = (*ToolApprovalRepository)(nil)

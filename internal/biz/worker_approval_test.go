@@ -63,6 +63,39 @@ func approvalMCPToolServer(t *testing.T, toolName string, onCall func(params map
 	return server
 }
 
+// approvalDeliveryTestAdapter 仅为既有 gomock 测试适配原子端口，生产代码不提供非原子回退。
+type approvalDeliveryTestAdapter struct {
+	runs      *mocks.MockRunRepository
+	sessions  *mocks.MockSessionRepository
+	steps     *mocks.MockExecutionStepRepository
+	approvals *mocks.MockToolApprovalRepository
+}
+
+func (a approvalDeliveryTestAdapter) DeliverApprovalAtomically(ctx context.Context, delivery biz.ApprovalDelivery) (biz.Message, error) {
+	stored, err := a.sessions.AppendMessageIdempotent(ctx, delivery.Message, delivery.Outbox, delivery.Fence)
+	if err != nil {
+		return biz.Message{}, err
+	}
+	if _, err := a.runs.AppendEventFenced(ctx, delivery.Event, delivery.Fence); err != nil {
+		return biz.Message{}, err
+	}
+	if delivery.StepPayload != nil {
+		if _, err := a.steps.SavePayload(ctx, *delivery.StepPayload); err != nil {
+			return biz.Message{}, err
+		}
+		if delivery.Approval.StepID == nil || delivery.StepUpdate == nil {
+			return biz.Message{}, fmt.Errorf("approval step outcome is incomplete")
+		}
+		if _, err := a.steps.FinishStep(ctx, delivery.Approval.UserID, *delivery.Approval.StepID, *delivery.StepUpdate); err != nil {
+			return biz.Message{}, err
+		}
+	}
+	if _, err := a.approvals.MarkApprovalDelivered(ctx, delivery.Approval.UserID, delivery.Approval.ID, delivery.Now); err != nil {
+		return biz.Message{}, err
+	}
+	return stored, nil
+}
+
 // approvalWorkerDependencies 构造带审批仓储的 Worker 依赖。
 func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, modelURL string, mcpServer *httptest.Server, riskLevel string, budgetCheckers ...biz.BudgetChecker) (*biz.ExecutionWorker, *mocks.MockRunExecutionQueue, *mocks.MockRunRepository, *mocks.MockSessionRepository, *mocks.MockExecutionStepRepository, *mocks.MockToolApprovalRepository) {
 	t.Helper()
@@ -115,6 +148,7 @@ func approvalWorkerDependencies(t *testing.T, ctrl *gomock.Controller, modelURL 
 			credential: providerCredential,
 		},
 		Opener: fakeOpener{key: "test-key"}, Attempts: attempts, Steps: steps, Approvals: approvals,
+		ApprovalDelivery: approvalDeliveryTestAdapter{runs: runs, sessions: sessions, steps: steps, approvals: approvals},
 		Budgets:          budgetChecker,
 		MCPs:             mcpCredentials,
 		MCPClientFactory: clientFactory,

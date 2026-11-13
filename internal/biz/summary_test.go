@@ -140,8 +140,10 @@ type fakeSummaryJobs struct {
 	renewed      int
 	released     int
 	claimErr     error
+	renewErr     error
 	renewBlocks  bool
 	renewStarted chan struct{}
+	renewGate    chan struct{}
 }
 
 // EnqueueRun 未被摘要 Worker 使用。
@@ -161,13 +163,27 @@ func (f *fakeSummaryJobs) Claim(context.Context, string, string, time.Duration, 
 	return f.job, true, nil
 }
 
-// Renew 记录续约；renewBlocks 为真时模拟在途续约，直到上下文取消才返回。
+// Renew 记录续约；测试可用 gate 精确控制失败时机，或模拟在途续约直到上下文取消。
 func (f *fakeSummaryJobs) Renew(ctx context.Context, _ uuid.UUID, _ string, _ int64, _ time.Duration, _ time.Time) error {
 	f.renewed++
-	if f.renewBlocks {
-		if f.renewStarted != nil {
+	if f.renewStarted != nil {
+		select {
+		case <-f.renewStarted:
+		default:
 			close(f.renewStarted)
 		}
+	}
+	if f.renewGate != nil {
+		select {
+		case <-f.renewGate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if f.renewErr != nil {
+		return f.renewErr
+	}
+	if f.renewBlocks {
 		<-ctx.Done()
 		return ctx.Err()
 	}

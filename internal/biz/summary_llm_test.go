@@ -132,6 +132,58 @@ func TestSummaryGeneratorChunksAndMerges(t *testing.T) {
 	}
 }
 
+// TestSummaryGeneratorRecordsUsageWhenLaterCallFails 验证后续分块或归并失败时，
+// 前序成功调用以及失败响应中已返回的 usage 都会记录一次。
+func TestSummaryGeneratorRecordsUsageWhenLaterCallFails(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		failCall int
+	}{
+		{name: "later chunk", failCall: 2},
+		{name: "merge", failCall: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			providerID, modelID := uuid.New(), uuid.New()
+			userID := uuid.New()
+			calls := 0
+			server := summaryProviderServer(t, func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/json")
+				if calls == test.failCall {
+					_, _ = io.WriteString(w, `{"error":{"code":"server_error"},"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"分块摘要"}}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+			})
+			defer server.Close()
+			ctrl := gomock.NewController(t)
+			generator, _, _ := newSummaryGenerator(t, ctrl, server.URL, providerID, modelID, nil, nil,
+				biz.SummaryLLMConfig{MaxInputBytes: 30, MaxOutputTokens: 512})
+			inputTokens := (test.failCall-1)*3 + 5
+			outputTokens := (test.failCall-1)*4 + 2
+			estimatedCost := 0.0
+			for call := 1; call <= test.failCall; call++ {
+				input, output := 3, 4
+				if call == test.failCall {
+					input, output = 5, 2
+				}
+				estimatedCost += float64(input)/1_000_000 + float64(output)*2/1_000_000
+			}
+			usage := mocks.NewMockUsageRecorder(ctrl)
+			usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID),
+				int64(inputTokens), int64(outputTokens), estimatedCost, gomock.Any()).Return(nil)
+			generator.WithUsageRecorder(usage)
+			_, err := generator.Summarize(context.Background(), userID, uuid.New(), "", []biz.Message{
+				{ID: uuid.New(), Role: biz.MessageUser, Content: "第一段"},
+				{ID: uuid.New(), Role: biz.MessageAssistant, Content: "第二段"},
+			})
+			if !errors.Is(err, model.ErrRetryable) || calls != test.failCall {
+				t.Fatalf("Summarize() calls=%d err=%v, want failure at call %d", calls, err, test.failCall)
+			}
+		})
+	}
+}
+
 // TestSummaryGeneratorErrorClassification 验证供应商错误被正确分类为永久或可重试。
 func TestSummaryGeneratorErrorClassification(t *testing.T) {
 	providerID, modelID := uuid.New(), uuid.New()

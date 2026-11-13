@@ -7,6 +7,16 @@ import (
 	"github.com/google/uuid"
 )
 
+// JobWriteFence 标识允许提交任务结果的租约；数据层必须在写事务内复核，不能只依赖 Worker 前置检查。
+type JobWriteFence struct {
+	// JobID 任务唯一标识。
+	JobID uuid.UUID
+	// Owner 当前租约持有者。
+	Owner string
+	// Token 当前 fencing token。
+	Token int64
+}
+
 // Job 是持久化异步任务，Worker 以租约与 fencing token 完成至少一次消费。
 type Job struct {
 	// ID 任务唯一标识。
@@ -35,6 +45,10 @@ type Job struct {
 	RunSettlement *RunJobSettlement
 }
 
+func newJobWriteFence(job Job, workerID string) JobWriteFence {
+	return JobWriteFence{JobID: job.ID, Owner: workerID, Token: job.FencingToken}
+}
+
 // RunJobSettlement 保存终态重试所需的信息，避免重新执行模型或工具。
 type RunJobSettlement struct {
 	Status  RunStatus      `json:"status"`
@@ -57,6 +71,58 @@ type JobQueue interface {
 	Complete(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64) error
 	// Fail 记录失败并在预算内退避重试，超出预算进入死信。
 	Fail(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, retryAt time.Time, reason string, now time.Time) error
+}
+
+// jobLeaseGuard 在任务执行期间持续续约；续约失败会取消执行上下文并记录失租原因。
+type jobLeaseGuard struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	lost   chan struct{}
+	err    error
+}
+
+// beginJobLease 启动与 summary Worker 相同语义的心跳：主动停止续约造成的取消不算失租。
+func beginJobLease(ctx context.Context, jobs JobQueue, job Job, workerID string, lease, heartbeat time.Duration, clock func() time.Time) (context.Context, *jobLeaseGuard) {
+	runCtx, cancel := context.WithCancel(ctx)
+	guard := &jobLeaseGuard{cancel: cancel, done: make(chan struct{}), lost: make(chan struct{})}
+	go func() {
+		defer close(guard.done)
+		ticker := time.NewTicker(heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			if err := jobs.Renew(runCtx, job.ID, workerID, job.FencingToken, lease, clock()); err != nil {
+				if runCtx.Err() == nil {
+					guard.err = err
+					close(guard.lost)
+					cancel()
+				}
+				return
+			}
+		}
+	}()
+	return runCtx, guard
+}
+
+// check 在执行关键写入前非阻塞检查租约。
+func (g *jobLeaseGuard) check() error {
+	select {
+	case <-g.lost:
+		return g.err
+	default:
+		return nil
+	}
+}
+
+// stop 等待心跳退出后再次检查租约，避免在途续约被漏判；重复调用安全。
+func (g *jobLeaseGuard) stop() error {
+	g.cancel()
+	<-g.done
+	return g.check()
 }
 
 // RunExecutionQueue 支持独立于执行预算重试 Run 的终态写入。

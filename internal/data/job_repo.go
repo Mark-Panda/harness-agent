@@ -65,6 +65,25 @@ func NewJobRepository(db *gorm.DB) *JobRepository {
 	return &JobRepository{db: db}
 }
 
+// lockJobForWrite 在结果写事务中锁定并复核租约，行锁持有到提交，封闭前置检查与写入之间的失租窗口。
+func lockJobForWrite(tx *gorm.DB, fence biz.JobWriteFence) error {
+	if fence.JobID == uuid.Nil || strings.TrimSpace(fence.Owner) == "" || fence.Token <= 0 {
+		return fmt.Errorf("%w: valid job write fence is required", biz.ErrInvalidConfig)
+	}
+	var locked bool
+	result := tx.Raw(`SELECT true FROM jobs
+WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?
+  AND lease_expires_at > clock_timestamp()
+FOR UPDATE`, fence.JobID, fence.Owner, fence.Token).Scan(&locked)
+	if result.Error != nil {
+		return result.Error
+	}
+	if !locked {
+		return fmt.Errorf("%w: job lease is no longer valid", biz.ErrResourceConflict)
+	}
+	return nil
+}
+
 // EnqueueRun 幂等写入 Run 执行任务；去重键为 run:<run_id>，重复入队直接视为成功。
 func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error {
 	if userID == uuid.Nil || runID == uuid.Nil {

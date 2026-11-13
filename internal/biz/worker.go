@@ -251,6 +251,8 @@ type ExecutionWorkerDependencies struct {
 	Steps ExecutionStepRepository
 	// Approvals 工具审批仓储，可为空表示不加载中高风险 MCP 工具。
 	Approvals ToolApprovalRepository
+	// ApprovalDelivery 审批结果原子投递端口；为空时使用 Approvals 的同名可选能力。
+	ApprovalDelivery AtomicApprovalDeliveryRepository
 	// Plans 计划与步骤仓储，可为空表示不支持 Plan 模式。
 	Plans PlanRepository
 	// SupervisorTasks Supervisor 子任务仓储，可为空表示不支持 Supervisor 模式。
@@ -295,36 +297,37 @@ type ExecutionWorkerDependencies struct {
 
 // ExecutionWorker 从持久化队列认领 Run 并执行 ReAct，事件与终态均以栅栏校验提交。
 type ExecutionWorker struct {
-	jobs            RunExecutionQueue
-	runs            RunRepository
-	sessions        SessionRepository
-	sessionPolicies SessionMemoryPolicyReader
-	providers       ProviderCredentialRepository
-	opener          CredentialOpener
-	attempts        ModelCallRepository
-	steps           ExecutionStepRepository
-	approvals       ToolApprovalRepository
-	plans           PlanRepository
-	supervisor      SupervisorTaskRepository
-	budgets         BudgetChecker
-	hotMessages     HotMessageStore
-	summaries       SummaryRepository
-	summary         SummaryTrigger
-	memory          MemoryRetrieverPort
-	memoryTrigger   MemoryTrigger
-	facts           FactReader
-	attachments     AttachmentTextReader
-	factTrigger     FactTrigger
-	mcps            MCPCredentialRepository
-	mcpClient       func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
-	mcpCache        *mcp.ClientCache
-	sandbox         sandbox.Runner
-	globalLimiter   model.ConcurrencyLimiter
-	userLimiter     model.ConcurrencyLimiter
-	health          model.HealthStore
-	config          WorkerConfig
-	clock           func() time.Time
-	logger          *slog.Logger
+	jobs             RunExecutionQueue
+	runs             RunRepository
+	sessions         SessionRepository
+	sessionPolicies  SessionMemoryPolicyReader
+	providers        ProviderCredentialRepository
+	opener           CredentialOpener
+	attempts         ModelCallRepository
+	steps            ExecutionStepRepository
+	approvals        ToolApprovalRepository
+	approvalDelivery AtomicApprovalDeliveryRepository
+	plans            PlanRepository
+	supervisor       SupervisorTaskRepository
+	budgets          BudgetChecker
+	hotMessages      HotMessageStore
+	summaries        SummaryRepository
+	summary          SummaryTrigger
+	memory           MemoryRetrieverPort
+	memoryTrigger    MemoryTrigger
+	facts            FactReader
+	attachments      AttachmentTextReader
+	factTrigger      FactTrigger
+	mcps             MCPCredentialRepository
+	mcpClient        func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
+	mcpCache         *mcp.ClientCache
+	sandbox          sandbox.Runner
+	globalLimiter    model.ConcurrencyLimiter
+	userLimiter      model.ConcurrencyLimiter
+	health           model.HealthStore
+	config           WorkerConfig
+	clock            func() time.Time
+	logger           *slog.Logger
 }
 
 // NewExecutionWorker 构造执行 Worker；缺少关键依赖时返回错误，避免运行期空指针。
@@ -350,11 +353,16 @@ func NewExecutionWorker(dependencies ExecutionWorkerDependencies, config WorkerC
 			return mcp.NewClientWithHeaders(endpoint, authHeaders, timeout, mcp.WithAllowPrivateEndpoints(allowPrivate))
 		}
 	}
+	approvalDelivery := dependencies.ApprovalDelivery
+	if approvalDelivery == nil {
+		approvalDelivery, _ = dependencies.Approvals.(AtomicApprovalDeliveryRepository)
+	}
 	return &ExecutionWorker{
 		jobs: dependencies.Jobs, runs: dependencies.Runs, sessions: dependencies.Sessions,
 		sessionPolicies: dependencies.SessionPolicies,
 		providers:       dependencies.Providers, opener: dependencies.Opener, attempts: dependencies.Attempts,
-		steps: dependencies.Steps, approvals: dependencies.Approvals, plans: dependencies.Plans, supervisor: dependencies.SupervisorTasks, budgets: dependencies.Budgets,
+		steps: dependencies.Steps, approvals: dependencies.Approvals, approvalDelivery: approvalDelivery,
+		plans: dependencies.Plans, supervisor: dependencies.SupervisorTasks, budgets: dependencies.Budgets,
 		hotMessages: dependencies.HotMessages, mcps: dependencies.MCPs, mcpClient: mcpClient, mcpCache: dependencies.MCPCache,
 		sandbox:   dependencies.Sandbox,
 		summaries: dependencies.Summaries, summary: dependencies.SummaryTrigger,
@@ -1368,6 +1376,11 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	if err := w.resumeApprovals(ctx, run, fence, tools); err != nil {
 		return react.Result{}, false, err
 	}
+	if run.Mode == AgentModeReact && run.AttemptNo > 0 {
+		if err := w.recoverUndispatchedReactTools(ctx, run, fence, tools); err != nil {
+			return react.Result{}, false, err
+		}
+	}
 	messages, err := w.buildMessages(ctx, run, fence)
 	if err != nil {
 		return react.Result{}, false, err
@@ -1824,8 +1837,6 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 			}
 		}
 	}
-	var recoveryToolSteps []ExecutionStep
-	recoveryStepsLoaded := false
 	for historyIndex, message := range history {
 		messageID, messageRunID := persistedMessageIdentity(message)
 		switch message.Role {
@@ -1856,18 +1867,8 @@ func (w *ExecutionWorker) buildMessages(ctx context.Context, run Run, fences ...
 					})
 					continue
 				}
-				if run.Mode == AgentModeReact && run.AttemptNo > 0 && w.steps != nil && messageRunID == run.ID.String() {
-					if !recoveryStepsLoaded {
-						steps, _, err := w.toolStepsForRecovery(ctx, run.UserID, run.ID, nil)
-						if err != nil {
-							return nil, err
-						}
-						recoveryToolSteps = steps
-						recoveryStepsLoaded = true
-					}
-					if err := missingReactToolResult(run, call.ID, call.Name, recoveryToolSteps); err != nil {
-						return nil, err
-					}
+				if run.Mode == AgentModeReact && run.AttemptNo > 0 && messageRunID == run.ID.String() {
+					return nil, fmt.Errorf("%w: observation for tool %s (%s) was not recovered", ErrToolResultPersistence, call.Name, call.ID)
 				}
 				messages = append(messages, react.Message{
 					RunID: messageRunID, Role: react.RoleTool, ToolCallID: call.ID, Name: call.Name,
@@ -3267,8 +3268,8 @@ func lookupApprovedTool(tools react.Registry, target mcp.ToolIdentity) (react.To
 	return nil, false
 }
 
-// deliverApprovalResult 把审批终态回填为 tool 消息、写入执行载荷并追加事件。
-// 消息 ID 由 Run 与审批 ID 确定性生成，Worker 重试不会产生重复消息。
+// deliverApprovalResult 通过单个事务回填审批消息、Outbox、Run 事件、投递时间与执行步骤。
+// 消息和事件 ID 均由 Run 与审批 ID 确定性生成，Worker 重试不会产生重复事实。
 func (w *ExecutionWorker) deliverApprovalResult(ctx context.Context, run Run, fence RunFence, approval ToolApproval) error {
 	writeContext := context.WithoutCancel(ctx)
 	content := approvalDeliveryContent(approval)
@@ -3282,73 +3283,72 @@ func (w *ExecutionWorker) deliverApprovalResult(ctx context.Context, run Run, fe
 		Role: MessageTool, Content: content, ToolCallID: approval.ToolCallID, ToolName: approval.ToolName,
 		RunID: &run.ID,
 	}
-	event := OutboxEvent{
-		UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message",
-		AggregateID: message.ID.String(), DedupeKey: fmt.Sprintf("message.created.agent:%s", message.ID),
-		Payload: map[string]any{"run_id": run.ID.String(), "approval_id": approval.ID.String()},
+	now := w.clock()
+	stepPayload, stepUpdate := w.approvalStepOutcome(run, approval, now)
+	delivery := ApprovalDelivery{
+		Approval: approval, Message: message, Fence: fence, Now: now,
+		Outbox: OutboxEvent{
+			UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message",
+			AggregateID: message.ID.String(), DedupeKey: fmt.Sprintf("message.created.agent:%s", message.ID),
+			Payload: map[string]any{"run_id": run.ID.String(), "approval_id": approval.ID.String()},
+		},
+		Event: RunEvent{
+			RunID: run.ID, UserID: run.UserID, EventID: deterministicApprovalEventID(run.ID, approval.ID), EventType: "tool.completed",
+			Payload: map[string]any{
+				"tool": approval.ToolName, "tool_call_id": approval.ToolCallID,
+				"approval_id": approval.ID.String(), "status": approvalDeliveryStatus(approval),
+				"message_id": message.ID.String(),
+			},
+		},
+		StepPayload: stepPayload, StepUpdate: stepUpdate,
 	}
-	stored, err := w.sessions.AppendMessageIdempotent(writeContext, message, event, fence)
+	port := w.approvalDelivery
+	if port == nil {
+		port, _ = w.approvals.(AtomicApprovalDeliveryRepository)
+	}
+	if port == nil {
+		return fmt.Errorf("%w: approval %s", ErrApprovalDeliveryUnsupported, approval.ID)
+	}
+	stored, err := port.DeliverApprovalAtomically(writeContext, delivery)
 	if err != nil {
 		return err
 	}
 	w.appendHotMessage(writeContext, run, stored)
-	if _, err := w.runs.AppendEventFenced(writeContext, RunEvent{
-		RunID: run.ID, UserID: run.UserID, EventType: "tool.completed",
-		Payload: map[string]any{
-			"tool": approval.ToolName, "tool_call_id": approval.ToolCallID,
-			"approval_id": approval.ID.String(), "status": approvalDeliveryStatus(approval),
-			"message_id": message.ID.String(),
-		},
-	}, fence); err != nil {
-		return err
-	}
-	w.recordApprovalStepOutcome(writeContext, run, approval)
-	if _, err := w.approvals.MarkApprovalDelivered(writeContext, run.UserID, approval.ID, w.clock()); err != nil {
-		return err
-	}
 	return nil
 }
 
-// recordApprovalStepOutcome 保存审批工具步骤的载荷与终态；步骤已结算时忽略冲突。
-func (w *ExecutionWorker) recordApprovalStepOutcome(ctx context.Context, run Run, approval ToolApproval) {
+// approvalStepOutcome 构造与核心投递事实同事务提交的步骤载荷和终态。
+func (w *ExecutionWorker) approvalStepOutcome(run Run, approval ToolApproval, now time.Time) (*ExecutionPayload, *StepUpdate) {
 	if w.steps == nil || approval.StepID == nil {
-		return
+		return nil, nil
 	}
 	stepID := *approval.StepID
-	update := StepUpdate{Status: StepCompleted, FinishedAt: w.clock()}
+	update := &StepUpdate{Status: StepCompleted, FinishedAt: now}
+	payload := &ExecutionPayload{
+		ID: deterministicApprovalPayloadID(approval.ID), RunID: run.ID, UserID: run.UserID, StepID: &stepID,
+		Type: PayloadToolError, CaptureMode: CaptureMetadataOnly, CreatedAt: now,
+	}
 	switch approval.Status {
 	case ApprovalExecuted:
 		text, truncated := captureExecutionText(string(approval.ResultJSON), w.config.MaxPayloadBytes)
-		if _, err := w.steps.SavePayload(ctx, ExecutionPayload{
-			RunID: run.ID, UserID: run.UserID, StepID: &stepID, Type: PayloadToolOutput,
-			ContentText: text, CaptureMode: CaptureRedacted,
-			OriginalSizeBytes: int64(len(approval.ResultJSON)), Truncated: truncated,
-		}); err != nil {
-			w.logger.Warn("save approved tool output payload failed", "run_id", run.ID, "error", err)
-		}
+		payload.Type = PayloadToolOutput
+		payload.ContentText = text
+		payload.CaptureMode = CaptureRedacted
+		payload.OriginalSizeBytes = int64(len(approval.ResultJSON))
+		payload.Truncated = truncated
 	case ApprovalDenied:
 		update.Status = StepFailed
 		update.ErrorCode = "approval_denied"
-		_, _ = w.steps.SavePayload(ctx, ExecutionPayload{
-			RunID: run.ID, UserID: run.UserID, StepID: &stepID, Type: PayloadToolError,
-			CaptureMode: CaptureMetadataOnly, ContentJSON: map[string]any{"error": "approval_denied"},
-		})
+		payload.ContentJSON = map[string]any{"error": "approval_denied"}
 	default:
 		update.Status = StepFailed
 		update.ErrorCode = approval.ErrorCode
 		if update.ErrorCode == "" {
 			update.ErrorCode = "tool_execution_failed"
 		}
-		_, _ = w.steps.SavePayload(ctx, ExecutionPayload{
-			RunID: run.ID, UserID: run.UserID, StepID: &stepID, Type: PayloadToolError,
-			CaptureMode: CaptureMetadataOnly,
-			ContentJSON: map[string]any{"error": approval.ErrorMessage, "code": update.ErrorCode},
-		})
+		payload.ContentJSON = map[string]any{"error": approval.ErrorMessage, "code": update.ErrorCode}
 	}
-	if _, err := w.steps.FinishStep(ctx, run.UserID, stepID, update); err != nil {
-		// 崩溃恢复可能已经结算过同一步骤，重复结算冲突不影响结果投递。
-		w.logger.Debug("finish approval step skipped", "run_id", run.ID, "step_id", stepID, "error", err)
-	}
+	return payload, update
 }
 
 // markApprovalStepReconciliation 把未知副作用的工具步骤标记为对账状态。
@@ -3409,6 +3409,16 @@ func approvalDeliveryStatus(approval ToolApproval) string {
 // deterministicApprovalMessageID 生成与审批记录绑定的确定性消息 ID。
 func deterministicApprovalMessageID(runID, approvalID uuid.UUID) uuid.UUID {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("run:%s:approval:%s", runID, approvalID)))
+}
+
+// deterministicApprovalEventID 生成审批工具终态事件的确定性 ID。
+func deterministicApprovalEventID(runID, approvalID uuid.UUID) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("run:%s:approval:%s:tool.completed", runID, approvalID)))
+}
+
+// deterministicApprovalPayloadID 生成审批步骤结果载荷的确定性 ID。
+func deterministicApprovalPayloadID(approvalID uuid.UUID) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("approval:%s:tool-result", approvalID)))
 }
 
 // approvalIdempotencyKey 生成审批执行的确定性幂等键，长度固定且可跨重启复现。

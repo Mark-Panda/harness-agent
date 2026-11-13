@@ -284,7 +284,15 @@ func (r *Router) CompleteStream(ctx context.Context, messages []react.Message, t
 }
 
 // complete 是流式与非流式调用的共享路由实现。
-func (r *Router) complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec, onDelta func(string)) (react.Completion, error) {
+func (r *Router) complete(ctx context.Context, messages []react.Message, tools []react.ToolSpec, onDelta func(string)) (result react.Completion, returnErr error) {
+	var totalUsage react.Usage
+	totalCost := 0.0
+	defer func() {
+		// 每次 Complete 只向调用方返回一次累计用量，包含失败与重试 Attempt；
+		// Eino 在调用返回后统一 recordUsage，无需也无法按 Attempt 重复累加。
+		result.Usage = totalUsage
+		result.EstimatedCost = totalCost
+	}()
 	chatMessages := toChatMessages(messages)
 	definitions := toToolDefinitions(tools)
 	inputTokens := EstimateRequestTokens(chatMessages, definitions)
@@ -385,6 +393,9 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			record.OutputTokens = response.OutputTokens
 			record.ResponseText = response.Content
 			record.EstimatedCost = estimateCost(candidate, response.InputTokens, response.OutputTokens)
+			totalUsage.InputTokens += record.InputTokens
+			totalUsage.OutputTokens += record.OutputTokens
+			totalCost += record.EstimatedCost
 			budgetErr := settle(&record)
 			// attempts 只统计当前模型连续失败的尝试次数；成功即结束本轮失败序列，
 			// 否则 ReAct 多轮调用会把历史成功次数累加，导致一次瞬时 429 被误判为重试超限。
@@ -415,6 +426,11 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			record.ProviderRequestID = response.ProviderRequestID
 		}
 		record.EstimatedCost = estimateCost(candidate, record.InputTokens, record.OutputTokens)
+		// 与 Attempt/settle 共用同一份最终明细；Provider 未给 usage 的失败也沿用
+		// record 中已有的请求侧估算与预算预留口径，不在返回层另造一套估算。
+		totalUsage.InputTokens += record.InputTokens
+		totalUsage.OutputTokens += record.OutputTokens
+		totalCost += record.EstimatedCost
 		// 用户取消与 Deadline 是控制流错误，不进入重试/切换决策。
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			record.Status = "cancelled"

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -126,5 +127,52 @@ func TestHotMessageStoreLifecycle(t *testing.T) {
 	}
 	if err := store.Append(ctx, uuid.Nil, sessionID, appended); err == nil || !strings.Contains(err.Error(), "required") {
 		t.Fatalf("nil user append error = %v", err)
+	}
+}
+
+// TestHotMessageStoreInvalidationDoesNotDeleteConcurrentAppend 验证残窗清理只针对已读取的快照。
+func TestHotMessageStoreInvalidationDoesNotDeleteConcurrentAppend(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	store, err := NewHotMessageStore(client, 20, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	userID, sessionID := uuid.New(), uuid.New()
+	base := time.Now().UTC()
+	messages := []biz.Message{
+		{ID: uuid.New(), Role: biz.MessageUser, Content: "first", CreatedAt: base},
+		{ID: uuid.New(), Role: biz.MessageAssistant, Content: "second", CreatedAt: base.Add(time.Second)},
+	}
+	if err := store.Save(ctx, userID, sessionID, messages); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{hotMessageKey(userID, sessionID), hotMessageMetadataKey(userID, sessionID)}
+	values, err := loadHotMessageScript.Run(ctx, client, keys).StringSlice()
+	if err != nil || len(values) < 2 {
+		t.Fatalf("load snapshot = %#v, %v", values, err)
+	}
+	concurrent := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "concurrent", CreatedAt: base.Add(2 * time.Second)}
+	if err := store.Append(ctx, userID, sessionID, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidateHotMessageScript.Run(ctx, client, keys, values[0], values[1]).Err(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, hit, err := store.Load(ctx, userID, sessionID)
+	if err != nil || !hit || len(loaded) != 3 || loaded[2].ID != concurrent.ID {
+		t.Fatalf("stale invalidation deleted concurrent append: loaded=%#v hit=%v err=%v", loaded, hit, err)
+	}
+	current, err := loadHotMessageScript.Run(ctx, client, keys).StringSlice()
+	if err != nil || len(current) < 2 {
+		t.Fatalf("load current snapshot = %#v, %v", current, err)
+	}
+	if err := invalidateHotMessageScript.Run(ctx, client, keys, current[0], current[1]).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, err := store.Load(ctx, userID, sessionID); err != nil || hit {
+		t.Fatalf("unchanged snapshot was not invalidated: hit=%v err=%v", hit, err)
 	}
 }

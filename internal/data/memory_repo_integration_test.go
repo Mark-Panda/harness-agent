@@ -4,6 +4,7 @@ package data
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -80,6 +81,17 @@ func TestMemoryRepositoryVectorsAndIndexes(t *testing.T) {
 	}, catalogEvent(admin.ID, "model.created", "llm_model", modelID)); err != nil {
 		t.Fatal(err)
 	}
+	// 生产契约选择创建时间最早的启用模型。共享集成库可能已有全局模型，
+	// 将本测试模型放到现有选择之前，避免依赖其他测试或环境必须为空。
+	var earliestModelAt time.Time
+	if err := adminDB.Raw(`SELECT COALESCE(MIN(m.created_at), CAST(? AS timestamptz))
+		FROM llm_models m JOIN llm_providers p ON p.id = m.provider_id
+		WHERE m.model_kind = 'embedding' AND m.status = 'enabled' AND p.status = 'enabled'`, now).Scan(&earliestModelAt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := adminDB.Exec("UPDATE llm_models SET created_at = ? WHERE id = ?", earliestModelAt.Add(-time.Second), modelID).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	memory := NewMemoryRepository(appDB)
 	provider, modelName, dimension, err := memory.GetEnabledEmbeddingModel(ctx)
@@ -89,7 +101,7 @@ func TestMemoryRepositoryVectorsAndIndexes(t *testing.T) {
 
 	index := biz.EmbeddingIndex{
 		ID: uuid.New(), Name: "index-" + suffix, ProviderID: providerID, Model: "embedding-model",
-		Dimension: biz.EmbeddingDimension, Version: "v1-" + suffix, Status: biz.EmbeddingIndexActive, DualWrite: true,
+		Dimension: biz.EmbeddingDimension, Version: "v1-" + suffix, Status: biz.EmbeddingIndexStaging, DualWrite: true,
 	}
 	if _, err := memory.CreateIndex(ctx, index); err != nil {
 		t.Fatal(err)
@@ -375,4 +387,57 @@ VALUES (?, 'feishu', 'tenant', ?, ?, ?)`, owner.ID, uuid.NewString(), test.threa
 			}
 		}
 	})
+}
+
+// TestMemoryRepositoryUpsertVectorsForJobChecksJobFence 验证向量写入在事务内拒绝失租与过期任务。
+func TestMemoryRepositoryUpsertVectorsForJobChecksJobFence(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	owner, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "memory_fence_" + uuid.NewString(), PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", owner.ID).Error })
+	sessions := NewSessionRepository(appDB)
+	sessionID := createMemoryIntegrationSession(t, ctx, sessions, owner.ID, "memory-fence")
+	messages := appendMemoryIntegrationMessages(t, ctx, sessions, owner.ID, sessionID, 1)
+	index := biz.EmbeddingIndex{ProviderID: uuid.New(), Model: "embedding-test", Dimension: biz.EmbeddingDimension, Version: uuid.NewString()}
+	vector := memoryVectorFor(owner.ID, sessionID, messages[0], index, memoryIntegrationVector(0, -1))
+	jobID := uuid.New()
+	fence := biz.JobWriteFence{JobID: jobID, Owner: "memory-worker", Token: 2}
+	if err := adminDB.Exec(`INSERT INTO jobs (id, user_id, job_type, status, attempts, lease_owner, lease_expires_at, fencing_token)
+VALUES (?, ?, ?, 'running', 1, ?, ?, ?)`, jobID, owner.ID, biz.MemoryEmbedJobType, fence.Owner, time.Now().UTC().Add(time.Hour), fence.Token).Error; err != nil {
+		t.Fatal(err)
+	}
+	memory := NewMemoryRepository(appDB)
+	stale := fence
+	stale.Token--
+	if err := memory.UpsertVectorsForJob(ctx, owner.ID, []biz.MemoryVector{vector}, stale); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale fence error = %v", err)
+	}
+	if err := memory.UpsertVectorsForJob(ctx, owner.ID, []biz.MemoryVector{vector}, fence); err != nil {
+		t.Fatalf("valid fence write: %v", err)
+	}
+	if err := adminDB.Exec("UPDATE jobs SET lease_expires_at = ? WHERE id = ?", time.Now().UTC().Add(-time.Second), jobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	updated := vector
+	updated.ID = uuid.New()
+	updated.Content = "expired overwrite"
+	updated.ContentHash = biz.MemoryContentHash(updated.Content)
+	if err := memory.UpsertVectorsForJob(ctx, owner.ID, []biz.MemoryVector{updated}, fence); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("expired fence error = %v", err)
+	}
+	hashes, err := memory.ListSourceHashes(ctx, owner.ID, index.Version, []uuid.UUID{messages[0].ID})
+	if err != nil || hashes[messages[0].ID] != vector.ContentHash {
+		t.Fatalf("vector changed after rejected writes: hashes=%#v err=%v", hashes, err)
+	}
 }

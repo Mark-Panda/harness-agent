@@ -97,6 +97,16 @@ func (e *FactLLMExtractor) Extract(ctx context.Context, userID, sessionID uuid.U
 		},
 		Temperature: e.config.Temperature, MaxOutputTokens: maxOutput,
 	})
+	// 响应一旦返回就先记录已发生的用量，空输出、tool call、解析失败及
+	// 携带 usage 的 Provider 错误均不能绕过计量。无 usage 的传输/状态错误保持原口径。
+	if e.usage != nil && (response.InputTokens > 0 || response.OutputTokens > 0) {
+		providerID := resolved.providerID
+		cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
+		if err := e.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); err != nil {
+			// 用量记录失败不阻断事实提取结果。
+			_ = err
+		}
+	}
 	if err != nil {
 		if errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) ||
 			errors.Is(err, model.ErrCapability) || errors.Is(err, model.ErrContextExceeded) {
@@ -109,14 +119,6 @@ func (e *FactLLMExtractor) Extract(ctx context.Context, userID, sessionID uuid.U
 	}
 	if len(response.ToolCalls) > 0 {
 		return nil, fmt.Errorf("%w: provider returned tool calls for fact extraction", ErrFactPermanent)
-	}
-	if e.usage != nil {
-		providerID := resolved.providerID
-		cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
-		if err := e.usage.RecordUsage(ctx, userID, nil, &providerID, int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); err != nil {
-			// 用量记录失败不阻断事实提取结果。
-			_ = err
-		}
 	}
 	candidates, err := ParseFactModelOutput(response.Content, messages)
 	if err != nil {

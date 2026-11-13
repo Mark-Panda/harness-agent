@@ -314,6 +314,15 @@ func (r *MemoryRepository) ListEmbeddableMessages(ctx context.Context, userID, s
 
 // UpsertVectors 幂等写入或更新向量，同一来源与版本只保留一条有效记录。
 func (r *MemoryRepository) UpsertVectors(ctx context.Context, userID uuid.UUID, vectors []biz.MemoryVector) error {
+	return r.upsertVectors(ctx, userID, vectors, nil)
+}
+
+// UpsertVectorsForJob 在向量与来源策略写事务内复核 Job 租约。
+func (r *MemoryRepository) UpsertVectorsForJob(ctx context.Context, userID uuid.UUID, vectors []biz.MemoryVector, fence biz.JobWriteFence) error {
+	return r.upsertVectors(ctx, userID, vectors, &fence)
+}
+
+func (r *MemoryRepository) upsertVectors(ctx context.Context, userID uuid.UUID, vectors []biz.MemoryVector, fence *biz.JobWriteFence) error {
 	if userID == uuid.Nil || len(vectors) == 0 {
 		return fmt.Errorf("%w: user and vectors are required", biz.ErrInvalidConfig)
 	}
@@ -326,6 +335,11 @@ ON CONFLICT (user_id, source_type, source_id, embedding_version)
 DO UPDATE SET session_id = EXCLUDED.session_id, content = EXCLUDED.content, embedding = EXCLUDED.embedding, metadata = EXCLUDED.metadata,
   content_hash = EXCLUDED.content_hash`
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if fence != nil {
+			if err := lockJobForWrite(tx, *fence); err != nil {
+				return err
+			}
+		}
 		eligibleSessions := make(map[uuid.UUID]bool)
 		for _, vector := range vectors {
 			if vector.Dimension != biz.EmbeddingDimension || len(vector.Embedding) != vector.Dimension {
@@ -611,7 +625,8 @@ func parseVectorText(text string) ([]float32, error) {
 
 // 编译期断言长期记忆仓储实现。
 var (
-	_ biz.EmbeddingIndexRepository = (*MemoryRepository)(nil)
-	_ biz.MemoryVectorRepository   = (*MemoryRepository)(nil)
-	_ biz.EmbeddingModelSource     = (*MemoryRepository)(nil)
+	_ biz.EmbeddingIndexRepository  = (*MemoryRepository)(nil)
+	_ biz.MemoryVectorRepository    = (*MemoryRepository)(nil)
+	_ biz.MemoryJobVectorRepository = (*MemoryRepository)(nil)
+	_ biz.EmbeddingModelSource      = (*MemoryRepository)(nil)
 )

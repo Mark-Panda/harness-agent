@@ -220,6 +220,147 @@ func TestPlanRepositoryLifecycle(t *testing.T) {
 	}
 }
 
+// TestPlanRepositoryCompletePlanAtomic 验证最终消息、Outbox、会话版本与完成 CAS 同生共死，
+// 并用 Run 行锁确定性地复现“Worker 等待完成锁时人工暂停先提交”的交错。
+func TestPlanRepositoryCompletePlanAtomic(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	// 完成与暂停必须使用不同连接；单连接池会让暂停排在等待 Run 行锁的完成事务之后。
+	appSQLDB, err := appDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appSQLDB.SetMaxOpenConns(2)
+	appSQLDB.SetMaxIdleConns(2)
+	ctx := context.Background()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	user, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "plan_complete_" + suffix, PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", user.ID).Error }()
+	session, err := NewSessionRepository(appDB).CreateSession(ctx, biz.Session{
+		ID: uuid.New(), UserID: user.ID, Title: "plan completion", Source: biz.SessionSourceWeb, Status: biz.SessionActive, Version: 1,
+	}, testOutboxEvent(user.ID, "session.created"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := NewRunRepository(appDB).CreateRun(ctx, biz.Run{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan, Status: biz.RunQueued,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := biz.PlanFence{Owner: "worker-a", Token: 9}
+	if err := adminDB.Exec("UPDATE agent_runs SET status = 'running', lease_owner = ?, fencing_token = ?, lease_expires_at = clock_timestamp() + interval '1 minute' WHERE id = ?", fence.Owner, fence.Token, run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	repo := NewPlanRepository(appDB)
+	planID := uuid.New()
+	plan, err := repo.CreatePlan(ctx, user.ID, biz.Plan{
+		ID: planID, UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 1,
+		Status: biz.PlanExecuting, Goal: "atomic completion", MaxSteps: 50,
+	}, testOutboxEvent(user.ID, "plan.created"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID := uuid.New()
+	completion := biz.PlanCompletion{
+		ExpectedRevision: plan.Revision, Fence: fence, FinishedAt: time.Now().UTC(),
+		Message: biz.Message{ID: messageID, SessionID: session.ID, UserID: user.ID, RunID: &run.ID, Role: biz.MessageAssistant, Content: "最终答案"},
+		Event: biz.OutboxEvent{UserID: user.ID, EventType: "message.created.agent", AggregateType: "message", AggregateID: messageID.String(),
+			DedupeKey: "message.created.agent:" + messageID.String(), Payload: map[string]any{"run_id": run.ID.String()}},
+	}
+	countRows := func(table string) int64 {
+		t.Helper()
+		var count int64
+		query := adminDB.Table(table).Where("user_id = ?", user.ID)
+		if table == "messages" {
+			query = query.Where("id = ?", messageID)
+		}
+		if table == "outbox_events" {
+			query = query.Where("dedupe_key = ?", completion.Event.DedupeKey)
+		}
+		if err := query.Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	sessionVersion := func() int64 {
+		t.Helper()
+		var version int64
+		if err := adminDB.Table("sessions").Select("version").Where("id = ?", session.ID).Scan(&version).Error; err != nil {
+			t.Fatal(err)
+		}
+		return version
+	}
+
+	invalid := completion
+	invalid.Event.Payload = map[string]any{"invalid_json": make(chan int)}
+	if _, _, err := repo.CompletePlan(ctx, user.ID, planID, invalid); err == nil {
+		t.Fatal("completion with invalid outbox payload succeeded")
+	}
+	afterFailure, err := repo.GetPlan(ctx, user.ID, planID)
+	if err != nil || afterFailure.Status != biz.PlanExecuting || afterFailure.Revision != plan.Revision ||
+		countRows("messages") != 0 || countRows("outbox_events") != 0 || sessionVersion() != 1 {
+		t.Fatalf("failed completion was not rolled back: plan=%#v messages=%d outbox=%d session_version=%d err=%v",
+			afterFailure, countRows("messages"), countRows("outbox_events"), sessionVersion(), err)
+	}
+
+	locked := adminDB.Begin()
+	if locked.Error != nil {
+		t.Fatal(locked.Error)
+	}
+	if err := locked.Exec("SELECT id FROM agent_runs WHERE id = ? FOR UPDATE", run.ID).Error; err != nil {
+		_ = locked.Rollback().Error
+		t.Fatal(err)
+	}
+	completionResult := make(chan error, 1)
+	go func() {
+		_, _, err := repo.CompletePlan(ctx, user.ID, planID, completion)
+		completionResult <- err
+	}()
+	paused, pauseErr := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanExecuting, biz.PlanPaused, plan.Revision, biz.PlanFence{}, biz.PlanUpdate{ErrorCode: "plan_paused"})
+	if rollbackErr := locked.Rollback().Error; rollbackErr != nil {
+		t.Fatal(rollbackErr)
+	}
+	if pauseErr != nil {
+		<-completionResult
+		t.Fatal(pauseErr)
+	}
+	if err := <-completionResult; !errors.Is(err, biz.ErrPlanPaused) {
+		t.Fatalf("completion after pause = %v", err)
+	}
+	if countRows("messages") != 0 || countRows("outbox_events") != 0 || sessionVersion() != 1 {
+		t.Fatal("paused completion published a message or outbox event")
+	}
+
+	resumed, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanPaused, biz.PlanExecuting, paused.Revision, biz.PlanFence{}, biz.PlanUpdate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion.ExpectedRevision = resumed.Revision
+	completion.FinishedAt = time.Now().UTC()
+	completed, stored, err := repo.CompletePlan(ctx, user.ID, planID, completion)
+	if err != nil || completed.Status != biz.PlanCompleted || stored.ID != messageID || stored.Content != "最终答案" {
+		t.Fatalf("CompletePlan() = plan=%#v message=%#v err=%v", completed, stored, err)
+	}
+	if countRows("messages") != 1 || countRows("outbox_events") != 1 || sessionVersion() != 2 {
+		t.Fatalf("successful completion did not commit exactly once: messages=%d outbox=%d session_version=%d",
+			countRows("messages"), countRows("outbox_events"), sessionVersion())
+	}
+	if _, err := repo.UpdatePlan(ctx, user.ID, planID, biz.PlanExecuting, biz.PlanPaused, completed.Revision, biz.PlanFence{}, biz.PlanUpdate{}); !errors.Is(err, biz.ErrPlanRevisionConflict) {
+		t.Fatalf("completed plan was paused by a stale worker view: %v", err)
+	}
+}
+
 func TestRevisePlanToolEffects(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {
 		t.Skip("requires PostgreSQL")

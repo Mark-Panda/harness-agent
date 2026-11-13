@@ -991,7 +991,18 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 		return react.Result{}, err
 	}
 	usage = budget.usage()
-	if aggregateErr == nil && strings.TrimSpace(completion.Content) != "" {
+	if aggregateErr == nil && strings.TrimSpace(completion.Content) == "" {
+		aggregateErr = react.ErrEmptyResponse
+	}
+	if aggregateErr != nil && !errors.Is(aggregateErr, ErrSupervisorBudget) {
+		// 只有明确的共享预算耗尽才允许降级为 Worker 原始结果。网络、鉴权、
+		// 解析、空响应或持久化等错误必须进入统一分类与重试，不能把降级文本固化成成功答案。
+		w.emitPlanEvent(ctx, run, fence, "supervisor.aggregate_failed", map[string]any{
+			"error": sanitizeExecutionError(aggregateErr),
+		})
+		return react.Result{}, fmt.Errorf("supervisor aggregation failed: %w", aggregateErr)
+	}
+	if aggregateErr == nil {
 		content = strings.TrimSpace(completion.Content)
 	}
 	if errors.Is(aggregateErr, ErrSupervisorBudget) {

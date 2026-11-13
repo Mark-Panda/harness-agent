@@ -5,12 +5,14 @@ package data
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type queuedSummaryGenerator func() biz.SummaryGeneration
@@ -23,6 +25,39 @@ type queuedFactExtractor func() []biz.FactCandidate
 
 func (f queuedFactExtractor) Extract(context.Context, uuid.UUID, uuid.UUID, []biz.Message) ([]biz.FactCandidate, error) {
 	return f(), nil
+}
+
+// queuedMemoryJobQueue 保留历史领取时钟对共享队列的隔离，同时在领取本测试任务后
+// 将租约对齐数据库真实时钟，避免策略测试被人为制造的过期租约中断。
+type queuedMemoryJobQueue struct {
+	*JobRepository
+	db            *gorm.DB
+	expectedJobID string
+}
+
+func (q *queuedMemoryJobQueue) Claim(ctx context.Context, workerID, jobType string, lease time.Duration, now time.Time) (biz.Job, bool, error) {
+	job, claimed, err := q.JobRepository.Claim(ctx, workerID, jobType, lease, now)
+	if err != nil || !claimed {
+		return job, claimed, err
+	}
+	if job.ID.String() != q.expectedJobID {
+		return biz.Job{}, false, fmt.Errorf("claimed unrelated job %s, want %s", job.ID, q.expectedJobID)
+	}
+	result := q.db.WithContext(ctx).Exec(`UPDATE jobs
+		SET lease_expires_at = clock_timestamp() + (? * INTERVAL '1 second')
+		WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?`,
+		lease.Seconds(), job.ID, workerID, job.FencingToken)
+	if result.Error != nil {
+		return biz.Job{}, false, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return biz.Job{}, false, fmt.Errorf("align claimed job lease affected %d rows", result.RowsAffected)
+	}
+	return job, true, nil
+}
+
+func (q *queuedMemoryJobQueue) Renew(ctx context.Context, jobID uuid.UUID, workerID string, fencingToken int64, lease time.Duration, _ time.Time) error {
+	return q.JobRepository.Renew(ctx, jobID, workerID, fencingToken, lease, time.Now().UTC())
 }
 
 func TestQueuedMemoryHonorsSessionPolicy(t *testing.T) {
@@ -94,6 +129,11 @@ func TestQueuedMemoryHonorsSessionPolicy(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				var jobID string
+				if err := adminDB.Raw("SELECT id::text FROM jobs WHERE user_id = ? AND job_type = ?", userID, jobType).Scan(&jobID).Error; err != nil || jobID == "" {
+					t.Fatalf("load queued job id = %q, err=%v", jobID, err)
+				}
+				queue := &queuedMemoryJobQueue{JobRepository: jobs, db: adminDB, expectedJobID: jobID}
 				if tc.before != "" {
 					setPolicy(tc.before)
 				}
@@ -113,7 +153,7 @@ func TestQueuedMemoryHonorsSessionPolicy(t *testing.T) {
 				var processOne func(context.Context) (bool, error)
 				if jobType == biz.SummaryJobType {
 					worker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
-						Jobs: jobs, Sessions: sessions, Messages: sessions, Summaries: summaries, Clock: clock,
+						Jobs: queue, Sessions: sessions, Messages: sessions, Summaries: summaries, Clock: clock,
 						Generator: queuedSummaryGenerator(func() biz.SummaryGeneration {
 							onCall()
 							return biz.SummaryGeneration{Text: "Generated summary"}
@@ -125,7 +165,7 @@ func TestQueuedMemoryHonorsSessionPolicy(t *testing.T) {
 					processOne = worker.ProcessOne
 				} else {
 					worker, err := biz.NewFactExtractionWorker(biz.FactExtractionWorkerDependencies{
-						Jobs: jobs, Messages: sessions, Facts: factService, Clock: clock,
+						Jobs: queue, Messages: sessions, Facts: factService, Clock: clock,
 						Extractor: queuedFactExtractor(func() []biz.FactCandidate {
 							onCall()
 							return []biz.FactCandidate{{

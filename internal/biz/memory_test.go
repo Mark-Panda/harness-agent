@@ -1,14 +1,18 @@
 package biz_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
+	"github.com/Mark-Panda/harness-agent/internal/service/mocks"
 	"github.com/google/uuid"
+	"go.uber.org/mock/gomock"
 )
 
 // fakeMemoryIndexes 是索引与维护统计端口的测试替身。
@@ -96,6 +100,7 @@ type fakeMemoryVectors struct {
 	matches []biz.MemoryMatch
 	hashes  map[uuid.UUID]string
 	upserts [][]biz.MemoryVector
+	fences  []biz.JobWriteFence
 	err     error
 }
 
@@ -106,6 +111,11 @@ func (f *fakeMemoryVectors) UpsertVectors(_ context.Context, _ uuid.UUID, vector
 	}
 	f.upserts = append(f.upserts, vectors)
 	return nil
+}
+
+func (f *fakeMemoryVectors) UpsertVectorsForJob(ctx context.Context, userID uuid.UUID, vectors []biz.MemoryVector, fence biz.JobWriteFence) error {
+	f.fences = append(f.fences, fence)
+	return f.UpsertVectors(ctx, userID, vectors)
 }
 
 // SearchVectors 返回预置检索结果。
@@ -142,17 +152,29 @@ func (f *fakeMemoryQueue) EnqueueMemory(_ context.Context, task biz.MemoryTask, 
 
 // fakeEmbeddingGenerator 是 embedding 生成器的测试替身。
 type fakeEmbeddingGenerator struct {
-	vectors    [][]float32
-	inputToken int
-	err        error
-	calls      int
-	inputs     []string
+	vectors       [][]float32
+	inputToken    int
+	err           error
+	calls         int
+	inputs        []string
+	started       chan struct{}
+	waitForCancel bool
 }
 
-// Embed 记录输入并返回预置向量。
-func (f *fakeEmbeddingGenerator) Embed(_ context.Context, index biz.EmbeddingIndex, inputs []string) (biz.EmbeddingResult, error) {
+// Embed 记录输入并返回预置向量；续约测试模拟 Provider 忽略取消后仍返回结果。
+func (f *fakeEmbeddingGenerator) Embed(ctx context.Context, index biz.EmbeddingIndex, inputs []string) (biz.EmbeddingResult, error) {
 	f.calls++
 	f.inputs = inputs
+	if f.started != nil {
+		select {
+		case <-f.started:
+		default:
+			close(f.started)
+		}
+	}
+	if f.waitForCancel {
+		<-ctx.Done()
+	}
 	if f.err != nil {
 		return biz.EmbeddingResult{}, f.err
 	}
@@ -211,9 +233,35 @@ func TestMemoryRetrieverMMRSemantics(t *testing.T) {
 	}
 }
 
+// TestMemoryRetrieverRecordsQueryEmbeddingUsage 验证查询 embedding 的输入 Token
+// 在后续向量检索失败前已按 active 索引 Provider 记录，且不虚构输出 Token 或费用。
+func TestMemoryRetrieverRecordsQueryEmbeddingUsage(t *testing.T) {
+	index := activeMemoryIndex()
+	searchErr := errors.New("search failed")
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{index}}
+	vectors := &fakeMemoryVectors{err: searchErr}
+	generator := &fakeEmbeddingGenerator{
+		vectors: [][]float32{makeEmbedding(biz.EmbeddingDimension, 0.1)}, inputToken: 17,
+	}
+	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, nil, biz.MemoryRetrieverConfig{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := gomock.NewController(t)
+	usage := mocks.NewMockUsageRecorder(ctrl)
+	userID := uuid.New()
+	usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&index.ProviderID),
+		int64(17), int64(0), float64(0), gomock.Any()).Return(nil)
+	retriever.WithUsageRecorder(usage)
+	if _, err := retriever.Retrieve(context.Background(), userID, uuid.New(), "查询"); !errors.Is(err, searchErr) {
+		t.Fatalf("Retrieve() error = %v, want search failure", err)
+	}
+}
+
 // fakeReranker 是 rerank 的测试替身，记录查询与候选文本。
 type fakeReranker struct {
 	scores    []float64
+	usage     biz.RerankUsage
 	err       error
 	calls     int
 	query     string
@@ -229,6 +277,42 @@ func (f *fakeReranker) Rerank(_ context.Context, query string, documents []strin
 		return nil, f.err
 	}
 	return f.scores, nil
+}
+
+// RerankWithUsage 模拟 Provider 在失败响应中仍返回已发生的输入 Token。
+func (f *fakeReranker) RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, biz.RerankUsage, error) {
+	scores, err := f.Rerank(ctx, query, documents)
+	return scores, f.usage, err
+}
+
+// TestMemoryRetrieverRecordsRerankUsageOnFailure 验证重排失败降级时仍记录已发生的调用用量。
+func TestMemoryRetrieverRecordsRerankUsageOnFailure(t *testing.T) {
+	index := activeMemoryIndex()
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{index}}
+	vectors := &fakeMemoryVectors{matches: []biz.MemoryMatch{
+		{VectorID: uuid.New(), Content: "候选一", Score: 0.95, Vector: []float32{1, 0}},
+		{VectorID: uuid.New(), Content: "候选二", Score: 0.94, Vector: []float32{0, 1}},
+	}}
+	generator := &fakeEmbeddingGenerator{vectors: [][]float32{makeEmbedding(biz.EmbeddingDimension, 0.1)}}
+	rerankErr := errors.New("rerank response invalid")
+	providerID := uuid.New()
+	reranker := &fakeReranker{usage: biz.RerankUsage{ProviderID: providerID, InputTokens: 13}, err: rerankErr}
+	retriever, err := biz.NewMemoryRetriever(indexes, vectors, generator, reranker, biz.MemoryRetrieverConfig{
+		TopK: 30, MMRTop: 2, MinSimilarity: 0.2, RerankEnabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := gomock.NewController(t)
+	usage := mocks.NewMockUsageRecorder(ctrl)
+	userID := uuid.New()
+	usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID),
+		int64(13), int64(0), float64(0), gomock.Any()).Return(nil)
+	retriever.WithUsageRecorder(usage)
+	matches, err := retriever.Retrieve(context.Background(), userID, uuid.New(), "查询")
+	if err != nil || len(matches) == 0 || reranker.calls != 1 {
+		t.Fatalf("Retrieve() matches=%d calls=%d error=%v; want vector fallback", len(matches), reranker.calls, err)
+	}
 }
 
 // TestMemoryRetrieverReranksBeforeMMR 验证 rerank 分数在多路召回后、MMR 之前生效。
@@ -395,6 +479,25 @@ func (f *fakeSummaryReader) ListEmbeddableMessages(ctx context.Context, userID, 
 	return f.ListMessagesByIDs(ctx, userID, sessionID, ids)
 }
 
+// batchMemoryReader 按请求 ID 返回单批消息，验证失租后不会继续下一批。
+type batchMemoryReader struct {
+	messages []biz.Message
+	calls    int
+}
+
+func (r *batchMemoryReader) ListEmbeddableMessages(_ context.Context, _, _ uuid.UUID, ids []uuid.UUID) ([]biz.Message, error) {
+	r.calls++
+	batch := make([]biz.Message, 0, len(ids))
+	for _, id := range ids {
+		for _, message := range r.messages {
+			if message.ID == id {
+				batch = append(batch, message)
+			}
+		}
+	}
+	return batch, nil
+}
+
 // TestMemoryEmbedWorkerWritesVectors 验证消息读取、跳过未变更内容并写入向量。
 func TestMemoryEmbedWorkerWritesVectors(t *testing.T) {
 	message := biz.Message{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Now().UTC()}
@@ -410,6 +513,9 @@ func TestMemoryEmbedWorkerWritesVectors(t *testing.T) {
 	}
 	if len(vectors.upserts) != 1 || len(vectors.upserts[0]) != 1 {
 		t.Fatalf("upserts = %#v", vectors.upserts)
+	}
+	if len(vectors.fences) != 1 || vectors.fences[0].JobID != job.ID || vectors.fences[0].Owner != "memory-test" || vectors.fences[0].Token != job.FencingToken {
+		t.Fatalf("vector write fence = %#v", vectors.fences)
 	}
 	if vectors.upserts[0][0].ContentHash != biz.MemoryContentHash("问题") {
 		t.Fatalf("content hash = %s", vectors.upserts[0][0].ContentHash)
@@ -456,6 +562,56 @@ func TestMemoryEmbedWorkerErrorClassification(t *testing.T) {
 	}
 	if jobs.failed != 1 {
 		t.Fatalf("retryable: failed=%d", jobs.failed)
+	}
+}
+
+// TestMemoryEmbedWorkerStopsAfterLeaseLoss 验证失租后不写当前批次、不调用后续 Provider，也不重复完成任务。
+func TestMemoryEmbedWorkerStopsAfterLeaseLoss(t *testing.T) {
+	userID, sessionID := uuid.New(), uuid.New()
+	messages := []biz.Message{
+		{ID: uuid.New(), UserID: userID, SessionID: sessionID, Role: biz.MessageUser, Content: "第一批", CreatedAt: time.Now().UTC()},
+		{ID: uuid.New(), UserID: userID, SessionID: sessionID, Role: biz.MessageUser, Content: "第二批", CreatedAt: time.Now().UTC().Add(time.Second)},
+	}
+	task := biz.MemoryTask{UserID: userID, SessionID: sessionID, MessageIDs: []uuid.UUID{messages[0].ID, messages[1].ID}, Versions: []string{"v1"}}
+	job := biz.Job{ID: uuid.New(), Type: biz.MemoryEmbedJobType, Payload: memoryJobPayload(task), Attempts: 1, FencingToken: 1}
+	renewStarted, renewGate, generatorStarted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	jobs := &fakeSummaryJobs{job: job, renewErr: biz.ErrResourceConflict, renewStarted: renewStarted, renewGate: renewGate}
+	reader := &batchMemoryReader{messages: messages}
+	vectors := &fakeMemoryVectors{}
+	generator := &fakeEmbeddingGenerator{started: generatorStarted, waitForCancel: true}
+	var logs bytes.Buffer
+	worker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
+		Jobs: jobs, Messages: reader, Indexes: &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{activeMemoryIndex()}},
+		Vectors: vectors, Generator: generator, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	}, biz.MemoryEmbedWorkerConfig{WorkerID: "memory-lease-test", Heartbeat: time.Millisecond, BatchSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := worker.ProcessOne(context.Background()); err != nil {
+			t.Errorf("process memory job: %v", err)
+		}
+	}()
+	wait := func(signal chan struct{}, name string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not start", name)
+		}
+	}
+	wait(generatorStarted, "first embedding batch")
+	wait(renewStarted, "memory lease renewal")
+	close(renewGate)
+	wait(done, "memory worker")
+	if generator.calls != 1 || reader.calls != 1 || len(vectors.upserts) != 0 || jobs.completed != 0 || jobs.failed != 0 {
+		t.Fatalf("lease loss continued batches or completed job: provider=%d reads=%d upserts=%d completed=%d failed=%d",
+			generator.calls, reader.calls, len(vectors.upserts), jobs.completed, jobs.failed)
+	}
+	if !strings.Contains(logs.String(), "lease_lost") {
+		t.Fatalf("missing lease_lost log: %s", logs.String())
 	}
 }
 

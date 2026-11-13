@@ -5,6 +5,7 @@ package data
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -126,5 +127,65 @@ func TestFactRepositoryRejectsInvalidValue(t *testing.T) {
 	}
 	if _, applied, err := facts.SaveFact(ctx, invalid, 0); err == nil || applied {
 		t.Fatalf("invalid value accepted: applied=%v err=%v", applied, err)
+	}
+}
+
+// TestFactRepositorySaveExtractedFactChecksJobFence 验证失租与过期任务不能提交事实，有效租约可以写入。
+func TestFactRepositorySaveExtractedFactChecksJobFence(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	owner, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "fact_fence_" + uuid.NewString(), PasswordHash: "hash", Role: biz.RoleUser,
+		Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", owner.ID).Error })
+	sessions := NewSessionRepository(appDB)
+	sessionID := createMemoryIntegrationSession(t, ctx, sessions, owner.ID, "fact-fence")
+	messages := appendMemoryIntegrationMessages(t, ctx, sessions, owner.ID, sessionID, 1)
+	source := biz.FactTask{
+		UserID: owner.ID, SessionID: sessionID, MessageIDs: []uuid.UUID{messages[0].ID},
+		Fingerprint: biz.SummarySourceFingerprint(messages),
+	}
+	jobID := uuid.New()
+	fence := biz.JobWriteFence{JobID: jobID, Owner: "fact-worker", Token: 2}
+	if err := adminDB.Exec(`INSERT INTO jobs (id, user_id, job_type, status, attempts, lease_owner, lease_expires_at, fencing_token)
+VALUES (?, ?, ?, 'running', 1, ?, ?, ?)`, jobID, owner.ID, biz.FactExtractJobType, fence.Owner, time.Now().UTC().Add(time.Hour), fence.Token).Error; err != nil {
+		t.Fatal(err)
+	}
+	sourceMessageID := messages[0].ID
+	fact := biz.MemoryFact{
+		ID: uuid.New(), UserID: owner.ID, SessionID: &sessionID, SourceMessageID: &sourceMessageID,
+		Key: "preference.fence", Value: json.RawMessage(`"first"`), Confidence: 0.9,
+		SourceKind: biz.FactSourceUser, Version: 1, ValidFrom: time.Now().UTC(), CreatedAt: time.Now().UTC(),
+	}
+	stale := fence
+	stale.Token--
+	if _, applied, err := NewFactRepository(appDB).SaveExtractedFact(ctx, fact, 0, source, stale); !errors.Is(err, biz.ErrResourceConflict) || applied {
+		t.Fatalf("stale fence write: applied=%v err=%v", applied, err)
+	}
+	if _, applied, err := NewFactRepository(appDB).SaveExtractedFact(ctx, fact, 0, source, fence); err != nil || !applied {
+		t.Fatalf("valid fence write: applied=%v err=%v", applied, err)
+	}
+	if err := adminDB.Exec("UPDATE jobs SET lease_expires_at = ? WHERE id = ?", time.Now().UTC().Add(-time.Second), jobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	second := fact
+	second.ID = uuid.New()
+	second.Version = 2
+	second.Value = json.RawMessage(`"expired"`)
+	if _, applied, err := NewFactRepository(appDB).SaveExtractedFact(ctx, second, 1, source, fence); !errors.Is(err, biz.ErrResourceConflict) || applied {
+		t.Fatalf("expired fence write: applied=%v err=%v", applied, err)
+	}
+	versions, err := NewFactRepository(appDB).ListFactVersions(ctx, owner.ID, fact.Key, 10)
+	if err != nil || len(versions) != 1 || string(versions[0].Value) != `"first"` {
+		t.Fatalf("facts after rejected writes = %#v, %v", versions, err)
 	}
 }

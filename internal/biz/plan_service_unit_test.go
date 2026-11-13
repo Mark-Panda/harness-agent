@@ -38,16 +38,23 @@ func (r *planServiceRunRepo) TransitionRun(_ context.Context, _ uuid.UUID, _ uui
 // planServiceQueue 记录入队次数。
 type planServiceQueue struct {
 	JobQueue
-	mu       sync.Mutex
-	enqueued int
+	mu         sync.Mutex
+	enqueued   int
+	enqueueErr error
 }
 
-// EnqueueRun 记录一次恢复入队。
+// EnqueueRun 记录一次恢复入队，并可注入队列故障。
 func (q *planServiceQueue) EnqueueRun(_ context.Context, _ uuid.UUID, _ uuid.UUID, _ time.Time) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.enqueued++
-	return nil
+	return q.enqueueErr
+}
+
+func (q *planServiceQueue) setEnqueueErr(err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.enqueueErr = err
 }
 
 // planServiceSessions 仅满足构造函数依赖。
@@ -178,6 +185,76 @@ func TestPlanServiceForbiddenQueries(t *testing.T) {
 	}
 	if _, err := service.Cancel(context.Background(), Principal{}, repo.run.ID); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("anonymous cancel error = %v", err)
+	}
+}
+
+func TestPlanServiceResumeEnqueueFailureCanRetry(t *testing.T) {
+	service, plans, repo, queue := planServiceFixture(t)
+	principal := Principal{UserID: uuid.New(), Role: RoleUser}
+	repo.run.UserID = principal.UserID
+	seedPlanForRun(plans, repo.run.ID, principal.UserID, PlanExecuting)
+	if _, err := service.Pause(context.Background(), principal, repo.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	enqueueErr := errors.New("queue unavailable")
+	queue.setEnqueueErr(enqueueErr)
+	paused, err := service.Resume(context.Background(), principal, repo.run.ID)
+	if !errors.Is(err, enqueueErr) || paused.Status != PlanPaused || paused.ErrorCode != "plan_resume_failed" {
+		t.Fatalf("Resume() after enqueue failure = %#v, %v", paused, err)
+	}
+
+	queue.setEnqueueErr(nil)
+	resumed, err := service.Resume(context.Background(), principal, repo.run.ID)
+	if err != nil || resumed.Status != PlanExecuting {
+		t.Fatalf("retry Resume() = %#v, %v", resumed, err)
+	}
+}
+
+func TestPlanServiceResumeReturnsCompensationFailure(t *testing.T) {
+	service, plans, repo, queue := planServiceFixture(t)
+	principal := Principal{UserID: uuid.New(), Role: RoleUser}
+	repo.run.UserID = principal.UserID
+	seedPlanForRun(plans, repo.run.ID, principal.UserID, PlanExecuting)
+	if _, err := service.Pause(context.Background(), principal, repo.run.ID); err != nil {
+		t.Fatal(err)
+	}
+	enqueueErr := errors.New("queue unavailable")
+	compensationErr := errors.New("database unavailable")
+	queue.setEnqueueErr(enqueueErr)
+	plans.updatePlanErrTo = PlanPaused
+	plans.updatePlanErr = compensationErr
+	_, err := service.Resume(context.Background(), principal, repo.run.ID)
+	if !errors.Is(err, enqueueErr) || !errors.Is(err, compensationErr) {
+		t.Fatalf("Resume() must preserve enqueue and compensation errors: %v", err)
+	}
+	latest, getErr := plans.GetPlanByRun(context.Background(), principal.UserID, repo.run.ID)
+	if getErr != nil || latest.Status != PlanExecuting {
+		t.Fatalf("failed compensation must not be reported as paused: %#v, %v", latest, getErr)
+	}
+}
+
+func TestPlanServiceReviseEnqueueFailureCanResumeNewVersion(t *testing.T) {
+	service, plans, repo, queue := planServiceFixture(t)
+	principal := Principal{UserID: uuid.New(), Role: RoleUser}
+	repo.run.UserID = principal.UserID
+	original := seedPlanForRun(plans, repo.run.ID, principal.UserID, PlanPaused)
+	enqueueErr := errors.New("queue unavailable")
+	queue.setEnqueueErr(enqueueErr)
+	paused, err := service.Revise(context.Background(), principal, repo.run.ID, PlanDraft{
+		Goal: "修订目标", Steps: []PlanDraftStep{{StepNo: 1, Title: "新步骤"}},
+	})
+	if !errors.Is(err, enqueueErr) || paused.Status != PlanPaused || paused.Version != 2 || paused.ErrorCode != "plan_resume_failed" {
+		t.Fatalf("Revise() after enqueue failure = %#v, %v", paused, err)
+	}
+	storedOriginal, getErr := plans.GetPlan(context.Background(), principal.UserID, original.ID)
+	if getErr != nil || storedOriginal.Status != PlanCancelled {
+		t.Fatalf("superseded original = %#v, %v", storedOriginal, getErr)
+	}
+
+	queue.setEnqueueErr(nil)
+	resumed, err := service.Resume(context.Background(), principal, repo.run.ID)
+	if err != nil || resumed.ID != paused.ID || resumed.Status != PlanExecuting {
+		t.Fatalf("Resume() revised version = %#v, %v", resumed, err)
 	}
 }
 

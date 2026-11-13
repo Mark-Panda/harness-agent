@@ -115,17 +115,24 @@ func (c *Client) Rerank(ctx context.Context, request RerankRequest) (RerankRespo
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<20)).Decode(&payload); err != nil {
 		return RerankResponse{}, fmt.Errorf("%w: decode rerank response: %v", ErrRetryable, err)
 	}
+	inputTokens := payload.Usage.PromptTokens
+	if inputTokens == 0 {
+		inputTokens = payload.Usage.TotalTokens
+	}
+	result := RerankResponse{InputTokens: inputTokens, ProviderRequestID: payload.ID}
 	if len(payload.Results) == 0 {
-		return RerankResponse{}, fmt.Errorf("%w: provider returned no rerank results", ErrRetryable)
+		return result, fmt.Errorf("%w: provider returned no rerank results", ErrRetryable)
 	}
 	hits := make([]RerankHit, 0, len(payload.Results))
 	seen := make(map[int]struct{}, len(payload.Results))
 	for _, item := range payload.Results {
 		if item.Index < 0 || item.Index >= len(request.Documents) {
-			return RerankResponse{}, fmt.Errorf("%w: rerank index %d is out of range", ErrRetryable, item.Index)
+			result.Results = hits
+			return result, fmt.Errorf("%w: rerank index %d is out of range", ErrRetryable, item.Index)
 		}
 		if _, exists := seen[item.Index]; exists {
-			return RerankResponse{}, fmt.Errorf("%w: duplicated rerank index %d", ErrRetryable, item.Index)
+			result.Results = hits
+			return result, fmt.Errorf("%w: duplicated rerank index %d", ErrRetryable, item.Index)
 		}
 		seen[item.Index] = struct{}{}
 		score := item.RelevanceScore
@@ -135,9 +142,6 @@ func (c *Client) Rerank(ctx context.Context, request RerankRequest) (RerankRespo
 		}
 		hits = append(hits, RerankHit{Index: item.Index, Score: score})
 	}
-	inputTokens := payload.Usage.PromptTokens
-	if inputTokens == 0 {
-		inputTokens = payload.Usage.TotalTokens
-	}
-	return RerankResponse{Results: hits, InputTokens: inputTokens, ProviderRequestID: payload.ID}, nil
+	result.Results = hits
+	return result, nil
 }

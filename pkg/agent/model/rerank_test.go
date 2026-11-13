@@ -85,9 +85,13 @@ func TestRerankGuards(t *testing.T) {
 	}
 
 	outOfRange := newRerankTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"results":[{"index":5,"relevance_score":0.1}]}`)
+		_, _ = io.WriteString(w, `{"id":"req-invalid","results":[{"index":5,"relevance_score":0.1}],"usage":{"prompt_tokens":13}}`)
 	})
-	if _, err := outOfRange.Rerank(context.Background(), RerankRequest{Model: "m", Query: "q", Documents: []string{"a"}}); !errors.Is(err, ErrRetryable) {
+	response, err := outOfRange.Rerank(context.Background(), RerankRequest{Model: "m", Query: "q", Documents: []string{"a"}})
+	if !errors.Is(err, ErrRetryable) {
 		t.Fatalf("out of range error = %v", err)
+	}
+	if response.InputTokens != 13 || response.ProviderRequestID != "req-invalid" {
+		t.Fatalf("invalid response must preserve decoded usage: %#v", response)
 	}
 }

@@ -64,6 +64,43 @@ func TestFactLLMExtractorSuccess(t *testing.T) {
 	}
 }
 
+// TestFactLLMExtractorRecordsUsageBeforeOutputValidation 验证空输出与意外 tool call
+// 都在返回前记录 Provider 已报告的 Token 与费用。
+func TestFactLLMExtractorRecordsUsageBeforeOutputValidation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response string
+		wantErr  bool
+	}{
+		{name: "empty output", response: `{"choices":[{"message":{"content":" "}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`},
+		{name: "tool call", response: `{"choices":[{"message":{"content":"{}","tool_calls":[{"id":"call-1","function":{"name":"unexpected","arguments":"{}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			providerID, modelID := uuid.New(), uuid.New()
+			userID := uuid.New()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.response)
+			}))
+			defer server.Close()
+			ctrl := gomock.NewController(t)
+			extractor := newFactExtractor(t, ctrl, server.URL, providerID, modelID)
+			usage := mocks.NewMockUsageRecorder(ctrl)
+			usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID),
+				int64(5), int64(7), 5.0/1_000_000+7.0*2/1_000_000, gomock.Any()).Return(nil)
+			extractor.WithUsageRecorder(usage)
+			candidates, err := extractor.Extract(context.Background(), userID, uuid.New(), []biz.Message{{ID: uuid.New(), Role: biz.MessageUser, Content: "x"}})
+			if test.wantErr {
+				if !errors.Is(err, biz.ErrFactPermanent) {
+					t.Fatalf("tool call error = %v", err)
+				}
+			} else if err != nil || len(candidates) != 0 {
+				t.Fatalf("empty output candidates=%#v err=%v", candidates, err)
+			}
+		})
+	}
+}
+
 // TestFactLLMExtractorErrors 验证空输出、不可重试错误与无模型语义。
 func TestFactLLMExtractorErrors(t *testing.T) {
 	providerID, modelID := uuid.New(), uuid.New()

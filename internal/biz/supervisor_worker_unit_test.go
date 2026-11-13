@@ -192,6 +192,31 @@ func supervisorFixture(t *testing.T, handler func(body string, w http.ResponseWr
 	return worker, repo, sessions, candidates, server
 }
 
+// recordingSupervisorRuns 记录事件，验证汇总失败具有可检索的诊断事实。
+type recordingSupervisorRuns struct {
+	stubRunRepository
+	mu     sync.Mutex
+	events []RunEvent
+}
+
+func (r *recordingSupervisorRuns) AppendEventFenced(_ context.Context, event RunEvent, _ RunFence) (RunEvent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+	return event, nil
+}
+
+func (r *recordingSupervisorRuns) hasEvent(eventType string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, event := range r.events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
 func supervisorReply(t *testing.T, w http.ResponseWriter, content string, status int) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -330,6 +355,55 @@ func TestSupervisorBudgetExceeded(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "结果") {
 		t.Fatalf("partial result content = %q", result.Content)
+	}
+}
+
+func TestExecuteSupervisorAggregateFailureDoesNotPublishFinalMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		content string
+		wantErr error
+	}{
+		{name: "model error", status: http.StatusInternalServerError, content: "不可用"},
+		{name: "empty response", status: http.StatusOK, content: "", wantErr: react.ErrEmptyResponse},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			delegation := `{"workers":[{"name":"A","task":"任务A","tools":[]}]}`
+			worker, _, sessions, candidates, _ := supervisorFixture(t, func(body string, w http.ResponseWriter) {
+				switch {
+				case strings.Contains(body, "请输出 Worker 委派 JSON"):
+					supervisorReply(t, w, delegation, http.StatusOK)
+				case strings.Contains(body, "请汇总以下 Worker 结果"):
+					supervisorReply(t, w, tc.content, tc.status)
+				default:
+					supervisorReply(t, w, "Worker 原始结果", http.StatusOK)
+				}
+			})
+			runs := &recordingSupervisorRuns{}
+			worker.runs = runs
+			run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+			result, err := worker.executeSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1},
+				candidates, nil, []react.Message{{Role: react.RoleUser, Content: "处理"}}, emptyToolRegistry{})
+			if err == nil || !strings.Contains(err.Error(), "supervisor aggregation failed") {
+				t.Fatalf("aggregate error = %v", err)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("aggregate error = %v, want %v", err, tc.wantErr)
+			}
+			if result.Content != "" {
+				t.Fatalf("failed aggregation returned fallback content: %q", result.Content)
+			}
+			finalID := deterministicSupervisorFinalMessageID(run.ID)
+			for _, message := range sessions.messages {
+				if message.ID.String() == finalID {
+					t.Fatalf("failed aggregation persisted final message: %#v", message)
+				}
+			}
+			if !runs.hasEvent("supervisor.aggregate_failed") || runs.hasEvent("supervisor.completed") {
+				t.Fatalf("aggregate diagnostic events = %#v", runs.events)
+			}
+		})
 	}
 }
 

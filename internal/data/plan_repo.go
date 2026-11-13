@@ -523,6 +523,104 @@ func (r *PlanRepository) UpdatePlan(ctx context.Context, userID, planID uuid.UUI
 	return r.GetPlan(ctx, userID, planID)
 }
 
+// CompletePlan 在同一事务内保存最终答复、推进会话版本、写 Outbox 并完成计划。
+// Run 与 Plan 行锁把 Worker 完成和人工暂停串行化，杜绝“已暂停却发布答案”或“完成后被暂停”的分裂状态。
+func (r *PlanRepository) CompletePlan(ctx context.Context, userID, planID uuid.UUID, completion biz.PlanCompletion) (biz.Plan, biz.Message, error) {
+	message := completion.Message
+	if planID == uuid.Nil || userID == uuid.Nil || completion.ExpectedRevision < 0 || completion.FinishedAt.IsZero() ||
+		message.ID == uuid.Nil || message.UserID != userID || message.SessionID == uuid.Nil || message.RunID == nil || *message.RunID == uuid.Nil ||
+		message.Role != biz.MessageAssistant || completion.Fence.Owner == "" || completion.Fence.Token <= 0 {
+		return biz.Plan{}, biz.Message{}, fmt.Errorf("%w: invalid plan completion", biz.ErrInvalidConfig)
+	}
+	toolCalls, err := json.Marshal(message.ToolCalls)
+	if message.ToolCalls == nil {
+		toolCalls = []byte("[]")
+	} else if err != nil {
+		return biz.Plan{}, biz.Message{}, err
+	}
+	now := time.Now().UTC()
+	record := messageModel{
+		ID: message.ID, SessionID: message.SessionID, UserID: userID, Role: string(message.Role), Content: message.Content,
+		ToolCalls: datatypes.JSON(toolCalls), ToolCallID: message.ToolCallID, ToolName: message.ToolName,
+		TokenCount: message.TokenCount, ExternalMessageID: message.ExternalMessageID,
+		SpeakerOpenID: message.SpeakerOpenID, RunID: message.RunID, CreatedAt: now,
+	}
+	var storedRecord messageModel
+	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		status, err := lockWorkerPlan(tx, userID, planID, completion.Fence, now)
+		if err != nil {
+			return planReplacementConflict(err)
+		}
+		switch status {
+		case biz.PlanPaused:
+			return biz.ErrPlanPaused
+		case biz.PlanCancelled:
+			return biz.ErrPlanCancelled
+		case biz.PlanExecuting:
+		default:
+			return fmt.Errorf("%w: plan is no longer executing", biz.ErrPlanRevisionConflict)
+		}
+		var plan planModel
+		if err := tx.Select("run_id", "session_id").Take(&plan, "id = ? AND user_id = ?", planID, userID).Error; err != nil {
+			return err
+		}
+		if plan.RunID != *message.RunID || plan.SessionID != message.SessionID {
+			return fmt.Errorf("%w: final message does not belong to the plan", biz.ErrResourceConflict)
+		}
+		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoNothing: true}).Create(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.First(&storedRecord, "id = ? AND user_id = ?", message.ID, userID).Error; err != nil {
+				return err
+			}
+			if storedRecord.SessionID != message.SessionID || storedRecord.RunID == nil || *storedRecord.RunID != *message.RunID {
+				return fmt.Errorf("%w: final message id is already bound to another execution", biz.ErrResourceConflict)
+			}
+		} else {
+			storedRecord = record
+			updated := tx.Model(&sessionModel{}).
+				Where("id = ? AND user_id = ? AND status = ?", message.SessionID, userID, biz.SessionActive).
+				Updates(map[string]any{"last_message_at": now, "updated_at": now, "version": gorm.Expr("version + 1")})
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected != 1 {
+				return fmt.Errorf("%w: session is missing or inactive", biz.ErrResourceConflict)
+			}
+			if err := appendOutbox(tx, completion.Event); err != nil {
+				return err
+			}
+		}
+		finishedAt := completion.FinishedAt.UTC()
+		updated := tx.Model(&planModel{}).
+			Where("id = ? AND user_id = ? AND status = ? AND revision = ?", planID, userID, biz.PlanExecuting, completion.ExpectedRevision).
+			Updates(map[string]any{
+				"status": string(biz.PlanCompleted), "revision": gorm.Expr("revision + 1"), "updated_at": now,
+				"error_code": "", "error_message": "", "finished_at": finishedAt,
+			})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return fmt.Errorf("%w: plan revision or status changed during completion", biz.ErrPlanRevisionConflict)
+		}
+		return nil
+	}); err != nil {
+		return biz.Plan{}, biz.Message{}, catalogError("complete plan", err)
+	}
+	stored, err := toBizMessage(storedRecord)
+	if err != nil {
+		return biz.Plan{}, biz.Message{}, err
+	}
+	updated, err := r.GetPlan(ctx, userID, planID)
+	if err != nil {
+		return biz.Plan{}, biz.Message{}, err
+	}
+	return updated, stored, nil
+}
+
 // lockWorkerPlan serializes a worker mutation with Run takeover, pause and rebinding.
 // Keep the lock order consistent with plan claims, replacement and tool dispatch.
 func lockWorkerPlan(tx *gorm.DB, userID, planID uuid.UUID, fence biz.PlanFence, now time.Time) (biz.PlanStatus, error) {
@@ -939,3 +1037,4 @@ func nonNilInts(values []int) []int {
 
 // 编译期断言接口实现，避免装配阶段才发现契约不一致。
 var _ biz.PlanRepository = (*PlanRepository)(nil)
+var _ biz.PlanCompletionRepository = (*PlanRepository)(nil)

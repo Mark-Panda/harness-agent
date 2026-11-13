@@ -203,6 +203,26 @@ type PlanDeadlineExtender interface {
 	ExtendPlanDeadline(ctx context.Context, userID, planID uuid.UUID, deadline time.Time, now time.Time) (Plan, error)
 }
 
+// PlanCompletion 是计划完成事务所需的全部写入事实。
+type PlanCompletion struct {
+	// ExpectedRevision 要求计划仍停留在 Worker 汇总前读取的版本。
+	ExpectedRevision int64
+	// Fence 当前 Worker 的 Run 租约栅栏。
+	Fence PlanFence
+	// Message 确定性 ID 的最终答复。
+	Message Message
+	// Event 最终答复对应的审计 Outbox。
+	Event OutboxEvent
+	// FinishedAt 计划完成时间。
+	FinishedAt time.Time
+}
+
+// PlanCompletionRepository 原子提交最终答复与计划完成状态。
+// 独立为窄端口是为了不让只读或管理用例依赖消息写入能力；Plan 执行路径必须要求该能力。
+type PlanCompletionRepository interface {
+	CompletePlan(ctx context.Context, userID, planID uuid.UUID, completion PlanCompletion) (Plan, Message, error)
+}
+
 // PlanRepository 定义计划持久化契约；所有查询与写入强制携带 user_id。
 type PlanRepository interface {
 	// CreatePlan 在同一事务内创建初始计划与全部步骤，并写入审计事件。

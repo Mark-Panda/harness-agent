@@ -161,6 +161,9 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 			case "raw-name":
 				toolRenamed.Store(true)
 			}
+			worker.approvalDelivery = testAtomicApprovalDelivery{
+				sessions: worker.sessions, runs: worker.runs, steps: worker.steps, approvals: worker.approvals,
+			}
 			resumed, err := worker.prepareMCPTools(ctx, run, fence)
 			if err != nil {
 				t.Fatal(err)

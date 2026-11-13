@@ -19,6 +19,22 @@ func TestPurgeExpiredRetention(t *testing.T) {
 	adminDB, appDB, authDB := feishuIntegrationDBs(t)
 	ctx := context.Background()
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	executionCutoff := time.Now().UTC().Add(-90 * 24 * time.Hour)
+	auditCutoff := time.Now().UTC().Add(-365 * 24 * time.Hour)
+	feishuCutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+	auditKey := []byte("01234567890123456789012345678901")
+	oldPartition := "1999-01-01"
+	// 保留期统计是全局语义。先清理本测试固定分区的历史残留并记录基线，
+	// 后续按增量验证，不再假设共享集成库没有其他过期数据。
+	if err := adminDB.Exec("SELECT set_config('audit.retention', 'on', false)").Error; err != nil {
+		t.Fatalf("enable retention scope: %v", err)
+	}
+	_ = adminDB.Exec("DELETE FROM audit_checkpoints WHERE partition_id = ?", oldPartition).Error
+	_ = adminDB.Exec("DELETE FROM audit_logs WHERE partition_id = ?", oldPartition).Error
+	baseline, err := PurgeExpired(ctx, adminDB, auditKey, executionCutoff, auditCutoff, feishuCutoff, false)
+	if err != nil {
+		t.Fatalf("baseline dry-run purge: %v", err)
+	}
 	users := NewUserRepository(appDB, authDB)
 	user, err := users.CreateUser(ctx, biz.User{
 		Username: "retention_" + suffix, PasswordHash: "hash", Role: biz.RoleUser,
@@ -78,13 +94,6 @@ func TestPurgeExpiredRetention(t *testing.T) {
 	}
 
 	// 审计旧事件与检查点使用历史时钟写入，便于按保留期清理。
-	oldPartition := "1999-01-01"
-	// 清理历史残留需要保留期特权开关；该设置只在当前管理员连接生效。
-	if err := adminDB.Exec("SELECT set_config('audit.retention', 'on', false)").Error; err != nil {
-		t.Fatalf("enable retention scope: %v", err)
-	}
-	_ = adminDB.Exec("DELETE FROM audit_checkpoints WHERE partition_id = ?", oldPartition).Error
-	_ = adminDB.Exec("DELETE FROM audit_logs WHERE partition_id = ?", oldPartition).Error
 	fixed := clock.NewFixed(time.Date(1999, time.January, 1, 0, 0, 0, 0, time.UTC))
 	recorder, err := audit.NewRecorder(authDB, []byte("01234567890123456789012345678901"), fixed)
 	if err != nil {
@@ -100,16 +109,16 @@ func TestPurgeExpiredRetention(t *testing.T) {
 		t.Fatalf("create old checkpoint: %v", err)
 	}
 
-	executionCutoff := time.Now().UTC().Add(-90 * 24 * time.Hour)
-	auditCutoff := time.Now().UTC().Add(-365 * 24 * time.Hour)
-	feishuCutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
-	auditKey := []byte("01234567890123456789012345678901")
 	dryRun, err := PurgeExpired(ctx, adminDB, auditKey, executionCutoff, auditCutoff, feishuCutoff, false)
 	if err != nil {
 		t.Fatalf("dry-run purge: %v", err)
 	}
-	if dryRun.ExecutionPayloads != 1 || dryRun.AuditLogs != 1 || dryRun.AuditCheckpoints != 1 || dryRun.FeishuEvents != 1 {
-		t.Fatalf("dry-run counts = %+v", dryRun)
+	if dryRun.ExecutionPayloads != baseline.ExecutionPayloads+1 ||
+		dryRun.AuditLogs != baseline.AuditLogs+1 ||
+		dryRun.AuditCheckpoints != baseline.AuditCheckpoints+1 ||
+		dryRun.FeishuEvents != baseline.FeishuEvents+1 ||
+		dryRun.IdempotencyKeys < baseline.IdempotencyKeys {
+		t.Fatalf("dry-run counts = %+v, baseline = %+v", dryRun, baseline)
 	}
 	// dry-run 不得删除任何数据。
 	var count int64
@@ -124,8 +133,12 @@ func TestPurgeExpiredRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply purge: %v", err)
 	}
-	if applied.ExecutionPayloads != 1 || applied.AuditLogs != 1 || applied.AuditCheckpoints != 1 || applied.FeishuEvents != 1 {
-		t.Fatalf("applied counts = %+v", applied)
+	if applied.ExecutionPayloads != dryRun.ExecutionPayloads ||
+		applied.AuditLogs != dryRun.AuditLogs ||
+		applied.AuditCheckpoints != dryRun.AuditCheckpoints ||
+		applied.FeishuEvents != dryRun.FeishuEvents ||
+		applied.IdempotencyKeys < dryRun.IdempotencyKeys {
+		t.Fatalf("applied counts = %+v, dry-run = %+v", applied, dryRun)
 	}
 	if err := adminDB.Table("execution_payloads").Where("id = ?", oldPayloadID).Count(&count).Error; err != nil || count != 0 {
 		t.Fatalf("old payload survived purge: count=%d err=%v", count, err)

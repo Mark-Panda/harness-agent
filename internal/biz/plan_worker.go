@@ -840,12 +840,16 @@ func CarryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 		if !ok {
 			continue
 		}
-		for _, old := range completedTools[operation] {
-			if !matchingPlanToolStep(old, *step, matchDescription, carried) {
+		candidates := completedTools[operation]
+		for oldIndex, old := range candidates {
+			if !matchingPlanToolStep(old, *step, carried) {
 				continue
 			}
 			carryPlanStepResult(step, old, true)
 			carried[step.StepNo] = PlanStepCompleted
+			// 一个已完成的旧副作用最多只能被一个新步骤复用；相同操作出现多次时，
+			// 必须按顺序消费不同的历史执行事实，不能让多个新步骤共享同一结果。
+			completedTools[operation] = append(candidates[:oldIndex], candidates[oldIndex+1:]...)
 			break
 		}
 	}
@@ -853,14 +857,10 @@ func CarryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 }
 
 // matchingPlanToolStep 判断工具步骤能否复用旧结果。
-// 依赖集合变化会改变执行语义，必须重跑；人工修订还要求标题与说明一致，
-// 自动重规划只按工具操作与依赖匹配，允许模型改写步骤标题。
-func matchingPlanToolStep(old, step PlanStep, matchDescription bool, carried map[int]PlanStepStatus) bool {
+// 工具名与规范化参数已在外层确定操作身份；标题和说明只是展示与提示信息，
+// 修改它们不得重复外部副作用。依赖集合或未完成的依赖变化仍会阻止复用。
+func matchingPlanToolStep(old, step PlanStep, carried map[int]PlanStepStatus) bool {
 	if !slices.Equal(slices.Sorted(slices.Values(old.DependsOn)), slices.Sorted(slices.Values(step.DependsOn))) {
-		return false
-	}
-	if matchDescription && (strings.TrimSpace(old.Title) != strings.TrimSpace(step.Title) ||
-		strings.TrimSpace(old.Description) != strings.TrimSpace(step.Description)) {
 		return false
 	}
 	return dependenciesCompleted(step.DependsOn, carried)
@@ -1281,24 +1281,29 @@ func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunF
 			return react.Result{}, err
 		}
 	}
-	// 先落最终消息再推进计划终态：若进程在两步之间崩溃，恢复时仍能读到本次模型汇总，
-	// 避免 Plan 已完成但最终消息缺失，导致恢复路径重新汇总或覆盖用户已看到的答案。
-	finalMessageID := deterministicPlanFinalMessageID(plan.ID)
-	if _, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, runFence, map[string]any{
-		"index": len(messages), "role": string(MessageAssistant), "content": content, "message_id": finalMessageID,
-	}); err != nil {
-		return react.Result{}, err
+	// 最终消息、会话版本、Outbox 与计划完成 CAS 必须共享一个数据库事务。
+	// 仓储在事务内锁定 Run 与 Plan：暂停先提交则不发布消息，完成先提交则暂停 revision CAS 失败。
+	completionRepository, ok := w.plans.(PlanCompletionRepository)
+	if !ok {
+		return react.Result{}, fmt.Errorf("%w: plan repository does not support atomic completion", ErrInvalidConfig)
 	}
-	now := w.clock()
-	updated, err := w.plans.UpdatePlan(ctx, run.UserID, plan.ID, PlanExecuting, PlanCompleted, latest.Revision,
-		fence, PlanUpdate{FinishedAt: &now})
+	finalMessageID := uuid.MustParse(deterministicPlanFinalMessageID(plan.ID))
+	message := Message{
+		ID: finalMessageID, SessionID: run.SessionID, UserID: run.UserID,
+		Role: MessageAssistant, Content: content, RunID: &run.ID,
+	}
+	event := OutboxEvent{
+		UserID: run.UserID, EventType: "message.created.agent", AggregateType: "message", AggregateID: message.ID.String(),
+		DedupeKey: fmt.Sprintf("message.created.agent:%s", message.ID), Payload: map[string]any{"run_id": run.ID.String()},
+	}
+	updated, stored, err := completionRepository.CompletePlan(context.WithoutCancel(ctx), run.UserID, plan.ID, PlanCompletion{
+		ExpectedRevision: latest.Revision, Fence: fence, Message: message, Event: event, FinishedAt: w.clock(),
+	})
 	if err != nil {
 		return react.Result{}, err
 	}
-	result, err := w.planResultWithStoredFinal(ctx, run, runFence, updated, messages, content)
-	if err != nil {
-		return react.Result{}, err
-	}
+	w.appendHotMessage(context.WithoutCancel(ctx), run, stored)
+	result := w.planResultFromMessage(ctx, run, runFence, updated, messages, stored)
 	w.emitPlanEvent(ctx, run, runFence, "plan.completed", map[string]any{
 		"plan_id": plan.ID.String(), "steps": len(updated.Steps),
 		"total_input_tokens": updated.TotalInputTokens, "total_output_tokens": updated.TotalOutputTokens,
@@ -1308,9 +1313,14 @@ func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunF
 
 // planFinalResult 在计划已完成的恢复路径上返回最终答案。
 func (w *ExecutionWorker) planFinalResult(ctx context.Context, run Run, fence RunFence, router *model.Router, plan Plan, messages []react.Message) (react.Result, error) {
-	// 以数据库中同一幂等消息为准：已保存的模型汇总不会被恢复路径覆盖。
+	// 历史中已经存在最终消息，说明其消息、会话版本与 Outbox 早已持久化；
+	// 恢复只需构造结果，不能再用 Run 租约执行一次冗余写入。
 	if stored, ok := findPlanFinalMessage(plan, messages); ok {
-		return w.planResultWithStoredFinal(ctx, run, fence, plan, messages, stored)
+		message := Message{
+			ID: uuid.MustParse(deterministicPlanFinalMessageID(plan.ID)), SessionID: run.SessionID, UserID: run.UserID,
+			Role: MessageAssistant, Content: stored, RunID: &run.ID,
+		}
+		return w.planResultFromMessage(ctx, run, fence, plan, messages, message), nil
 	}
 	// 兼容历史数据：计划已完成但最终消息缺失时重新生成模型汇总，保持与正常完成路径一致。
 	// 不得回退为内部步骤拼接，否则用户会看到流程编号与原始工具输出。
@@ -1349,11 +1359,18 @@ func (w *ExecutionWorker) planResultWithStoredFinal(ctx context.Context, run Run
 	if err != nil {
 		return react.Result{}, err
 	}
+	return w.planResultFromMessage(ctx, run, fence, plan, messages, stored), nil
+}
+
+// planResultFromMessage 用事务提交后的权威消息构造结果，不再执行第二次跨表写入。
+func (w *ExecutionWorker) planResultFromMessage(ctx context.Context, run Run, fence RunFence, plan Plan, messages []react.Message, stored Message) react.Result {
 	resultMessages := messages
 	alreadyPresent := len(messages) > 0 && messages[len(messages)-1].Role == react.RoleAssistant && messages[len(messages)-1].Content == stored.Content
 	if !alreadyPresent {
 		resultMessages = append(resultMessages, react.Message{ID: stored.ID.String(), RunID: run.ID.String(), Role: react.RoleAssistant, Content: stored.Content})
-		payload["content"] = stored.Content
+		payload := map[string]any{
+			"index": len(messages), "role": string(stored.Role), "content": stored.Content, "message_id": stored.ID.String(),
+		}
 		if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
 			RunID: run.ID, UserID: run.UserID, EventType: "message.created", Payload: payload,
 		}, fence); err != nil {
@@ -1364,7 +1381,7 @@ func (w *ExecutionWorker) planResultWithStoredFinal(ctx context.Context, run Run
 		Content: stored.Content, Steps: len(plan.Steps),
 		TotalTokens: int(plan.TotalInputTokens + plan.TotalOutputTokens), EstimatedCost: plan.EstimatedCost,
 		Messages: resultMessages, FinalMessageID: stored.ID.String(),
-	}, nil
+	}
 }
 
 // failPlan 标记计划失败、跳过依赖失败的待执行步骤并返回业务错误。

@@ -1,9 +1,11 @@
 package biz_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ type fakeFactRepository struct {
 	applied bool
 	err     error
 	deleted []string
+	fences  []biz.JobWriteFence
 }
 
 // ListActiveFacts 返回内存中的生效事实。
@@ -52,7 +55,8 @@ func (f *fakeFactRepository) SaveFact(_ context.Context, fact biz.MemoryFact, _ 
 	return fact, f.applied, nil
 }
 
-func (f *fakeFactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, _ biz.FactTask) (biz.MemoryFact, bool, error) {
+func (f *fakeFactRepository) SaveExtractedFact(ctx context.Context, fact biz.MemoryFact, expectedVersion int64, _ biz.FactTask, fence biz.JobWriteFence) (biz.MemoryFact, bool, error) {
+	f.fences = append(f.fences, fence)
 	return f.SaveFact(ctx, fact, expectedVersion)
 }
 
@@ -189,14 +193,22 @@ func TestFactServiceValidationAndDeletion(t *testing.T) {
 
 // fakeFactExtractor 是事实提取器的测试替身。
 type fakeFactExtractor struct {
-	candidates []biz.FactCandidate
-	err        error
-	calls      int
+	candidates    []biz.FactCandidate
+	err           error
+	calls         int
+	started       chan struct{}
+	waitForCancel bool
 }
 
-// Extract 记录调用并返回预置候选。
-func (f *fakeFactExtractor) Extract(context.Context, uuid.UUID, uuid.UUID, []biz.Message) ([]biz.FactCandidate, error) {
+// Extract 记录调用并返回预置候选；续约测试模拟 Provider 忽略取消后仍返回结果。
+func (f *fakeFactExtractor) Extract(ctx context.Context, _ uuid.UUID, _ uuid.UUID, _ []biz.Message) ([]biz.FactCandidate, error) {
 	f.calls++
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.waitForCancel {
+		<-ctx.Done()
+	}
 	return f.candidates, f.err
 }
 
@@ -254,6 +266,61 @@ func TestFactExtractionWorkerSuccess(t *testing.T) {
 	}
 	if !repo.saved[0].Corrected && repo.saved[0].SourceKind != biz.FactSourceUser {
 		t.Fatalf("saved fact = %#v", repo.saved[0])
+	}
+}
+
+// TestFactExtractionWorkerStopsAfterLeaseLoss 验证续约冲突取消提取，且忽略取消的 Provider 也不能写库或完成任务。
+func TestFactExtractionWorkerStopsAfterLeaseLoss(t *testing.T) {
+	message := biz.Message{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Role: biz.MessageUser, Content: "我偏好中文", CreatedAt: time.Now().UTC()}
+	task := biz.FactTask{
+		UserID: message.UserID, SessionID: message.SessionID, MessageIDs: []uuid.UUID{message.ID},
+		Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+	}
+	job := biz.Job{ID: uuid.New(), Type: biz.FactExtractJobType, Payload: factJobPayload(task), Attempts: 1, FencingToken: 1}
+	renewStarted, renewGate, extractorStarted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	jobs := &fakeSummaryJobs{job: job, renewErr: biz.ErrResourceConflict, renewStarted: renewStarted, renewGate: renewGate}
+	repo := &fakeFactRepository{applied: true, active: map[string]biz.MemoryFact{}}
+	factService, err := biz.NewFactService(repo, biz.FactPolicy{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extractor := &fakeFactExtractor{
+		candidates: []biz.FactCandidate{factCandidate("preference.language", `"中文"`, 0.9, false)},
+		started:    extractorStarted, waitForCancel: true,
+	}
+	var logs bytes.Buffer
+	worker, err := biz.NewFactExtractionWorker(biz.FactExtractionWorkerDependencies{
+		Jobs: jobs, Messages: &fakeSummaryReader{byIDs: []biz.Message{message}}, Facts: factService, Extractor: extractor,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	}, biz.FactExtractionWorkerConfig{WorkerID: "fact-lease-test", Heartbeat: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := worker.ProcessOne(context.Background()); err != nil {
+			t.Errorf("process fact job: %v", err)
+		}
+	}()
+	wait := func(signal chan struct{}, name string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not start", name)
+		}
+	}
+	wait(extractorStarted, "fact extraction")
+	wait(renewStarted, "fact lease renewal")
+	close(renewGate)
+	wait(done, "fact worker")
+	if extractor.calls != 1 || len(repo.saved) != 0 || jobs.completed != 0 || jobs.failed != 0 {
+		t.Fatalf("lease loss wrote or completed job: calls=%d saved=%d completed=%d failed=%d",
+			extractor.calls, len(repo.saved), jobs.completed, jobs.failed)
+	}
+	if !strings.Contains(logs.String(), "lease_lost") {
+		t.Fatalf("missing lease_lost log: %s", logs.String())
 	}
 }
 
@@ -435,6 +502,9 @@ func TestFactExtractionWorkerWritesSpeakerOwnership(t *testing.T) {
 	}
 	if jobs.completed != 1 || len(repo.saved) != 1 {
 		t.Fatalf("completed=%d saved=%d", jobs.completed, len(repo.saved))
+	}
+	if len(repo.fences) != 1 || repo.fences[0].JobID != job.ID || repo.fences[0].Owner != "fact-test" || repo.fences[0].Token != job.FencingToken {
+		t.Fatalf("fact write fence = %#v", repo.fences)
 	}
 	// 事实归属必须切换到发言人本人，而非会话所有者。
 	if repo.saved[0].UserID != speakerID {

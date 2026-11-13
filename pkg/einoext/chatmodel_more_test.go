@@ -55,6 +55,44 @@ func TestChatModelGenerateAndLastContent(t *testing.T) {
 	}
 }
 
+// TestChatModelRetryUsageRecordedOnce 验证 Router 重试汇总用量在 Eino 侧只累计一次，
+// 既不遗漏失败 Attempt，也不按 Provider 调用次数重复记账。
+func TestChatModelRetryUsageRecordedOnce(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			fmt.Fprint(w, `{"error":{"code":"server_error"},"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
+			return
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`)
+	}))
+	t.Cleanup(server.Close)
+	router, err := model.NewRouter([]model.Candidate{{
+		Ref: model.ModelRef{
+			ProviderID: "provider", ModelID: "model", RemoteModelName: "test-model",
+			ContextWindowTokens: 1_000_000, MaxOutputTokens: 4096, Tools: true,
+		},
+		BaseURL: server.URL, APIKey: "test-key", InputPricePerMillion: 1_000_000, OutputPricePerMillion: 2_000_000,
+	}}, nil, model.RouterConfig{
+		MinContextTokens: 1_000_000, MaxAttemptsPerModel: 2, MaxAttemptsPerRun: 4,
+		RequestTimeout: 5 * time.Second,
+	}, nil, model.WithSleep(func(context.Context, time.Duration) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewChatModel(router, nil, 4, 0, 0)
+	message, err := m.Generate(context.Background(), []*schema.Message{schema.UserMessage("hi")})
+	if err != nil || message.Content != "answer" {
+		t.Fatalf("Generate() = %#v, %v", message, err)
+	}
+	usedCalls, input, output, cost := m.Usage()
+	if calls != 2 || usedCalls != 1 || input != 8 || output != 9 || cost != 26 {
+		t.Fatalf("provider calls=%d usage=%d/%d/%d/%f, want 2 provider calls and one 8/9/26 record", calls, usedCalls, input, output, cost)
+	}
+}
+
 // TestChatModelSummarizeAfterStepLimit 覆盖步数耗尽后的禁止工具收尾调用。
 func TestChatModelSummarizeAfterStepLimit(t *testing.T) {
 	router := newChatModelTestRouter(t, func(w http.ResponseWriter, r *http.Request) {
