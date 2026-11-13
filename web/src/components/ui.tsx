@@ -174,6 +174,7 @@ export function Badge({ tone = "neutral", children }: { tone?: BadgeTone; childr
 
 export function Card({
   id, title, description, actions, children, className, collapsible = false, defaultOpen = true,
+  open: controlledOpen, onOpenChange,
 }: {
   id?: string;
   title?: string;
@@ -183,9 +184,19 @@ export function Card({
   className?: string;
   collapsible?: boolean;
   defaultOpen?: boolean;
+  // 传入 open 时由父组件控制展开状态，便于按钮点击后自动定位到折叠区域。
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [internalOpen, setInternalOpen] = useState(defaultOpen);
+  const open = controlledOpen ?? internalOpen;
   const expanded = !collapsible || open;
+  const setOpen = (next: boolean) => {
+    if (controlledOpen === undefined) {
+      setInternalOpen(next);
+    }
+    onOpenChange?.(next);
+  };
   return (
     <section id={id} className={cn("min-w-0 scroll-mt-20 rounded-xl border border-line bg-paper-raised", className)}>
       {(title || actions) && (
@@ -196,7 +207,7 @@ export function Card({
                 <button
                   type="button"
                   aria-expanded={expanded}
-                  onClick={() => setOpen((value) => !value)}
+                  onClick={() => setOpen(!open)}
                   className="flex items-center gap-2 rounded text-left hover:text-accent"
                 >
                   {title}

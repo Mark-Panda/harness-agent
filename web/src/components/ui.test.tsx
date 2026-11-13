@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it } from "vitest";
-import { Field, Input } from "./ui";
+import { Card, Field, Input } from "./ui";
 
 describe("Field", () => {
   it("links its hint and shows a field-level required error until the value changes", () => {
@@ -15,6 +16,25 @@ describe("Field", () => {
     fireEvent.change(input, { target: { value: "模型服务" } });
     expect(input).not.toHaveAttribute("aria-invalid", "true");
     expect(input).toHaveAccessibleDescription("填写一个易于识别的名称");
+  });
+
+  it("keeps a collapsed section closed until the controlled open state changes", () => {
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>展开输入输出</button>
+          <Card title="输入与输出" collapsible open={open} onOpenChange={setOpen}>
+            <p>载荷内容</p>
+          </Card>
+        </>
+      );
+    }
+    render(<Harness />);
+    expect(screen.queryByText("载荷内容")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开输入输出" }));
+    expect(screen.getByText("载荷内容")).toBeInTheDocument();
   });
 
   it("reveals a password without submitting the form or changing the value", () => {

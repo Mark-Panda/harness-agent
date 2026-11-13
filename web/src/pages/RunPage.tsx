@@ -74,6 +74,7 @@ export default function RunPage() {
 
   const [payloads, setPayloads] = useState<ExecutionPayload[]>([]);
   const [payloadStepID, setPayloadStepID] = useState<string | null>(null);
+  const [payloadOpen, setPayloadOpen] = useState(false);
   const [reason, setReason] = useState("");
   const [reasonError, setReasonError] = useState<string | null>(null);
   const [payloadBusy, setPayloadBusy] = useState(false);
@@ -119,9 +120,22 @@ export default function RunPage() {
   }, [orderedSteps]);
   const modelNames = useMemo(() => candidateNames(run.data?.model_policy_snapshot), [run.data?.model_policy_snapshot]);
 
+  // openPayloadPanel 展开输入输出区域并滚动定位；需要填写理由时同时聚焦输入框。
+  const openPayloadPanel = (focusReason: boolean) => {
+    setPayloadOpen(true);
+    window.requestAnimationFrame(() => {
+      document.getElementById("payloads")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (focusReason) {
+        document.getElementById("payload-reason")?.focus();
+      }
+    });
+  };
+
   const loadPayloads = async (stepID: string) => {
     if (reason.trim().length < 4) {
-      setReasonError("请填写至少 4 个字符的查看理由，理由会进入审计记录。");
+      setReasonError("请先在下方的“查看输入与输出”区域填写至少 4 个字符的查看理由，理由会进入审计记录。");
+      // 面板默认折叠，必须展开并定位，否则用户点击按钮后看不到任何反馈。
+      openPayloadPanel(true);
       return;
     }
     setPayloadBusy(true);
@@ -132,8 +146,10 @@ export default function RunPage() {
       );
       setPayloads(response.payloads ?? []);
       setPayloadStepID(stepID);
+      openPayloadPanel(false);
     } catch (failure) {
       setReasonError(describeError(failure));
+      openPayloadPanel(false);
     } finally {
       setPayloadBusy(false);
     }
@@ -439,7 +455,15 @@ export default function RunPage() {
                   <div className="flex items-center gap-2 text-xs text-muted">
                     <span>调用 #{step.attempt_no}</span>
                     <span>{formatDuration(step.started_at, step.finished_at)}</span>
-                    <Button size="sm" variant="secondary" loading={payloadBusy && payloadStepID === step.id} onClick={() => void loadPayloads(step.id)}>查看输入输出</Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={payloadBusy && payloadStepID === step.id}
+                      title="点击后会在下方展开输入输出；首次查看需要填写查看理由"
+                      onClick={() => void loadPayloads(step.id)}
+                    >
+                      查看输入输出
+                    </Button>
                   </div>
                 </div>
                 {step.error_code ? <p className="mt-2 text-xs text-rust">错误码：{step.error_code}</p> : null}
@@ -544,13 +568,26 @@ export default function RunPage() {
         </Card>
       ) : null}
 
-      <Card id="payloads" collapsible defaultOpen={false} title="查看输入与输出" description="这里保存模型请求、响应与工具读写的脱敏副本。查看需要填写理由，并会记入审计记录。">
+      <Card
+        id="payloads"
+        collapsible
+        open={payloadOpen}
+        onOpenChange={setPayloadOpen}
+        title="查看输入与输出"
+        description="这里保存模型请求、响应与工具读写的脱敏副本。查看需要填写理由，并会记入审计记录。"
+      >
         <div className="grid gap-4 md:grid-cols-[320px_1fr]">
           <div className="flex flex-col gap-3">
             <Field label="查看理由" error={reasonError}>
-              <Textarea className="min-h-20" value={reason} onChange={(event) => setReason(event.target.value)} placeholder="例如：核对失败步骤的错误响应" />
+              <Textarea
+                id="payload-reason"
+                className="min-h-20"
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                placeholder="例如：核对失败步骤的错误响应"
+              />
             </Field>
-            <p className="text-xs leading-5 text-muted">先在“步骤明细”里选择步骤，再点“查看输入输出”。敏感内容会按脱敏策略展示。</p>
+            <p className="text-xs leading-5 text-muted">先填写查看理由，再点击任意步骤的“查看输入输出”；点击后会自动定位到这里。敏感内容会按脱敏策略展示。</p>
           </div>
           <div className="min-w-0">
             {payloads.length === 0 ? (
