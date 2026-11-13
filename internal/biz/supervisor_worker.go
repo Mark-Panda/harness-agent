@@ -27,8 +27,9 @@ JSON 结构：{"workers":[{"name":"Worker 名称","task":"子任务描述","tool
 3. tools 只能从主 Agent 可用工具中选择；不得请求中高风险工具或越权访问其他用户数据。
 4. 不得输出密钥、凭证、隐藏推理或与任务无关的内容。`
 
-// supervisorPlannerToolLimit 是委派提示中完整列出的工具数量上限。
-const supervisorPlannerToolLimit = 200
+// supervisorToolCatalogMaxTokens 是委派提示中工具清单的总 Token 预算。
+// 不设置工具数量上限：预算允许时完整注入，避免模型看不到可委派的工具。
+const supervisorToolCatalogMaxTokens = 40_000
 
 // 子 Agent 上下文摘要参数：最近几轮对话、每条消息的字符上限。
 const (
@@ -38,25 +39,37 @@ const (
 
 // supervisorPlannerSystem 在固定规划指令后追加真实可用工具清单，避免模型猜测或简写工具名。
 func supervisorPlannerSystem(specs []react.ToolSpec) string {
+	return supervisorPlannerSystemWithBudget(specs, supervisorToolCatalogMaxTokens)
+}
+
+// supervisorPlannerSystemWithBudget 按 Token 预算注入完整工具清单。
+func supervisorPlannerSystemWithBudget(specs []react.ToolSpec, maxTokens int) string {
 	var builder strings.Builder
 	builder.WriteString(supervisorPlannerInstruction)
 	if len(specs) == 0 {
 		builder.WriteString("\n当前没有可用工具；workers[].tools 必须为空数组。")
 		return builder.String()
 	}
+	if maxTokens <= 0 {
+		maxTokens = supervisorToolCatalogMaxTokens
+	}
 	builder.WriteString("\n可用工具（workers[].tools 必须逐字使用以下完整名称，禁止简写、改写或猜测）：\n")
-	for index, spec := range specs {
-		// 上限与注册表规模对齐，避免被省略的工具无法通过逐字校验而永远无法委派。
-		if index >= supervisorPlannerToolLimit {
-			builder.WriteString("- ……其余工具已省略，不要委派给这些工具\n")
+	used, written := 0, 0
+	for _, spec := range specs {
+		description := truncateText(strings.TrimSpace(spec.Description), 100)
+		entry := "- " + spec.Name
+		if description != "" {
+			entry += "：" + description
+		}
+		entry += "\n"
+		entryTokens := react.EstimateTextTokens(entry)
+		if written > 0 && used+entryTokens > maxTokens {
+			builder.WriteString(fmt.Sprintf("- ……其余 %d 个工具因上下文预算已省略，不要委派给这些工具\n", len(specs)-written))
 			break
 		}
-		description := truncateText(strings.TrimSpace(spec.Description), 100)
-		if description == "" {
-			builder.WriteString("- " + spec.Name + "\n")
-			continue
-		}
-		builder.WriteString("- " + spec.Name + "：" + description + "\n")
+		builder.WriteString(entry)
+		used += entryTokens
+		written++
 	}
 	return builder.String()
 }
@@ -672,8 +685,10 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	limits.MaxTotalTokens = w.config.ReactMaxTotalTokens
 	limits.MaxCost = w.config.ReactMaxCost
 	// recorded 是待写入子会话的助手与工具消息；Eino 只推送增量，需要单独记录完整消息。
+	// eventState 收集过程事件落库错误，任务成功后仍写入降级事件，避免运行详情静默缺失。
+	eventState := &runEventSink{}
 	emitter := newRecordingEmitter(&einoWorkerEmitter{
-		sink: w.workerDeltaSink(ctx, run, fence, task.WorkerName), initialMessageIndex: len(childMessages),
+		sink: w.workerDeltaSink(ctx, run, fence, task.WorkerName, eventState), initialMessageIndex: len(childMessages),
 	})
 	agent, err := einoext.NewReactAgent(ctx, einoext.ReactConfig{
 		Router: router, Registry: registry, Emitter: emitter,
@@ -687,7 +702,15 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 		return react.Result{}, 0, 0, 0, err
 	}
 	result, err := agent.Run(ctx, childMessages)
+	eventState.Flush()
 	recorded := emitter.Messages()
+	if eventErr := eventState.Err(); eventErr != nil {
+		// 过程事件写库失败不改变任务结果（工具副作用已发生，重试会重复执行），
+		// 但必须写入降级事件，让运行详情明确标注执行过程缺失。
+		w.emitPlanEvent(context.WithoutCancel(ctx), run, fence, "supervisor.events_degraded", map[string]any{
+			"task_id": task.ID.String(), "worker": task.WorkerName, "error": sanitizeExecutionError(eventErr),
+		})
+	}
 	if err != nil {
 		if errors.Is(err, react.ErrApprovalRequired) {
 			workerStatus = StepWaitingApproval

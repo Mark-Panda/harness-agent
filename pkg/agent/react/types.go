@@ -191,6 +191,8 @@ type Usage struct {
 type Completion struct {
 	// Content 最终文本。
 	Content string
+	// ReasoningContent 供应商返回的推理内容，仅用于判断“只推理无回答”，不进入上下文也不持久化。
+	ReasoningContent string
 	// ToolCalls 工具调用列表。
 	ToolCalls []ToolCall
 	// FinishReason 结束原因。

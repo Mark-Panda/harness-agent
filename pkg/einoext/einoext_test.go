@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 
@@ -54,6 +55,7 @@ func (r testRegistry) List() []react.ToolSpec {
 }
 
 type testEmitter struct {
+	mu       sync.Mutex
 	events   []string
 	messages []map[string]any
 	next     int
@@ -62,18 +64,31 @@ type testEmitter struct {
 }
 
 func (e *testEmitter) Emit(eventType string, payload map[string]any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.events = append(e.events, eventType)
 	if eventType == "message.created" {
 		e.messages = append(e.messages, payload)
 	}
 }
 func (e *testEmitter) NextMessageIndex() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.next++
 	e.lastID = "msg-" + string(rune('0'+e.next))
 	return e.next
 }
-func (e *testEmitter) NextStep() int         { e.step++; return e.step }
-func (e *testEmitter) LastMessageID() string { return e.lastID }
+func (e *testEmitter) NextStep() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.step++
+	return e.step
+}
+func (e *testEmitter) LastMessageID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastID
+}
 
 func TestMessageRoundTrip(t *testing.T) {
 	input := []react.Message{
@@ -155,11 +170,11 @@ func TestTruncateUTF8KeepsValidRunes(t *testing.T) {
 	if !utf8.ValidString(truncated) {
 		t.Fatal("truncated tool output contains invalid UTF-8")
 	}
-	if !strings.HasSuffix(truncated, "[... tool result truncated ...]") {
+	if !strings.Contains(truncated, "tool result truncated") {
 		t.Fatalf("missing truncation marker")
 	}
-	if got := len(truncated) - len("\n[... tool result truncated ...]"); got > 64*1024 {
-		t.Fatalf("truncated size = %d", got)
+	if len(truncated) > maximumToolOutputBytes {
+		t.Fatalf("truncated size = %d", len(truncated))
 	}
 	if text := errorText(errors.New(strings.Repeat("中文错误", 100))); !utf8.ValidString(text) {
 		t.Fatal("truncated error text contains invalid UTF-8")

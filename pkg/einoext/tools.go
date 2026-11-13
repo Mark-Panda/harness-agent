@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -118,12 +119,39 @@ func toolErrorContent(status string, err error, output []byte) string {
 	return string(encoded)
 }
 
+// maximumToolOutputBytes 是单个工具结果进入模型上下文的字节上限。
+const maximumToolOutputBytes = 64 * 1024
+
+// truncateToolOutput 超限时保留首尾片段并说明原始大小。
+// 只保留头部会丢掉 JSON 尾部字段、日志结论和最终状态，因此必须首尾同时保留；
+// 完整结果已由执行步骤载荷归档，可在运行详情中回查。
 func truncateToolOutput(output string) string {
-	const maximum = 64 * 1024
-	if len(output) <= maximum {
+	if len(output) <= maximumToolOutputBytes {
 		return output
 	}
-	return truncateUTF8(output, maximum) + "\n[... tool result truncated ...]"
+	note := fmt.Sprintf("\n[... tool result truncated: original %d bytes; showing head and tail, full result is archived in execution details ...]\n", len(output))
+	budget := maximumToolOutputBytes - len(note)
+	if budget < 2*1024 {
+		budget = 2 * 1024
+	}
+	headBytes := budget * 2 / 3
+	tailBytes := budget - headBytes
+	return truncateUTF8(output, headBytes) + note + truncateUTF8FromEnd(output, tailBytes)
+}
+
+// truncateUTF8FromEnd 按字节上限保留尾部且不切断多字节字符。
+func truncateUTF8FromEnd(text string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(text) <= maximum {
+		return text
+	}
+	start := len(text) - maximum
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	return text[start:]
 }
 
 // truncateUTF8 按字节上限截断且不切断多字节字符，避免 PostgreSQL 拒绝非法 UTF-8。

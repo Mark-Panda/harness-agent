@@ -171,12 +171,13 @@ type ThreadReply struct {
 	ThreadID string
 }
 
-// ReplyRequest is the Feishu reply body. Keep the body unchanged when reusing UUID.
+// ReplyRequest 是飞书回复请求的业务描述。
+// 传输层单独构造请求体：飞书要求 reply_in_thread 为字符串 "true"，布尔值会被忽略。
 type ReplyRequest struct {
-	Content  string `json:"content"`
-	Type     string `json:"msg_type"`
-	InThread bool   `json:"reply_in_thread,omitempty"`
-	UUID     string `json:"uuid,omitempty"`
+	Content  string
+	Type     string
+	InThread bool
+	UUID     string
 }
 
 // ReplyCard 以可更新卡片回复指定消息，返回飞书消息 ID。
@@ -239,10 +240,18 @@ func (c *Client) Reply(ctx context.Context, replyTo string, payload ReplyRequest
 			ThreadID  string `json:"thread_id"`
 		} `json:"data"`
 	}
+	body := map[string]any{"content": payload.Content, "msg_type": payload.Type}
+	if payload.InThread {
+		// 飞书只识别字符串 "true"；布尔 true 会被忽略并退化为普通回复，无法创建话题。
+		body["reply_in_thread"] = "true"
+	}
+	if payload.UUID != "" {
+		body["uuid"] = payload.UUID
+	}
 	err := c.callWithTokenRetry(ctx, func() error {
 		response.Code, response.Msg = 0, ""
 		response.Data.MessageID, response.Data.ThreadID = "", ""
-		if err := c.authenticated(ctx, http.MethodPost, "/open-apis/im/v1/messages/"+url.PathEscape(replyTo)+"/reply", payload, &response); err != nil {
+		if err := c.authenticated(ctx, http.MethodPost, "/open-apis/im/v1/messages/"+url.PathEscape(replyTo)+"/reply", body, &response); err != nil {
 			return err
 		}
 		if response.Code != 0 {

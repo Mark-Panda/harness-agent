@@ -4,12 +4,14 @@ package quality_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,7 +88,7 @@ func (s *scriptedState) record(messages []requestMessage) {
 
 // newScriptedServer 按场景脚本返回工具调用或最终回答。
 // 工具循环场景在收到步数上限收尾指令后返回最终结论，验证 Eino 收尾节点生效。
-func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedState) *httptest.Server {
+func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedState, duplicateThreshold int) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -126,11 +128,22 @@ func newScriptedServer(t *testing.T, scenario goldenScenario, state *scriptedSta
 				toolCalls = scriptedToolCalls(scenario)
 			}
 		case "tool_loop":
-			// 收到重复调用提示或步数上限收尾指令后停止调用工具并给出结论。
+			// 同一轮返回多个相同工具调用，验证重复阈值只作用于当前模型轮次。
 			if stepLimit || loopedToolCall {
 				content = "工具调用达到上限，已停止重复调用。"
 			} else {
-				toolCalls = scriptedToolCalls(scenario)
+				arguments := string(scenario.Arguments)
+				if strings.TrimSpace(arguments) == "" {
+					arguments = "{}"
+				}
+				for index := 0; index < duplicateThreshold; index++ {
+					toolCalls = append(toolCalls, map[string]any{
+						"id": fmt.Sprintf("call-%s-%d", scenario.ID, index),
+						"function": map[string]any{
+							"name": scenario.Tool, "arguments": arguments,
+						},
+					})
+				}
 			}
 		default:
 			t.Fatalf("unknown scenario kind %q", scenario.Kind)
@@ -226,7 +239,8 @@ func (e *qualityEmitter) toolMessages() []string {
 type goldenTool struct {
 	scenario goldenScenario
 	// calls 记录真实执行次数，用于验证重复工具调用被拦截。
-	calls int
+	// 同一轮工具调用会并行执行，计数必须原子化。
+	calls atomic.Int64
 }
 
 // Spec 返回工具定义。
@@ -236,7 +250,7 @@ func (t *goldenTool) Spec() react.ToolSpec {
 
 // Invoke 返回场景输出；oversize 场景生成超过上限的结果。
 func (t *goldenTool) Invoke(_ context.Context, _ json.RawMessage) (json.RawMessage, error) {
-	t.calls++
+	t.calls.Add(1)
 	if t.scenario.Kind == "oversize_result" {
 		return json.RawMessage(`{"content":"` + strings.Repeat("x", 131072) + `"}`), nil
 	}
@@ -294,7 +308,7 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 		scenario := scenario
 		t.Run(scenario.ID, func(t *testing.T) {
 			state := &scriptedState{}
-			server := newScriptedServer(t, scenario, state)
+			server := newScriptedServer(t, scenario, state, config.Thresholds.DuplicateToolThreshold)
 			registry := &goldenRegistry{}
 			if scenario.Tool != "" && scenario.Kind != "unknown_tool" {
 				registry.tool = &goldenTool{scenario: scenario}
@@ -353,8 +367,8 @@ func TestGoldenAndAdversarialScenarios(t *testing.T) {
 				if registry.tool == nil {
 					t.Fatal("tool loop scenario registered no tool")
 				}
-				if want := config.Thresholds.DuplicateToolThreshold - 1; registry.tool.calls != want {
-					t.Fatalf("repeated tool call was executed %d times, want %d", registry.tool.calls, want)
+				if want := int64(config.Thresholds.DuplicateToolThreshold - 1); registry.tool.calls.Load() != want {
+					t.Fatalf("repeated tool call was executed %d times, want %d", registry.tool.calls.Load(), want)
 				}
 				tools := emitter.toolMessages()
 				if len(tools) == 0 || !strings.Contains(tools[len(tools)-1], `"error":"repeated_tool_call"`) {

@@ -105,17 +105,22 @@ func TestExecutePlanEinoCompletedPlanRecovery(t *testing.T) {
 		writeCompletion(t, w, "unused", http.StatusOK)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
-	plans.seedPlan(Plan{
+	completed := Plan{
 		ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
 		Status: PlanCompleted, Goal: "g", MaxSteps: 50,
 		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}},
-	})
+	}
+	plans.seedPlan(completed)
+	messages := []react.Message{
+		{Role: react.RoleUser, Content: "任务"},
+		{ID: deterministicPlanFinalMessageID(completed.ID), Role: react.RoleAssistant, Content: "已保存的最终答复"},
+	}
 	result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router,
-		[]react.Message{{Role: react.RoleUser, Content: "任务"}}, emptyToolRegistry{})
+		messages, emptyToolRegistry{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result.Content, "结果") {
+	if result.Content != "已保存的最终答复" {
 		t.Fatalf("recovered content = %q", result.Content)
 	}
 }

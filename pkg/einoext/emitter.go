@@ -125,6 +125,25 @@ func (g *LoopGuard) Repeated(name, arguments string) bool {
 	return err != nil || content != ""
 }
 
+// ResetRound 清空上一轮模型调用的计数。
+// 重复阈值只作用于同一轮模型返回的工具批次，避免跨轮累计把合法轮询误判为死循环；
+// 跨轮死循环由 MaxSteps 兜底终止。
+func (g *LoopGuard) ResetRound() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.counts = make(map[string]int)
+	g.mu.Unlock()
+}
+
+// resetLoopGuard 重置当前上下文中的循环守卫。
+func resetLoopGuard(ctx context.Context) {
+	if guard := LoopGuardFromContext(ctx); guard != nil {
+		guard.ResetRound()
+	}
+}
+
 type loopGuardContextKey struct{}
 
 // WithLoopGuard 注入本次 Run 的工具循环守卫。

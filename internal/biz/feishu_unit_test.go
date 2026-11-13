@@ -322,6 +322,12 @@ func (s *feishuOutboundStub) CheckOutboundClaim(_ context.Context, _ biz.FeishuO
 	return nil
 }
 
+func (s *feishuOutboundStub) SetOutboundPost(_ context.Context, _ biz.FeishuOutbound, post *biz.FeishuOutboundPost, _ time.Time) error {
+	// 模拟数据库持久化 POST 意图：Worker 重启后据此复用同一 UUID，避免重复发送。
+	s.claimed.Post = post
+	return nil
+}
+
 func (s *feishuOutboundStub) PromoteOutboundThread(_ context.Context, outbound biz.FeishuOutbound, threadID string, _ time.Time) (int, error) {
 	s.promoteCalls++
 	s.promotedThread = threadID
@@ -335,6 +341,8 @@ func (s *feishuOutboundStub) UpdateOutboundMessageID(_ context.Context, _ biz.Fe
 		return s.saveMessageErr
 	}
 	s.claimed.MessageID = messageID
+	// POST 已确认成功，清理待投递意图，避免下一次领取重复发送同一条消息。
+	s.claimed.Post = nil
 	return nil
 }
 
@@ -397,9 +405,31 @@ type feishuSenderStub struct {
 	textThreadCalls int
 }
 
+// Reply 按持久化请求的类型与话题语义分派到对应的测试行为。
+func (s *feishuSenderStub) Reply(ctx context.Context, replyTo string, request feishu.ReplyRequest) (biz.FeishuThreadedMessage, error) {
+	switch {
+	case request.Type == "interactive" && request.InThread:
+		return s.ReplyCardInThread(ctx, replyTo, request.Content)
+	case request.Type == "interactive":
+		messageID, err := s.ReplyCard(ctx, replyTo, request.Content)
+		return biz.FeishuThreadedMessage{MessageID: messageID}, err
+	case request.InThread:
+		return s.ReplyTextInThread(ctx, replyTo, request.Content)
+	default:
+		messageID, err := s.ReplyText(ctx, replyTo, request.Content)
+		return biz.FeishuThreadedMessage{MessageID: messageID}, err
+	}
+}
+
 func (s *feishuSenderStub) ReplyCard(_ context.Context, _ string, _ any) (string, error) {
 	s.cardCalls++
-	return s.cardMessageID, s.cardErr
+	if s.cardErr != nil {
+		return "", s.cardErr
+	}
+	if s.cardMessageID == "" {
+		return "om_card", nil
+	}
+	return s.cardMessageID, nil
 }
 
 // ReplyCardInThread 模拟在指定消息下创建或复用话题并回复卡片。
@@ -417,7 +447,11 @@ func (s *feishuSenderStub) ReplyCardInThread(_ context.Context, _ string, _ any)
 	if threadID == "" {
 		threadID = "omt_created"
 	}
-	return biz.FeishuThreadedMessage{MessageID: s.cardMessageID, ThreadID: threadID}, nil
+	messageID := s.cardMessageID
+	if messageID == "" {
+		messageID = "om_card"
+	}
+	return biz.FeishuThreadedMessage{MessageID: messageID, ThreadID: threadID}, nil
 }
 
 func (s *feishuSenderStub) UpdateCard(_ context.Context, _ string, _ any) error {
@@ -695,9 +729,11 @@ func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	if sender.cardCalls != 1 || outbound.completed != 1 || len(outbound.updateIDs) != 1 {
 		t.Fatalf("card calls=%d completed=%d updates=%v", sender.cardCalls, outbound.completed, outbound.updateIDs)
 	}
-	// 卡片发送失败时降级为纯文本，保证用户至少收到结果。
-	sender.cardErr = errors.New("card unavailable")
+	// 飞书明确拒绝卡片时降级为纯文本，保证用户至少收到结果。
+	sender.cardErr = &feishu.APIError{StatusCode: 400, Code: 230001, Message: "card rejected"}
 	outbound.completed = 0
+	// 模拟首次发送未落库消息 ID，下一次仍需走新建卡片路径。
+	outbound.claimed.MessageID, outbound.claimed.CardFingerprint = "", ""
 	if claimed, err := worker.ProcessOne(context.Background()); err != nil || !claimed {
 		t.Fatalf("fallback claimed=%v err=%v", claimed, err)
 	}
@@ -706,6 +742,7 @@ func TestFeishuReplyWorkerFinalCardAndFallback(t *testing.T) {
 	}
 	// Run 未结束时发送占位卡片并延后检查，不消耗失败预算。
 	outbound.deferred, outbound.completed, sender.cardCalls = 0, 0, 0
+	outbound.claimed.MessageID, outbound.claimed.Post, outbound.claimed.CardFingerprint = "", nil, ""
 	runs := &feishuRunsStub{run: biz.Run{Status: biz.RunRunning}}
 	worker, err = biz.NewFeishuReplyWorker(biz.FeishuReplyWorkerDependencies{
 		Outbound: outbound, Runs: runs, Sender: sender,
@@ -1651,7 +1688,7 @@ func TestFeishuReplyWorkerChecksClaimBeforeFallback(t *testing.T) {
 	fixture := newFeishuReplyFixture(t, biz.FeishuOutbound{
 		ID: uuid.New(), ThreadID: "om_root", ReplyToMessageID: "om_root", Attempts: 1,
 	}, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
-	fixture.sender.threadErr = errors.New("topic creation failed")
+	fixture.sender.threadErr = &feishu.APIError{StatusCode: 400, Code: 230071, Message: "topic unsupported"}
 	fixture.outbound.checkClaim = func() error {
 		if fixture.sender.threadCalls != 0 {
 			return biz.ErrFeishuOutboundClaimLost
@@ -1911,15 +1948,16 @@ func TestFeishuReplyWorkerThreadReplyPromotionAndFallback(t *testing.T) {
 		t.Fatalf("existing threads=%d promote=%d", existing.sender.threadCalls, existing.outbound.promoteCalls)
 	}
 
-	// 普通群不支持话题：过渡别名回复失败时降级为主时间线文本，保证至少送达一次。
+	// 普通群不支持话题：过渡别名回复失败时去掉 reply_in_thread，改发主时间线卡片，保证至少送达一次。
 	fallback := newFeishuReplyFixture(t, newOutbound("om_root", "om_root"), run, biz.FeishuReplyWorkerConfig{})
-	fallback.sender.cardErr = errors.New("thread card unavailable")
+	fallback.sender.threadErr = &feishu.APIError{StatusCode: 400, Code: 230071, Message: "topic unsupported"}
 	if _, err := fallback.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("fallback process: %v", err)
 	}
-	if fallback.sender.threadCalls != 1 || fallback.sender.textThreadCalls != 1 || fallback.outbound.completed != 1 {
-		t.Fatalf("fallback threads=%d textThreads=%d completed=%d",
-			fallback.sender.threadCalls, fallback.sender.textThreadCalls, fallback.outbound.completed)
+	if fallback.sender.threadCalls != 1 || fallback.sender.cardCalls != 2 ||
+		fallback.sender.textThreadCalls != 0 || fallback.outbound.completed != 1 {
+		t.Fatalf("fallback threads=%d cards=%d textThreads=%d completed=%d",
+			fallback.sender.threadCalls, fallback.sender.cardCalls, fallback.sender.textThreadCalls, fallback.outbound.completed)
 	}
 
 	// 已存在真实话题时禁止降级到主时间线，避免不同话题的上下文串台；失败进入退避重试。
@@ -1973,10 +2011,10 @@ func TestFeishuReplyWorkerRateLimitAndTextFallback(t *testing.T) {
 	if wrapped.outbound.failed != 1 || !wrapped.outbound.lastRetryAfter.Equal(now.Add(2*time.Second)) || wrapped.sender.textCalls != 0 {
 		t.Fatalf("wrapped failed=%d retry=%s texts=%d", wrapped.outbound.failed, wrapped.outbound.lastRetryAfter, wrapped.sender.textCalls)
 	}
-	// 卡片更新返回普通错误时降级为纯文本，确保用户收到结果。
+	// 飞书明确拒绝卡片更新时降级为纯文本，确保用户收到结果。
 	fallback := newFeishuReplyFixture(t, base, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
 	fallback.outbound.assistant = biz.Message{Content: "答案"}
-	fallback.sender.updateErr = errors.New("card update failed")
+	fallback.sender.updateErr = &feishu.APIError{StatusCode: 400, Code: 230001, Message: "card rejected"}
 	if _, err := fallback.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("fallback process: %v", err)
 	}
@@ -1986,7 +2024,7 @@ func TestFeishuReplyWorkerRateLimitAndTextFallback(t *testing.T) {
 	// 卡片与文本均失败时按指数退避记录失败，超出预算由仓储进入死信。
 	broken := newFeishuReplyFixture(t, base, biz.Run{Status: biz.RunCompleted}, biz.FeishuReplyWorkerConfig{})
 	broken.outbound.assistant = biz.Message{Content: "答案"}
-	broken.sender.updateErr = errors.New("card update failed")
+	broken.sender.updateErr = &feishu.APIError{StatusCode: 400, Code: 230001, Message: "card rejected"}
 	broken.sender.textErr = errors.New("text reply failed")
 	if _, err := broken.worker.ProcessOne(context.Background()); err != nil {
 		t.Fatalf("broken process: %v", err)
@@ -2090,6 +2128,10 @@ func (s *blockingFeishuOutboundStore) CheckOutboundClaim(_ context.Context, _ bi
 	return nil
 }
 
+func (s *blockingFeishuOutboundStore) SetOutboundPost(_ context.Context, _ biz.FeishuOutbound, _ *biz.FeishuOutboundPost, _ time.Time) error {
+	return nil
+}
+
 // DeferOutbound 记录并发限制导致的延后。
 func (s *blockingFeishuOutboundStore) DeferOutbound(_ context.Context, _ biz.FeishuOutbound, _ time.Time, _ time.Time) error {
 	s.deferred.Add(1)
@@ -2117,6 +2159,11 @@ type blockingFeishuSender struct {
 	biz.FeishuReplySender
 	started chan string
 	release chan struct{}
+}
+
+func (s *blockingFeishuSender) Reply(ctx context.Context, replyTo string, request feishu.ReplyRequest) (biz.FeishuThreadedMessage, error) {
+	messageID, err := s.ReplyCard(ctx, replyTo, request.Content)
+	return biz.FeishuThreadedMessage{MessageID: messageID}, err
 }
 
 func (s *blockingFeishuSender) ReplyCard(_ context.Context, replyTo string, _ any) (string, error) {

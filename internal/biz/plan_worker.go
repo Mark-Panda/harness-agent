@@ -106,12 +106,19 @@ JSON 结构：{"goal":"计划目标","steps":[{"step_no":1,"title":"步骤标题
 4. tool_name 必须逐字使用系统消息中列出的完整工具名，禁止简写、改写或猜测；只能使用 low 风险工具。
 5. 不得输出密钥、凭证、隐藏推理或与任务无关的内容。`
 
-// planPlannerToolLimit 是规划提示中完整列出的工具数量上限，超出后省略并提示不要把步骤绑定到被省略的工具。
-const planPlannerToolLimit = 200
+// planToolCatalogMaxTokens 是规划提示中工具清单的总 Token 预算。
+// 不设置工具数量上限：只要预算允许就完整注入，避免模型看不到可用工具而编造名称。
+const planToolCatalogMaxTokens = 40_000
 
 // planPlannerSystem 在固定规划指令后追加真实可执行工具清单。
 // 不提供清单时 Planner 只能猜测工具名，工具步骤会因 unknown_tool 直接失败。
 func planPlannerSystem(tools react.Registry) string {
+	return planPlannerSystemWithBudget(tools, planToolCatalogMaxTokens)
+}
+
+// planPlannerSystemWithBudget 按 Token 预算注入完整工具目录与参数 Schema。
+// 只有预算耗尽的尾部工具会被省略，并明确告知省略数量，而不是硬编码数量上限。
+func planPlannerSystemWithBudget(tools react.Registry, maxTokens int) string {
 	if tools == nil {
 		return planPlannerInstruction + "\n当前没有可执行工具：所有步骤都不要填写 tool_name。"
 	}
@@ -119,14 +126,14 @@ func planPlannerSystem(tools react.Registry) string {
 	if len(specs) == 0 {
 		return planPlannerInstruction + "\n当前没有可执行工具：所有步骤都不要填写 tool_name。"
 	}
+	if maxTokens <= 0 {
+		maxTokens = planToolCatalogMaxTokens
+	}
 	var builder strings.Builder
 	builder.WriteString(planPlannerInstruction)
 	builder.WriteString("\n可用工具（tool_name 必须逐字使用以下完整名称）：\n")
-	for index, spec := range specs {
-		if index >= planPlannerToolLimit {
-			builder.WriteString("- ……其余工具已省略，不要为这些工具生成步骤\n")
-			break
-		}
+	used, written := 0, 0
+	for _, spec := range specs {
 		description := truncateText(strings.TrimSpace(spec.Description), 100)
 		entry := "- " + spec.Name
 		if description != "" {
@@ -136,30 +143,30 @@ func planPlannerSystem(tools react.Registry) string {
 			entry += "\n  参数 Schema：" + schema
 		}
 		entry += "\n"
-		// 工具清单同样消耗规划上下文：达到预算后停止追加，避免 200 个工具的 Schema 撑爆窗口。
-		if builder.Len()+len(entry) > planToolCatalogMaxRunes {
-			builder.WriteString("- ……其余工具因上下文预算已省略，不要为这些工具生成步骤\n")
+		entryTokens := react.EstimateTextTokens(entry)
+		// 至少注入第一个工具，避免预算极小时规划器完全看不到能力清单。
+		if written > 0 && used+entryTokens > maxTokens {
+			builder.WriteString(fmt.Sprintf("- ……其余 %d 个工具因上下文预算已省略，不要为这些工具生成步骤\n", len(specs)-written))
 			break
 		}
 		builder.WriteString(entry)
+		used += entryTokens
+		written++
 	}
 	return builder.String()
 }
 
-// planToolCatalogMaxRunes 是规划提示中工具清单的总字符预算。
-const planToolCatalogMaxRunes = 24_000
-
-// compactToolSchema 把工具参数 JSON Schema 压缩成单行并限制长度，
-// 让 Planner 生成可直接执行的 arguments，而不是靠猜参数名。
+// compactToolSchema 把工具参数 JSON Schema 压缩成单行，但不截断内容。
+// 截断 Schema 会让模型猜测参数名，进而生成必然失败的工具步骤。
 func compactToolSchema(raw json.RawMessage) string {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return ""
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, raw); err != nil {
-		return truncateText(strings.TrimSpace(string(raw)), 240)
+		return strings.TrimSpace(string(raw))
 	}
-	return truncateText(compact.String(), 240)
+	return compact.String()
 }
 
 // truncateText 按字符数截断文本，避免按字节切断中文等多字节字符。
@@ -280,7 +287,16 @@ func (w *ExecutionWorker) loadOrCreatePlan(ctx context.Context, run Run, fence R
 func (w *ExecutionWorker) generatePlan(ctx context.Context, router *model.Router, messages []react.Message, tools react.Registry) (PlanDraft, react.Completion, error) {
 	executable := lowRiskToolRegistry{parent: tools}
 	planMessages := make([]react.Message, 0, len(messages)+2)
-	planMessages = append(planMessages, react.Message{Role: react.RoleSystem, Content: planPlannerSystem(executable)})
+	// 工具目录预算随 Prompt 预算收紧，但不再设置硬编码数量上限。
+	catalogBudget := planToolCatalogMaxTokens
+	if w.config.PromptTokenBudget > 0 {
+		if dynamic := w.config.PromptTokenBudget / 3; dynamic < catalogBudget {
+			catalogBudget = dynamic
+		}
+	}
+	planMessages = append(planMessages, react.Message{
+		Role: react.RoleSystem, Content: planPlannerSystemWithBudget(executable, catalogBudget),
+	})
 	// Planner 必须看到完整的 Agent 人设、Skill 与对话上下文，否则生成的计划会偏离 Agent 的职责，
 	// 也会丢失多轮对话中已经确认的目标与约束。
 	for _, message := range messages {
@@ -699,7 +715,18 @@ func (w *ExecutionWorker) executePlanModelStep(ctx context.Context, run Run, fen
 	}
 	content := strings.TrimSpace(result.Content)
 	if content == "" {
-		content = "步骤已完成，但模型未返回文本结果。"
+		// 空回答不能当作步骤成功：后续步骤会基于不存在的成果继续推理，最终产出错误结论。
+		stepStatus = StepFailed
+		stepCode = "empty_model_response"
+		if _, err := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
+			Status: PlanStepFailed, ErrorCode: stepCode, ErrorMessage: "模型未返回该步骤的文本结果", FinishedAt: ptrTime(w.clock()),
+		}); err != nil {
+			return sinkState.Streamed(), err
+		}
+		w.emitPlanEvent(ctx, run, RunFence(fence), "plan.step.failed", map[string]any{
+			"step_no": step.StepNo, "code": stepCode, "message": "模型未返回该步骤的文本结果",
+		})
+		return sinkState.Streamed(), nil
 	}
 	if _, err := w.plans.UpdatePlanStep(ctx, run.UserID, plan.ID, claimed.ID, fence, PlanStepUpdate{
 		Status: PlanStepCompleted, Result: map[string]any{"content": content}, FinishedAt: ptrTime(w.clock()),
@@ -771,12 +798,10 @@ func (r lowRiskToolRegistry) List() []react.ToolSpec {
 // still need matching instructions and reusable dependencies to reuse their results.
 func CarryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription bool, olderTools ...PlanStep) []PlanStep {
 	completedModels := make(map[int]PlanStep)
-	completedTools := make(map[planToolOperation]PlanStep)
+	completedTools := make(map[planToolOperation][]PlanStep)
 	rememberTool := func(step PlanStep) {
 		if operation, ok := planOperation(step); ok {
-			if _, exists := completedTools[operation]; !exists {
-				completedTools[operation] = step
-			}
+			completedTools[operation] = append(completedTools[operation], step)
 		}
 	}
 	for _, step := range previous.Steps {
@@ -802,31 +827,57 @@ func CarryCompletedPlanSteps(steps []PlanStep, previous Plan, matchDescription b
 	carried := make(map[int]PlanStepStatus, len(steps))
 	for _, index := range order {
 		step := &steps[index]
-		var old PlanStep
-		var exists bool
 		if step.ToolName == "" {
-			old, exists = completedModels[step.StepNo]
+			old, exists := completedModels[step.StepNo]
 			if !exists || !matchingPlanModelStep(old, *step, matchDescription, carried) {
 				continue
 			}
-		} else {
-			operation, ok := planOperation(*step)
-			old, exists = completedTools[operation]
-			if !ok || !exists {
+			carryPlanStepResult(step, old, false)
+			carried[step.StepNo] = PlanStepCompleted
+			continue
+		}
+		operation, ok := planOperation(*step)
+		if !ok {
+			continue
+		}
+		for _, old := range completedTools[operation] {
+			if !matchingPlanToolStep(old, *step, matchDescription, carried) {
 				continue
 			}
-			step.IdempotencyKey = old.IdempotencyKey
+			carryPlanStepResult(step, old, true)
+			carried[step.StepNo] = PlanStepCompleted
+			break
 		}
-		step.Status = PlanStepCompleted
-		carried[step.StepNo] = PlanStepCompleted
-		step.Result = old.Result
-		step.Attempts = old.Attempts
-		step.StartedAt = old.StartedAt
-		step.FinishedAt = old.FinishedAt
-		// The original execution tree remains associated with the original step.
-		step.ExecutionStepID = nil
 	}
 	return steps
+}
+
+// matchingPlanToolStep 判断工具步骤能否复用旧结果。
+// 依赖集合变化会改变执行语义，必须重跑；人工修订还要求标题与说明一致，
+// 自动重规划只按工具操作与依赖匹配，允许模型改写步骤标题。
+func matchingPlanToolStep(old, step PlanStep, matchDescription bool, carried map[int]PlanStepStatus) bool {
+	if !slices.Equal(slices.Sorted(slices.Values(old.DependsOn)), slices.Sorted(slices.Values(step.DependsOn))) {
+		return false
+	}
+	if matchDescription && (strings.TrimSpace(old.Title) != strings.TrimSpace(step.Title) ||
+		strings.TrimSpace(old.Description) != strings.TrimSpace(step.Description)) {
+		return false
+	}
+	return dependenciesCompleted(step.DependsOn, carried)
+}
+
+// carryPlanStepResult 把旧步骤的已完成结果复制到新步骤。
+// 执行树仍归属旧步骤，新版本只复用结果，不复制执行事实。
+func carryPlanStepResult(step *PlanStep, old PlanStep, carryIdempotency bool) {
+	if carryIdempotency {
+		step.IdempotencyKey = old.IdempotencyKey
+	}
+	step.Status = PlanStepCompleted
+	step.Result = old.Result
+	step.Attempts = old.Attempts
+	step.StartedAt = old.StartedAt
+	step.FinishedAt = old.FinishedAt
+	step.ExecutionStepID = nil
 }
 
 type planToolOperation struct {
@@ -1137,29 +1188,50 @@ const planAggregatorInstruction = `你是计划执行的最终汇总器。根据
 // planAggregatorMaxRunes 限制送入汇总模型的步骤结果长度，避免长计划把预算耗尽。
 const planAggregatorMaxRunes = 8_000
 
-// summarizePlan 用一次无工具模型调用把步骤结果整理成最终答案；失败时回退为结构化拼接。
-// 同时返回本次调用的用量，调用方必须把它纳入计划预算与累计统计。
-func (w *ExecutionWorker) summarizePlan(ctx context.Context, router *model.Router, plan Plan) (string, react.Completion, error) {
-	fallback := planFinalContent(plan)
-	if router == nil {
-		return fallback, react.Completion{}, nil
+// planStepBundle 把已完成步骤结果整理为汇总模型的输入素材。
+// 它只作为汇总模型的输入，不得直接作为最终回答返回给用户。
+func planStepBundle(plan Plan) string {
+	var builder strings.Builder
+	builder.WriteString("计划目标：")
+	builder.WriteString(plan.Goal)
+	builder.WriteString("\n\n步骤结果：\n")
+	for _, step := range plan.Steps {
+		builder.WriteString(fmt.Sprintf("步骤 %d「%s」：\n", step.StepNo, step.Title))
+		switch step.Status {
+		case PlanStepCompleted:
+			builder.WriteString(planStepResultText(step))
+		case PlanStepSkipped:
+			builder.WriteString("已跳过：前置步骤失败。")
+		default:
+			builder.WriteString("未完成：" + step.ErrorMessage)
+		}
+		builder.WriteString("\n\n")
 	}
-	bundle := truncateText(fallback, planAggregatorMaxRunes)
+	return strings.TrimSpace(builder.String())
+}
+
+// summarizePlan 用一次无工具模型调用把步骤结果整理成最终答案。
+// 汇总失败必须显式返回错误，不能回退为内部步骤拼接，否则用户会看到流程编号与原始工具输出。
+func (w *ExecutionWorker) summarizePlan(ctx context.Context, router *model.Router, plan Plan) (string, react.Completion, error) {
+	if router == nil {
+		return "", react.Completion{}, fmt.Errorf("%w: plan summary requires a model router", ErrPlanInvalid)
+	}
+	bundle := truncateText(planStepBundle(plan), planAggregatorMaxRunes)
 	completion, err := router.Complete(ctx, []react.Message{
 		{Role: react.RoleSystem, Content: planAggregatorInstruction},
-		{Role: react.RoleUser, Content: "计划目标：\n" + plan.Goal + "\n\n步骤结果：\n" + bundle},
+		{Role: react.RoleUser, Content: bundle},
 	}, nil)
 	if err != nil {
-		if errors.Is(err, ErrPlanBudget) {
-			return "", react.Completion{}, err
+		return "", completion, err
+	}
+	content := strings.TrimSpace(completion.Content)
+	if content == "" {
+		if strings.TrimSpace(completion.ReasoningContent) != "" {
+			return "", completion, fmt.Errorf("%w", react.ErrReasoningOnly)
 		}
-		w.logger.Warn("summarize plan failed; falling back to step concatenation", "plan_id", plan.ID, "error", err)
-		return fallback, react.Completion{}, nil
+		return "", completion, fmt.Errorf("%w", react.ErrEmptyResponse)
 	}
-	if content := strings.TrimSpace(completion.Content); content != "" {
-		return content, completion, nil
-	}
-	return fallback, completion, nil
+	return content, completion, nil
 }
 
 // deterministicPlanFinalMessageID 为计划最终答复提供跨重试稳定、独立于局部步骤序号的幂等键。
@@ -1169,11 +1241,16 @@ func deterministicPlanFinalMessageID(planID uuid.UUID) string {
 
 // finishPlan 汇总步骤结果、落库最终消息并推进计划终态。
 func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunFence, router *model.Router, plan Plan, messages []react.Message) (react.Result, error) {
-	// 先汇总再落终态：汇总失败只回退文本，不影响计划完成状态。
-	content, aggregation, aggregateErr := w.summarizePlan(ctx, router, plan)
 	fence := PlanFence(runFence)
-	if err := w.recordPlanUsage(ctx, plan, int64(aggregation.Usage.InputTokens), int64(aggregation.Usage.OutputTokens), aggregation.EstimatedCost); err != nil {
-		return react.Result{}, err
+	content, storedFinal := findPlanFinalMessage(plan, messages)
+	var aggregateErr error
+	if !storedFinal {
+		var aggregation react.Completion
+		content, aggregation, aggregateErr = w.summarizePlan(ctx, router, plan)
+		// 汇总调用才产生新用量；已有最终消息的恢复路径不得重复计费。
+		if err := w.recordPlanUsage(ctx, plan, int64(aggregation.Usage.InputTokens), int64(aggregation.Usage.OutputTokens), aggregation.EstimatedCost); err != nil {
+			return react.Result{}, err
+		}
 	}
 	latest, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
 	if err != nil {
@@ -1192,9 +1269,24 @@ func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunF
 		return react.Result{}, ErrPlanRevisionConflict
 	}
 	if aggregateErr != nil {
-		return react.Result{}, w.persistPlanFailure(ctx, latest, fence, "plan_budget_exceeded", "计划汇总超出模型用量上限")
+		code, message := "plan_summary_failed", "计划最终汇总失败"
+		if errors.Is(aggregateErr, ErrPlanBudget) {
+			code, message = "plan_budget_exceeded", "计划汇总超出模型用量上限"
+		}
+		return react.Result{}, w.persistPlanFailure(ctx, latest, fence, code, message)
 	}
-	if err := w.checkPlanBudget(ctx, latest, fence); err != nil {
+	// 汇总已完成且最终答案已存在时不再因累计预算拒绝完成，避免用户已看到答案但 Run 失败。
+	if !storedFinal {
+		if err := w.checkPlanBudget(ctx, latest, fence); err != nil {
+			return react.Result{}, err
+		}
+	}
+	// 先落最终消息再推进计划终态：若进程在两步之间崩溃，恢复时仍能读到本次模型汇总，
+	// 避免 Plan 已完成但最终消息缺失，导致恢复路径重新汇总或覆盖用户已看到的答案。
+	finalMessageID := deterministicPlanFinalMessageID(plan.ID)
+	if _, err := w.persistRunnerMessageRecord(context.WithoutCancel(ctx), run, runFence, map[string]any{
+		"index": len(messages), "role": string(MessageAssistant), "content": content, "message_id": finalMessageID,
+	}); err != nil {
 		return react.Result{}, err
 	}
 	now := w.clock()
@@ -1215,9 +1307,38 @@ func (w *ExecutionWorker) finishPlan(ctx context.Context, run Run, runFence RunF
 }
 
 // planFinalResult 在计划已完成的恢复路径上返回最终答案。
-func (w *ExecutionWorker) planFinalResult(ctx context.Context, run Run, fence RunFence, plan Plan, messages []react.Message) (react.Result, error) {
-	// 以数据库中同一幂等消息为准：已保存的模型汇总不会被恢复路径的步骤拼接覆盖。
-	return w.planResultWithStoredFinal(ctx, run, fence, plan, messages, planFinalContent(plan))
+func (w *ExecutionWorker) planFinalResult(ctx context.Context, run Run, fence RunFence, router *model.Router, plan Plan, messages []react.Message) (react.Result, error) {
+	// 以数据库中同一幂等消息为准：已保存的模型汇总不会被恢复路径覆盖。
+	if stored, ok := findPlanFinalMessage(plan, messages); ok {
+		return w.planResultWithStoredFinal(ctx, run, fence, plan, messages, stored)
+	}
+	// 兼容历史数据：计划已完成但最终消息缺失时重新生成模型汇总，保持与正常完成路径一致。
+	// 不得回退为内部步骤拼接，否则用户会看到流程编号与原始工具输出。
+	content, aggregation, aggregateErr := w.summarizePlan(ctx, router, plan)
+	if recordErr := w.recordPlanUsage(ctx, plan, int64(aggregation.Usage.InputTokens), int64(aggregation.Usage.OutputTokens), aggregation.EstimatedCost); recordErr != nil {
+		return react.Result{}, recordErr
+	}
+	if aggregateErr != nil {
+		return react.Result{}, aggregateErr
+	}
+	return w.planResultWithStoredFinal(ctx, run, fence, plan, messages, content)
+}
+
+// findPlanFinalMessage 在已加载的会话历史中按确定性 ID 查找计划最终消息，
+// 避免恢复路径重复调用汇总模型。历史已由 buildMessages 从数据库回放，无需再次查询。
+func findPlanFinalMessage(plan Plan, messages []react.Message) (string, bool) {
+	target := deterministicPlanFinalMessageID(plan.ID)
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].ID != target {
+			continue
+		}
+		// 空内容不能作为最终答案复用，否则用户会拿到空白结论且无法自动恢复。
+		if strings.TrimSpace(messages[index].Content) == "" {
+			return "", false
+		}
+		return messages[index].Content, true
+	}
+	return "", false
 }
 
 // planResultWithStoredFinal 用稳定的计划级消息 ID 读取或创建最终答复，并避免恢复时重复追加。
@@ -1406,28 +1527,6 @@ func planStepResultText(step PlanStep) string {
 		}
 	}
 	return ""
-}
-
-// planFinalContent 汇总全部步骤结果作为最终回答。
-func planFinalContent(plan Plan) string {
-	var builder strings.Builder
-	builder.WriteString("## 计划执行完成\n\n")
-	builder.WriteString("目标：")
-	builder.WriteString(plan.Goal)
-	builder.WriteString("\n\n")
-	for _, step := range plan.Steps {
-		builder.WriteString(fmt.Sprintf("### 步骤 %d：%s\n\n", step.StepNo, step.Title))
-		switch step.Status {
-		case PlanStepCompleted:
-			builder.WriteString(planStepResultText(step))
-		case PlanStepSkipped:
-			builder.WriteString("已跳过：前置步骤失败。")
-		default:
-			builder.WriteString("未完成：" + step.ErrorMessage)
-		}
-		builder.WriteString("\n\n")
-	}
-	return strings.TrimSpace(builder.String())
 }
 
 // approvalErrorCode 返回审批失败的业务码。

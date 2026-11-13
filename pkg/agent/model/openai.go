@@ -146,10 +146,13 @@ type ToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
-// ChatResponse 是模型调用结果，刻意不包含隐藏思维链。
+// ChatResponse 是模型调用结果。
+// ReasoningContent 仅用于判定“只推理无回答”的异常响应，不进入上下文也不持久化。
 type ChatResponse struct {
 	// Content 最终文本。
 	Content string
+	// ReasoningContent 供应商返回的推理内容，仅在内存中用于空回答判定。
+	ReasoningContent string
 	// ToolCalls 工具调用列表。
 	ToolCalls []ToolCall
 	// FinishReason 结束原因。
@@ -512,6 +515,7 @@ func (c *Client) decodeResponse(response *http.Response, request ChatRequest) (C
 	}
 	choice := payload.Choices[0]
 	result.Content = choice.Message.Content
+	result.ReasoningContent = choice.Message.ReasoningContent
 	result.FinishReason = choice.FinishReason
 	result.ToolCalls = make([]ToolCall, 0, len(choice.Message.ToolCalls))
 	for _, call := range choice.Message.ToolCalls {
@@ -556,6 +560,7 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 	scanner.Buffer(make([]byte, 64<<10), maxEventBytes)
 	var event bytes.Buffer
 	var content strings.Builder
+	var reasoningText strings.Builder
 	var reasoning textTokenEstimate
 	calls := map[int]*streamToolCall{}
 	result := ChatResponse{}
@@ -642,6 +647,7 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 		}
 		choice := chunk.Choices[0]
 		reasoning.add(choice.Delta.ReasoningContent)
+		reasoningText.WriteString(choice.Delta.ReasoningContent)
 		if choice.Delta.Content != "" {
 			content.WriteString(choice.Delta.Content)
 			onDelta(choice.Delta.Content)
@@ -672,6 +678,7 @@ func (c *Client) decodeStream(response *http.Response, onDelta func(string), fal
 		readErr = providerBodyError(response, nil)
 	}
 	result.Content = content.String()
+	result.ReasoningContent = reasoningText.String()
 	if result.InputTokens == 0 && fallbackInputTokens > 0 {
 		// 流式响应常省略 usage：用请求侧估算回填输入 Token，避免预算与成本统计恒为零。
 		result.InputTokens = int(fallbackInputTokens)

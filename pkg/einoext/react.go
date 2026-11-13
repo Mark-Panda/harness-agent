@@ -60,8 +60,9 @@ func NewReactAgent(ctx context.Context, config ReactConfig) (*ReactAgent, error)
 		ToolCallingModel: chatModel,
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: tools,
-			// 串行执行保证审批门禁、事件顺序与工具副作用顺序稳定。
-			ExecuteSequentially: true,
+			// 同一条助手消息中的工具调用相互独立，并行执行可避免延迟串行叠加；
+			// 工具结果仍由 ToolsNode 按调用顺序组装，审批门禁在工具内部生效。
+			ExecuteSequentially: false,
 			UnknownToolsHandler: func(ctx context.Context, name, arguments string) (string, error) {
 				content := `{"error":"unknown_tool","hint":"该工具不存在，请使用已注册工具或直接回答。"}`
 				// 未知工具同样要落库为 tool 消息，否则历史中会留下没有结果的 tool_calls。
@@ -96,6 +97,7 @@ func (a *ReactAgent) Run(ctx context.Context, messages []react.Message) (react.R
 	if a.emitter != nil {
 		ctx = WithEmitter(ctx, a.emitter)
 	}
+	// 循环守卫按模型轮次重置，避免跨轮累计把合法轮询误判为死循环。
 	ctx = WithLoopGuard(ctx, NewLoopGuard(a.loopThreshold))
 	stream, err := a.agent.Stream(ctx, ToSchemaMessages(messages))
 	if err != nil {
@@ -120,6 +122,10 @@ func (a *ReactAgent) Run(ctx context.Context, messages []react.Message) (react.R
 	if strings.TrimSpace(finalContent) == "" {
 		// 部分供应商或非流式模型不会产生增量帧，使用最近一次完整响应兜底。
 		finalContent = a.model.LastContent()
+	}
+	// 兜底后仍为空说明模型既没有正文也没有工具调用，不能当作成功返回。
+	if strings.TrimSpace(finalContent) == "" {
+		return a.result(ctx, messages, "", react.ErrEmptyResponse)
 	}
 	return a.result(ctx, messages, finalContent, nil)
 }

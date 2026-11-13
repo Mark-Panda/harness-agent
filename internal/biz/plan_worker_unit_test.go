@@ -836,8 +836,9 @@ func TestFinishPlanAndFinalResult(t *testing.T) {
 	if stored.Status != PlanCompleted || stored.FinishedAt == nil {
 		t.Fatalf("completed plan = %#v", stored)
 	}
-	final, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, stored, messages)
-	if err != nil || !strings.Contains(final.Content, "结果") {
+	final, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, stored, messages)
+	// 最终消息缺失时必须重新调用汇总模型，不得回退拼接内部步骤结果。
+	if err != nil || final.Content != "汇总答案" {
 		t.Fatalf("planFinalResult() = %#v, %v", final, err)
 	}
 }
@@ -862,7 +863,7 @@ func TestPlanFinalResultRecoveryKeepsStoredSummary(t *testing.T) {
 		t.Fatalf("aggregator usage was not recorded: %d", result.TotalTokens)
 	}
 	stored, _ := plans.GetPlan(context.Background(), run.UserID, plan.ID)
-	recovered, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, stored, result.Messages)
+	recovered, err := worker.planFinalResult(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, stored, result.Messages)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -965,11 +966,14 @@ func TestPlanCompletedAndCancelledEntry(t *testing.T) {
 		writeCompletion(t, w, "unused", http.StatusOK)
 	})
 	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
-	messages := []react.Message{{Role: react.RoleUser, Content: "任务"}}
 	completedPlan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
 		Status: PlanCompleted, Goal: "g", MaxSteps: 50, Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}}}
 	plans.seedPlan(completedPlan)
-	if result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); err != nil || !strings.Contains(result.Content, "结果") {
+	messages := []react.Message{
+		{Role: react.RoleUser, Content: "任务"},
+		{ID: deterministicPlanFinalMessageID(completedPlan.ID), Role: react.RoleAssistant, Content: "已保存的最终答复"},
+	}
+	if result, _, err := worker.executePlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, messages, emptyToolRegistry{}); err != nil || result.Content != "已保存的最终答复" {
 		t.Fatalf("completed plan result = %#v, %v", result, err)
 	}
 	plans.seedPlan(Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 2, Status: PlanCancelled, MaxSteps: 50})
@@ -1081,5 +1085,41 @@ func TestExecutePlanFailedAndRecoverModelStep(t *testing.T) {
 	recovered, err := worker.recoverPlanSteps(context.Background(), plan, RunFence{Owner: "plan-worker", Token: 1})
 	if err != nil || recovered.Steps[0].Status != PlanStepFailed {
 		t.Fatalf("model step recovery = %#v, %v", recovered.Steps[0], err)
+	}
+}
+
+// TestSummarizePlanRejectsEmptyResponse 验证汇总模型空回答不会被当作最终结论。
+func TestSummarizePlanRejectsEmptyResponse(t *testing.T) {
+	worker, _, router, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
+		writeCompletion(t, w, "", http.StatusOK)
+	})
+	plan := Plan{ID: uuid.New(), Status: PlanExecuting, Goal: "g", Steps: []PlanStep{
+		{StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}},
+	}}
+	content, _, err := worker.summarizePlan(context.Background(), router, plan)
+	if !errors.Is(err, react.ErrEmptyResponse) || content != "" {
+		t.Fatalf("summarize = %q, %v", content, err)
+	}
+}
+
+// TestFinishPlanFailsWhenSummaryUnavailable 验证汇总失败时计划显式失败，不回退内部步骤拼接。
+func TestFinishPlanFailsWhenSummaryUnavailable(t *testing.T) {
+	worker, plans, router, _ := planWorkerFixture(t, func(_ string, w http.ResponseWriter) {
+		writeCompletion(t, w, "", http.StatusOK)
+	})
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModePlan}
+	plan := Plan{ID: uuid.New(), UserID: run.UserID, RunID: run.ID, SessionID: run.SessionID, Version: 1,
+		Status: PlanExecuting, Goal: "g", MaxSteps: 50, Revision: 0,
+		Steps: []PlanStep{{ID: uuid.New(), StepNo: 1, Title: "s", Status: PlanStepCompleted, Result: map[string]any{"content": "结果"}}}}
+	plan.Steps[0].PlanID = plan.ID
+	plans.seedPlan(plan)
+	_, err := worker.finishPlan(context.Background(), run, RunFence{Owner: "plan-worker", Token: 1}, router, plan,
+		[]react.Message{{Role: react.RoleUser, Content: "任务"}})
+	if !errors.Is(err, ErrPlanFailed) {
+		t.Fatalf("finishPlan error = %v", err)
+	}
+	stored, err := plans.GetPlanByRun(context.Background(), run.UserID, run.ID)
+	if err != nil || stored.Status != PlanFailed || stored.ErrorCode != "plan_summary_failed" {
+		t.Fatalf("stored plan = %#v, %v", stored, err)
 	}
 }

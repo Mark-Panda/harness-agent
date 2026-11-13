@@ -1570,7 +1570,43 @@ const deltaFlushBytes = 256
 
 // workerDeltaSink 转发指定 Worker 的执行事件并标注 worker，
 // 让主 Run 的 SSE 时间线能看到子 Agent 的轮次与工具调用；完整消息仍由子会话落库。
-func (w *ExecutionWorker) workerDeltaSink(ctx context.Context, run Run, fence RunFence, worker string) react.EventSink {
+// 流式增量按步骤合并后再落库，避免每个 Token 一次事务放大写压力；
+// 事件写入失败会记录到 state，由调用方写入降级事件，避免静默丢失执行过程。
+func (w *ExecutionWorker) workerDeltaSink(ctx context.Context, run Run, fence RunFence, worker string, state *runEventSink) react.EventSink {
+	var (
+		deltaMu     sync.Mutex
+		deltaActive bool
+		deltaStep   int
+		deltaText   strings.Builder
+	)
+	write := func(eventType string, payload map[string]any) {
+		if state != nil && state.Err() != nil {
+			return
+		}
+		if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
+			RunID: run.ID, UserID: run.UserID, EventType: eventType, Payload: payload,
+		}, fence); err != nil {
+			w.logger.Warn("append worker delta event failed", "run_id", run.ID, "worker", worker, "event", eventType, "error", err)
+			if state != nil {
+				state.Fail(err)
+			}
+		}
+	}
+	flush := func() {
+		deltaMu.Lock()
+		if !deltaActive {
+			deltaMu.Unlock()
+			return
+		}
+		payload := map[string]any{"step": deltaStep, "delta": deltaText.String(), "worker": worker}
+		deltaActive = false
+		deltaText.Reset()
+		deltaMu.Unlock()
+		write("message.delta", payload)
+	}
+	if state != nil {
+		state.SetFlush(flush)
+	}
 	return func(event react.StepEvent) {
 		// 子会话消息由 Worker 完成后单独落库，这里只转发执行过程事件，避免消息重复。
 		if event.Type == "message.created" {
@@ -1578,17 +1614,30 @@ func (w *ExecutionWorker) workerDeltaSink(ctx context.Context, run Run, fence Ru
 		}
 		if event.Type == "message.delta" {
 			markStreamedFromContext(ctx)
+			step := int(eventNumber(event.Payload["step"]))
+			text, _ := event.Payload["delta"].(string)
+			deltaMu.Lock()
+			if deltaActive && deltaStep != step {
+				deltaMu.Unlock()
+				flush()
+				deltaMu.Lock()
+			}
+			deltaActive, deltaStep = true, step
+			deltaText.WriteString(text)
+			buffered := deltaText.Len()
+			deltaMu.Unlock()
+			if buffered >= deltaFlushBytes {
+				flush()
+			}
+			return
 		}
+		flush()
 		payload := make(map[string]any, len(event.Payload)+1)
 		for key, value := range event.Payload {
 			payload[key] = value
 		}
 		payload["worker"] = worker
-		if _, err := w.runs.AppendEventFenced(context.WithoutCancel(ctx), RunEvent{
-			RunID: run.ID, UserID: run.UserID, EventType: event.Type, Payload: payload,
-		}, fence); err != nil {
-			w.logger.Warn("append worker delta event failed", "run_id", run.ID, "worker", worker, "error", err)
-		}
+		write(event.Type, payload)
 	}
 }
 

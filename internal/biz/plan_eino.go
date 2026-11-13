@@ -219,7 +219,7 @@ func (w *ExecutionWorker) buildPlanGraph(
 	})
 
 	final := compose.InvokableLambda(func(ctx context.Context, state *planGraphState) (*planGraphState, error) {
-		result, err := w.planFinalResult(ctx, run, fence, state.Plan, messages)
+		result, err := w.planFinalResult(ctx, run, fence, router, state.Plan, messages)
 		if err != nil {
 			return nil, err
 		}

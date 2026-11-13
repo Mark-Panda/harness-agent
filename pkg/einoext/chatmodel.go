@@ -109,7 +109,7 @@ func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...
 		m.finishStep(ctx, step, completion, err)
 		return nil, err
 	}
-	if reasonErr := completionError(completion); reasonErr != nil {
+	if reasonErr := completionResponseError(completion); reasonErr != nil {
 		m.finishStep(ctx, step, completion, reasonErr)
 		return nil, reasonErr
 	}
@@ -119,6 +119,10 @@ func (m *ChatModel) Generate(ctx context.Context, input []*schema.Message, _ ...
 		if err != nil {
 			m.finishStep(ctx, step, completion, err)
 			return nil, err
+		}
+		if emptyErr := completionResponseError(completion); emptyErr != nil {
+			m.finishStep(ctx, step, completion, emptyErr)
+			return nil, emptyErr
 		}
 	}
 	// 步骤完成事件在续写合并后发出，Token 口径包含两次真实调用。
@@ -161,8 +165,8 @@ func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, _ ...ei
 			sender.send(nil, err)
 			return
 		}
-		// 内容审核与工具调用截断必须在执行工具前终止，避免产生非预期副作用。
-		if reasonErr := completionError(completion); reasonErr != nil {
+		// 内容审核、工具调用截断与空回答必须在执行工具前终止，避免产生非预期副作用。
+		if reasonErr := completionResponseError(completion); reasonErr != nil {
 			m.finishStep(ctx, step, completion, reasonErr)
 			sender.send(nil, reasonErr)
 			return
@@ -176,6 +180,11 @@ func (m *ChatModel) Stream(ctx context.Context, input []*schema.Message, _ ...ei
 				return
 			}
 			completion = continued
+			if emptyErr := completionResponseError(completion); emptyErr != nil {
+				m.finishStep(ctx, step, completion, emptyErr)
+				sender.send(nil, emptyErr)
+				return
+			}
 		}
 		// 步骤事件在续写合并后发出，Token 口径与真实调用一致。
 		normalizeToolCallIDs(&completion)
@@ -227,9 +236,12 @@ func (m *ChatModel) summarize(ctx context.Context, input []*schema.Message) (*sc
 	if err != nil {
 		return nil, fmt.Errorf("%w: final summary failed: %w", react.ErrStepLimit, err)
 	}
-	// 收尾答案被截断或审核拦截时不能当作有效结论返回。
-	if reasonErr := completionError(completion); reasonErr != nil {
+	// 收尾答案被截断、审核拦截或为空时不能当作有效结论返回。
+	if reasonErr := completionResponseError(completion); reasonErr != nil {
 		return nil, reasonErr
+	}
+	if len(completion.ToolCalls) > 0 {
+		return nil, fmt.Errorf("%w: final summary returned tool calls", react.ErrIncompleteToolCall)
 	}
 	if isLengthFinish(completion) {
 		return nil, fmt.Errorf("%w: final summary truncated", react.ErrStepLimit)
@@ -265,8 +277,12 @@ func (m *ChatModel) summarizeStream(ctx context.Context, input []*schema.Message
 			sender.send(nil, fmt.Errorf("%w: final summary failed: %w", react.ErrStepLimit, err))
 			return
 		}
-		if reasonErr := completionError(completion); reasonErr != nil {
+		if reasonErr := completionResponseError(completion); reasonErr != nil {
 			sender.send(nil, reasonErr)
+			return
+		}
+		if len(completion.ToolCalls) > 0 {
+			sender.send(nil, fmt.Errorf("%w: final summary returned tool calls", react.ErrIncompleteToolCall))
 			return
 		}
 		if isLengthFinish(completion) {
@@ -401,6 +417,8 @@ func (m *ChatModel) setLastContent(content string) {
 }
 
 func (m *ChatModel) beginStep(ctx context.Context) int {
+	// 每轮模型调用开始前重置工具重复计数，重复阈值只作用于同一批次。
+	resetLoopGuard(ctx)
 	if m.emitter == nil {
 		return 0
 	}
@@ -487,6 +505,22 @@ func completionToMessage(completion react.Completion) *schema.Message {
 		})
 	}
 	return message
+}
+
+// completionResponseError 把异常结束原因与空回答统一转换为执行错误。
+// 只有推理内容、没有最终回答的响应同样不能视为成功，否则用户会拿到空白答案。
+func completionResponseError(completion react.Completion) error {
+	if err := completionError(completion); err != nil {
+		return err
+	}
+	// 携带工具调用的轮次允许正文为空，模型会在拿到工具结果后继续生成。
+	if len(completion.ToolCalls) > 0 || strings.TrimSpace(completion.Content) != "" {
+		return nil
+	}
+	if strings.TrimSpace(completion.ReasoningContent) != "" {
+		return fmt.Errorf("%w", react.ErrReasoningOnly)
+	}
+	return fmt.Errorf("%w", react.ErrEmptyResponse)
 }
 
 // completionError 把供应商结束原因转换为统一执行错误。

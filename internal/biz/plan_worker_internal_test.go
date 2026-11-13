@@ -3,6 +3,9 @@ package biz
 import (
 	"strings"
 	"testing"
+
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
+	"github.com/google/uuid"
 )
 
 // TestCarryCompletedPlanSteps 验证新版本计划会继承匹配的已完成步骤结果。
@@ -79,16 +82,16 @@ func TestSelectPlanStep(t *testing.T) {
 	}
 }
 
-// TestPlanFinalContent 验证最终回答包含步骤结果与失败原因。
-func TestPlanFinalContent(t *testing.T) {
+// TestPlanStepBundle 验证汇总素材包含目标、步骤结果与失败原因，且只作为模型输入。
+func TestPlanStepBundle(t *testing.T) {
 	plan := Plan{Goal: "整理报告", Steps: []PlanStep{
 		{StepNo: 1, Title: "收集数据", Status: PlanStepCompleted, Result: map[string]any{"content": "数据已汇总"}},
 		{StepNo: 2, Title: "生成摘要", Status: PlanStepFailed, ErrorMessage: "模型不可用"},
 	}}
-	content := planFinalContent(plan)
+	content := planStepBundle(plan)
 	for _, want := range []string{"整理报告", "收集数据", "数据已汇总", "生成摘要", "模型不可用"} {
 		if !strings.Contains(content, want) {
-			t.Fatalf("final content missing %q: %s", want, content)
+			t.Fatalf("step bundle missing %q: %s", want, content)
 		}
 	}
 }
@@ -130,5 +133,20 @@ func TestCarryCompletedPlanStepsChecksEffectiveArgumentsAndDependencies(t *testi
 				t.Errorf("matchDescription=%t step %d status=%s, want %s", matchDescription, index+1, steps[index].Status, want)
 			}
 		}
+	}
+}
+
+// TestFindPlanFinalMessage 验证恢复路径只复用非空的计划最终消息。
+func TestFindPlanFinalMessage(t *testing.T) {
+	plan := Plan{ID: uuid.New()}
+	finalID := deterministicPlanFinalMessageID(plan.ID)
+	if content, ok := findPlanFinalMessage(plan, []react.Message{{ID: uuid.NewString(), Role: react.RoleAssistant, Content: "无关消息"}}); ok || content != "" {
+		t.Fatalf("unrelated message matched: %q", content)
+	}
+	if content, ok := findPlanFinalMessage(plan, []react.Message{{ID: finalID, Role: react.RoleAssistant, Content: " "}}); ok || content != "" {
+		t.Fatalf("empty stored answer matched: %q", content)
+	}
+	if content, ok := findPlanFinalMessage(plan, []react.Message{{ID: finalID, Role: react.RoleAssistant, Content: "答案"}}); !ok || content != "答案" {
+		t.Fatalf("stored answer = %q, %v", content, ok)
 	}
 }

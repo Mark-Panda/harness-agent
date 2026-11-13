@@ -147,23 +147,26 @@ type plannerCatalog struct {
 
 func (r plannerCatalog) List() []react.ToolSpec { return r.specs }
 
-func TestPlannerToolCatalogBoundsAndFormatsSchemas(t *testing.T) {
+func TestPlannerToolCatalogFormatsSchemasAndHonorsBudget(t *testing.T) {
 	tool := react.ToolSpec{Name: "search", Description: "Lookup documents", Parameters: json.RawMessage(` { "type": "object" } `)}
 	prompt := planPlannerSystem(plannerCatalog{specs: []react.ToolSpec{tool}})
 	if !strings.Contains(prompt, "Lookup documents") || !strings.Contains(prompt, `{"type":"object"}`) {
 		t.Fatalf("unexpected planner prompt: %s", prompt)
 	}
-	specs := make([]react.ToolSpec, planPlannerToolLimit+1)
-	for i := range specs {
-		specs[i] = react.ToolSpec{Name: "search"}
+	// 参数 Schema 必须完整注入，截断会让模型猜测字段名。
+	longSchema := json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"` + strings.Repeat("x", 300) + `"}}}`)
+	full := planPlannerSystem(plannerCatalog{specs: []react.ToolSpec{{Name: "search", Parameters: longSchema}}})
+	if !strings.Contains(full, string(longSchema)) {
+		t.Fatalf("planner schema was truncated")
 	}
-	specs[len(specs)-1].Name = "hidden"
-	if prompt := planPlannerSystem(plannerCatalog{specs: specs}); strings.Contains(prompt, "hidden") || !strings.Contains(prompt, "其余工具已省略") {
-		t.Fatalf("planner tool count was not bounded")
+	// 预算不足时明确标注省略数量，而不是隐藏固定数量的工具。
+	specs := make([]react.ToolSpec, 50)
+	for index := range specs {
+		specs[index] = react.ToolSpec{Name: "tool_" + strings.Repeat("x", index+1)}
 	}
-	specs[0] = react.ToolSpec{Name: strings.Repeat("x", planToolCatalogMaxRunes)}
-	if prompt := planPlannerSystem(plannerCatalog{specs: specs}); len(prompt) >= planToolCatalogMaxRunes || !strings.Contains(prompt, "上下文预算已省略") {
-		t.Fatalf("planner tool catalog was not bounded")
+	bounded := planPlannerSystemWithBudget(plannerCatalog{specs: specs}, 1)
+	if !strings.Contains(bounded, "因上下文预算已省略") || !strings.Contains(bounded, specs[0].Name) {
+		t.Fatalf("planner tool catalog budget was not applied: %s", bounded)
 	}
 }
 
