@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Icon } from "../components/Icon";
-import { MessageBubble, formatFileSize } from "../components/ChatMessage";
+import { MessageBubble, ProcessRecord, formatFileSize, toolCallNames } from "../components/ChatMessage";
 import { useToast } from "../components/Toast";
 import { ActionLink, Badge, Button, ConfirmDialog, ErrorBanner, LoadingState, cn } from "../components/ui";
 import { downloadAttachment, mutate, requestJSON, streamRunEvents, uploadAttachment } from "../lib/api";
@@ -84,6 +84,36 @@ interface TimelineEntry {
   tone: "info" | "success" | "danger" | "warning";
 }
 
+// TranscriptMessage 是持久化消息与临时流消息的统一视图模型。
+interface TranscriptMessage {
+  key: string;
+  role: string;
+  content: string;
+  toolCalls?: unknown;
+  name?: string;
+  createdAt?: string;
+  attachments?: Attachment[];
+  // live 表示这条消息来自当前 Run 的临时流，尚未落库。
+  live: boolean;
+  // streaming 表示这条消息仍在增量输出。
+  streaming: boolean;
+}
+
+// TranscriptBlock 是正文中的一个渲染块：普通消息或折叠的过程记录。
+type TranscriptBlock =
+  | { kind: "message"; key: string; message: TranscriptMessage }
+  | { kind: "process"; key: string; items: TranscriptMessage[] };
+
+// isProcessMessage 判断消息是否属于执行过程，正文只保留一行摘要。
+function isProcessMessage(message: { role: string; toolCalls?: unknown }): boolean {
+  return message.role === "tool" || (message.role === "assistant" && Array.isArray(message.toolCalls) && message.toolCalls.length > 0);
+}
+
+// processToolNames 汇总过程记录中的工具名称，用于运行中状态提示。
+function processToolNames(items: TranscriptMessage[]): string[] {
+  return [...new Set(items.flatMap((item) => (item.name ? [item.name] : toolCallNames(item.toolCalls))))];
+}
+
 // sleep 支持取消的等待。
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -93,6 +123,24 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolve();
     }, { once: true });
   });
+}
+
+// ProcessSummary 把一轮工具过程折叠成一行摘要，明细统一收进运行详情。
+function ProcessSummary({ items, running, onOpen }: { items: TranscriptMessage[]; running: boolean; onOpen: () => void }) {
+  const names = processToolNames(items);
+  const preview = names.slice(0, 3).join("、");
+  const extra = names.length > 3 ? ` 等 ${names.length} 个工具` : "";
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-line/70 bg-paper-raised/45 px-3 py-2 text-xs text-muted">
+      <Icon name="activity" className={cn("size-3.5 shrink-0", running && "text-accent")} />
+      <span className="min-w-0 flex-1 break-words">
+        {running ? `正在调用工具${preview ? `：${preview}${extra}` : "…"}` : `本轮处理过程 · ${items.length} 条记录`}
+      </span>
+      <Button size="sm" variant="ghost" className="px-1.5 text-xs text-accent" onClick={onOpen}>
+        查看运行详情
+      </Button>
+    </div>
+  );
 }
 
 export default function ChatPage() {
@@ -677,6 +725,56 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
       : current);
   }, [messages.data]);
   const liveVisible = liveUntilReload === null || liveUntilReload.page === messages.data ? liveMessages : [];
+  // transcriptMessages 把持久化消息与临时流消息归一化，保持原有时间顺序。
+  const transcriptMessages = useMemo<TranscriptMessage[]>(() => [
+    ...persistedMessages.map((message) => ({
+      key: message.id,
+      role: message.role,
+      content: message.content,
+      toolCalls: message.tool_calls ?? undefined,
+      createdAt: message.created_at,
+      attachments: message.attachments,
+      live: false,
+      streaming: false,
+    })),
+    ...liveVisible.map((message) => ({
+      key: message.key,
+      role: message.role,
+      content: message.content,
+      toolCalls: message.toolCalls,
+      name: message.name,
+      live: true,
+      streaming: message.key.startsWith("delta:"),
+    })),
+  ], [persistedMessages, liveVisible]);
+  // transcriptBlocks 把连续的过程记录合并成一行摘要，正文只保留对话内容。
+  const transcriptBlocks = useMemo<TranscriptBlock[]>(() => {
+    const blocks: TranscriptBlock[] = [];
+    let group: TranscriptMessage[] = [];
+    const flush = () => {
+      if (!group.length) return;
+      blocks.push({ kind: "process", key: `process:${group[0].key}`, items: group });
+      group = [];
+    };
+    for (const message of transcriptMessages) {
+      if (isProcessMessage(message)) {
+        group.push(message);
+        continue;
+      }
+      flush();
+      blocks.push({ kind: "message", key: message.key, message });
+    }
+    flush();
+    return blocks;
+  }, [transcriptMessages]);
+  // currentProcessItems 取最近一轮用户输入之后的全部过程记录，供运行详情展示。
+  const currentProcessItems = useMemo(() => {
+    let start = 0;
+    transcriptMessages.forEach((message, index) => {
+      if (message.role === "user") start = index;
+    });
+    return transcriptMessages.slice(start + 1).filter(isProcessMessage);
+  }, [transcriptMessages]);
   const hasMessages = persistedMessages.length + liveVisible.length > 0;
   const lastUserContent = persistedMessages.slice().reverse().find((message) => message.role === "user")?.content;
   const latestRun = runs.data?.items[0] ?? null;
@@ -840,34 +938,30 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
                 </Button>
               </div>
             ) : null}
-            {persistedMessages.map((message) => (
+            {transcriptBlocks.map((block) => (block.kind === "process" ? (
+              <ProcessSummary
+                key={block.key}
+                items={block.items}
+                running={runActive && block.items.some((item) => item.live)}
+                onOpen={() => setInspectorOpen(true)}
+              />
+            ) : (
               <MessageBubble
-                key={message.id}
-                messageKey={message.id}
-                role={message.role}
-                content={message.content}
-                toolCalls={message.tool_calls}
-                attachments={message.attachments}
+                key={block.key}
+                messageKey={block.message.key}
+                role={block.message.role}
+                content={block.message.content}
+                attachments={block.message.attachments}
                 onDownloadAttachment={downloadMessageAttachment}
-                createdAt={message.created_at}
-                copied={copiedKey === message.id}
+                createdAt={block.message.createdAt}
+                live={runActive && block.message.streaming}
+                copied={copiedKey === block.message.key}
                 onCopy={copyMessage}
-                onEdit={canCompose && message.role === "user" && message.content ? () => editMessage(message.content) : undefined}
+                onEdit={canCompose && !block.message.live && block.message.role === "user" && block.message.content
+                  ? () => editMessage(block.message.content)
+                  : undefined}
               />
-            ))}
-            {liveVisible.map((message) => (
-              <MessageBubble
-                key={message.key}
-                messageKey={message.key}
-                role={message.role}
-                content={message.content}
-                toolCalls={message.toolCalls}
-                name={message.name}
-                live={runActive && message.key.startsWith("delta:")}
-                copied={copiedKey === message.key}
-                onCopy={copyMessage}
-              />
-            ))}
+            )))}
 
             {failedRun ? (
               <div role="alert" className="rounded-xl border border-rust/40 bg-rust-soft/65 p-4">
@@ -1085,6 +1179,23 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
                   ) : <p className="text-sm text-muted">暂无过程事件</p>}
                 </section>
               ) : null}
+              <section aria-label="本轮过程记录" className="space-y-2">
+                <h3 className="text-sm font-semibold">本轮工具调用与结果{currentProcessItems.length ? `（${currentProcessItems.length}）` : ""}</h3>
+                {currentProcessItems.length ? (
+                  <div className="space-y-2">
+                    {currentProcessItems.map((item) => (
+                      <ProcessRecord
+                        key={item.key}
+                        role={item.role}
+                        content={item.content}
+                        toolCalls={item.toolCalls}
+                        name={item.name}
+                        createdAt={item.createdAt}
+                      />
+                    ))}
+                  </div>
+                ) : <p className="text-sm text-muted">本轮没有工具调用记录。</p>}
+              </section>
               <section aria-label="历史处理记录">
                 <h3 className="mb-2 text-sm font-semibold">历史处理记录</h3>
                 {runs.error ? <ErrorBanner message={runs.error} onRetry={runs.reload} /> : runs.loading && !runs.data ? <LoadingState /> : runs.data?.items.length ? (

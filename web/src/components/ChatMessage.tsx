@@ -4,8 +4,8 @@ import { Icon } from "./Icon";
 import { SafeMarkdown } from "./SafeMarkdown";
 import { Button } from "./ui";
 
-// toolCallNames 从消息的工具调用记录中提取名称，用于气泡内展示。
-function toolCallNames(value: unknown): string[] {
+// toolCallNames 从消息的工具调用记录中提取名称，用于过程摘要。
+export function toolCallNames(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -29,16 +29,14 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// MessageBubble 保留工具过程折叠，最终回复使用完整阅读宽度。
+// MessageBubble 渲染正文消息；工具过程记录统一收进运行详情。
 export function MessageBubble({
-  messageKey, role, content, toolCalls, name, createdAt, attachments, onDownloadAttachment,
+  messageKey, role, content, createdAt, attachments, onDownloadAttachment,
   live = false, copied, onCopy, onEdit,
 }: {
   messageKey: string;
   role: string;
   content: string;
-  toolCalls?: unknown;
-  name?: string;
   createdAt?: string;
   attachments?: Attachment[];
   onDownloadAttachment?: (attachment: Attachment) => void;
@@ -47,8 +45,6 @@ export function MessageBubble({
   onCopy: (key: string, content: string) => Promise<void>;
   onEdit?: () => void;
 }) {
-  const toolNames = toolCallNames(toolCalls);
-  const toolCount = Array.isArray(toolCalls) ? toolCalls.length : 0;
   const copy = () => void onCopy(messageKey, content);
   const timestamp = createdAt ? formatDateTime(createdAt) : null;
   if (role === "system") {
@@ -89,30 +85,8 @@ export function MessageBubble({
       </article>
     );
   }
-  if (role === "tool" || toolCount > 0) {
-    return (
-      <details className="group rounded-xl border border-line bg-paper-raised/70">
-        <summary className="flex min-h-11 list-none flex-wrap items-center gap-2 rounded-xl px-3 py-2 text-sm text-ink-soft transition-colors hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
-          <Icon name="activity" className="size-4 text-muted" />
-          <span className="min-w-0 flex-1 wrap-anywhere">{role === "tool" ? `工具结果${name ? ` · ${name}` : ""}` : `工具调用 · ${toolNames.join("、") || `${toolCount} 项`}`}</span>
-          {timestamp ? <time dateTime={createdAt} className="text-xs text-muted">{timestamp}</time> : null}
-          <Icon name="chevronDown" className="size-4 text-muted transition-transform group-open:rotate-180" />
-        </summary>
-        <div className="border-t border-line px-4 py-3 leading-relaxed text-ink-soft">
-          {role === "tool" ? (
-            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all font-mono text-sm" tabIndex={0}>{content}</pre>
-          ) : content ? <SafeMarkdown content={content} /> : <p className="text-sm text-muted">等待工具返回结果…</p>}
-          {toolCount > 0 ? (
-            <details className="mt-3 text-sm text-muted">
-              <summary className="cursor-pointer">调用参数</summary>
-              <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-paper p-3 font-mono text-xs" tabIndex={0}>
-                {JSON.stringify(toolCalls, null, 2)}
-              </pre>
-            </details>
-          ) : null}
-        </div>
-      </details>
-    );
+  if (role === "tool") {
+    return null;
   }
   return (
     <article aria-label="助手回复" data-message-id={messageKey} className="min-w-0">
@@ -129,6 +103,44 @@ export function MessageBubble({
       </div>
       {content && !live ? <div className="mt-2"><CopyMessageButton copied={copied} onClick={copy} /></div> : null}
     </article>
+  );
+}
+
+// ProcessRecord 展示单条工具过程记录，在运行详情中按需展开。
+export function ProcessRecord({
+  role, content, toolCalls, name, createdAt,
+}: {
+  role: string;
+  content: string;
+  toolCalls?: unknown;
+  name?: string;
+  createdAt?: string;
+}) {
+  const toolNames = toolCallNames(toolCalls);
+  const toolCount = Array.isArray(toolCalls) ? toolCalls.length : 0;
+  const timestamp = createdAt ? formatDateTime(createdAt) : null;
+  return (
+    <details className="group rounded-lg border border-line bg-paper-raised/70">
+      <summary className="flex min-h-10 list-none flex-wrap items-center gap-2 rounded-lg px-3 py-2 text-sm text-ink-soft transition-colors hover:bg-paper-deep [&::-webkit-details-marker]:hidden">
+        <Icon name="activity" className="size-4 text-muted" />
+        <span className="min-w-0 flex-1 wrap-anywhere">{role === "tool" ? `工具结果${name ? ` · ${name}` : ""}` : `工具调用 · ${toolNames.join("、") || `${toolCount} 项`}`}</span>
+        {timestamp ? <time dateTime={createdAt} className="text-xs text-muted">{timestamp}</time> : null}
+        <Icon name="chevronDown" className="size-4 text-muted transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="border-t border-line px-3 py-3 leading-relaxed text-ink-soft">
+        {role === "tool" ? (
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all font-mono text-sm" tabIndex={0}>{content}</pre>
+        ) : content ? <SafeMarkdown content={content} /> : <p className="text-sm text-muted">这一步没有文本输出。</p>}
+        {toolCount > 0 ? (
+          <details className="mt-3 text-sm text-muted">
+            <summary className="cursor-pointer">调用参数</summary>
+            <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-paper p-3 font-mono text-xs" tabIndex={0}>
+              {JSON.stringify(toolCalls, null, 2)}
+            </pre>
+          </details>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
