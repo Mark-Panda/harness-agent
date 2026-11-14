@@ -2,7 +2,9 @@ package data
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -233,9 +235,18 @@ AND NOT EXISTS (
   WHERE b.session_id = s.id AND b.user_id = s.user_id AND b.thread_id <> 'p2p'
 )`
 
+// memoryClearedWatermark 过滤用户主动清理记忆之前的消息；
+// 否则清理后回填与增量索引会把历史会话重新写入向量，导致已删除记忆复活。
+const memoryClearedWatermark = `
+m.created_at > COALESCE(
+  (SELECT state.memory_cleared_at FROM user_memory_state state WHERE state.user_id = m.user_id),
+  '-infinity'::timestamptz
+)`
+
 const embeddableMessage = `
 m.deleted_at IS NULL AND m.role = 'user' AND m.content ~ '[^[:space:]]'
 AND m.feishu_group_message_id IS NULL
+AND ` + memoryClearedWatermark + `
 AND EXISTS (
   SELECT 1 FROM sessions s WHERE s.id = m.session_id AND s.user_id = m.user_id
   AND ` + privateMemorySession + `
@@ -270,6 +281,32 @@ func (r *MemoryRepository) CountEligibleMessages(ctx context.Context) (int64, er
 		return 0, catalogError("count eligible messages", err)
 	}
 	return count, nil
+}
+
+// MemoryClearedAt 读取用户最近一次清理记忆的时间；从未清理时返回零值。
+func (r *MemoryRepository) MemoryClearedAt(ctx context.Context, userID uuid.UUID) (time.Time, error) {
+	if userID == uuid.Nil {
+		return time.Time{}, fmt.Errorf("%w: user id is required", biz.ErrInvalidConfig)
+	}
+	var clearedAt *time.Time
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		row := tx.Raw(`SELECT memory_cleared_at FROM user_memory_state WHERE user_id = ?`, userID).Row()
+		if scanErr := row.Scan(&clearedAt); scanErr != nil {
+			// 表为空表示用户从未清理过记忆，按零值处理而不是报错。
+			if errors.Is(scanErr, sql.ErrNoRows) {
+				return nil
+			}
+			return scanErr
+		}
+		return nil
+	})
+	if err != nil {
+		return time.Time{}, catalogError("get memory cleared at", err)
+	}
+	if clearedAt == nil {
+		return time.Time{}, nil
+	}
+	return *clearedAt, nil
 }
 
 // ListUnembeddedMessages 读取尚未写入指定版本的候选消息。

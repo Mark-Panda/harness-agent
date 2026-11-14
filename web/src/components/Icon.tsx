@@ -5,6 +5,7 @@ const paths = {
   dashboard: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
   chat: <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l1.7-4.1a8.5 8.5 0 1 1 15.3-4.4Z" />,
   agent: <><rect x="4" y="7" width="16" height="13" rx="3" /><path d="M12 7V3m-2 0h4M2 12v3m20-3v3M8 12h.01m8 0h.01M9 16h6" /></>,
+  skill: <><path d="M12 3 4 7l8 4 8-4-8-4Z" /><path d="m4 12 8 4 8-4M4 17l8 4 8-4" /></>,
   memory: <><circle cx="12" cy="5" r="2" /><circle cx="5" cy="18" r="2" /><circle cx="19" cy="18" r="2" /><path d="m11 7-5 9m7-9 5 9M7 18h10" /></>,
   activity: <path d="M3 12h4l3-7 4 14 3-7h4" />,
   plus: <path d="M12 5v14M5 12h14" />,

@@ -579,7 +579,7 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	if runs.calls != 1 || runs.input.IdempotencyKey != "feishu:om_1" || runs.input.SessionID != conversations.session.ID {
 		t.Fatalf("run input = %+v", runs.input)
 	}
-	if messages.message.UserID != userID || messages.message.ExternalMessageID != "om_1" || messages.message.SpeakerOpenID != "ou_user" {
+	if messages.message.UserID != userID || messages.message.ExternalMessageID != "om_1" || messages.message.SpeakerOpenID != "" {
 		t.Fatalf("inbound message = %+v", messages.message)
 	}
 	if events.statuses["evt-om_1"] != biz.FeishuEventProcessed {

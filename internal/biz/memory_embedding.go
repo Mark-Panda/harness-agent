@@ -70,19 +70,28 @@ func (c MemoryIndexerConfig) normalize() MemoryIndexerConfig {
 	return c
 }
 
+// MemoryClearanceReader 读取用户最近一次主动清理记忆的时间。
+// 向量索引必须跳过该时间之前的消息，避免“删除记忆”后被回填任务重新写入。
+type MemoryClearanceReader interface {
+	// MemoryClearedAt 返回清理时间；从未清理时返回零值。
+	MemoryClearedAt(ctx context.Context, userID uuid.UUID) (time.Time, error)
+}
+
 // MemoryIndexer 根据当前索引版本为最近消息入队向量化任务。
 type MemoryIndexer struct {
-	messages SummaryMessageReader
-	indexes  EmbeddingIndexRepository
-	queue    MemoryJobQueue
-	config   MemoryIndexerConfig
-	clock    func() time.Time
-	logger   *slog.Logger
+	messages  SummaryMessageReader
+	indexes   EmbeddingIndexRepository
+	clearance MemoryClearanceReader
+	queue     MemoryJobQueue
+	config    MemoryIndexerConfig
+	clock     func() time.Time
+	logger    *slog.Logger
 }
 
 // NewMemoryIndexer 构造向量化触发器。
 func NewMemoryIndexer(messages SummaryMessageReader, indexes EmbeddingIndexRepository, queue MemoryJobQueue,
-	config MemoryIndexerConfig, logger *slog.Logger, clock func() time.Time) (*MemoryIndexer, error) {
+	config MemoryIndexerConfig, logger *slog.Logger, clock func() time.Time,
+	clearance MemoryClearanceReader) (*MemoryIndexer, error) {
 	if messages == nil || indexes == nil || queue == nil {
 		return nil, invalid("memory indexer requires messages, indexes and queue")
 	}
@@ -92,7 +101,8 @@ func NewMemoryIndexer(messages SummaryMessageReader, indexes EmbeddingIndexRepos
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	return &MemoryIndexer{messages: messages, indexes: indexes, queue: queue, config: config.normalize(), clock: clock, logger: logger}, nil
+	return &MemoryIndexer{messages: messages, indexes: indexes, clearance: clearance, queue: queue,
+		config: config.normalize(), clock: clock, logger: logger}, nil
 }
 
 // MaybeEnqueue 为最近的可向量化消息入队任务；没有 active 索引时不做任何事。
@@ -111,9 +121,20 @@ func (i *MemoryIndexer) MaybeEnqueue(ctx context.Context, userID, sessionID uuid
 	if err != nil {
 		return err
 	}
+	// 用户清理记忆后，最近窗口内的历史消息不得再次进入长期记忆。
+	var clearedAt time.Time
+	if i.clearance != nil {
+		clearedAt, err = i.clearance.MemoryClearedAt(ctx, userID)
+		if err != nil {
+			return err
+		}
+	}
 	ids := make([]uuid.UUID, 0, len(recent))
 	for _, message := range recent {
 		if !embeddableRole(message.Role) || strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		if !clearedAt.IsZero() && !message.CreatedAt.After(clearedAt) {
 			continue
 		}
 		ids = append(ids, message.ID)

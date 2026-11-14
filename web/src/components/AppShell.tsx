@@ -12,6 +12,8 @@ const workItems: Array<{ to: string; label: string; icon: IconName }> = [
   { to: "/", label: "工作台", icon: "dashboard" },
   { to: "/sessions", label: "对话", icon: "chat" },
   { to: "/agents", label: "助手", icon: "agent" },
+  { to: "/skills", label: "我的技能", icon: "skill" },
+  { to: "/feishu-bots", label: "飞书机器人", icon: "link" },
   { to: "/memory", label: "记忆", icon: "memory" },
   { to: "/audit", label: "运行记录", icon: "activity" },
 ];

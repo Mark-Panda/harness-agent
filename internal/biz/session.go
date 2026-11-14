@@ -132,6 +132,8 @@ type SessionRepository interface {
 	GetSession(ctx context.Context, userID, sessionID uuid.UUID) (Session, error)
 	// ListSessions 按用户游标分页列出会话。
 	ListSessions(ctx context.Context, userID uuid.UUID, limit int, cursor string) (Page[Session], error)
+	// ListSessionsActiveSince 列出指定时间后有消息活动的会话，按最近消息时间倒序。
+	ListSessionsActiveSince(ctx context.Context, userID uuid.UUID, since time.Time, limit int) ([]Session, error)
 	// ArchiveSession 以版本号乐观锁归档会话。
 	ArchiveSession(ctx context.Context, session Session, event OutboxEvent) (Session, error)
 	// UpdateSessionMemoryPolicy 以版本号乐观锁更新会话记忆策略。

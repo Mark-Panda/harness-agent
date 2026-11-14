@@ -1,9 +1,10 @@
 // Skill 模板管理：提示词模板与参数 Schema，管理员维护平台级能力。
 import { useRef, useState } from "react";
 import { FormDrawer } from "../../components/FormDrawer";
+import { SkillBundlePanel } from "../../components/SkillBundlePanel";
 import { useToast } from "../../components/Toast";
 import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../../components/ui";
-import { mutate, requestJSON } from "../../lib/api";
+import { mutate, requestJSON, uploadSkillPackage } from "../../lib/api";
 import { describeError } from "../../lib/errors";
 import { parseSkillPackage } from "../../lib/skillPackage";
 import { formatDateTime, statusLabel, statusTone } from "../../lib/format";
@@ -110,6 +111,7 @@ export default function SkillsPage() {
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importNote, setImportNote] = useState<string | null>(null);
+  const [bundleSkill, setBundleSkill] = useState<Skill | null>(null);
   const importRef = useRef<HTMLInputElement | null>(null);
   const skillItems = skills.data?.items ?? [];
   const paging = useClientPage(skillItems, 10);
@@ -120,6 +122,13 @@ export default function SkillsPage() {
     setImportError(null);
     setImportNote(null);
     try {
+      // zip 交由后端整包解析，完整保留多文件夹与脚本；其余格式沿用前端解析。
+      if (file.name.toLowerCase().endsWith(".zip")) {
+        const created = await uploadSkillPackage<Skill>("/api/v1/skills/import", file);
+        skills.reload();
+        setImportNote(`已导入「${created.name}」，文件与脚本已保存；请检查后发布。`);
+        return;
+      }
       const parsed = await parseSkillPackage(file);
       const created = await mutate<Skill>("/api/v1/skills", "POST", {
         name: parsed.name,
@@ -202,19 +211,38 @@ export default function SkillsPage() {
                       <h3 className="text-sm font-semibold text-ink">{skill.name}</h3>
                       <Badge tone="neutral">v{skill.version}</Badge>
                       <Badge tone={statusTone(skill.status)}>{statusLabel(skill.status)}</Badge>
+                      {skill.bundle ? <Badge tone="info">技能包 · {skill.bundle.file_count} 文件</Badge> : null}
+                      {skill.bundle?.has_scripts ? <Badge tone={skill.bundle.execution_enabled ? "warning" : "neutral"}>{skill.bundle.execution_enabled ? "脚本可执行" : "含脚本"}</Badge> : null}
                     </div>
                     <p className="mt-1 text-xs text-muted">{skill.description || "无描述"}</p>
                     <p className="mt-1 text-[11px] text-muted">更新于 {formatDateTime(skill.updated_at)}</p>
                   </div>
-                  <RowMenu name={skill.name}>
-                    <MenuItem icon="edit" onClick={() => setEditing(skill)}>编辑</MenuItem>
-                    <MenuItem icon="trash" danger onClick={() => { setDeleting(skill); setDeleteError(null); }}>删除</MenuItem>
-                  </RowMenu>
+                  <div className="flex items-center gap-2">
+                    {skill.bundle ? (
+                      <Button size="sm" variant="secondary" onClick={() => setBundleSkill(skill)}>文件</Button>
+                    ) : null}
+                    <RowMenu name={skill.name}>
+                      <MenuItem icon="edit" onClick={() => setEditing(skill)}>编辑</MenuItem>
+                      <MenuItem icon="trash" danger onClick={() => { setDeleting(skill); setDeleteError(null); }}>删除</MenuItem>
+                    </RowMenu>
+                  </div>
                 </div>
                 <details className="mt-3 text-xs text-muted">
                   <summary className="cursor-pointer text-muted">查看提示词模板</summary>
                   <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded border border-line bg-paper-raised p-3 font-mono text-[11px] text-ink-soft">{skill.prompt_template}</pre>
                 </details>
+                {skill.bundle && bundleSkill?.id === skill.id ? (
+                  <div className="mt-3">
+                    <SkillBundlePanel
+                      basePath="/api/v1/skills"
+                      skillId={skill.id}
+                      skillName={skill.name}
+                      bundle={skill.bundle}
+                      onClose={() => setBundleSkill(null)}
+                      onExecutionChanged={() => skills.reload()}
+                    />
+                  </div>
+                ) : null}
               </article>
             ))}
           </div>

@@ -107,6 +107,31 @@ export interface ModelPolicy {
 
 export type SkillStatus = "draft" | "published" | "disabled";
 
+// SkillBundleInfo 是标准技能包（Anthropic Agent Skills）元数据。
+export interface SkillBundleInfo {
+  format: string;
+  entrypoint: string;
+  file_count: number;
+  total_bytes: number;
+  has_scripts: boolean;
+  execution_enabled: boolean;
+  digest: string;
+}
+
+// SkillBundleFile 是技能包内的单个文件元数据。
+export interface SkillBundleFile {
+  path: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  is_script: boolean;
+}
+
+// SkillBundleFileContent 是技能包内单个文件的文本内容。
+export interface SkillBundleFileContent extends SkillBundleFile {
+  content: string;
+}
+
 export interface Skill {
   id: string;
   name: string;
@@ -115,8 +140,61 @@ export interface Skill {
   prompt_template: string;
   parameters: Record<string, unknown>;
   status: SkillStatus;
+  bundle: SkillBundleInfo | null;
   created_at: string;
   updated_at: string;
+}
+
+export type UserSkillStatus = "auto_generated" | "published" | "disabled";
+export type UserSkillOrigin = "auto" | "manual";
+
+// UserSkillSynthesisSettings 是当前用户每日技能提炼设置。
+export interface UserSkillSynthesisSettings {
+  enabled: boolean;
+  model_policy_id: string | null;
+  model_policy_version: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// UserSkillSynthesisSettingsInput 是完整替换提炼设置的写请求。
+export interface UserSkillSynthesisSettingsInput {
+  enabled: boolean;
+  model_policy_id: string | null;
+  model_policy_version: number | null;
+}
+
+// UserSkillSynthesisPolicy 是用户可选的已发布提炼策略。
+export interface UserSkillSynthesisPolicy {
+  id: string;
+  name: string;
+  version: number;
+}
+
+// UserSkill 是用户私有技能，可由每日对话提炼或手动创建。
+export interface UserSkill {
+  id: string;
+  user_id: string;
+  name: string;
+  version: number;
+  description: string;
+  prompt_template: string;
+  parameters: Record<string, unknown>;
+  status: UserSkillStatus;
+  origin: UserSkillOrigin;
+  source_session_ids: string[];
+  confidence: number;
+  bundle: SkillBundleInfo | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// UserSkillInput 是创建或更新用户技能的写请求。
+export interface UserSkillInput {
+  name: string;
+  description: string;
+  prompt_template: string;
+  parameters: Record<string, unknown>;
 }
 
 export type MCPStatus = "enabled" | "disabled";
@@ -207,6 +285,7 @@ export interface Agent {
   version: number;
   config_snapshot: Record<string, unknown> | null;
   skill_ids: string[];
+  user_skill_ids: string[];
   mcp_ids: string[];
   status: AgentStatus;
   created_at: string;
@@ -220,6 +299,7 @@ export interface AgentInput {
   model_policy_id: string | null;
   model_policy_version: number | null;
   skill_ids: string[];
+  user_skill_ids: string[];
   mcp_ids: string[];
 }
 

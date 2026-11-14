@@ -21,6 +21,7 @@ type platformGRPCServer struct {
 	harnessv1.UnimplementedModelCatalogServiceServer
 	harnessv1.UnimplementedModelPolicyServiceServer
 	harnessv1.UnimplementedAgentServiceServer
+	harnessv1.UnimplementedUserSkillServiceServer
 	harnessv1.UnimplementedConversationServiceServer
 	platform *service.PlatformService
 }
@@ -340,7 +341,7 @@ func (s *platformGRPCServer) CreateAgent(ctx context.Context, request *harnessv1
 	agent, err := s.platform.Agents.Create(ctx, principal, biz.Agent{
 		Name: request.GetName(), Description: request.GetDescription(), Mode: biz.AgentMode(request.GetMode()),
 		ModelPolicyID: optionalUUID(request.ModelPolicyId), ModelPolicyVersion: optionalInt(request.ModelPolicyVersion),
-		SkillIDs: parseUUIDList(request.GetSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
+		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
 	})
 	if err != nil {
 		return nil, grpcError(err)
@@ -361,7 +362,7 @@ func (s *platformGRPCServer) UpdateAgent(ctx context.Context, request *harnessv1
 	agent, err := s.platform.Agents.Update(ctx, principal, biz.Agent{
 		ID: agentID, Description: request.GetDescription(), Mode: biz.AgentMode(request.GetMode()),
 		ModelPolicyID: optionalUUID(request.ModelPolicyId), ModelPolicyVersion: optionalInt(request.ModelPolicyVersion),
-		SkillIDs: parseUUIDList(request.GetSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
+		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
 	})
 	if err != nil {
 		return nil, grpcError(err)
@@ -737,7 +738,7 @@ func toProtoAgent(agent biz.Agent) *harnessv1.Agent {
 	result := &harnessv1.Agent{
 		Id: agent.ID.String(), UserId: agent.UserID.String(), Name: agent.Name, Description: agent.Description,
 		Mode: string(agent.Mode), Version: clampInt32(agent.Version), ConfigSnapshot: toProtoStruct(agent.ConfigSnapshot),
-		SkillIds: uuidStrings(agent.SkillIDs), McpIds: uuidStrings(agent.MCPIDs), Status: string(agent.Status),
+		SkillIds: uuidStrings(agent.SkillIDs), UserSkillIds: uuidStrings(agent.UserSkillIDs), McpIds: uuidStrings(agent.MCPIDs), Status: string(agent.Status),
 		CreatedAt: timestamp(agent.CreatedAt), UpdatedAt: timestamp(agent.UpdatedAt),
 	}
 	if agent.ModelPolicyID != nil {
@@ -797,6 +798,211 @@ func uuidStrings(values []uuid.UUID) []string {
 	result := make([]string, 0, len(values))
 	for _, value := range values {
 		result = append(result, value.String())
+	}
+	return result
+}
+
+// CreateUserSkill 处理用户手动创建技能草稿。
+func (s *platformGRPCServer) CreateUserSkill(ctx context.Context, request *harnessv1.CreateUserSkillRequest) (*harnessv1.CreateUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skill, err := s.platform.UserSkills.Create(ctx, principal, biz.UserSkill{
+		Name: request.GetName(), Description: request.GetDescription(),
+		PromptTemplate: request.GetPromptTemplate(), Parameters: request.GetParameters().AsMap(),
+	})
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.CreateUserSkillResponse{Skill: toProtoUserSkill(skill)}, nil
+}
+
+// UpdateUserSkill 处理用户技能草稿更新（仅 auto_generated 可修改）。
+func (s *platformGRPCServer) UpdateUserSkill(ctx context.Context, request *harnessv1.UpdateUserSkillRequest) (*harnessv1.UpdateUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skillID, err := parseUUID(request.GetId())
+	if err != nil {
+		return nil, err
+	}
+	skill, err := s.platform.UserSkills.Update(ctx, principal, biz.UserSkill{
+		ID: skillID, Description: request.GetDescription(),
+		PromptTemplate: request.GetPromptTemplate(), Parameters: request.GetParameters().AsMap(),
+	})
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.UpdateUserSkillResponse{Skill: toProtoUserSkill(skill)}, nil
+}
+
+// GetUserSkill 处理用户技能读取。
+func (s *platformGRPCServer) GetUserSkill(ctx context.Context, request *harnessv1.GetUserSkillRequest) (*harnessv1.GetUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skillID, err := parseUUID(request.GetId())
+	if err != nil {
+		return nil, err
+	}
+	skill, err := s.platform.UserSkills.Get(ctx, principal, skillID)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.GetUserSkillResponse{Skill: toProtoUserSkill(skill)}, nil
+}
+
+// DeleteUserSkill 处理用户技能删除。
+func (s *platformGRPCServer) DeleteUserSkill(ctx context.Context, request *harnessv1.DeleteUserSkillRequest) (*harnessv1.DeleteUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skillID, err := parseUUID(request.GetId())
+	if err != nil {
+		return nil, err
+	}
+	if err := s.platform.UserSkills.Delete(ctx, principal, skillID); err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.DeleteUserSkillResponse{}, nil
+}
+
+// PublishUserSkill 处理用户技能发布，使其可被 Agent 引用。
+func (s *platformGRPCServer) PublishUserSkill(ctx context.Context, request *harnessv1.PublishUserSkillRequest) (*harnessv1.PublishUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skillID, err := parseUUID(request.GetId())
+	if err != nil {
+		return nil, err
+	}
+	skill, err := s.platform.UserSkills.Publish(ctx, principal, skillID)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.PublishUserSkillResponse{Skill: toProtoUserSkill(skill)}, nil
+}
+
+// DisableUserSkill 处理用户技能停用。
+func (s *platformGRPCServer) DisableUserSkill(ctx context.Context, request *harnessv1.DisableUserSkillRequest) (*harnessv1.DisableUserSkillResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skillID, err := parseUUID(request.GetId())
+	if err != nil {
+		return nil, err
+	}
+	skill, err := s.platform.UserSkills.Disable(ctx, principal, skillID)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.DisableUserSkillResponse{Skill: toProtoUserSkill(skill)}, nil
+}
+
+// ListUserSkills 处理用户技能列表查询。
+func (s *platformGRPCServer) ListUserSkills(ctx context.Context, request *harnessv1.ListUserSkillsRequest) (*harnessv1.ListUserSkillsResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skills, err := s.platform.UserSkills.List(ctx, principal, int(request.GetLimit()))
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	items := make([]*harnessv1.UserSkill, 0, len(skills))
+	for _, skill := range skills {
+		items = append(items, toProtoUserSkill(skill))
+	}
+	return &harnessv1.ListUserSkillsResponse{Items: items}, nil
+}
+
+// toProtoUserSkill 转换用户技能出参。
+func toProtoUserSkill(skill biz.UserSkill) *harnessv1.UserSkill {
+	return &harnessv1.UserSkill{
+		Id: skill.ID.String(), UserId: skill.UserID.String(), Name: skill.Name,
+		Version: clampInt32(skill.Version), Description: skill.Description,
+		PromptTemplate: skill.PromptTemplate, Parameters: toProtoStruct(skill.Parameters),
+		Status: string(skill.Status), Origin: string(skill.Origin),
+		SourceSessionIds: uuidStrings(skill.SourceSessionIDs), Confidence: skill.Confidence,
+		CreatedAt: timestamp(skill.CreatedAt), UpdatedAt: timestamp(skill.UpdatedAt),
+	}
+}
+
+// GetUserSkillSynthesisSettings 读取当前用户的技能提炼设置。
+func (s *platformGRPCServer) GetUserSkillSynthesisSettings(ctx context.Context, request *harnessv1.GetUserSkillSynthesisSettingsRequest) (*harnessv1.GetUserSkillSynthesisSettingsResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	settings, err := s.platform.UserSkills.GetSynthesisSettings(ctx, principal)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.GetUserSkillSynthesisSettingsResponse{Settings: toProtoUserSkillSynthesisSettings(settings)}, nil
+}
+
+// UpdateUserSkillSynthesisSettings 完整替换当前用户的技能提炼设置。
+func (s *platformGRPCServer) UpdateUserSkillSynthesisSettings(ctx context.Context, request *harnessv1.UpdateUserSkillSynthesisSettingsRequest) (*harnessv1.UpdateUserSkillSynthesisSettingsResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	input := biz.UserSkillSynthesisSettings{Enabled: request.GetEnabled()}
+	if request.ModelPolicyId != nil {
+		policyID, err := parseUUID(request.GetModelPolicyId())
+		if err != nil {
+			return nil, err
+		}
+		input.ModelPolicyID = &policyID
+	}
+	if request.ModelPolicyVersion != nil {
+		version := int(request.GetModelPolicyVersion())
+		input.ModelPolicyVersion = &version
+	}
+	settings, err := s.platform.UserSkills.UpdateSynthesisSettings(ctx, principal, input)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &harnessv1.UpdateUserSkillSynthesisSettingsResponse{Settings: toProtoUserSkillSynthesisSettings(settings)}, nil
+}
+
+// ListUserSkillSynthesisPolicies 列出当前用户可选的已发布提炼策略。
+func (s *platformGRPCServer) ListUserSkillSynthesisPolicies(ctx context.Context, _ *harnessv1.ListUserSkillSynthesisPoliciesRequest) (*harnessv1.ListUserSkillSynthesisPoliciesResponse, error) {
+	principal, err := grpcPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	policies, err := s.platform.UserSkills.ListSynthesisPolicies(ctx, principal)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	items := make([]*harnessv1.SynthesisPolicyOption, 0, len(policies))
+	for _, policy := range policies {
+		items = append(items, &harnessv1.SynthesisPolicyOption{
+			Id: policy.ID.String(), Name: policy.Name, Version: clampInt32(policy.Version),
+		})
+	}
+	return &harnessv1.ListUserSkillSynthesisPoliciesResponse{Items: items}, nil
+}
+
+// toProtoUserSkillSynthesisSettings 转换用户提炼设置出参。
+func toProtoUserSkillSynthesisSettings(settings biz.UserSkillSynthesisSettings) *harnessv1.UserSkillSynthesisSettings {
+	result := &harnessv1.UserSkillSynthesisSettings{
+		Enabled: settings.Enabled, CreatedAt: timestamp(settings.CreatedAt), UpdatedAt: timestamp(settings.UpdatedAt),
+	}
+	if settings.ModelPolicyID != nil {
+		value := settings.ModelPolicyID.String()
+		result.ModelPolicyId = &value
+	}
+	if settings.ModelPolicyVersion != nil {
+		value := clampInt32(*settings.ModelPolicyVersion)
+		result.ModelPolicyVersion = &value
 	}
 	return result
 }

@@ -48,6 +48,8 @@ type PlatformService struct {
 	FeishuBots *biz.FeishuBotService
 	// FeishuBotBindings 助手绑定飞书机器人的用户侧服务。
 	FeishuBotBindings *biz.FeishuBotBindingService
+	// UserSkills 当前用户私有技能（含每日对话自动提炼）的管理用例。
+	UserSkills *biz.UserSkillService
 }
 
 // WithFeishuBots 附加飞书机器人注册与助手绑定能力。

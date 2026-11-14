@@ -102,7 +102,7 @@ func (r *fakeFeishuBotRepository) GetFeishuBotCredential(ctx context.Context, bo
 func (r *fakeFeishuBotRepository) ListFeishuBotsForUser(_ context.Context, userID uuid.UUID) ([]biz.FeishuBot, error) {
 	result := make([]biz.FeishuBot, 0, len(r.bots))
 	for _, bot := range r.bots {
-		if bot.Status != biz.FeishuBotEnabled {
+		if bot.OwnerUserID != userID {
 			continue
 		}
 		binding, bound := r.bindings[bot.ID]
@@ -212,8 +212,19 @@ func TestFeishuBotServiceAdminLifecycleAndCredentialRetention(t *testing.T) {
 	if secret.AppSecret != "secret" || secret.VerificationToken != "verify" || secret.EncryptKey != "encrypt" || credential.KeyVersion != "v1" {
 		t.Fatalf("stored credential = %#v", secret)
 	}
-	if _, err := service.Create(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, input); !errors.Is(err, biz.ErrForbidden) {
-		t.Fatalf("non-admin create error = %v", err)
+	tenant := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	tenantBot, err := service.Create(context.Background(), tenant, input)
+	if err != nil || tenantBot.OwnerUserID != tenant.UserID {
+		t.Fatalf("tenant create = %#v, %v", tenantBot, err)
+	}
+	if _, err := service.Update(context.Background(), tenant, bot.ID, input); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("cross-tenant update error = %v", err)
+	}
+	if err := service.Delete(context.Background(), tenant, bot.ID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("cross-tenant delete error = %v", err)
+	}
+	if err := service.Delete(context.Background(), tenant, tenantBot.ID); err != nil {
+		t.Fatalf("tenant delete own bot error = %v", err)
 	}
 	if _, err := service.Create(context.Background(), admin, biz.FeishuBotInput{Name: "no secret", AppID: "cli_nosecret"}); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("missing secret error = %v", err)
@@ -287,8 +298,8 @@ func TestFeishuBotBindingEnforcesPublishedOwnershipAndExclusivity(t *testing.T) 
 		otherID:           {ID: otherID, UserID: other.UserID, Name: "他人助手", Version: 1, Status: biz.AgentPublished, Mode: biz.AgentModeReact},
 	}}
 	botID, disabledID := uuid.New(), uuid.New()
-	repo.bots[botID] = biz.FeishuBot{ID: botID, Name: "共享机器人", AppID: "cli_shared", Status: biz.FeishuBotEnabled}
-	repo.bots[disabledID] = biz.FeishuBot{ID: disabledID, Name: "停用机器人", AppID: "cli_disabled", Status: biz.FeishuBotDisabled}
+	repo.bots[botID] = biz.FeishuBot{ID: botID, Name: "租户机器人", AppID: "cli_shared", OwnerUserID: owner.UserID, Status: biz.FeishuBotEnabled}
+	repo.bots[disabledID] = biz.FeishuBot{ID: disabledID, Name: "停用机器人", AppID: "cli_disabled", OwnerUserID: owner.UserID, Status: biz.FeishuBotDisabled}
 	service, err := biz.NewFeishuBotBindingService(repo, repo, agents)
 	if err != nil {
 		t.Fatal(err)
@@ -311,17 +322,17 @@ func TestFeishuBotBindingEnforcesPublishedOwnershipAndExclusivity(t *testing.T) 
 	if err := service.Bind(context.Background(), owner, secondPublishedID, botID); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("duplicate bot bind error = %v", err)
 	}
-	if err := service.Bind(context.Background(), other, otherID, botID); !errors.Is(err, biz.ErrResourceConflict) {
-		t.Fatalf("other user duplicate bind error = %v", err)
+	if err := service.Bind(context.Background(), other, otherID, botID); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("cross-tenant bind error = %v", err)
 	}
 
-	// 所有者看到自己的绑定，其他用户只看到机器人不可用。
+	// 所有者看到自己的绑定，其他租户看不到该机器人。
 	ownerOptions, err := service.List(context.Background(), owner)
 	if err != nil || len(ownerOptions) != 1 || ownerOptions[0].Available || ownerOptions[0].BoundAgentID == nil || *ownerOptions[0].BoundAgentID != publishedID {
 		t.Fatalf("owner options = %#v, %v", ownerOptions, err)
 	}
 	otherOptions, err := service.List(context.Background(), other)
-	if err != nil || len(otherOptions) != 1 || otherOptions[0].Available || otherOptions[0].BoundAgentID != nil {
+	if err != nil || len(otherOptions) != 0 {
 		t.Fatalf("other options = %#v, %v", otherOptions, err)
 	}
 
@@ -339,5 +350,43 @@ func TestFeishuBotBindingEnforcesPublishedOwnershipAndExclusivity(t *testing.T) 
 	}
 	if err := service.Unbind(context.Background(), biz.Principal{}, publishedID); !errors.Is(err, biz.ErrForbidden) {
 		t.Fatalf("anonymous unbind error = %v", err)
+	}
+}
+
+// TestFeishuBotServiceLongConnectionCredentials 验证长连接无需 Webhook 凭据且列表按租户隔离。
+func TestFeishuBotServiceLongConnectionCredentials(t *testing.T) {
+	repo := newFakeFeishuBotRepository()
+	service, err := biz.NewFeishuBotService(repo, fixedCipher{}, jsonOpener{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	input := biz.FeishuBotInput{Name: "长连接机器人", AppID: "cli_long", AppSecret: "secret", Status: biz.FeishuBotEnabled}
+	if _, err := service.Create(context.Background(), owner, input); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("webhook credentials error = %v", err)
+	}
+	service.WithLongConnection()
+	bot, err := service.Create(context.Background(), owner, input)
+	if err != nil {
+		t.Fatalf("long connection create error = %v", err)
+	}
+	input.Name = "长连接机器人 v2"
+	updated, err := service.Update(context.Background(), owner, bot.ID, biz.FeishuBotInput{Name: input.Name, AppID: input.AppID, Status: biz.FeishuBotEnabled})
+	if err != nil || updated.Name != input.Name {
+		t.Fatalf("long connection update = %#v, %v", updated, err)
+	}
+	other := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	otherInput := input
+	otherInput.AppID = "cli_other"
+	if _, err := service.Create(context.Background(), other, otherInput); err != nil {
+		t.Fatal(err)
+	}
+	ownerBots, err := service.List(context.Background(), owner)
+	if err != nil || len(ownerBots) != 1 || ownerBots[0].ID != bot.ID {
+		t.Fatalf("owner bots = %#v, %v", ownerBots, err)
+	}
+	adminBots, err := service.List(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin})
+	if err != nil || len(adminBots) != 2 {
+		t.Fatalf("admin bots = %#v, %v", adminBots, err)
 	}
 }

@@ -54,6 +54,8 @@ type Agent struct {
 	ConfigSnapshot map[string]any
 	// SkillIDs 绑定的 Skill 列表。
 	SkillIDs []uuid.UUID
+	// UserSkillIDs 绑定的用户级技能列表（仅当前用户的 published 技能）。
+	UserSkillIDs []uuid.UUID
 	// MCPIDs 绑定的 MCP 列表。
 	MCPIDs []uuid.UUID
 	// Status 版本生命周期状态。
@@ -149,6 +151,8 @@ type AgentRepository interface {
 	ListModelsByIDs(ctx context.Context, modelIDs []uuid.UUID) ([]Model, error)
 	// ListSkillsByIDs 批量读取 Skill 摘要。
 	ListSkillsByIDs(ctx context.Context, skillIDs []uuid.UUID) ([]Skill, error)
+	// ListUserSkillsByIDs 批量读取当前用户的技能摘要，用于 Agent 发布校验。
+	ListUserSkillsByIDs(ctx context.Context, userID uuid.UUID, skillIDs []uuid.UUID) ([]UserSkill, error)
 	// ListMCPsByIDs 批量读取 MCP 摘要。
 	ListMCPsByIDs(ctx context.Context, mcpIDs []uuid.UUID) ([]MCP, error)
 	// CountAgents 统计当前用户 Agent 版本总数，用于配额校验。
@@ -382,10 +386,13 @@ func (s *AgentService) validate(ctx context.Context, agent *Agent, publishing bo
 	if (agent.ModelPolicyID == nil) != (agent.ModelPolicyVersion == nil) {
 		return invalid("model policy id and version must be provided together")
 	}
-	if len(agent.SkillIDs) > 64 || len(agent.MCPIDs) > 64 {
+	if len(agent.SkillIDs)+len(agent.UserSkillIDs) > 64 || len(agent.MCPIDs) > 64 {
 		return invalid("an agent supports at most 64 skill and MCP bindings")
 	}
 	if err := uniqueUUIDs(agent.SkillIDs); err != nil {
+		return err
+	}
+	if err := uniqueUUIDs(agent.UserSkillIDs); err != nil {
 		return err
 	}
 	if err := uniqueUUIDs(agent.MCPIDs); err != nil {
@@ -439,6 +446,21 @@ func (s *AgentService) buildSnapshot(ctx context.Context, agent Agent) (map[stri
 			return nil, invalid("published agents can only bind published skills")
 		}
 	}
+	var userSkills []UserSkill
+	if len(agent.UserSkillIDs) > 0 {
+		userSkills, err = s.repo.ListUserSkillsByIDs(ctx, agent.UserID, agent.UserSkillIDs)
+		if err != nil {
+			return nil, err
+		}
+		if len(userSkills) != len(agent.UserSkillIDs) {
+			return nil, invalid("agent snapshot contains missing user skills")
+		}
+		for _, userSkill := range userSkills {
+			if userSkill.Status != UserSkillPublished {
+				return nil, invalid("published agents can only bind published user skills")
+			}
+		}
+	}
 	mcps, err := s.repo.ListMCPsByIDs(ctx, agent.MCPIDs)
 	if err != nil {
 		return nil, err
@@ -453,7 +475,7 @@ func (s *AgentService) buildSnapshot(ctx context.Context, agent Agent) (map[stri
 	}
 	return map[string]any{
 		"agent":        map[string]any{"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "version": agent.Version},
-		"model_policy": policy, "models": models, "skills": skills, "mcps": mcps,
+		"model_policy": policy, "models": models, "skills": skills, "user_skills": userSkills, "mcps": mcps,
 	}, nil
 }
 

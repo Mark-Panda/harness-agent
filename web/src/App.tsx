@@ -8,12 +8,14 @@ import AgentWizardPage from "./pages/AgentWizardPage";
 import AgentsPage from "./pages/AgentsPage";
 import AuditPage from "./pages/AuditPage";
 import ChatPage from "./pages/ChatPage";
+import TenantFeishuBotsPage from "./pages/FeishuBotsPage";
 import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
 import MemoryGraphPage from "./pages/MemoryGraphPage";
 import RegisterPage from "./pages/RegisterPage";
 import RunPage from "./pages/RunPage";
 import SessionsPage from "./pages/SessionsPage";
+import UserSkillsPage from "./pages/UserSkillsPage";
 import AdminAgentsPage from "./pages/admin/AdminAgentsPage";
 import MCPsPage from "./pages/admin/MCPsPage";
 import ModelsPage from "./pages/admin/ModelsPage";
@@ -36,7 +38,9 @@ export const appRoutes = createRoutesFromElements(
     >
       <Route path="/" element={<HomePage />} />
       <Route path="/agents" element={<AgentsPage />} />
+      <Route path="/skills" element={<UserSkillsPage />} />
       <Route path="/agents/new" element={<AgentWizardPage />} />
+      <Route path="/feishu-bots" element={<TenantFeishuBotsPage />} />
       <Route path="/agents/:agentId/edit" element={<AgentWizardPage />} />
       <Route path="/sessions" element={<SessionsPage />} />
       <Route path="/memory" element={<MemoryGraphPage />} />

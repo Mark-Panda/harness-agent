@@ -28,6 +28,20 @@ type skillRecordModel struct {
 	ParametersJSON datatypes.JSON
 	// Status 生命周期：draft/published/disabled。
 	Status string
+	// BundleFormat 技能包格式。
+	BundleFormat string
+	// BundleEntrypoint 技能包入口文件。
+	BundleEntrypoint string
+	// BundleFileCount 技能包文件数。
+	BundleFileCount int
+	// BundleTotalBytes 技能包总字节数。
+	BundleTotalBytes int64
+	// BundleHasScripts 是否包含脚本。
+	BundleHasScripts bool
+	// BundleExecutionEnabled 是否允许执行脚本。
+	BundleExecutionEnabled bool
+	// BundleDigest 技能包摘要。
+	BundleDigest string
 	// CreatedAt 创建时间。
 	CreatedAt time.Time
 	// UpdatedAt 更新时间。
@@ -257,6 +271,10 @@ func fromBizSkill(skill biz.SkillTemplate) (skillRecordModel, error) {
 	return skillRecordModel{
 		ID: skill.ID, Name: skill.Name, Version: skill.Version, Description: skill.Description,
 		PromptTemplate: skill.PromptTemplate, ParametersJSON: datatypes.JSON(parameters), Status: string(skill.Status),
+		BundleFormat: skill.Bundle.Format, BundleEntrypoint: skill.Bundle.Entrypoint,
+		BundleFileCount: skill.Bundle.FileCount, BundleTotalBytes: skill.Bundle.TotalBytes,
+		BundleHasScripts: skill.Bundle.HasScripts, BundleExecutionEnabled: skill.Bundle.ExecutionEnabled,
+		BundleDigest: skill.Bundle.Digest,
 	}, nil
 }
 
@@ -269,6 +287,12 @@ func toBizSkill(record skillRecordModel) (biz.SkillTemplate, error) {
 	return biz.SkillTemplate{
 		ID: record.ID, Name: record.Name, Version: record.Version, Description: record.Description,
 		PromptTemplate: record.PromptTemplate, Parameters: parameters, Status: biz.SkillStatus(record.Status),
+		Bundle: biz.SkillBundleInfo{
+			Format: record.BundleFormat, Entrypoint: record.BundleEntrypoint,
+			FileCount: record.BundleFileCount, TotalBytes: record.BundleTotalBytes,
+			HasScripts: record.BundleHasScripts, ExecutionEnabled: record.BundleExecutionEnabled,
+			Digest: record.BundleDigest,
+		},
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}, nil
 }

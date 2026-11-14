@@ -363,6 +363,17 @@ func (e *DeletionExecutor) DeleteMemory(ctx context.Context, userID uuid.UUID) e
 		if err := tx.Model(&sessionModel{}).Where("user_id = ?", userID).Pluck("id", &sessionIDs).Error; err != nil {
 			return err
 		}
+		// 先记录清理水位：回填与增量索引会跳过该时间之前的消息，
+		// 避免清理完成后历史会话被后台任务重新向量化。
+		clearedAt := time.Now().UTC()
+		if err := tx.Exec(`
+INSERT INTO user_memory_state (user_id, memory_cleared_at, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT (user_id) DO UPDATE
+SET memory_cleared_at = EXCLUDED.memory_cleared_at, updated_at = EXCLUDED.updated_at`,
+			userID, clearedAt, clearedAt).Error; err != nil {
+			return err
+		}
 		if err := tx.Exec(`DELETE FROM jobs WHERE user_id = ? AND job_type IN ?`,
 			userID, []string{biz.MemoryEmbedJobType, biz.SummaryJobType, biz.FactExtractJobType}).Error; err != nil {
 			return err

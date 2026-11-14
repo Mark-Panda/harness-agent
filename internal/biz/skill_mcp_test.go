@@ -1,6 +1,8 @@
 package biz_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -76,6 +78,102 @@ func TestSkillServiceLifecycleAndImmutability(t *testing.T) {
 	}
 	if _, err := biz.NewSkillService(nil); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("nil dependency error = %v", err)
+	}
+}
+
+// fakePlatformSkillBundles 是平台技能包仓储的内存实现。
+type fakePlatformSkillBundles struct {
+	info  biz.SkillBundleInfo
+	files []biz.SkillBundleFile
+}
+
+func (f *fakePlatformSkillBundles) ReplaceSkillBundle(_ context.Context, _, _ uuid.UUID, info biz.SkillBundleInfo, files []biz.SkillBundleFile, _ biz.OutboxEvent) error {
+	f.info, f.files = info, append([]biz.SkillBundleFile(nil), files...)
+	return nil
+}
+
+func (f *fakePlatformSkillBundles) ListSkillFileMeta(context.Context, uuid.UUID) ([]biz.SkillBundleFile, error) {
+	return append([]biz.SkillBundleFile(nil), f.files...), nil
+}
+
+func (f *fakePlatformSkillBundles) GetSkillFile(_ context.Context, _ uuid.UUID, path string) (biz.SkillBundleFile, error) {
+	for _, file := range f.files {
+		if file.Path == path {
+			return file, nil
+		}
+	}
+	return biz.SkillBundleFile{}, biz.ErrSkillBundleNotFound
+}
+
+func (f *fakePlatformSkillBundles) SetSkillBundleExecution(_ context.Context, _, _ uuid.UUID, enabled bool, _ biz.OutboxEvent) error {
+	f.info.ExecutionEnabled = enabled
+	return nil
+}
+
+func newPlatformSkillTestArchive(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	entries := []struct{ name, content string }{
+		{name: "SKILL.md", content: "---\nname: 平台技能\ndescription: 验证平台技能包\n---\n\n# 平台技能\n\n按步骤执行。\n"},
+		{name: "scripts/hello.py", content: "print('hello')\n"},
+		{name: "references/guide.md", content: "# 平台指南\n"},
+	}
+	for _, entry := range entries {
+		file, err := writer.Create(entry.name)
+		if err != nil {
+			t.Fatalf("create zip entry: %v", err)
+		}
+		if _, err := file.Write([]byte(entry.content)); err != nil {
+			t.Fatalf("write zip entry: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	return buffer.Bytes()
+}
+
+func TestSkillServiceBundleLifecycle(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockSkillRepository(ctrl)
+	bundles := &fakePlatformSkillBundles{}
+	admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+	service, err := biz.NewSkillService(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithBundles(bundles)
+	var created biz.SkillTemplate
+	repo.EXPECT().CreateSkill(gomock.Any(), admin.UserID, gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, skill biz.SkillTemplate, _ biz.OutboxEvent) (biz.SkillTemplate, error) {
+			created = skill
+			return skill, nil
+		},
+	)
+	repo.EXPECT().GetSkill(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID) (biz.SkillTemplate, error) {
+			current := created
+			current.Bundle = bundles.info
+			return current, nil
+		},
+	).Times(5)
+
+	imported, err := service.ImportBundle(context.Background(), admin, newPlatformSkillTestArchive(t))
+	if err != nil || imported.Bundle.FileCount != 3 || !imported.Bundle.HasScripts {
+		t.Fatalf("ImportBundle() = %#v, %v", imported, err)
+	}
+	files, err := service.GetBundleFiles(context.Background(), admin, imported.ID)
+	if err != nil || len(files) != 3 || files[0].Owner != biz.SkillFileOwnerPlatform {
+		t.Fatalf("GetBundleFiles() = %#v, %v", files, err)
+	}
+	file, err := service.ReadBundleFile(context.Background(), admin, imported.ID, "references/guide.md")
+	if err != nil || string(file.Content) != "# 平台指南\n" {
+		t.Fatalf("ReadBundleFile() = %#v, %v", file, err)
+	}
+	enabled, err := service.SetBundleExecution(context.Background(), admin, imported.ID, true)
+	if err != nil || !enabled.Bundle.ExecutionEnabled {
+		t.Fatalf("SetBundleExecution() = %#v, %v", enabled, err)
 	}
 }
 

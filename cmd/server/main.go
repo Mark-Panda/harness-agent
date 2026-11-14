@@ -251,17 +251,18 @@ func run() error {
 	}
 	// 依赖探针把故障状态暴露给负载均衡：
 	// PostgreSQL 是关键依赖，故障时实例退出流量；Redis 仅缓存与会话热数据，故障时仍可降级服务。
-	server.SetDependencyProbes(
-		server.DependencyProbe{Name: "postgres", Critical: true, Check: func(ctx context.Context) error {
+	dependencyProbes := []server.DependencyProbe{
+		{Name: "postgres", Critical: true, Check: func(ctx context.Context) error {
 			if err := appSQL.PingContext(ctx); err != nil {
 				return err
 			}
 			return authSQL.PingContext(ctx)
 		}},
-		server.DependencyProbe{Name: "redis", Critical: false, Check: func(ctx context.Context) error {
+		{Name: "redis", Critical: false, Check: func(ctx context.Context) error {
 			return redisClient.Ping(ctx).Err()
 		}},
-	)
+	}
+	server.SetDependencyProbes(dependencyProbes...)
 	// 刷新并发重放依赖 Redis 短时缓存，键只包含令牌哈希的二次摘要。
 	refreshReplay, err := data.NewRefreshReplayStore(redisClient)
 	if err != nil {
@@ -290,8 +291,9 @@ func run() error {
 		}
 		authOptions = append(authOptions, service.WithFeishuLogin(oauthClient, data.NewFeishuIdentityRepository(authDB), cfg.Feishu.LoginRedirectURL))
 	}
+	userRepository := data.NewUserRepository(appDB, authDB)
 	authService, err := service.NewAuthService(
-		data.NewUserRepository(appDB, authDB),
+		userRepository,
 		data.NewRefreshTokenRepository(authDB),
 		jwtManager,
 		[]byte(cfg.Auth.RefreshTokenPepper),
@@ -306,6 +308,8 @@ func run() error {
 		return err
 	}
 	catalogRepository := data.NewCatalogRepository(appDB)
+	// 技能包文件同时服务平台与用户技能；用户数据在仓库内部强制按 user_id 隔离。
+	skillBundleRepository := data.NewSkillBundleRepository(appDB)
 	catalogContext, cancelCatalogCheck := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelCatalogCheck()
 	if err := catalogRepository.ValidateCatalog(catalogContext); err != nil {
@@ -328,6 +332,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	skillService.WithBundles(skillBundleRepository)
 	mcpService, err := biz.NewMCPService(catalogRepository, credentialKeys)
 	if err != nil {
 		return err
@@ -342,13 +347,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// 飞书机器人注册与助手绑定：机器人配置全局共享，绑定关系按用户隔离。
+	// 飞书机器人注册与助手绑定：机器人与绑定关系均按归属用户隔离。
 	feishuBotRepository := data.NewFeishuBotRepository(appDB)
 	feishuBotService, err := biz.NewFeishuBotService(feishuBotRepository, credentialKeys, credentialKeys)
 	if err != nil {
 		return err
 	}
 	feishuBotService.WithTester(feishuBotTester{})
+	if cfg.Feishu.NormalizedEventMode() == config.FeishuEventModeLongConnection {
+		feishuBotService.WithLongConnection()
+	}
 	feishuBotBindingService, err := biz.NewFeishuBotBindingService(feishuBotRepository, feishuBotRepository, agentRepository)
 	if err != nil {
 		return err
@@ -362,6 +370,7 @@ func run() error {
 	jobRepository := data.NewJobRepository(appDB)
 	memoryRepository := data.NewMemoryRepository(appDB)
 	factRepository := data.NewFactRepository(appDB)
+	userSkillRepository := data.NewUserSkillRepository(appDB)
 	var summaryPlanner *biz.SummaryPlanner
 	var memoryIndexer *biz.MemoryIndexer
 	var memoryRetriever *biz.MemoryRetriever
@@ -385,7 +394,7 @@ func run() error {
 		}
 		memoryIndexer, err = biz.NewMemoryIndexer(sessionRepository, memoryRepository, jobRepository, biz.MemoryIndexerConfig{
 			RecentMessages: cfg.Agent.Memory.Vector.RecentMessages,
-		}, slog.Default(), nil)
+		}, slog.Default(), nil, memoryRepository)
 		if err != nil {
 			return err
 		}
@@ -486,6 +495,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	userSkillService, err := biz.NewUserSkillService(userSkillRepository)
+	if err != nil {
+		return err
+	}
+	userSkillService.WithSynthesisSettings(userSkillRepository, catalogRepository)
+	userSkillService.WithBundles(skillBundleRepository)
+	platformService.UserSkills = userSkillService
 	platformService.WithFeishuBots(feishuBotService, feishuBotBindingService)
 	// 路由健康聚合仅管理员可读，供 Web 展示熔断状态。
 	routingHealth, err := biz.NewRoutingHealthService(catalogRepository, routeHealth)
@@ -685,6 +701,10 @@ func run() error {
 			}
 			feishuLongConnection, err = feishu.NewLongConnection(feishu.LongConnectionConfig{
 				Bots: bots,
+				LoadBots: func(ctx context.Context) ([]feishu.LongConnectionBot, error) {
+					return loadFeishuLongConnectionBots(ctx, feishuBotRepository, credentialKeys, slog.Default())
+				},
+				RefreshInterval: 10 * time.Second,
 				Handler: func(ctx context.Context, botID, appID string, body []byte) error {
 					botUUID, parseErr := uuid.Parse(botID)
 					if parseErr != nil {
@@ -700,6 +720,14 @@ func run() error {
 			}
 			slog.Info("feishu long connection configured", "bots", len(bots))
 		}
+	}
+	// 长连接故障只标记降级，不摘除仍可服务 Web 请求的实例；探针不暴露凭据或上游错误详情。
+	if feishuLongConnection != nil {
+		dependencyProbes = append(dependencyProbes, server.DependencyProbe{
+			Name: "feishu_long_connection", Critical: false,
+			Check: func(context.Context) error { return feishuLongConnection.Health() },
+		})
+		server.SetDependencyProbes(dependencyProbes...)
 	}
 	// API 多维限流：全局、来源 IP 与登录用户三个维度各自独立计数；
 	// 任一维度配置为 0 视为关闭该维度，便于按环境逐步启用。
@@ -783,6 +811,7 @@ func run() error {
 			Memory: memoryRetriever, MemoryTrigger: memoryIndexer,
 			Facts: factService, FactTrigger: factIndexer,
 			Attachments:   attachmentRepository,
+			SkillBundles:  skillBundleRepository,
 			GlobalLimiter: globalLimiter, UserLimiter: userLimiter,
 			Health: routeHealth, Sandbox: sandboxRunner,
 		}, biz.WorkerConfig{
@@ -792,19 +821,24 @@ func run() error {
 			MaxPayloadBytes:           cfg.Agent.ExecutionRecords.MaxInlinePayloadBytes,
 			RetainPartialResponse:     cfg.Agent.ExecutionRecords.RetainPartialResponse,
 			RequireSandboxForHighRisk: cfg.Agent.Sandbox.RequireForHighRisk,
-			ReactMaxSteps:             cfg.Agent.Worker.ReactMaxSteps,
-			RunDeadline:               cfg.Agent.Worker.RunDeadline.Duration,
-			ReactMaxTotalTokens:       cfg.Agent.Worker.ReactMaxTotalTokens,
-			ReactMaxCost:              cfg.Agent.Worker.ReactMaxCost,
-			SupervisorMaxTokens:       cfg.Agent.Worker.SupervisorMaxTokens,
-			SupervisorMaxCost:         cfg.Agent.Worker.SupervisorMaxCost,
-			MCPTimeout:                cfg.Agent.Worker.MCPTimeout.Duration,
-			MCPAllowPrivateNetwork:    cfg.Agent.Worker.AllowPrivateMCPEndpoints,
-			ApprovalPoll:              cfg.Agent.Worker.ApprovalPoll.Duration,
-			PromptTokenBudget:         int(cfg.Agent.ModelRouting.MaxPromptTokens),
-			ReserveOutputTokens:       int(cfg.Agent.ModelRouting.ReserveOutputTokens),
-			SafetyMarginTokens:        int(cfg.Agent.ModelRouting.SafetyMarginTokens),
-			HistoryLimit:              cfg.Agent.Memory.HotWindowMessages,
+			SkillExecution: biz.SkillExecutionConfig{
+				AllowLocalExecution: cfg.Agent.Skills.EnableLocalExecution,
+				Timeout:             cfg.Agent.Skills.Timeout.Duration,
+				MaxOutputBytes:      cfg.Agent.Skills.MaxOutputBytes,
+			},
+			ReactMaxSteps:          cfg.Agent.Worker.ReactMaxSteps,
+			RunDeadline:            cfg.Agent.Worker.RunDeadline.Duration,
+			ReactMaxTotalTokens:    cfg.Agent.Worker.ReactMaxTotalTokens,
+			ReactMaxCost:           cfg.Agent.Worker.ReactMaxCost,
+			SupervisorMaxTokens:    cfg.Agent.Worker.SupervisorMaxTokens,
+			SupervisorMaxCost:      cfg.Agent.Worker.SupervisorMaxCost,
+			MCPTimeout:             cfg.Agent.Worker.MCPTimeout.Duration,
+			MCPAllowPrivateNetwork: cfg.Agent.Worker.AllowPrivateMCPEndpoints,
+			ApprovalPoll:           cfg.Agent.Worker.ApprovalPoll.Duration,
+			PromptTokenBudget:      int(cfg.Agent.ModelRouting.MaxPromptTokens),
+			ReserveOutputTokens:    int(cfg.Agent.ModelRouting.ReserveOutputTokens),
+			SafetyMarginTokens:     int(cfg.Agent.ModelRouting.SafetyMarginTokens),
+			HistoryLimit:           cfg.Agent.Memory.HotWindowMessages,
 			Routing: model.RouterConfig{
 				MinContextTokens:    cfg.Agent.ModelRouting.MinContextTokens,
 				MaxAttemptsPerModel: cfg.Agent.ModelRouting.MaxAttemptsPerModel,
@@ -919,6 +953,68 @@ func run() error {
 		go func() {
 			defer workers.Done()
 			factWorker.Start(workerContext)
+		}()
+	}
+	if cfg.Agent.Memory.SkillSynthesis.Enabled {
+		var defaultSkillPolicyID *uuid.UUID
+		if raw := strings.TrimSpace(cfg.Agent.Memory.SkillSynthesis.DefaultModelPolicyID); raw != "" {
+			parsed, parseErr := uuid.Parse(raw)
+			if parseErr != nil {
+				return parseErr
+			}
+			defaultSkillPolicyID = &parsed
+		}
+		skillExtractor, err := biz.NewSkillLLMExtractor(userSkillRepository, catalogRepository, catalogRepository, credentialKeys, biz.UserSkillLLMConfig{
+			DefaultModelPolicyID:      defaultSkillPolicyID,
+			DefaultModelPolicyVersion: cfg.Agent.Memory.SkillSynthesis.DefaultModelPolicyVersion,
+			MaxMessageBytes:           cfg.Agent.Memory.SkillSynthesis.MaxMessageBytes,
+			MaxOutputTokens:           cfg.Agent.Memory.SkillSynthesis.MaxOutputTokens,
+			Temperature:               cfg.Agent.Memory.SkillSynthesis.Temperature,
+			RequestTimeout:            cfg.Agent.Memory.SkillSynthesis.RequestTimeout.Duration,
+		})
+		if err != nil {
+			return err
+		}
+		skillExtractor.WithUsageRecorder(budgetRepository)
+		skillSynthesisWorker, err := biz.NewSkillSynthesisWorker(biz.SkillSynthesisWorkerDependencies{
+			Jobs: jobRepository, Settings: userSkillRepository, Sessions: sessionRepository, UserSkills: userSkillService,
+			Extractor: skillExtractor, Logger: slog.Default(),
+		}, biz.SkillSynthesisConfig{
+			Enabled:                cfg.Agent.Memory.SkillSynthesis.Enabled,
+			LookbackHours:          cfg.Agent.Memory.SkillSynthesis.LookbackHours,
+			MinConfidence:          cfg.Agent.Memory.SkillSynthesis.MinConfidence,
+			MaxSkillsPerUserPerDay: cfg.Agent.Memory.SkillSynthesis.MaxSkillsPerUserPerDay,
+			MaxSessionsPerUser:     cfg.Agent.Memory.SkillSynthesis.MaxSessionsPerUser,
+			MaxMessagesPerSession:  cfg.Agent.Memory.SkillSynthesis.MaxMessagesPerSession,
+			MaxMessageBytes:        cfg.Agent.Memory.SkillSynthesis.MaxMessageBytes,
+			MaxOutputTokens:        cfg.Agent.Memory.SkillSynthesis.MaxOutputTokens,
+			Temperature:            cfg.Agent.Memory.SkillSynthesis.Temperature,
+			RequestTimeout:         cfg.Agent.Memory.SkillSynthesis.RequestTimeout.Duration,
+			Concurrency:            cfg.Agent.Memory.SkillSynthesis.Concurrency,
+			PollInterval:           cfg.Agent.Memory.SkillSynthesis.PollInterval.Duration,
+			Lease:                  cfg.Agent.Memory.SkillSynthesis.Lease.Duration,
+			Heartbeat:              cfg.Agent.Memory.SkillSynthesis.Heartbeat.Duration,
+		})
+		if err != nil {
+			return err
+		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			skillSynthesisWorker.Start(workerContext)
+		}()
+		skillSynthesisMaintenance, err := biz.NewSkillSynthesisMaintenance(userRepository, userSkillRepository, jobRepository, biz.SkillSynthesisConfig{
+			Enabled:       cfg.Agent.Memory.SkillSynthesis.Enabled,
+			Interval:      cfg.Agent.Memory.SkillSynthesis.Interval.Duration,
+			LookbackHours: cfg.Agent.Memory.SkillSynthesis.LookbackHours,
+		}, slog.Default(), nil)
+		if err != nil {
+			return err
+		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			skillSynthesisMaintenance.Start(workerContext)
 		}()
 	}
 	if cfg.Agent.Worker.Enabled {

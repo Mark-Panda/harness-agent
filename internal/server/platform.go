@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/service"
+	"github.com/Mark-Panda/harness-agent/pkg/skillpkg"
 	"github.com/google/uuid"
 )
 
@@ -60,6 +61,11 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("POST /api/v1/model-policies/{id}/publish", "model_policy", handler.publishPolicy)
 	// 管理员接口：平台级 Skill 模板与 MCP 工具接入。
 	handleWrite("POST /api/v1/skills", "skill", handler.createSkill)
+	// 标准技能包：整包导入并保留多文件夹与脚本，只有管理员可操作。
+	handleWrite("POST /api/v1/skills/import", "skill", handler.importSkillPackage)
+	handle("GET /api/v1/skills/{id}/bundle", handler.getSkillBundle)
+	handle("GET /api/v1/skills/{id}/bundle/file", handler.readSkillBundleFile)
+	handleWrite("PUT /api/v1/skills/{id}/bundle/execution", "skill", handler.setSkillBundleExecution)
 	handle("GET /api/v1/skills", handler.listSkills)
 	handle("GET /api/v1/skills/{id}", handler.getSkill)
 	handle("PUT /api/v1/skills/{id}", handler.updateSkill)
@@ -81,6 +87,24 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("POST /api/v1/agents/{id}/publish", "agent", handler.publishAgent)
 	handleWrite("POST /api/v1/agents/{id}/unpublish", "agent", handler.unpublishAgent)
 	handleWrite("POST /api/v1/agents/{id}/archive", "agent", handler.archiveAgent)
+	// 用户级技能提炼设置：开关与模型策略均归属于当前登录用户。
+	handle("GET /api/v1/user-skill-synthesis/settings", handler.getUserSkillSynthesisSettings)
+	handleWrite("PUT /api/v1/user-skill-synthesis/settings", "user_skill_synthesis_settings", handler.updateUserSkillSynthesisSettings)
+	// 可选提炼策略：仅返回已发布策略，供普通用户配置提炼模型。
+	handle("GET /api/v1/user-skill-synthesis/policies", handler.listUserSkillSynthesisPolicies)
+	// 用户级技能：每日对话自动提炼生成，用户可审核、发布后被 Agent 引用。
+	handleWrite("POST /api/v1/user-skills", "user_skill", handler.createUserSkill)
+	// 用户技能包：导入后保存完整目录树，脚本默认不可执行且需人工审批。
+	handleWrite("POST /api/v1/user-skills/import", "user_skill", handler.importUserSkillPackage)
+	handle("GET /api/v1/user-skills/{id}/bundle", handler.getUserSkillBundle)
+	handle("GET /api/v1/user-skills/{id}/bundle/file", handler.readUserSkillBundleFile)
+	handleWrite("PUT /api/v1/user-skills/{id}/bundle/execution", "user_skill", handler.setUserSkillBundleExecution)
+	handle("GET /api/v1/user-skills", handler.listUserSkills)
+	handle("GET /api/v1/user-skills/{id}", handler.getUserSkill)
+	handleWrite("PUT /api/v1/user-skills/{id}", "user_skill", handler.updateUserSkill)
+	handleWrite("DELETE /api/v1/user-skills/{id}", "user_skill", handler.deleteUserSkill)
+	handleWrite("POST /api/v1/user-skills/{id}/publish", "user_skill", handler.publishUserSkill)
+	handleWrite("POST /api/v1/user-skills/{id}/disable", "user_skill", handler.disableUserSkill)
 	handleWrite("POST /api/v1/sessions", "session", handler.createSession)
 	handle("GET /api/v1/sessions", handler.listSessions)
 	handle("GET /api/v1/sessions/{id}", handler.getSession)
@@ -162,7 +186,14 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		handleWrite("PUT /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.updateFeishuBot)
 		handleWrite("DELETE /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.deleteFeishuBot)
 		handleWrite("POST /api/v1/admin/feishu-bots/{id}/test", "feishu_bot", handler.testFeishuBot)
+		// 多租户 SaaS：普通用户可创建与管理自己的机器人，归属与操作权限由 biz 层校验。
+		handleWrite("POST /api/v1/feishu/bots", "feishu_bot", handler.createFeishuBot)
+		// 租户自助视图：只返回归属当前用户的机器人，管理员返回全部。
+		handle("GET /api/v1/feishu/my-bots", handler.listMyFeishuBots)
 		handle("GET /api/v1/feishu/bots", handler.listFeishuBotOptions)
+		handleWrite("PUT /api/v1/feishu/bots/{id}", "feishu_bot", handler.updateFeishuBot)
+		handleWrite("DELETE /api/v1/feishu/bots/{id}", "feishu_bot", handler.deleteFeishuBot)
+		handleWrite("POST /api/v1/feishu/bots/{id}/test", "feishu_bot", handler.testFeishuBot)
 		handleWrite("POST /api/v1/agents/{id}/feishu-bot", "agent", handler.bindFeishuBot)
 		handleWrite("DELETE /api/v1/agents/{id}/feishu-bot", "agent", handler.unbindFeishuBot)
 	}
@@ -243,6 +274,8 @@ type agentRequest struct {
 	ModelPolicyVersion *int `json:"model_policy_version"`
 	// SkillIDs 绑定的 Skill。
 	SkillIDs []uuid.UUID `json:"skill_ids"`
+	// UserSkillIDs 绑定的用户级技能。
+	UserSkillIDs []uuid.UUID `json:"user_skill_ids"`
 	// MCPIDs 绑定的 MCP。
 	MCPIDs []uuid.UUID `json:"mcp_ids"`
 }
@@ -311,14 +344,16 @@ type feishuBotRequest struct {
 	AppID string `json:"app_id"`
 	// AppSecret 应用密钥，更新时留空表示保留原值。
 	AppSecret string `json:"app_secret"`
-	// VerificationToken 事件订阅 Verification Token。
+	// VerificationToken 事件订阅 Verification Token；长连接模式可为空。
 	VerificationToken string `json:"verification_token"`
-	// EncryptKey 事件加密密钥。
+	// EncryptKey 事件加密密钥；长连接模式可为空。
 	EncryptKey string `json:"encrypt_key"`
 	// BotOpenID 机器人 open_id。
 	BotOpenID string `json:"bot_open_id"`
 	// Status 启停状态。
 	Status biz.FeishuBotStatus `json:"status"`
+	// OwnerUserID 归属用户；仅管理员创建时可指定，普通用户创建时忽略并强制为本人。
+	OwnerUserID uuid.UUID `json:"owner_user_id"`
 }
 
 // feishuBotBindRequest 是助手绑定机器人的请求体。
@@ -380,6 +415,50 @@ func (h *platformHTTPHandler) getSkill(w http.ResponseWriter, r *http.Request) {
 func (h *platformHTTPHandler) listSkills(w http.ResponseWriter, r *http.Request) {
 	skills, err := h.service.Skills.List(r.Context(), requestPrincipal(r))
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(skills, skillResponse)}, err)
+}
+
+// importSkillPackage 处理 POST /api/v1/skills/import：整包导入平台技能。
+func (h *platformHTTPHandler) importSkillPackage(w http.ResponseWriter, r *http.Request) {
+	archive, ok := readSkillArchive(w, r)
+	if !ok {
+		return
+	}
+	skill, err := h.service.Skills.ImportBundle(r.Context(), requestPrincipal(r), archive)
+	writePlatformResult(w, http.StatusCreated, skillResponse(skill), err)
+}
+
+// getSkillBundle 处理 GET /api/v1/skills/{id}/bundle：列出平台技能包文件。
+func (h *platformHTTPHandler) getSkillBundle(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	files, err := h.service.Skills.GetBundleFiles(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, map[string]any{"files": mapItems(files, bundleFileMetaResponse)}, err)
+}
+
+// readSkillBundleFile 处理 GET /api/v1/skills/{id}/bundle/file：读取平台技能包文本文件。
+func (h *platformHTTPHandler) readSkillBundleFile(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	file, err := h.service.Skills.ReadBundleFile(r.Context(), requestPrincipal(r), id, r.URL.Query().Get("path"))
+	writePlatformResult(w, http.StatusOK, bundleFileResponse(file), err)
+}
+
+// setSkillBundleExecution 处理 PUT /api/v1/skills/{id}/bundle/execution：切换平台脚本执行开关。
+func (h *platformHTTPHandler) setSkillBundleExecution(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request bundleExecutionRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	skill, err := h.service.Skills.SetBundleExecution(r.Context(), requestPrincipal(r), id, request.Enabled)
+	writePlatformResult(w, http.StatusOK, skillResponse(skill), err)
 }
 
 // createMCP 处理 POST /api/v1/mcps：创建 MCP 并加密凭证，端点通过 SSRF 准入。
@@ -528,6 +607,12 @@ func (h *platformHTTPHandler) testFeishuBot(w http.ResponseWriter, r *http.Reque
 
 // listFeishuBots 处理 GET /api/v1/admin/feishu-bots：列出机器人及绑定助手。
 func (h *platformHTTPHandler) listFeishuBots(w http.ResponseWriter, r *http.Request) {
+	bots, err := h.service.FeishuBots.List(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(bots, feishuBotResponse)}, err)
+}
+
+// listMyFeishuBots 处理 GET /api/v1/feishu/my-bots：返回当前用户归属的机器人，管理员返回全部。
+func (h *platformHTTPHandler) listMyFeishuBots(w http.ResponseWriter, r *http.Request) {
 	bots, err := h.service.FeishuBots.List(r.Context(), requestPrincipal(r))
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(bots, feishuBotResponse)}, err)
 }
@@ -1239,6 +1324,12 @@ func writePlatformError(w http.ResponseWriter, err error) {
 		writeErrorCode(w, http.StatusConflict, "resource_conflict")
 	case errors.Is(err, biz.ErrInvalidConfig):
 		writeErrorCode(w, http.StatusBadRequest, "invalid_configuration")
+	case errors.Is(err, skillpkg.ErrInvalidPackage):
+		writeErrorCode(w, http.StatusBadRequest, "invalid_skill_package")
+	case errors.Is(err, biz.ErrSkillBundleNotFound):
+		writeErrorCode(w, http.StatusNotFound, "skill_bundle_not_found")
+	case errors.Is(err, biz.ErrSkillBundleUnsupported):
+		writeErrorCode(w, http.StatusBadRequest, "skill_bundle_unsupported")
 	case errors.Is(err, context.DeadlineExceeded):
 		// 数据库/依赖调用超时属于暂时性不可用：返回 503 与 Retry-After，提示客户端稍后重试。
 		w.Header().Set("Retry-After", "5")
@@ -1271,7 +1362,7 @@ func policyInput(request policyRequest) biz.ModelPolicy {
 
 // agentInput 将 HTTP 请求体转换为 Agent 领域实体（user_id 不来自客户端）。
 func agentInput(request agentRequest) biz.Agent {
-	return biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, MCPIDs: request.MCPIDs}
+	return biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, UserSkillIDs: request.UserSkillIDs, MCPIDs: request.MCPIDs}
 }
 
 // mcpInput 将 HTTP 请求体转换为 MCP 入参。
@@ -1288,6 +1379,7 @@ func skillResponse(skill biz.SkillTemplate) map[string]any {
 	return map[string]any{
 		"id": skill.ID, "name": skill.Name, "version": skill.Version, "description": skill.Description,
 		"prompt_template": skill.PromptTemplate, "parameters": skill.Parameters, "status": skill.Status,
+		"bundle":     bundleResponse(skill.Bundle),
 		"created_at": skill.CreatedAt, "updated_at": skill.UpdatedAt,
 	}
 }
@@ -1307,7 +1399,7 @@ func feishuBotInput(request feishuBotRequest) biz.FeishuBotInput {
 	return biz.FeishuBotInput{
 		Name: request.Name, AppID: request.AppID, AppSecret: request.AppSecret,
 		VerificationToken: request.VerificationToken, EncryptKey: request.EncryptKey,
-		BotOpenID: request.BotOpenID, Status: request.Status,
+		BotOpenID: request.BotOpenID, Status: request.Status, OwnerUserID: request.OwnerUserID,
 	}
 }
 
@@ -1315,7 +1407,8 @@ func feishuBotInput(request feishuBotRequest) biz.FeishuBotInput {
 func feishuBotResponse(bot biz.FeishuBot) map[string]any {
 	return map[string]any{
 		"id": bot.ID, "name": bot.Name, "app_id": bot.AppID, "bot_open_id": bot.BotOpenID,
-		"key_version": bot.KeyVersion, "status": bot.Status,
+		"owner_user_id": bot.OwnerUserID,
+		"key_version":   bot.KeyVersion, "status": bot.Status,
 		"bound_user_id": bot.BoundUserID, "bound_username": bot.BoundUsername,
 		"bound_agent_id": bot.BoundAgentID, "bound_agent_name": bot.BoundAgentName,
 		"bound_agent_version": bot.BoundAgentVersion,
@@ -1366,7 +1459,8 @@ func agentResponse(agent biz.Agent) map[string]any {
 	return map[string]any{
 		"id": agent.ID, "user_id": agent.UserID, "name": agent.Name, "description": agent.Description, "mode": agent.Mode,
 		"model_policy_id": agent.ModelPolicyID, "model_policy_version": agent.ModelPolicyVersion, "version": agent.Version,
-		"config_snapshot": agent.ConfigSnapshot, "skill_ids": agent.SkillIDs, "mcp_ids": agent.MCPIDs, "status": agent.Status,
+		"config_snapshot": agent.ConfigSnapshot, "skill_ids": agent.SkillIDs, "user_skill_ids": agent.UserSkillIDs,
+		"mcp_ids": agent.MCPIDs, "status": agent.Status,
 		"created_at": agent.CreatedAt, "updated_at": agent.UpdatedAt,
 	}
 }
@@ -1425,4 +1519,263 @@ func mapItems[T any](items []T, convert func(T) map[string]any) []map[string]any
 		result = append(result, convert(item))
 	}
 	return result
+}
+
+// userSkillRequest 是创建或更新用户技能的请求体。
+type userSkillRequest struct {
+	// Name 技能名称。
+	Name string `json:"name"`
+	// Description 用途描述。
+	Description string `json:"description"`
+	// PromptTemplate 提示词模板。
+	PromptTemplate string `json:"prompt_template"`
+	// Parameters 参数定义 JSON Schema。
+	Parameters map[string]any `json:"parameters"`
+}
+
+// createUserSkill 处理 POST /api/v1/user-skills：手动创建技能草稿。
+func (h *platformHTTPHandler) createUserSkill(w http.ResponseWriter, r *http.Request) {
+	var request userSkillRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	skill, err := h.service.UserSkills.Create(r.Context(), requestPrincipal(r), biz.UserSkill{
+		Name: request.Name, Description: request.Description,
+		PromptTemplate: request.PromptTemplate, Parameters: request.Parameters,
+	})
+	writePlatformResult(w, http.StatusCreated, userSkillResponse(skill), err)
+}
+
+// updateUserSkill 处理 PUT /api/v1/user-skills/{id}：更新技能草稿（仅 auto_generated 可修改）。
+func (h *platformHTTPHandler) updateUserSkill(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request userSkillRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	skill, err := h.service.UserSkills.Update(r.Context(), requestPrincipal(r), biz.UserSkill{
+		ID: id, Description: request.Description,
+		PromptTemplate: request.PromptTemplate, Parameters: request.Parameters,
+	})
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// getUserSkill 处理 GET /api/v1/user-skills/{id}：读取当前用户技能。
+func (h *platformHTTPHandler) getUserSkill(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	skill, err := h.service.UserSkills.Get(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// deleteUserSkill 处理 DELETE /api/v1/user-skills/{id}：删除当前用户技能。
+func (h *platformHTTPHandler) deleteUserSkill(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	writePlatformResult(w, http.StatusNoContent, nil, h.service.UserSkills.Delete(r.Context(), requestPrincipal(r), id))
+}
+
+// publishUserSkill 处理 POST /api/v1/user-skills/{id}/publish：发布技能使其可被 Agent 引用。
+func (h *platformHTTPHandler) publishUserSkill(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	skill, err := h.service.UserSkills.Publish(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// disableUserSkill 处理 POST /api/v1/user-skills/{id}/disable：停用技能。
+func (h *platformHTTPHandler) disableUserSkill(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	skill, err := h.service.UserSkills.Disable(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// listUserSkills 处理 GET /api/v1/user-skills：列出当前用户全部技能。
+func (h *platformHTTPHandler) listUserSkills(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	skills, err := h.service.UserSkills.List(r.Context(), requestPrincipal(r), limit)
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": mapItems(skills, userSkillResponse)}, err)
+}
+
+// importUserSkillPackage 处理 POST /api/v1/user-skills/import：整包导入用户技能。
+func (h *platformHTTPHandler) importUserSkillPackage(w http.ResponseWriter, r *http.Request) {
+	archive, ok := readSkillArchive(w, r)
+	if !ok {
+		return
+	}
+	skill, err := h.service.UserSkills.ImportBundle(r.Context(), requestPrincipal(r), archive)
+	writePlatformResult(w, http.StatusCreated, userSkillResponse(skill), err)
+}
+
+// getUserSkillBundle 处理 GET /api/v1/user-skills/{id}/bundle：列出用户技能包文件。
+func (h *platformHTTPHandler) getUserSkillBundle(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	files, err := h.service.UserSkills.GetBundleFiles(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, map[string]any{"files": mapItems(files, bundleFileMetaResponse)}, err)
+}
+
+// readUserSkillBundleFile 处理 GET /api/v1/user-skills/{id}/bundle/file：读取用户技能包文本文件。
+func (h *platformHTTPHandler) readUserSkillBundleFile(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	file, err := h.service.UserSkills.ReadBundleFile(r.Context(), requestPrincipal(r), id, r.URL.Query().Get("path"))
+	writePlatformResult(w, http.StatusOK, bundleFileResponse(file), err)
+}
+
+// setUserSkillBundleExecution 处理 PUT /api/v1/user-skills/{id}/bundle/execution：切换脚本执行开关。
+func (h *platformHTTPHandler) setUserSkillBundleExecution(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request bundleExecutionRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	skill, err := h.service.UserSkills.SetBundleExecution(r.Context(), requestPrincipal(r), id, request.Enabled)
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// bundleExecutionRequest 是脚本执行开关请求体。
+type bundleExecutionRequest struct {
+	// Enabled 是否允许执行包内脚本。
+	Enabled bool `json:"enabled"`
+}
+
+// readSkillArchive 读取 multipart 中的技能包 zip，并限制请求体大小。
+func readSkillArchive(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, skillpkg.MaxArchiveBytes+1<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErrorCode(w, http.StatusRequestEntityTooLarge, "skill_package_too_large")
+			return nil, false
+		}
+		writeErrorCode(w, http.StatusBadRequest, "invalid_multipart")
+		return nil, false
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "file_field_required")
+		return nil, false
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, skillpkg.MaxArchiveBytes+1))
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "read_file_failed")
+		return nil, false
+	}
+	if len(data) > skillpkg.MaxArchiveBytes {
+		writeErrorCode(w, http.StatusRequestEntityTooLarge, "skill_package_too_large")
+		return nil, false
+	}
+	return data, true
+}
+
+// bundleResponse 构造技能包元数据出参；未导入时返回 nil。
+func bundleResponse(info biz.SkillBundleInfo) map[string]any {
+	if info.Empty() {
+		return nil
+	}
+	return map[string]any{
+		"format": info.Format, "entrypoint": info.Entrypoint, "file_count": info.FileCount,
+		"total_bytes": info.TotalBytes, "has_scripts": info.HasScripts,
+		"execution_enabled": info.ExecutionEnabled, "digest": info.Digest,
+	}
+}
+
+// bundleFileMetaResponse 构造技能包文件元数据出参。
+func bundleFileMetaResponse(file biz.SkillBundleFile) map[string]any {
+	return map[string]any{
+		"path": file.Path, "mime": file.MIME, "size": file.SizeBytes,
+		"sha256": file.SHA256, "is_script": file.IsScript,
+	}
+}
+
+// bundleFileResponse 构造技能包文件内容出参。
+func bundleFileResponse(file biz.SkillBundleFile) map[string]any {
+	result := bundleFileMetaResponse(file)
+	result["content"] = string(file.Content)
+	return result
+}
+
+// userSkillResponse 构造用户技能出参。
+func userSkillResponse(skill biz.UserSkill) map[string]any {
+	return map[string]any{
+		"id": skill.ID, "user_id": skill.UserID, "name": skill.Name, "version": skill.Version,
+		"description": skill.Description, "prompt_template": skill.PromptTemplate,
+		"parameters": skill.Parameters, "status": skill.Status, "origin": skill.Origin,
+		"source_session_ids": skill.SourceSessionIDs, "confidence": skill.Confidence,
+		"bundle":     bundleResponse(skill.Bundle),
+		"created_at": skill.CreatedAt, "updated_at": skill.UpdatedAt,
+	}
+}
+
+// userSkillSynthesisSettingsRequest 是完整替换提炼设置的请求体；不接受 user_id。
+type userSkillSynthesisSettingsRequest struct {
+	Enabled            bool       `json:"enabled"`
+	ModelPolicyID      *uuid.UUID `json:"model_policy_id"`
+	ModelPolicyVersion *int       `json:"model_policy_version"`
+}
+
+// getUserSkillSynthesisSettings 处理 GET /api/v1/user-skill-synthesis/settings。
+func (h *platformHTTPHandler) getUserSkillSynthesisSettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := h.service.UserSkills.GetSynthesisSettings(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusOK, userSkillSynthesisSettingsResponse(settings), err)
+}
+
+// updateUserSkillSynthesisSettings 处理 PUT /api/v1/user-skill-synthesis/settings。
+func (h *platformHTTPHandler) updateUserSkillSynthesisSettings(w http.ResponseWriter, r *http.Request) {
+	var request userSkillSynthesisSettingsRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	settings, err := h.service.UserSkills.UpdateSynthesisSettings(r.Context(), requestPrincipal(r), biz.UserSkillSynthesisSettings{
+		Enabled: request.Enabled, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion,
+	})
+	writePlatformResult(w, http.StatusOK, userSkillSynthesisSettingsResponse(settings), err)
+}
+
+// listUserSkillSynthesisPolicies 处理 GET /api/v1/user-skill-synthesis/policies：列出可选已发布策略。
+func (h *platformHTTPHandler) listUserSkillSynthesisPolicies(w http.ResponseWriter, r *http.Request) {
+	policies, err := h.service.UserSkills.ListSynthesisPolicies(r.Context(), requestPrincipal(r))
+	items := make([]map[string]any, 0, len(policies))
+	for _, policy := range policies {
+		items = append(items, map[string]any{
+			"id": policy.ID, "name": policy.Name, "version": policy.Version,
+		})
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items}, err)
+}
+
+// userSkillSynthesisSettingsResponse 构造用户提炼设置出参。
+func userSkillSynthesisSettingsResponse(settings biz.UserSkillSynthesisSettings) map[string]any {
+	return map[string]any{
+		"enabled": settings.Enabled, "model_policy_id": settings.ModelPolicyID,
+		"model_policy_version": settings.ModelPolicyVersion,
+		"created_at":           settings.CreatedAt, "updated_at": settings.UpdatedAt,
+	}
 }

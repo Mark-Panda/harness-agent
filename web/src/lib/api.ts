@@ -122,6 +122,13 @@ export function uploadAttachment<T>(path: string, file: File): Promise<T> {
   return requestJSON<T>(path, { method: "POST", body });
 }
 
+// uploadSkillPackage 以 multipart 上传标准技能包 zip，保留完整目录树与脚本。
+export function uploadSkillPackage<T>(path: string, file: File): Promise<T> {
+  const body = new FormData();
+  body.append("file", file);
+  return requestJSON<T>(path, { method: "POST", body });
+}
+
 // downloadAttachment 鉴权下载附件并触发浏览器保存，避免把令牌拼进 URL。
 export async function downloadAttachment(path: string, filename: string): Promise<void> {
   const attempt = async (retry: boolean): Promise<Response> => {

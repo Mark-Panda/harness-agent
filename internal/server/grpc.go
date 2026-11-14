@@ -34,6 +34,7 @@ func NewGRPCServer(addr string, auth AuthApplication, platform *service.Platform
 	harnessv1.RegisterModelCatalogServiceServer(server, platformServer)
 	harnessv1.RegisterModelPolicyServiceServer(server, platformServer)
 	harnessv1.RegisterAgentServiceServer(server, platformServer)
+	harnessv1.RegisterUserSkillServiceServer(server, platformServer)
 	harnessv1.RegisterConversationServiceServer(server, platformServer)
 	return &GRPCServer{addr: addr, server: server}, nil
 }

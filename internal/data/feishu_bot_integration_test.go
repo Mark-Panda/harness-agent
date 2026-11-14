@@ -51,7 +51,7 @@ VALUES (?, ?, ?, '', 'react', 1, 'published', '{}'::jsonb)`, id, owner.ID, name)
 
 	repo := NewFeishuBotRepository(appDB)
 	bot, err := repo.CreateFeishuBot(ctx, owner.ID, biz.FeishuBot{
-		ID: botID, Name: "integration-bot-" + suffix, AppID: "cli_" + suffix, BotOpenID: "ou_" + suffix, Status: biz.FeishuBotEnabled,
+		ID: botID, Name: "integration-bot-" + suffix, AppID: "cli_" + suffix, OwnerUserID: owner.ID, BotOpenID: "ou_" + suffix, Status: biz.FeishuBotEnabled,
 	}, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, testOutboxEvent(owner.ID, "feishu_bot.created"))
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ VALUES (?, ?, ?, '', 'react', 1, 'published', '{}'::jsonb)`, id, owner.ID, name)
 		t.Fatalf("duplicate bind error = %v", err)
 	}
 
-	// 所有者可见自己的绑定，其他用户只能看到占用状态。
+	// 所有者可见自己的绑定，其他租户看不到该机器人。
 	findBot := func(bots []biz.FeishuBot) (biz.FeishuBot, bool) {
 		for _, item := range bots {
 			if item.ID == botID {
@@ -87,8 +87,8 @@ VALUES (?, ?, ?, '', 'react', 1, 'published', '{}'::jsonb)`, id, owner.ID, name)
 		t.Fatalf("owner bots = %#v, %v", ownerBots, err)
 	}
 	otherBots, err := repo.ListFeishuBotsForUser(ctx, other.ID)
-	otherView, ok := findBot(otherBots)
-	if err != nil || !ok || otherView.BoundAgentID != nil {
+	_, ok = findBot(otherBots)
+	if err != nil || ok {
 		t.Fatalf("other bots = %#v, %v", otherBots, err)
 	}
 	found, exists, err := repo.LookupFeishuBot(ctx, "cli_"+suffix)

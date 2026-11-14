@@ -331,6 +331,8 @@ message Agent {
   google.protobuf.Timestamp created_at = 13;
   // updated_at 更新时间（UTC）。
   google.protobuf.Timestamp updated_at = 14;
+  // user_skill_ids 绑定的用户级技能列表。
+  repeated string user_skill_ids = 15;
 }
 
 // CreateAgentRequest 是创建 Agent 草稿的入参。
@@ -349,6 +351,8 @@ message CreateAgentRequest {
   repeated string skill_ids = 6;
   // mcp_ids 绑定的 MCP 列表。
   repeated string mcp_ids = 7;
+  // user_skill_ids 绑定的用户级技能列表。
+  repeated string user_skill_ids = 8;
 }
 
 // UpdateAgentRequest 是更新 Agent 草稿的入参；名称与版本由服务端保持。
@@ -367,6 +371,8 @@ message UpdateAgentRequest {
   repeated string skill_ids = 6;
   // mcp_ids 绑定的 MCP 列表。
   repeated string mcp_ids = 7;
+  // user_skill_ids 绑定的用户级技能列表。
+  repeated string user_skill_ids = 8;
 }
 
 // GetAgentRequest 是读取 Agent 的入参。
@@ -407,6 +413,182 @@ message ListAgentsResponse {
   repeated Agent items = 1;
   // next_cursor 下一页游标，空串表示末页。
   string next_cursor = 2;
+}
+
+// UserSkill 是用户级技能模板，从每日有效对话自动提炼或用户手动创建。
+message UserSkill {
+  // id 技能 ID。
+  string id = 1;
+  // user_id 所属用户 ID（只读）。
+  string user_id = 2;
+  // name 技能名称。
+  string name = 3;
+  // version 版本号。
+  int32 version = 4;
+  // description 用途描述。
+  string description = 5;
+  // prompt_template 提示词模板。
+  string prompt_template = 6;
+  // parameters 参数定义 JSON Schema。
+  google.protobuf.Struct parameters = 7;
+  // status 生命周期：auto_generated/published/disabled。
+  string status = 8;
+  // origin 来源：auto/manual。
+  string origin = 9;
+  // source_session_ids 提炼来源会话 ID 列表。
+  repeated string source_session_ids = 10;
+  // confidence LLM 判定置信度 [0,1]。
+  double confidence = 11;
+  // created_at 创建时间（UTC）。
+  google.protobuf.Timestamp created_at = 12;
+  // updated_at 更新时间（UTC）。
+  google.protobuf.Timestamp updated_at = 13;
+}
+
+// CreateUserSkillRequest 是用户手动创建技能的入参。
+message CreateUserSkillRequest {
+  // name 技能名称。
+  string name = 1;
+  // description 用途描述。
+  string description = 2;
+  // prompt_template 提示词模板。
+  string prompt_template = 3;
+  // parameters 参数定义 JSON Schema。
+  google.protobuf.Struct parameters = 4;
+}
+
+// UpdateUserSkillRequest 是更新技能草稿的入参；仅 auto_generated 状态可修改。
+message UpdateUserSkillRequest {
+  // id 技能 ID。
+  string id = 1;
+  // description 用途描述。
+  string description = 2;
+  // prompt_template 提示词模板。
+  string prompt_template = 3;
+  // parameters 参数定义 JSON Schema。
+  google.protobuf.Struct parameters = 4;
+}
+
+// GetUserSkillRequest 是读取技能的入参。
+message GetUserSkillRequest {
+  // id 技能 ID。
+  string id = 1;
+}
+
+// DeleteUserSkillRequest 是删除技能的入参。
+message DeleteUserSkillRequest {
+  // id 技能 ID。
+  string id = 1;
+}
+
+// PublishUserSkillRequest 是发布技能的入参。
+message PublishUserSkillRequest {
+  // id 技能 ID。
+  string id = 1;
+}
+
+// DisableUserSkillRequest 是停用技能的入参。
+message DisableUserSkillRequest {
+  // id 技能 ID。
+  string id = 1;
+}
+
+// ListUserSkillsRequest 是列出用户技能的入参。
+message ListUserSkillsRequest {
+  // limit 页大小，1-200，默认 50。
+  int32 limit = 1;
+}
+
+// ListUserSkillsResponse 是用户技能列表出参。
+message ListUserSkillsResponse {
+  // items 用户技能列表。
+  repeated UserSkill items = 1;
+}
+
+// SynthesisPolicyOption 是用户可选的已发布提炼策略。
+message SynthesisPolicyOption {
+  // id 策略 ID。
+  string id = 1;
+  // name 策略名称。
+  string name = 2;
+  // version 已发布版本号。
+  int32 version = 3;
+}
+
+// ListUserSkillSynthesisPoliciesRequest 是列出可选提炼策略的入参。
+message ListUserSkillSynthesisPoliciesRequest {}
+
+// ListUserSkillSynthesisPoliciesResponse 是可选提炼策略出参。
+message ListUserSkillSynthesisPoliciesResponse {
+  // items 已发布策略列表。
+  repeated SynthesisPolicyOption items = 1;
+}
+
+// CreateUserSkillResponse 是创建技能的出参。
+message CreateUserSkillResponse {
+  // skill 创建的技能。
+  UserSkill skill = 1;
+}
+
+// UpdateUserSkillResponse 是更新技能的出参。
+message UpdateUserSkillResponse {
+  // skill 更新后的技能。
+  UserSkill skill = 1;
+}
+
+// GetUserSkillResponse 是读取技能的出参。
+message GetUserSkillResponse {
+  // skill 技能详情。
+  UserSkill skill = 1;
+}
+
+// DeleteUserSkillResponse 是删除技能的出参。
+message DeleteUserSkillResponse {}
+
+// PublishUserSkillResponse 是发布技能的出参。
+message PublishUserSkillResponse {
+  // skill 发布后的技能。
+  UserSkill skill = 1;
+}
+
+// DisableUserSkillResponse 是停用技能的出参。
+message DisableUserSkillResponse {
+  // skill 停用后的技能。
+  UserSkill skill = 1;
+}
+
+// UserSkillSynthesisSettings 是当前用户的每日技能提炼设置。
+message UserSkillSynthesisSettings {
+  // enabled 是否允许后台分析对话，默认 false。
+  bool enabled = 1;
+  // model_policy_id 用户选择的已发布平台策略；为空时使用平台默认策略。
+  optional string model_policy_id = 2;
+  // model_policy_version 策略版本，与 model_policy_id 成对出现。
+  optional int32 model_policy_version = 3;
+  // created_at 首次保存时间；从未保存时为空。
+  google.protobuf.Timestamp created_at = 4;
+  // updated_at 最后保存时间；从未保存时为空。
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// GetUserSkillSynthesisSettingsRequest 是读取当前用户提炼设置的入参。
+message GetUserSkillSynthesisSettingsRequest {}
+
+// GetUserSkillSynthesisSettingsResponse 是提炼设置出参。
+message GetUserSkillSynthesisSettingsResponse {
+  UserSkillSynthesisSettings settings = 1;
+}
+
+// UpdateUserSkillSynthesisSettingsRequest 完整替换当前用户提炼设置。
+message UpdateUserSkillSynthesisSettingsRequest {
+  bool enabled = 1;
+  optional string model_policy_id = 2;
+  optional int32 model_policy_version = 3;
+}
+
+// UpdateUserSkillSynthesisSettingsResponse 是更新后的提炼设置出参。
+message UpdateUserSkillSynthesisSettingsResponse {
+  UserSkillSynthesisSettings settings = 1;
 }
 
 // Session 是用户私有会话的对外视图。
@@ -617,6 +799,30 @@ service AgentService {
   rpc CreateAgentVersion(CreateAgentVersionRequest) returns (CreateAgentVersionResponse);
   // ListAgents 游标分页列出当前用户的 Agent。
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+}
+
+// UserSkillService 管理当前用户的私有技能（含每日对话自动提炼生成的技能）。
+service UserSkillService {
+  // CreateUserSkill 手动创建技能草稿。
+  rpc CreateUserSkill(CreateUserSkillRequest) returns (CreateUserSkillResponse);
+  // UpdateUserSkill 更新技能草稿（仅 auto_generated 状态可修改）。
+  rpc UpdateUserSkill(UpdateUserSkillRequest) returns (UpdateUserSkillResponse);
+  // GetUserSkill 读取技能。
+  rpc GetUserSkill(GetUserSkillRequest) returns (GetUserSkillResponse);
+  // DeleteUserSkill 删除技能。
+  rpc DeleteUserSkill(DeleteUserSkillRequest) returns (DeleteUserSkillResponse);
+  // PublishUserSkill 发布技能，使其可被 Agent 引用。
+  rpc PublishUserSkill(PublishUserSkillRequest) returns (PublishUserSkillResponse);
+  // DisableUserSkill 停用技能。
+  rpc DisableUserSkill(DisableUserSkillRequest) returns (DisableUserSkillResponse);
+  // ListUserSkills 列出当前用户的全部技能。
+  rpc ListUserSkills(ListUserSkillsRequest) returns (ListUserSkillsResponse);
+  // GetUserSkillSynthesisSettings 读取当前用户的技能提炼设置。
+  rpc GetUserSkillSynthesisSettings(GetUserSkillSynthesisSettingsRequest) returns (GetUserSkillSynthesisSettingsResponse);
+  // UpdateUserSkillSynthesisSettings 完整替换当前用户的技能提炼设置。
+  rpc UpdateUserSkillSynthesisSettings(UpdateUserSkillSynthesisSettingsRequest) returns (UpdateUserSkillSynthesisSettingsResponse);
+  // ListUserSkillSynthesisPolicies 列出当前用户可选的已发布提炼策略。
+  rpc ListUserSkillSynthesisPolicies(ListUserSkillSynthesisPoliciesRequest) returns (ListUserSkillSynthesisPoliciesResponse);
 }
 
 // ConversationService 管理当前用户的会话与消息。

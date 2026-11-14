@@ -46,6 +46,8 @@ func loadFactSourceMessages(tx *gorm.DB, task biz.FactTask) ([]biz.Message, erro
 	var records []messageModel
 	query := tx.Where(`user_id = ? AND session_id = ? AND id IN ? AND deleted_at IS NULL
 		AND feishu_group_message_id IS NULL AND content ~ '[^[:space:]]'`, task.UserID, task.SessionID, task.MessageIDs)
+	// 用户清理记忆后，清理前的消息不得再次参与事实提取或重建画像。
+	query = query.Where(memoryClearedFilter, task.UserID)
 	if speaker {
 		query = query.Where("role = 'user' AND speaker_open_id = ?", task.SpeakerOpenID)
 	} else {

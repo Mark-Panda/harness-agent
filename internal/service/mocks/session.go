@@ -12,6 +12,7 @@ package mocks
 import (
 	context "context"
 	reflect "reflect"
+	time "time"
 
 	biz "github.com/Mark-Panda/harness-agent/internal/biz"
 	uuid "github.com/google/uuid"
@@ -253,6 +254,21 @@ func (m *MockSessionRepository) ListSessions(ctx context.Context, userID uuid.UU
 func (mr *MockSessionRepositoryMockRecorder) ListSessions(ctx, userID, limit, cursor any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListSessions", reflect.TypeOf((*MockSessionRepository)(nil).ListSessions), ctx, userID, limit, cursor)
+}
+
+// ListSessionsActiveSince mocks base method.
+func (m *MockSessionRepository) ListSessionsActiveSince(ctx context.Context, userID uuid.UUID, since time.Time, limit int) ([]biz.Session, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListSessionsActiveSince", ctx, userID, since, limit)
+	ret0, _ := ret[0].([]biz.Session)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListSessionsActiveSince indicates an expected call of ListSessionsActiveSince.
+func (mr *MockSessionRepositoryMockRecorder) ListSessionsActiveSince(ctx, userID, since, limit any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListSessionsActiveSince", reflect.TypeOf((*MockSessionRepository)(nil).ListSessionsActiveSince), ctx, userID, since, limit)
 }
 
 // UpdateSessionMemoryPolicy mocks base method.

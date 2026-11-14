@@ -114,6 +114,8 @@ type WorkerConfig struct {
 	RetainPartialResponse bool
 	// RequireSandboxForHighRisk 高风险工具必须通过独立 Sandbox Runner 执行。
 	RequireSandboxForHighRisk bool
+	// SkillExecution 标准技能包脚本执行护栏；生产环境必须保持关闭。
+	SkillExecution SkillExecutionConfig
 	// ReactMaxSteps 单次 ReAct Run 允许的最大模型步数，默认 12。
 	ReactMaxSteps int
 	// RunDeadline 单次 Run 的总时长上限，默认 5 分钟。
@@ -273,6 +275,8 @@ type ExecutionWorkerDependencies struct {
 	Facts FactReader
 	// Attachments 会话附件文本读取端口，可为空表示不注入附件内容。
 	Attachments AttachmentTextReader
+	// SkillBundles 标准技能包文件读取端口，可为空表示不加载技能工具。
+	SkillBundles SkillBundleReader
 	// FactTrigger 事实提取任务触发端口，可为空表示不触发事实提取。
 	FactTrigger FactTrigger
 	// MCPs MCP 凭证读取端口，可为空表示不加载远端工具。
@@ -317,6 +321,8 @@ type ExecutionWorker struct {
 	memoryTrigger    MemoryTrigger
 	facts            FactReader
 	attachments      AttachmentTextReader
+	skillBundles     SkillBundleReader
+	skillExecSem     chan struct{}
 	factTrigger      FactTrigger
 	mcps             MCPCredentialRepository
 	mcpClient        func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
@@ -369,6 +375,8 @@ func NewExecutionWorker(dependencies ExecutionWorkerDependencies, config WorkerC
 		memory: dependencies.Memory, memoryTrigger: dependencies.MemoryTrigger,
 		facts: dependencies.Facts, factTrigger: dependencies.FactTrigger,
 		attachments:   dependencies.Attachments,
+		skillBundles:  dependencies.SkillBundles,
+		skillExecSem:  make(chan struct{}, maxSkillConcurrentScripts),
 		globalLimiter: dependencies.GlobalLimiter, userLimiter: dependencies.UserLimiter,
 		health: dependencies.Health, config: config.normalize(), clock: clock, logger: logger,
 	}, nil
@@ -777,6 +785,8 @@ const agentBehaviorInstruction = `回答规范：
 
 // snapshotSkill 是发布快照中的 Skill 冻结视图。
 type snapshotSkill struct {
+	// ID Skill 唯一标识，用于加载技能包文件。
+	ID string `json:"id"`
 	// Name Skill 名称。
 	Name string `json:"name"`
 	// Description Skill 用途说明。
@@ -787,16 +797,26 @@ type snapshotSkill struct {
 	Parameters map[string]any `json:"parameters,omitempty"`
 }
 
-// snapshotSkills 从 Run 配置快照读取冻结的 Skill；兼容新旧两种快照层级。
+// snapshotSkills 从 Run 配置快照读取冻结的平台 Skill；兼容新旧两种快照层级。
 func snapshotSkills(snapshot map[string]any) []snapshotSkill {
+	return snapshotSkillList(snapshot, "skills")
+}
+
+// snapshotUserSkills 从 Run 配置快照读取冻结的用户 Skill。
+func snapshotUserSkills(snapshot map[string]any) []snapshotSkill {
+	return snapshotSkillList(snapshot, "user_skills")
+}
+
+// snapshotSkillList 按字段名读取快照中的技能列表。
+func snapshotSkillList(snapshot map[string]any, key string) []snapshotSkill {
 	if snapshot == nil {
 		return nil
 	}
-	raw, exists := snapshot["skills"]
+	raw, exists := snapshot[key]
 	if !exists {
 		// Run 快照把 Agent 发布快照放在 published_snapshot 下，历史实现曾直接平铺。
 		nested, _ := snapshot["published_snapshot"].(map[string]any)
-		raw = nested["skills"]
+		raw = nested[key]
 	}
 	if raw == nil {
 		return nil
@@ -808,6 +828,33 @@ func snapshotSkills(snapshot map[string]any) []snapshotSkill {
 	var skills []snapshotSkill
 	if err := json.Unmarshal(encoded, &skills); err != nil {
 		return nil
+	}
+	// 兼容历史快照：早期直接序列化领域结构，键名是 Go 字段名。
+	var legacy []struct {
+		ID             uuid.UUID
+		Name           string
+		Description    string
+		PromptTemplate string
+		Parameters     map[string]any
+	}
+	if err := json.Unmarshal(encoded, &legacy); err == nil && len(legacy) == len(skills) {
+		for index := range skills {
+			if skills[index].ID == "" && legacy[index].ID != uuid.Nil {
+				skills[index].ID = legacy[index].ID.String()
+			}
+			if skills[index].Name == "" {
+				skills[index].Name = legacy[index].Name
+			}
+			if skills[index].Description == "" {
+				skills[index].Description = legacy[index].Description
+			}
+			if skills[index].PromptTemplate == "" {
+				skills[index].PromptTemplate = legacy[index].PromptTemplate
+			}
+			if len(skills[index].Parameters) == 0 {
+				skills[index].Parameters = legacy[index].Parameters
+			}
+		}
 	}
 	return skills
 }
@@ -834,41 +881,52 @@ func (w *ExecutionWorker) buildSystemPrompt(run Run, factsText string) string {
 	builder.WriteString(agentBehaviorInstruction)
 	builder.WriteString("\n")
 	builder.WriteString(UntrustedContentInstruction)
-	if skills := snapshotSkills(run.ConfigSnapshot); len(skills) > 0 {
-		builder.WriteString("\n\n以下是当前 Agent 绑定的 Skill 指令；Skill 属于系统指令的一部分，按顺序执行：")
-		remaining := maxSkillsTotalTokens
-		for _, skill := range skills {
-			if strings.TrimSpace(skill.PromptTemplate) == "" {
-				continue
-			}
-			// 每个 Skill 与全部 Skill 的总量都有上限，防止超长模板挤占 system 段预算。
-			prompt := truncateTextByTokens(skill.PromptTemplate, maxSkillPromptTokens)
-			description := truncateTextByTokens(skill.Description, maxSkillDescriptionTokens)
-			parameters := renderSkillParameters(skill.Parameters)
-			remaining -= react.EstimateTextTokens(prompt) + react.EstimateTextTokens(description) + react.EstimateTextTokens(parameters)
-			builder.WriteString("\n\n## Skill：")
-			builder.WriteString(skill.Name)
-			if description != "" {
-				builder.WriteString("\n用途：")
-				builder.WriteString(description)
-			}
-			builder.WriteString("\n")
-			builder.WriteString(prompt)
-			if parameters != "" {
-				builder.WriteString(skillParameterInstruction)
-				builder.WriteString(parameters)
-			}
-			if remaining <= 0 {
-				builder.WriteString("\n（其余 Skill 因上下文预算已省略）")
-				break
-			}
-		}
+	appendSkillSection(&builder, snapshotSkills(run.ConfigSnapshot))
+	appendSkillSection(&builder, snapshotUserSkills(run.ConfigSnapshot))
+	if resources, ok := run.ConfigSnapshot["skill_resources"].(string); ok && strings.TrimSpace(resources) != "" {
+		builder.WriteString("\n\n")
+		builder.WriteString(resources)
 	}
 	if strings.TrimSpace(factsText) != "" {
 		builder.WriteString("\n\n")
 		builder.WriteString(truncateTextByTokens(factsText, maxFactsTokens))
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+// appendSkillSection 把一组技能指令注入系统提示，并强制单技能与总量预算。
+func appendSkillSection(builder *strings.Builder, skills []snapshotSkill) {
+	if len(skills) == 0 {
+		return
+	}
+	builder.WriteString("\n\n以下是当前 Agent 绑定的 Skill 指令；Skill 属于系统指令的一部分，按顺序执行：")
+	remaining := maxSkillsTotalTokens
+	for _, skill := range skills {
+		if strings.TrimSpace(skill.PromptTemplate) == "" {
+			continue
+		}
+		// 每个 Skill 与全部 Skill 的总量都有上限，防止超长模板挤占 system 段预算。
+		prompt := truncateTextByTokens(skill.PromptTemplate, maxSkillPromptTokens)
+		description := truncateTextByTokens(skill.Description, maxSkillDescriptionTokens)
+		parameters := renderSkillParameters(skill.Parameters)
+		remaining -= react.EstimateTextTokens(prompt) + react.EstimateTextTokens(description) + react.EstimateTextTokens(parameters)
+		builder.WriteString("\n\n## Skill：")
+		builder.WriteString(skill.Name)
+		if description != "" {
+			builder.WriteString("\n用途：")
+			builder.WriteString(description)
+		}
+		builder.WriteString("\n")
+		builder.WriteString(prompt)
+		if parameters != "" {
+			builder.WriteString(skillParameterInstruction)
+			builder.WriteString(parameters)
+		}
+		if remaining <= 0 {
+			builder.WriteString("\n（其余 Skill 因上下文预算已省略）")
+			break
+		}
+	}
 }
 
 const (
@@ -1367,10 +1425,28 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 			return react.Result{}, false, err
 		}
 	}
-	// 先加载 MCP 工具：恢复审批结果时需要执行已批准的工具。
+	// 先加载 MCP 与技能工具：恢复审批结果时需要执行已批准的工具。
 	tools, err := w.prepareMCPTools(ctx, run, fence)
 	if err != nil {
 		return react.Result{}, false, err
+	}
+	skillTools, resourcePrompt, cleanupSkills, err := w.prepareSkillTools(ctx, run)
+	if err != nil {
+		return react.Result{}, false, err
+	}
+	defer cleanupSkills()
+	if skillTools != nil {
+		// 内置技能工具优先于外部 MCP 工具，避免同名工具被外部实现覆盖。
+		tools = combineToolRegistries(skillTools, tools)
+	}
+	if strings.TrimSpace(resourcePrompt) != "" {
+		// 把技能资源清单写回本次 Run 的本地快照，供系统提示注入；不落库。
+		snapshot := make(map[string]any, len(run.ConfigSnapshot)+1)
+		for key, value := range run.ConfigSnapshot {
+			snapshot[key] = value
+		}
+		snapshot["skill_resources"] = resourcePrompt
+		run.ConfigSnapshot = snapshot
 	}
 	// 审批恢复必须在组装上下文之前完成，确保结果已落库为 tool 消息。
 	if err := w.resumeApprovals(ctx, run, fence, tools); err != nil {

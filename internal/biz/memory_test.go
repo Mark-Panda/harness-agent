@@ -404,7 +404,7 @@ func TestMemoryIndexerUsesDualWriteVersions(t *testing.T) {
 		{ID: uuid.New(), Role: biz.MessageAssistant, Content: "回答"},
 	}}
 	queue := &fakeMemoryQueue{}
-	indexer, err := biz.NewMemoryIndexer(reader, indexes, queue, biz.MemoryIndexerConfig{RecentMessages: 3}, nil, nil)
+	indexer, err := biz.NewMemoryIndexer(reader, indexes, queue, biz.MemoryIndexerConfig{RecentMessages: 3}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestMemoryIndexerUsesDualWriteVersions(t *testing.T) {
 // TestMemoryIndexerSkipsWithoutActiveIndex 验证没有 active 索引时不做任何事。
 func TestMemoryIndexerSkipsWithoutActiveIndex(t *testing.T) {
 	queue := &fakeMemoryQueue{}
-	indexer, err := biz.NewMemoryIndexer(&fakeSummaryReader{}, &fakeMemoryIndexes{}, queue, biz.MemoryIndexerConfig{}, nil, nil)
+	indexer, err := biz.NewMemoryIndexer(&fakeSummaryReader{}, &fakeMemoryIndexes{}, queue, biz.MemoryIndexerConfig{}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,6 +438,45 @@ func TestMemoryIndexerSkipsWithoutActiveIndex(t *testing.T) {
 	}
 	if err := indexer.MaybeEnqueue(context.Background(), uuid.Nil, uuid.New()); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("identity error = %v", err)
+	}
+}
+
+// fakeMemoryClearance 返回固定的记忆清理水位，供向量索引过滤测试使用。
+type fakeMemoryClearance struct {
+	at  time.Time
+	err error
+}
+
+// MemoryClearedAt 返回预置清理时间。
+func (f *fakeMemoryClearance) MemoryClearedAt(context.Context, uuid.UUID) (time.Time, error) {
+	return f.at, f.err
+}
+
+// TestMemoryIndexerSkipsMessagesBeforeMemoryClear 验证清理水位之前的消息不再入队。
+func TestMemoryIndexerSkipsMessagesBeforeMemoryClear(t *testing.T) {
+	userID, sessionID := uuid.New(), uuid.New()
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{activeMemoryIndex()}}
+	cleared := time.Date(2026, 11, 14, 8, 0, 0, 0, time.UTC)
+	oldMessage := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "清理前的问题",
+		CreatedAt: cleared.Add(-time.Minute)}
+	newMessage := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "清理后的问题",
+		CreatedAt: cleared.Add(time.Minute)}
+	reader := &fakeSummaryReader{recent: []biz.Message{oldMessage, newMessage}}
+	queue := &fakeMemoryQueue{}
+	indexer, err := biz.NewMemoryIndexer(reader, indexes, queue, biz.MemoryIndexerConfig{RecentMessages: 4},
+		nil, nil, &fakeMemoryClearance{at: cleared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := indexer.MaybeEnqueue(context.Background(), userID, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if len(queue.tasks) != 1 {
+		t.Fatalf("tasks = %#v", queue.tasks)
+	}
+	ids := queue.tasks[0].MessageIDs
+	if len(ids) != 1 || ids[0] != newMessage.ID {
+		t.Fatalf("message ids = %v, want only post-clear message", ids)
 	}
 }
 

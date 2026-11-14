@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mark-Panda/harness-agent/pkg/skillpkg"
 	"github.com/google/uuid"
 )
 
@@ -24,23 +25,25 @@ const (
 // SkillTemplate 是平台级 Skill 模板，供 Agent 复用提示词与参数定义。
 type SkillTemplate struct {
 	// ID Skill 唯一标识。
-	ID uuid.UUID
+	ID uuid.UUID `json:"id"`
 	// Name Skill 名称。
-	Name string
+	Name string `json:"name"`
 	// Version 版本号，与名称共同唯一。
-	Version int
+	Version int `json:"version"`
 	// Description Skill 描述。
-	Description string
+	Description string `json:"description"`
 	// PromptTemplate 提示词模板，上限 256KB。
-	PromptTemplate string
+	PromptTemplate string `json:"prompt_template"`
 	// Parameters 参数定义 JSON Schema。
-	Parameters map[string]any
+	Parameters map[string]any `json:"parameters"`
 	// Status 生命周期状态。
-	Status SkillStatus
+	Status SkillStatus `json:"status"`
+	// Bundle 标准技能包元数据；零值表示仅提示词技能。
+	Bundle SkillBundleInfo `json:"bundle"`
 	// CreatedAt 创建时间（UTC）。
-	CreatedAt time.Time
+	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt 更新时间（UTC）。
-	UpdatedAt time.Time
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // SkillRepository 定义 Skill 模板持久化契约，写操作与审计事件同事务提交。
@@ -59,7 +62,8 @@ type SkillRepository interface {
 
 // SkillService 实现平台级 Skill 管理，仅管理员可写。
 type SkillService struct {
-	repo SkillRepository
+	repo    SkillRepository
+	bundles SkillBundleRepository
 }
 
 // NewSkillService 构造 Skill 服务。
@@ -68,6 +72,103 @@ func NewSkillService(repo SkillRepository) (*SkillService, error) {
 		return nil, invalid("skill repository is required")
 	}
 	return &SkillService{repo: repo}, nil
+}
+
+// WithBundles 附加平台技能包能力；未注入时导入相关接口返回未配置错误。
+func (s *SkillService) WithBundles(repo SkillBundleRepository) *SkillService {
+	if repo != nil {
+		s.bundles = repo
+	}
+	return s
+}
+
+// ImportBundle 解析标准技能包 zip 并创建平台技能草稿，仅管理员可用。
+func (s *SkillService) ImportBundle(ctx context.Context, principal Principal, archive []byte) (SkillTemplate, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return SkillTemplate{}, err
+	}
+	if s.bundles == nil {
+		return SkillTemplate{}, invalid("skill bundles are not configured")
+	}
+	pkg, err := skillpkg.ParseZip(archive, "技能包")
+	if err != nil {
+		return SkillTemplate{}, err
+	}
+	skill, err := s.Create(ctx, principal, SkillTemplate{
+		Name: pkg.Name, Description: pkg.Description,
+		PromptTemplate: pkg.PromptTemplate, Parameters: map[string]any{},
+	})
+	if err != nil {
+		return SkillTemplate{}, err
+	}
+	info, files := bundleFromPackage(pkg, SkillFileOwnerPlatform, skill.ID)
+	if err := s.bundles.ReplaceSkillBundle(ctx, principal.UserID, skill.ID, info, files,
+		mutationEvent(principal.UserID, "skill.bundle_imported", "skill", skill.ID)); err != nil {
+		_ = s.repo.DeleteSkill(context.WithoutCancel(ctx), principal.UserID, skill.ID,
+			mutationEvent(principal.UserID, "skill.deleted", "skill", skill.ID))
+		return SkillTemplate{}, err
+	}
+	return s.Get(ctx, principal, skill.ID)
+}
+
+// GetBundleFiles 列出平台技能包文件元数据，仅管理员可用。
+func (s *SkillService) GetBundleFiles(ctx context.Context, principal Principal, skillID uuid.UUID) ([]SkillBundleFile, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return nil, err
+	}
+	if s.bundles == nil {
+		return nil, invalid("skill bundles are not configured")
+	}
+	if _, err := s.repo.GetSkill(ctx, skillID); err != nil {
+		return nil, err
+	}
+	return s.bundles.ListSkillFileMeta(ctx, skillID)
+}
+
+// ReadBundleFile 读取平台技能包内单个文本文件，仅管理员可用。
+func (s *SkillService) ReadBundleFile(ctx context.Context, principal Principal, skillID uuid.UUID, filePath string) (SkillBundleFile, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return SkillBundleFile{}, err
+	}
+	if s.bundles == nil {
+		return SkillBundleFile{}, invalid("skill bundles are not configured")
+	}
+	if _, err := s.repo.GetSkill(ctx, skillID); err != nil {
+		return SkillBundleFile{}, err
+	}
+	file, err := s.bundles.GetSkillFile(ctx, skillID, filePath)
+	if err != nil {
+		return SkillBundleFile{}, err
+	}
+	if err := validateSkillFileRead(file); err != nil {
+		return SkillBundleFile{}, err
+	}
+	return file, nil
+}
+
+// SetBundleExecution 更新平台技能脚本执行开关，仅管理员可用。
+func (s *SkillService) SetBundleExecution(ctx context.Context, principal Principal, skillID uuid.UUID, enabled bool) (SkillTemplate, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return SkillTemplate{}, err
+	}
+	if s.bundles == nil {
+		return SkillTemplate{}, invalid("skill bundles are not configured")
+	}
+	current, err := s.repo.GetSkill(ctx, skillID)
+	if err != nil {
+		return SkillTemplate{}, err
+	}
+	if current.Bundle.Empty() {
+		return SkillTemplate{}, ErrSkillBundleNotFound
+	}
+	if enabled && !current.Bundle.HasScripts {
+		return SkillTemplate{}, invalid("skill bundle contains no executable scripts")
+	}
+	if err := s.bundles.SetSkillBundleExecution(ctx, principal.UserID, skillID, enabled,
+		mutationEvent(principal.UserID, "skill.bundle_execution_changed", "skill", skillID)); err != nil {
+		return SkillTemplate{}, err
+	}
+	return s.Get(ctx, principal, skillID)
 }
 
 // Create 创建 Skill 草稿，版本固定为 1。

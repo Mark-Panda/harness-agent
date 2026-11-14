@@ -8,7 +8,7 @@ import { useRemote } from "../lib/hooks";
 import { MultiSelect } from "../components/MultiSelect";
 import { Icon } from "../components/Icon";
 import { useToast } from "../components/Toast";
-import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill } from "../lib/types";
+import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill, UserSkill } from "../lib/types";
 import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea, cn } from "../components/ui";
 
 const modes: Array<{ value: AgentMode; title: string; description: string; badge?: string }> = [
@@ -48,6 +48,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   );
   const policies = useRemote(() => requestJSON<Page<ModelPolicy>>("/api/v1/model-policies"), []);
   const skills = useRemote(() => requestJSON<Page<Skill>>("/api/v1/skills"), []);
+  const userSkills = useRemote(() => requestJSON<Page<UserSkill>>("/api/v1/user-skills?limit=200"), []);
   const mcps = useRemote(() => requestJSON<Page<MCP>>("/api/v1/mcps"), []);
 
   const [step, setStep] = useState(0);
@@ -56,6 +57,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const [mode, setMode] = useState<AgentMode>("react");
   const [policyID, setPolicyID] = useState("");
   const [skillIDs, setSkillIDs] = useState<string[]>([]);
+  const [userSkillIDs, setUserSkillIDs] = useState<string[]>([]);
   const [mcpIDs, setMcpIDs] = useState<string[]>([]);
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,6 +83,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
 
   const publishedPolicies = (policies.data?.items ?? []).filter((policy) => policy.status === "published");
   const activeSkills = (skills.data?.items ?? []).filter((skill) => skill.status === "published");
+  const activeUserSkills = (userSkills.data?.items ?? []).filter((skill) => skill.status === "published");
   const activeMCPs = (mcps.data?.items ?? []).filter((mcp) => mcp.status === "enabled");
   const selectedPolicy = publishedPolicies.find((policy) => policy.id === policyID) ?? null;
   const selectedMode = modes.find((item) => item.value === mode) ?? modes[0];
@@ -95,6 +98,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
     setMode(editing.data.mode);
     setPolicyID(editing.data.model_policy_id ?? "");
     setSkillIDs(editing.data.skill_ids ?? []);
+    setUserSkillIDs(editing.data.user_skill_ids ?? []);
     setMcpIDs(editing.data.mcp_ids ?? []);
     setInitialized(true);
   }, [editing.data, initialized]);
@@ -110,7 +114,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const canLeaveModel = selectedPolicy !== null;
   // 有未保存内容时，关闭浏览器和返回列表前都先确认，避免整页填写白费。
   const defaultPolicyID = publishedPolicies[0]?.id ?? "";
-  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...mcpIDs].sort()]);
+  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...userSkillIDs].sort(), [...mcpIDs].sort()]);
   const dirty = useMemo(() => {
     if (savedDraft?.signature === draftSignature) return false;
     if (isEditing && editing.data) {
@@ -120,6 +124,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         || mode !== editing.data.mode
         || policyID !== (editing.data.model_policy_id ?? "")
         || !sameIDs(skillIDs, editing.data.skill_ids ?? [])
+        || !sameIDs(userSkillIDs, editing.data.user_skill_ids ?? [])
         || !sameIDs(mcpIDs, editing.data.mcp_ids ?? []);
     }
     return name.trim().length > 0
@@ -127,8 +132,9 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       || mode !== "react"
       || policyID !== defaultPolicyID
       || skillIDs.length > 0
+      || userSkillIDs.length > 0
       || mcpIDs.length > 0;
-  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, mcpIDs, draftSignature, savedDraft]);
+  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, userSkillIDs, mcpIDs, draftSignature, savedDraft]);
 
   const blocker = useBlocker(({ currentLocation, nextLocation }) =>
     !allowNavigation.current && dirty && currentLocation.pathname !== nextLocation.pathname,
@@ -180,6 +186,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         model_policy_id: selectedPolicy.id,
         model_policy_version: selectedPolicy.version,
         skill_ids: skillIDs,
+        user_skill_ids: userSkillIDs,
         mcp_ids: mcpIDs,
       };
       const draftID = agentId ?? savedDraft?.id;
@@ -332,6 +339,19 @@ function AgentWizard({ agentId }: { agentId?: string }) {
             />
             {skills.error ? <div className="mt-2"><ErrorBanner message={skills.error} onRetry={skills.reload} /></div> : null}
           </div>
+          <div className="min-w-0 sm:col-span-2">
+            <MultiSelect
+              label="我的技能"
+              options={activeUserSkills.map((skill) => ({
+                id: skill.id, label: skill.name, detail: skill.description,
+                badge: <Badge tone={skill.bundle ? "info" : "neutral"}>{skill.bundle ? `技能包 · ${skill.bundle.file_count} 文件` : `v${skill.version}`}</Badge>,
+              }))}
+              value={userSkillIDs}
+              onChange={setUserSkillIDs}
+              empty={userSkills.error ? "我的技能加载失败" : "暂无已发布的个人技能"}
+            />
+            {userSkills.error ? <div className="mt-2"><ErrorBanner message={userSkills.error} onRetry={userSkills.reload} /></div> : null}
+          </div>
           <div className="min-w-0">
             <MultiSelect
               label="外部工具"
@@ -374,9 +394,9 @@ function AgentWizard({ agentId }: { agentId?: string }) {
             </div>
             <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">技能与工具</dt>
-              <dd className="mt-1 text-lg text-ink">{skillIDs.length} 个技能 · {mcpIDs.length} 个工具</dd>
+              <dd className="mt-1 text-lg text-ink">{skillIDs.length + userSkillIDs.length} 个技能 · {mcpIDs.length} 个工具</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">
-                {skillIDs.length + mcpIDs.length === 0 ? "未绑定，只使用基础对话能力" : "已绑定，发布后可在对话中调用"}
+                {skillIDs.length + userSkillIDs.length + mcpIDs.length === 0 ? "未绑定，只使用基础对话能力" : "已绑定，发布后可在对话中调用"}
               </dd>
             </div>
           </dl>

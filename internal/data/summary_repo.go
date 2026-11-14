@@ -17,6 +17,17 @@ import (
 // uuidArray 是 PostgreSQL uuid[] 的自定义映射，避免把 JSON 数组误写为数组字面量。
 type uuidArray []uuid.UUID
 
+// memoryClearedFilter 排除用户主动清理记忆之前的消息，避免摘要与事实在清理后重建旧记忆。
+// 使用位置参数传入 user_id，调用方需按顺序追加该参数。
+const memoryClearedFilter = `created_at > COALESCE(
+  (SELECT state.memory_cleared_at FROM user_memory_state state WHERE state.user_id = ?),
+  '-infinity'::timestamptz)`
+
+// memoryClearedFilterAliased 与 memoryClearedFilter 相同，用于 messages 使用 m 别名的查询。
+const memoryClearedFilterAliased = `m.created_at > COALESCE(
+  (SELECT state.memory_cleared_at FROM user_memory_state state WHERE state.user_id = ?),
+  '-infinity'::timestamptz)`
+
 // Value 把 UUID 列表编码为 PostgreSQL 数组字面量。
 func (a uuidArray) Value() (driver.Value, error) {
 	if len(a) == 0 {
@@ -143,10 +154,12 @@ func (r *SummaryRepository) GetActiveSummary(ctx context.Context, userID, sessio
 				Updates(map[string]any{"status": biz.SummaryInvalidated, "updated_at": time.Now().UTC()}).Error
 		}
 		// 边界之前的消息被删除会使摘要失真；计数不一致时立即失效，禁止把陈旧摘要冒充最新状态。
+		// 记忆清理前的消息不计入覆盖数，与摘要生成时的统计口径保持一致。
 		var count int64
 		if err := tx.Model(&messageModel{}).
 			Where("user_id = ? AND session_id = ? AND deleted_at IS NULL AND (created_at < ? OR (created_at = ? AND id <= ?))",
 				userID, sessionID, *record.SourceEndAt, *record.SourceEndAt, *record.SourceEndMessageID).
+			Where(memoryClearedFilter, userID).
 			Count(&count).Error; err != nil {
 			return err
 		}
@@ -266,10 +279,12 @@ func (r *SummaryRepository) SaveSummary(ctx context.Context, summary biz.Session
 			}
 		}
 		// 累计覆盖数必须与边界前的实际消息数一致，禁止来源范围出现空洞。
+		// 记忆清理前的消息已被排除在摘要之外，统计时必须使用同一水位口径。
 		var covered int64
 		if err := tx.Model(&messageModel{}).
 			Where("user_id = ? AND session_id = ? AND deleted_at IS NULL AND (created_at < ? OR (created_at = ? AND id <= ?))",
 				summary.UserID, summary.SessionID, *summary.SourceEndAt, *summary.SourceEndAt, *summary.SourceEndMessageID).
+			Where(memoryClearedFilter, summary.UserID).
 			Count(&covered).Error; err != nil {
 			return err
 		}
@@ -402,6 +417,7 @@ func (r *SessionRepository) ListRecentMessages(ctx context.Context, userID, sess
 	var records []messageModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		return tx.Where("user_id = ? AND session_id = ? AND deleted_at IS NULL", userID, sessionID).
+			Where(memoryClearedFilter, userID).
 			Order("created_at DESC, id DESC").Limit(limit).Find(&records).Error
 	})
 	if err != nil {
@@ -418,7 +434,8 @@ func (r *SessionRepository) ListMessagesAfter(ctx context.Context, userID, sessi
 	limit = NormalizeLimit(limit)
 	var records []messageModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		query := tx.Where("user_id = ? AND session_id = ? AND deleted_at IS NULL", userID, sessionID)
+		query := tx.Where("user_id = ? AND session_id = ? AND deleted_at IS NULL", userID, sessionID).
+			Where(memoryClearedFilter, userID)
 		if !after.IsZero() {
 			query = query.Where("(created_at > ? OR (created_at = ? AND id > ?))", after.CreatedAt, after.CreatedAt, after.ID)
 		}
@@ -453,6 +470,7 @@ func (r *SessionRepository) listMessagesByIDs(ctx context.Context, userID, sessi
 		if forSummary {
 			query = query.Where(`m.feishu_group_message_id IS NULL AND EXISTS (
 				SELECT 1 FROM sessions s WHERE s.id = m.session_id AND s.user_id = m.user_id AND ` + summarizableSession + `)`)
+			query = query.Where(memoryClearedFilterAliased, userID)
 		}
 		return query.
 			Order("created_at ASC, id ASC").Find(&records).Error
@@ -473,6 +491,7 @@ func (r *SessionRepository) CountMessagesThrough(ctx context.Context, userID, se
 		return tx.Model(&messageModel{}).
 			Where("user_id = ? AND session_id = ? AND deleted_at IS NULL AND (created_at < ? OR (created_at = ? AND id <= ?))",
 				userID, sessionID, boundary.CreatedAt, boundary.CreatedAt, boundary.ID).
+			Where(memoryClearedFilter, userID).
 			Count(&count).Error
 	})
 	if err != nil {

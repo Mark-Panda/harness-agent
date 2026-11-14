@@ -30,7 +30,8 @@ type FeishuBotSecret struct {
 	EncryptKey string `json:"encrypt_key"`
 }
 
-// FeishuBot 是管理员登记的飞书机器人配置，仅保存凭据密文与元数据。
+// FeishuBot 是登记的飞书机器人配置，仅保存凭据密文与元数据。
+// 多租户 SaaS 模式下机器人归属单个用户（租户），只有归属用户与管理员可以绑定、更新或删除。
 type FeishuBot struct {
 	// ID 机器人唯一标识。
 	ID uuid.UUID
@@ -38,6 +39,8 @@ type FeishuBot struct {
 	Name string
 	// AppID 飞书应用 App ID，事件回执按此路由。
 	AppID string
+	// OwnerUserID 归属用户（租户），创建后不可转移。
+	OwnerUserID uuid.UUID
 	// BotOpenID 机器人 open_id，用于群聊 @ 判断。
 	BotOpenID string
 	// KeyVersion 凭据密文对应的密钥版本。
@@ -68,14 +71,16 @@ type FeishuBotInput struct {
 	AppID string
 	// AppSecret 应用密钥，创建时必填。
 	AppSecret string
-	// VerificationToken 事件订阅 Verification Token。
+	// VerificationToken 事件订阅 Verification Token；长连接模式可为空。
 	VerificationToken string
-	// EncryptKey 事件加密密钥。
+	// EncryptKey 事件加密密钥；长连接模式可为空。
 	EncryptKey string
 	// BotOpenID 机器人 open_id。
 	BotOpenID string
 	// Status 启停状态。
 	Status FeishuBotStatus
+	// OwnerUserID 归属用户；仅管理员创建时可指定他人，普通用户创建时强制为本人。
+	OwnerUserID uuid.UUID
 }
 
 // FeishuBotRepository 定义机器人配置持久化契约，写操作与审计事件同事务提交。
@@ -90,6 +95,8 @@ type FeishuBotRepository interface {
 	GetFeishuBot(ctx context.Context, botID uuid.UUID) (FeishuBot, error)
 	// ListFeishuBots 列出全部机器人（管理员视图）。
 	ListFeishuBots(ctx context.Context) ([]FeishuBot, error)
+	// ListFeishuBotsForUser 列出归属指定用户的机器人（租户视图）。
+	ListFeishuBotsForUser(ctx context.Context, userID uuid.UUID) ([]FeishuBot, error)
 	// GetFeishuBotCredential 读取机器人元数据与加密凭据，仅供验签与服务端客户端构造使用。
 	GetFeishuBotCredential(ctx context.Context, botID uuid.UUID) (FeishuBot, ProviderCredential, error)
 }
@@ -108,12 +115,15 @@ type FeishuBotTestResult struct {
 	Message string
 }
 
-// FeishuBotService 实现机器人注册管理，仅管理员可写。
+// FeishuBotService 实现机器人注册管理。
+// 多租户 SaaS：机器人归属单个用户，归属用户与管理员可管理；普通用户可创建自己的机器人。
 type FeishuBotService struct {
 	repo   FeishuBotRepository
 	cipher CredentialCipher
 	opener CredentialOpener
 	tester FeishuBotTester
+	// longConnection 为 true 表示事件通过长连接推送，无需 Webhook 验签凭据。
+	longConnection bool
 }
 
 // NewFeishuBotService 构造机器人管理服务。
@@ -130,20 +140,46 @@ func (s *FeishuBotService) WithTester(tester FeishuBotTester) *FeishuBotService 
 	return s
 }
 
-// Create 创建机器人；应用密钥必填，且 Verification Token 与 Encrypt Key 至少配置一项。
-func (s *FeishuBotService) Create(ctx context.Context, principal Principal, input FeishuBotInput) (FeishuBot, error) {
-	if err := RequireAdmin(principal); err != nil {
-		return FeishuBot{}, err
+// WithLongConnection 标记事件接入模式为长连接；此时不再强制要求 Webhook 验签凭据。
+func (s *FeishuBotService) WithLongConnection() *FeishuBotService {
+	s.longConnection = true
+	return s
+}
+
+// requireOwnerOrAdmin 校验操作者是机器人归属用户或管理员。
+func requireOwnerOrAdmin(principal Principal, bot FeishuBot) error {
+	if principal.UserID == uuid.Nil {
+		return ErrForbidden
 	}
+	if principal.Role == RoleAdmin || bot.OwnerUserID == principal.UserID {
+		return nil
+	}
+	return ErrForbidden
+}
+
+// Create 创建机器人；应用密钥必填。
+// Webhook 模式要求 Verification Token 与 Encrypt Key 至少一项；长连接模式不要求。
+// 普通用户创建的机器人归属本人，管理员可通过 OwnerUserID 指定归属用户。
+func (s *FeishuBotService) Create(ctx context.Context, principal Principal, input FeishuBotInput) (FeishuBot, error) {
+	if principal.UserID == uuid.Nil {
+		return FeishuBot{}, ErrForbidden
+	}
+	// 归属用户：管理员可指定，普通用户强制为本人。
+	ownerID := principal.UserID
+	if principal.Role == RoleAdmin && input.OwnerUserID != uuid.Nil {
+		ownerID = input.OwnerUserID
+	}
+	input.OwnerUserID = ownerID
 	bot, err := validateFeishuBot(uuid.New(), input)
 	if err != nil {
 		return FeishuBot{}, err
 	}
+	bot.OwnerUserID = ownerID
 	if strings.TrimSpace(input.AppSecret) == "" {
 		return FeishuBot{}, invalid("feishu bot app secret is required")
 	}
-	// 没有任何可验证凭据的回调只能 fail-open，必须在创建时拒绝。
-	if strings.TrimSpace(input.VerificationToken) == "" && strings.TrimSpace(input.EncryptKey) == "" {
+	// Webhook 模式没有任何可验证凭据的回调只能 fail-open，必须在创建时拒绝；长连接模式无此要求。
+	if !s.longConnection && strings.TrimSpace(input.VerificationToken) == "" && strings.TrimSpace(input.EncryptKey) == "" {
 		return FeishuBot{}, invalid("feishu bot verification token or encrypt key is required")
 	}
 	secret := FeishuBotSecret{
@@ -160,18 +196,21 @@ func (s *FeishuBotService) Create(ctx context.Context, principal Principal, inpu
 }
 
 // Update 更新机器人元数据；凭据字段留空时保留原密文，填写时整体重建加密凭据。
+// 仅归属用户或管理员可更新；OwnerUserID 不可转移。
 func (s *FeishuBotService) Update(ctx context.Context, principal Principal, botID uuid.UUID, input FeishuBotInput) (FeishuBot, error) {
-	if err := RequireAdmin(principal); err != nil {
-		return FeishuBot{}, err
-	}
 	current, credential, err := s.repo.GetFeishuBotCredential(ctx, botID)
 	if err != nil {
 		return FeishuBot{}, err
 	}
+	if err := requireOwnerOrAdmin(principal, current); err != nil {
+		return FeishuBot{}, err
+	}
+	input.OwnerUserID = current.OwnerUserID
 	bot, err := validateFeishuBot(botID, input)
 	if err != nil {
 		return FeishuBot{}, err
 	}
+	bot.OwnerUserID = current.OwnerUserID
 	bot.KeyVersion = current.KeyVersion
 	var updatedCredential *ProviderCredential
 	if strings.TrimSpace(input.AppSecret) != "" || strings.TrimSpace(input.VerificationToken) != "" || strings.TrimSpace(input.EncryptKey) != "" {
@@ -195,8 +234,8 @@ func (s *FeishuBotService) Update(ctx context.Context, principal Principal, botI
 		if strings.TrimSpace(secret.AppSecret) == "" {
 			return FeishuBot{}, invalid("feishu bot app secret is required")
 		}
-		// 更新后同样必须保留至少一项回调验证凭据，否则该机器人会退化为 fail-open。
-		if strings.TrimSpace(secret.VerificationToken) == "" && strings.TrimSpace(secret.EncryptKey) == "" {
+		// Webhook 模式更新后同样必须保留至少一项回调验证凭据；长连接模式无此要求。
+		if !s.longConnection && strings.TrimSpace(secret.VerificationToken) == "" && strings.TrimSpace(secret.EncryptKey) == "" {
 			return FeishuBot{}, invalid("feishu bot verification token or encrypt key is required")
 		}
 		sealed, err := s.sealSecret(secret)
@@ -210,40 +249,52 @@ func (s *FeishuBotService) Update(ctx context.Context, principal Principal, botI
 		mutationEvent(principal.UserID, "feishu_bot.updated", "feishu_bot", botID))
 }
 
-// Delete 删除机器人；绑定关系由外键级联解除。
+// Delete 删除机器人；绑定关系由外键级联解除。仅归属用户或管理员可删除。
 func (s *FeishuBotService) Delete(ctx context.Context, principal Principal, botID uuid.UUID) error {
-	if err := RequireAdmin(principal); err != nil {
+	current, err := s.repo.GetFeishuBot(ctx, botID)
+	if err != nil {
+		return err
+	}
+	if err := requireOwnerOrAdmin(principal, current); err != nil {
 		return err
 	}
 	return s.repo.DeleteFeishuBot(ctx, principal.UserID, botID, mutationEvent(principal.UserID, "feishu_bot.deleted", "feishu_bot", botID))
 }
 
-// List 列出全部机器人及绑定信息，仅管理员可用。
+// List 列出机器人及绑定信息：管理员看全部，普通用户只看自己归属的机器人。
 func (s *FeishuBotService) List(ctx context.Context, principal Principal) ([]FeishuBot, error) {
-	if err := RequireAdmin(principal); err != nil {
-		return nil, err
+	if principal.UserID == uuid.Nil {
+		return nil, ErrForbidden
 	}
-	return s.repo.ListFeishuBots(ctx)
+	if principal.Role == RoleAdmin {
+		return s.repo.ListFeishuBots(ctx)
+	}
+	return s.repo.ListFeishuBotsForUser(ctx, principal.UserID)
 }
 
-// Get 读取单个机器人元数据，仅管理员可用。
+// Get 读取单个机器人元数据，仅归属用户或管理员可用。
 func (s *FeishuBotService) Get(ctx context.Context, principal Principal, botID uuid.UUID) (FeishuBot, error) {
-	if err := RequireAdmin(principal); err != nil {
+	bot, err := s.repo.GetFeishuBot(ctx, botID)
+	if err != nil {
 		return FeishuBot{}, err
 	}
-	return s.repo.GetFeishuBot(ctx, botID)
+	if err := requireOwnerOrAdmin(principal, bot); err != nil {
+		return FeishuBot{}, err
+	}
+	return bot, nil
 }
 
 // Test 使用机器人应用凭据请求飞书 Tenant Access Token，验证凭据与网络连通性。
+// 仅归属用户或管理员可测试。
 func (s *FeishuBotService) Test(ctx context.Context, principal Principal, botID uuid.UUID) (FeishuBotTestResult, error) {
-	if err := RequireAdmin(principal); err != nil {
-		return FeishuBotTestResult{}, err
-	}
 	if s.tester == nil {
 		return FeishuBotTestResult{}, fmt.Errorf("%w: feishu bot tester is not configured", ErrInvalidConfig)
 	}
 	bot, credential, err := s.repo.GetFeishuBotCredential(ctx, botID)
 	if err != nil {
+		return FeishuBotTestResult{}, err
+	}
+	if err := requireOwnerOrAdmin(principal, bot); err != nil {
 		return FeishuBotTestResult{}, err
 	}
 	plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
@@ -383,6 +434,9 @@ func (s *FeishuBotBindingService) List(ctx context.Context, principal Principal)
 	}
 	options := make([]FeishuBotOption, 0, len(bots))
 	for _, bot := range bots {
+		if bot.Status != FeishuBotEnabled {
+			continue
+		}
 		occupied := bot.BoundUserID != nil
 		option := FeishuBotOption{ID: bot.ID, Name: bot.Name, BotOpenID: bot.BotOpenID, Status: bot.Status, Available: bot.Status == FeishuBotEnabled && !occupied}
 		if occupied && *bot.BoundUserID == principal.UserID {
@@ -395,6 +449,7 @@ func (s *FeishuBotBindingService) List(ctx context.Context, principal Principal)
 }
 
 // Bind 把已发布助手绑定到启用且未占用的机器人；一个机器人只能绑定一个助手。
+// 多租户隔离：普通用户只能绑定归属自己的机器人，管理员可绑定任意机器人。
 func (s *FeishuBotBindingService) Bind(ctx context.Context, principal Principal, agentID, botID uuid.UUID) error {
 	if principal.UserID == uuid.Nil {
 		return ErrForbidden
@@ -415,6 +470,10 @@ func (s *FeishuBotBindingService) Bind(ctx context.Context, principal Principal,
 	}
 	if bot.Status != FeishuBotEnabled {
 		return fmt.Errorf("%w: the feishu bot is disabled", ErrResourceConflict)
+	}
+	// 租户隔离：机器人必须归属当前用户，防止跨租户劫持事件流。
+	if principal.Role != RoleAdmin && bot.OwnerUserID != principal.UserID {
+		return fmt.Errorf("%w: feishu bot belongs to another tenant", ErrForbidden)
 	}
 	binding := FeishuBotBinding{
 		BotID: botID, BotName: bot.Name, BotOpenID: bot.BotOpenID, UserID: principal.UserID,

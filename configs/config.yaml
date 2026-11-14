@@ -139,6 +139,14 @@ agent:
     per_provider_concurrency: 20
     # 并发槽位租约，超时后自动回收崩溃实例占用的槽位。
     concurrency_lease: 6m
+  # 标准技能包脚本执行护栏。
+  skills:
+    # 是否允许在本机进程执行标准技能包内的脚本；仅开发环境允许开启。
+    enable_local_execution: false
+    # 单次脚本执行超时。
+    timeout: 30s
+    # 单次脚本输出截断上限。
+    max_output_bytes: 65536
   # 高风险工具的 Sandbox Runner 配置。
   sandbox:
     # 是否强制高风险工具必须在独立 Sandbox Runner 中执行；本地未配置时关闭。
@@ -273,6 +281,40 @@ agent:
       lease: 90s
       # 事实任务租约续约间隔。
       heartbeat: 30s
+    skill_synthesis:
+      # 平台总开关；开启后仍仅处理在用户设置中显式启用提炼的账号。
+      enabled: false
+      # 平台默认提炼模型策略；用户未选择策略时兜底，二者均为空时跳过该用户。
+      default_model_policy_id: ""
+      default_model_policy_version: 0
+      # 维护循环轮询间隔（每日扫描一次）。
+      interval: 24h
+      # 回看对话的小时数。
+      lookback_hours: 24
+      # LLM 判定置信度阈值，低于此值不创建技能草稿。
+      min_confidence: 0.6
+      # 单用户每日最多生成的技能数。
+      max_skills_per_user_per_day: 3
+      # 单次提炼最多扫描的会话数。
+      max_sessions_per_user: 20
+      # 单会话最多纳入的消息数。
+      max_messages_per_session: 50
+      # 单条消息进入提示词的最大字节数。
+      max_message_bytes: 8192
+      # 技能 JSON 输出的 Token 上限。
+      max_output_tokens: 2048
+      # 技能提炼采样温度（低温度以保证稳定输出）。
+      temperature: 0.1
+      # 单次模型调用超时。
+      request_timeout: 60s
+      # 单实例并发提炼任务数。
+      concurrency: 1
+      # 无任务时的轮询间隔。
+      poll_interval: 1s
+      # 任务租约时长。
+      lease: 120s
+      # 任务租约续约间隔。
+      heartbeat: 40s
 
 auth:
   # JWT 签发者标识，用于校验签发来源。

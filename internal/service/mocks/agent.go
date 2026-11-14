@@ -220,6 +220,21 @@ func (mr *MockAgentRepositoryMockRecorder) ListSkillsByIDs(ctx, skillIDs any) *g
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListSkillsByIDs", reflect.TypeOf((*MockAgentRepository)(nil).ListSkillsByIDs), ctx, skillIDs)
 }
 
+// ListUserSkillsByIDs mocks base method.
+func (m *MockAgentRepository) ListUserSkillsByIDs(ctx context.Context, userID uuid.UUID, skillIDs []uuid.UUID) ([]biz.UserSkill, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListUserSkillsByIDs", ctx, userID, skillIDs)
+	ret0, _ := ret[0].([]biz.UserSkill)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListUserSkillsByIDs indicates an expected call of ListUserSkillsByIDs.
+func (mr *MockAgentRepositoryMockRecorder) ListUserSkillsByIDs(ctx, userID, skillIDs any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListUserSkillsByIDs", reflect.TypeOf((*MockAgentRepository)(nil).ListUserSkillsByIDs), ctx, userID, skillIDs)
+}
+
 // NextAgentVersion mocks base method.
 func (m *MockAgentRepository) NextAgentVersion(ctx context.Context, userID uuid.UUID, name string) (int, error) {
 	m.ctrl.T.Helper()

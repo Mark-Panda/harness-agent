@@ -483,9 +483,15 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 	// 乱序保护：消息时间取飞书 create_time，而不是任务实际处理时间；
 	// 这样旧事件晚到时仍按发生时间落库，上下文与摘要顺序不会被投递顺序打乱。
 	occurredAt := messageEvent.CreatedAt(w.clock())
+	// 单聊的发言人就是会话所有者本人，不能写 speaker_open_id：
+	// 否则上下文组装会给单聊消息加上群聊发言人前缀，模型会把私有对话误判成群聊。
+	speakerOpenID := ""
+	if messageEvent.ChatType == feishu.ChatTypeGroup {
+		speakerOpenID = messageEvent.SenderOpenID
+	}
 	inbound := Message{
 		ID: uuid.New(), SessionID: session.ID, UserID: binding.UserID, Role: MessageUser,
-		Content: text, ExternalMessageID: messageEvent.MessageID, SpeakerOpenID: messageEvent.SenderOpenID,
+		Content: text, ExternalMessageID: messageEvent.MessageID, SpeakerOpenID: speakerOpenID,
 		CreatedAt: occurredAt,
 	}
 	stored, created, err := w.messages.AppendInbound(ctx, inbound, mutationEvent(binding.UserID, "message.created", "message", uuid.New()))

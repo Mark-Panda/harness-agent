@@ -138,6 +138,17 @@ type AgentConfig struct {
 	Budgets          BudgetsConfig          `yaml:"budgets"`
 	Memory           MemoryConfig           `yaml:"memory"`
 	Sandbox          SandboxConfig          `yaml:"sandbox"`
+	Skills           SkillExecutionConfig   `yaml:"skills"`
+}
+
+// SkillExecutionConfig 配置标准技能包脚本的本机执行护栏。
+type SkillExecutionConfig struct {
+	// EnableLocalExecution 是否允许在本机进程执行技能脚本；仅开发环境可开启。
+	EnableLocalExecution bool `yaml:"enable_local_execution"`
+	// Timeout 单次脚本执行超时，零值使用默认 30 秒。
+	Timeout Duration `yaml:"timeout"`
+	// MaxOutputBytes 单次脚本输出截断上限，零值使用默认 64KB。
+	MaxOutputBytes int `yaml:"max_output_bytes"`
 }
 
 // SandboxConfig 配置高风险工具 Sandbox Runner。
@@ -168,6 +179,8 @@ type MemoryConfig struct {
 	Vector VectorConfig `yaml:"vector"`
 	// Facts 结构化事实提取配置。
 	Facts FactConfig `yaml:"facts"`
+	// SkillSynthesis 每日对话技能自动提炼配置。
+	SkillSynthesis SkillSynthesisConfig `yaml:"skill_synthesis"`
 }
 
 // FactConfig 是结构化事实提取与冲突策略配置。
@@ -201,6 +214,44 @@ type FactConfig struct {
 	// Lease 事实任务租约时长。
 	Lease Duration `yaml:"lease"`
 	// Heartbeat 事实任务租约续约间隔。
+	Heartbeat Duration `yaml:"heartbeat"`
+}
+
+// SkillSynthesisConfig 是每日对话技能自动提炼配置。
+type SkillSynthesisConfig struct {
+	// Enabled 是否启用每日技能提炼的平台总开关。
+	Enabled bool `yaml:"enabled"`
+	// DefaultModelPolicyID 平台默认提炼策略；用户未配置策略时使用。
+	DefaultModelPolicyID string `yaml:"default_model_policy_id"`
+	// DefaultModelPolicyVersion 默认策略版本，必须与策略 ID 成对配置。
+	DefaultModelPolicyVersion int `yaml:"default_model_policy_version"`
+	// Interval 维护循环轮询间隔，零值默认 24 小时。
+	Interval Duration `yaml:"interval"`
+	// LookbackHours 回看对话的小时数，零值默认 24。
+	LookbackHours int `yaml:"lookback_hours"`
+	// MinConfidence LLM 判定置信度阈值，低于此值不创建技能。
+	MinConfidence float64 `yaml:"min_confidence"`
+	// MaxSkillsPerUserPerDay 单用户每日最多生成的技能数。
+	MaxSkillsPerUserPerDay int `yaml:"max_skills_per_user_per_day"`
+	// MaxSessionsPerUser 单次提炼最多扫描的会话数。
+	MaxSessionsPerUser int `yaml:"max_sessions_per_user"`
+	// MaxMessagesPerSession 单会话最多纳入的消息数。
+	MaxMessagesPerSession int `yaml:"max_messages_per_session"`
+	// MaxMessageBytes 单条消息进入提示的最大字节数。
+	MaxMessageBytes int `yaml:"max_message_bytes"`
+	// MaxOutputTokens 技能 JSON 输出上限。
+	MaxOutputTokens int `yaml:"max_output_tokens"`
+	// Temperature 采样温度。
+	Temperature float64 `yaml:"temperature"`
+	// RequestTimeout 单次模型调用超时。
+	RequestTimeout Duration `yaml:"request_timeout"`
+	// Concurrency 单实例并发提炼任务数。
+	Concurrency int `yaml:"concurrency"`
+	// PollInterval 无任务时的轮询间隔。
+	PollInterval Duration `yaml:"poll_interval"`
+	// Lease 任务租约时长。
+	Lease Duration `yaml:"lease"`
+	// Heartbeat 续约间隔。
 	Heartbeat Duration `yaml:"heartbeat"`
 }
 
@@ -624,6 +675,13 @@ func (c Config) Validate() error {
 	if routing.CircuitBreaker.FailureThreshold <= 0 || routing.CircuitBreaker.Window.Duration <= 0 || routing.CircuitBreaker.OpenFor.Duration <= 0 {
 		return fmt.Errorf("circuit breaker thresholds and durations must be positive")
 	}
+	// 本机脚本执行违反多租户隔离基线：生产与预发必须保持关闭，仅开发环境允许。
+	if c.Agent.Skills.EnableLocalExecution && c.Environment != "development" {
+		return fmt.Errorf("agent.skills.enable_local_execution is only allowed in development")
+	}
+	if c.Agent.Skills.EnableLocalExecution && c.Agent.Skills.MaxOutputBytes < 0 {
+		return fmt.Errorf("agent.skills.max_output_bytes must not be negative")
+	}
 	worker := c.Agent.Worker
 	if worker.Enabled {
 		if worker.Concurrency <= 0 {
@@ -739,6 +797,17 @@ func (c Config) Validate() error {
 		}
 	}
 	facts := memory.Facts
+	skillSynthesis := memory.SkillSynthesis
+	defaultPolicyID := strings.TrimSpace(skillSynthesis.DefaultModelPolicyID)
+	if (defaultPolicyID == "") != (skillSynthesis.DefaultModelPolicyVersion == 0) {
+		return fmt.Errorf("agent.memory.skill_synthesis default model policy id and version must be configured together")
+	}
+	if defaultPolicyID != "" {
+		policyID, err := uuid.Parse(defaultPolicyID)
+		if err != nil || policyID == uuid.Nil || skillSynthesis.DefaultModelPolicyVersion <= 0 {
+			return fmt.Errorf("agent.memory.skill_synthesis default model policy requires a valid id and positive version")
+		}
+	}
 	if facts.Enabled {
 		if facts.MinConfidence <= 0 || facts.MinConfidence > 1 || facts.CorrectionGuard <= 0 || facts.CorrectionGuard > 1 {
 			return fmt.Errorf("agent.memory.facts confidence thresholds must be within (0, 1]")

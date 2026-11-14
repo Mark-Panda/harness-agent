@@ -491,7 +491,7 @@ func TestFeishuBotAdminPaths(t *testing.T) {
 
 	repo := NewFeishuBotRepository(appDB)
 	bot, err := repo.CreateFeishuBot(ctx, owner.ID, biz.FeishuBot{
-		ID: uuid.New(), Name: "admin-bot-" + suffix, AppID: "cli_" + suffix, BotOpenID: "ou_" + suffix,
+		ID: uuid.New(), Name: "admin-bot-" + suffix, AppID: "cli_" + suffix, OwnerUserID: owner.ID, BotOpenID: "ou_" + suffix,
 		Status: biz.FeishuBotEnabled,
 	}, biz.ProviderCredential{Encrypted: []byte("bot-token-v1"), KeyVersion: "v1"}, testOutboxEvent(owner.ID, "feishu_bot.created"))
 	if err != nil {

@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// feishuBotModel 对应 feishu_bots 表：管理员登记的飞书机器人。
+// feishuBotModel 对应 feishu_bots 表：按租户归属的飞书机器人。
 type feishuBotModel struct {
 	// ID 机器人主键。
 	ID uuid.UUID `gorm:"type:uuid;primaryKey"`
@@ -18,6 +18,8 @@ type feishuBotModel struct {
 	Name string
 	// AppID 飞书应用 App ID。
 	AppID string
+	// OwnerUserID 归属用户（租户）。
+	OwnerUserID uuid.UUID `gorm:"type:uuid"`
 	// BotOpenID 机器人 open_id。
 	BotOpenID string
 	// KeyVersion 凭据密文密钥版本。
@@ -81,7 +83,7 @@ func NewFeishuBotRepository(db *gorm.DB) *FeishuBotRepository {
 // CreateFeishuBot 在系统作用域内创建机器人并写入审计事件。
 func (r *FeishuBotRepository) CreateFeishuBot(ctx context.Context, actorID uuid.UUID, bot biz.FeishuBot, credential biz.ProviderCredential, event biz.OutboxEvent) (biz.FeishuBot, error) {
 	record := feishuBotModel{
-		ID: bot.ID, Name: bot.Name, AppID: bot.AppID, BotOpenID: bot.BotOpenID,
+		ID: bot.ID, Name: bot.Name, AppID: bot.AppID, OwnerUserID: bot.OwnerUserID, BotOpenID: bot.BotOpenID,
 		KeyVersion: credential.KeyVersion, Credentials: credential.Encrypted, Status: string(bot.Status),
 	}
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
@@ -154,12 +156,14 @@ func (r *FeishuBotRepository) ListFeishuBots(ctx context.Context) ([]biz.FeishuB
 	return r.listBots(ctx, false, uuid.Nil)
 }
 
-// ListFeishuBotsForUser 列出机器人；停用机器人仍会返回，便于已绑定用户查看并解绑。
+// ListFeishuBotsForUser 列出归属该用户的机器人；停用机器人仍会返回，便于已绑定用户查看并解绑。
+// 多租户隔离：不再返回其他租户的机器人。
 func (r *FeishuBotRepository) ListFeishuBotsForUser(ctx context.Context, userID uuid.UUID) ([]biz.FeishuBot, error) {
 	return r.listBots(ctx, false, userID)
 }
 
 // listBots 查询机器人列表并合并绑定信息；onlyEnabled 为 true 时只返回可用机器人。
+// viewerID 非空时按归属用户过滤（多租户隔离），同时控制绑定详情可见性。
 func (r *FeishuBotRepository) listBots(ctx context.Context, onlyEnabled bool, viewerID uuid.UUID) ([]biz.FeishuBot, error) {
 	var records []feishuBotModel
 	var views []feishuBotBindingView
@@ -167,6 +171,9 @@ func (r *FeishuBotRepository) listBots(ctx context.Context, onlyEnabled bool, vi
 		query := tx.Order("created_at DESC")
 		if onlyEnabled {
 			query = query.Where("status = ?", string(biz.FeishuBotEnabled))
+		}
+		if viewerID != uuid.Nil {
+			query = query.Where("owner_user_id = ?", viewerID)
 		}
 		if err := query.Find(&records).Error; err != nil {
 			return err
@@ -312,8 +319,8 @@ func (r *FeishuBotRepository) UnbindFeishuBot(ctx context.Context, userID, agent
 // toBizFeishuBot 将数据库模型转换为领域实体，不携带凭据。
 func toBizFeishuBot(record feishuBotModel) biz.FeishuBot {
 	return biz.FeishuBot{
-		ID: record.ID, Name: record.Name, AppID: record.AppID, BotOpenID: record.BotOpenID,
-		KeyVersion: record.KeyVersion, Status: biz.FeishuBotStatus(record.Status),
+		ID: record.ID, Name: record.Name, AppID: record.AppID, OwnerUserID: record.OwnerUserID,
+		BotOpenID: record.BotOpenID, KeyVersion: record.KeyVersion, Status: biz.FeishuBotStatus(record.Status),
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
 }

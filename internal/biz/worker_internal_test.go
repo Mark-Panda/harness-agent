@@ -987,6 +987,11 @@ func (f fakeSessionRepository) ListSessions(context.Context, uuid.UUID, int, str
 	return Page[Session]{}, nil
 }
 
+// ListSessionsActiveSince 返回空列表，测试不使用。
+func (f fakeSessionRepository) ListSessionsActiveSince(context.Context, uuid.UUID, time.Time, int) ([]Session, error) {
+	return nil, nil
+}
+
 // ArchiveSession 返回空会话，测试不使用。
 func (f fakeSessionRepository) ArchiveSession(context.Context, Session, OutboxEvent) (Session, error) {
 	return Session{}, nil

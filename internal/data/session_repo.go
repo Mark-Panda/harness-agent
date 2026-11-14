@@ -175,6 +175,26 @@ func (r *SessionRepository) ListSessions(ctx context.Context, userID uuid.UUID, 
 	return page, nil
 }
 
+// ListSessionsActiveSince 列出指定时间后有消息活动的会话，按最近消息时间倒序。
+func (r *SessionRepository) ListSessionsActiveSince(ctx context.Context, userID uuid.UUID, since time.Time, limit int) ([]biz.Session, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var records []sessionModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND status = ? AND last_message_at >= ?", userID, biz.SessionActive, since).
+			Order("last_message_at DESC").Limit(limit).Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list sessions active since", err)
+	}
+	result := make([]biz.Session, 0, len(records))
+	for _, record := range records {
+		result = append(result, toBizSession(record))
+	}
+	return result, nil
+}
+
 // ArchiveSession 使用 version 乐观锁归档，避免并发写覆盖。
 func (r *SessionRepository) ArchiveSession(ctx context.Context, session biz.Session, event biz.OutboxEvent) (biz.Session, error) {
 	var record sessionModel

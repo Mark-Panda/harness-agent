@@ -73,6 +73,21 @@ type agentMCPModel struct {
 // TableName 指定 Agent MCP 绑定表名。
 func (agentMCPModel) TableName() string { return "agent_mcps" }
 
+// agentUserSkillModel 对应 agent_user_skills 表：Agent 与用户级 Skill 的绑定。
+type agentUserSkillModel struct {
+	// AgentID Agent 版本 ID。
+	AgentID uuid.UUID `gorm:"type:uuid;primaryKey"`
+	// UserSkillID 绑定的用户级 Skill。
+	UserSkillID uuid.UUID `gorm:"column:user_skill_id;type:uuid;primaryKey"`
+	// UserID 所属用户，RLS 隔离键。
+	UserID uuid.UUID `gorm:"type:uuid;not null"`
+	// CreatedAt 绑定时间。
+	CreatedAt time.Time `gorm:"not null"`
+}
+
+// TableName 指定 Agent 用户技能绑定表名。
+func (agentUserSkillModel) TableName() string { return "agent_user_skills" }
+
 // skillModel 是 skills 表的只读摘要，用于发布快照校验。
 type skillModel struct {
 	// ID Skill 主键。
@@ -124,7 +139,7 @@ func NewAgentRepository(db *gorm.DB) *AgentRepository {
 
 // CreateAgent 在用户 scope 事务内创建 Agent 版本、绑定与审计事件。
 func (r *AgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, event biz.OutboxEvent) (biz.Agent, error) {
-	record, skills, mcps, err := fromBizAgent(agent)
+	record, skills, userSkills, mcps, err := fromBizAgent(agent)
 	if err != nil {
 		return biz.Agent{}, err
 	}
@@ -132,7 +147,7 @@ func (r *AgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, even
 		if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
-		if err := createAgentBindings(tx, skills, mcps); err != nil {
+		if err := createAgentBindings(tx, skills, userSkills, mcps); err != nil {
 			return err
 		}
 		return appendOutbox(tx, event)
@@ -145,7 +160,7 @@ func (r *AgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, even
 
 // UpdateAgent 仅更新草稿版本：按状态条件更新主记录后整体替换 Skill/MCP 绑定。
 func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, event biz.OutboxEvent) (biz.Agent, error) {
-	record, skills, mcps, err := fromBizAgent(agent)
+	record, skills, userSkills, mcps, err := fromBizAgent(agent)
 	if err != nil {
 		return biz.Agent{}, err
 	}
@@ -167,7 +182,10 @@ func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, even
 		if err := tx.Delete(&agentMCPModel{}, "agent_id = ? AND user_id = ?", agent.ID, agent.UserID).Error; err != nil {
 			return err
 		}
-		if err := createAgentBindings(tx, skills, mcps); err != nil {
+		if err := tx.Delete(&agentUserSkillModel{}, "agent_id = ? AND user_id = ?", agent.ID, agent.UserID).Error; err != nil {
+			return err
+		}
+		if err := createAgentBindings(tx, skills, userSkills, mcps); err != nil {
 			return err
 		}
 		return appendOutbox(tx, event)
@@ -202,7 +220,7 @@ func (r *AgentRepository) GetAgentAdmin(ctx context.Context, agentID uuid.UUID) 
 	if err != nil {
 		return biz.Agent{}, catalogError("get agent", err)
 	}
-	return toBizAgent(record, nil, nil)
+	return toBizAgent(record, nil, nil, nil)
 }
 
 // DeleteAgentAdmin 以 system scope 删除任意用户的助手版本；会话与运行记录由外键 SET NULL 保留。
@@ -247,6 +265,7 @@ func (r *AgentRepository) UpdateAgentStatus(ctx context.Context, userID, agentID
 func (r *AgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUID) (biz.Agent, error) {
 	var record agentModel
 	var skillIDs []uuid.UUID
+	var userSkillIDs []uuid.UUID
 	var mcpIDs []uuid.UUID
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		if err := tx.First(&record, "id = ? AND user_id = ?", agentID, userID).Error; err != nil {
@@ -255,12 +274,15 @@ func (r *AgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUI
 		if err := tx.Model(&agentSkillModel{}).Where("agent_id = ? AND user_id = ?", agentID, userID).Order("skill_id").Pluck("skill_id", &skillIDs).Error; err != nil {
 			return err
 		}
+		if err := tx.Model(&agentUserSkillModel{}).Where("agent_id = ? AND user_id = ?", agentID, userID).Order("user_skill_id").Pluck("user_skill_id", &userSkillIDs).Error; err != nil {
+			return err
+		}
 		return tx.Model(&agentMCPModel{}).Where("agent_id = ? AND user_id = ?", agentID, userID).Order("mcp_id").Pluck("mcp_id", &mcpIDs).Error
 	})
 	if err != nil {
 		return biz.Agent{}, catalogError("get agent", err)
 	}
-	return toBizAgent(record, skillIDs, mcpIDs)
+	return toBizAgent(record, skillIDs, userSkillIDs, mcpIDs)
 }
 
 // ListAgents 按创建时间与 ID 降序游标分页，多取一条用于判断是否还有下一页；默认排除已归档版本。
@@ -359,7 +381,7 @@ func (r *AgentRepository) ListAllAgents(ctx context.Context, filter biz.AdminAge
 		}
 	}
 	for _, record := range records {
-		agent, err := toBizAgent(record, nil, nil)
+		agent, err := toBizAgent(record, nil, nil, nil)
 		if err != nil {
 			return biz.Page[biz.AdminAgent]{}, catalogError("decode agent", err)
 		}
@@ -414,6 +436,29 @@ func (r *AgentRepository) ListSkillsByIDs(ctx context.Context, skillIDs []uuid.U
 	return result, nil
 }
 
+// ListUserSkillsByIDs 批量读取当前用户的技能摘要（用户级隔离数据，使用用户作用域）。
+func (r *AgentRepository) ListUserSkillsByIDs(ctx context.Context, userID uuid.UUID, skillIDs []uuid.UUID) ([]biz.UserSkill, error) {
+	if len(skillIDs) == 0 {
+		return []biz.UserSkill{}, nil
+	}
+	var records []userSkillModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND id IN ?", userID, skillIDs).Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list agent user skills", err)
+	}
+	result := make([]biz.UserSkill, 0, len(records))
+	for _, record := range records {
+		skill, err := toUserSkill(record)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, skill)
+	}
+	return result, nil
+}
+
 // ListMCPsByIDs 批量读取 MCP 摘要（平台级只读数据，使用 system scope）。
 func (r *AgentRepository) ListMCPsByIDs(ctx context.Context, mcpIDs []uuid.UUID) ([]biz.MCP, error) {
 	if len(mcpIDs) == 0 {
@@ -446,14 +491,19 @@ func (r *AgentRepository) CountAgents(ctx context.Context, userID uuid.UUID) (in
 }
 
 // fromBizAgent 将 Agent 聚合拆分为主记录与 Skill/MCP 绑定行。
-func fromBizAgent(agent biz.Agent) (agentModel, []agentSkillModel, []agentMCPModel, error) {
+func fromBizAgent(agent biz.Agent) (agentModel, []agentSkillModel, []agentUserSkillModel, []agentMCPModel, error) {
 	snapshot, err := json.Marshal(nonNilMap(agent.ConfigSnapshot))
 	if err != nil {
-		return agentModel{}, nil, nil, err
+		return agentModel{}, nil, nil, nil, err
 	}
 	skills := make([]agentSkillModel, 0, len(agent.SkillIDs))
 	for _, skillID := range agent.SkillIDs {
 		skills = append(skills, agentSkillModel{AgentID: agent.ID, SkillID: skillID, UserID: agent.UserID, Config: datatypes.JSON([]byte("{}"))})
+	}
+	userSkills := make([]agentUserSkillModel, 0, len(agent.UserSkillIDs))
+	now := time.Now().UTC()
+	for _, userSkillID := range agent.UserSkillIDs {
+		userSkills = append(userSkills, agentUserSkillModel{AgentID: agent.ID, UserSkillID: userSkillID, UserID: agent.UserID, CreatedAt: now})
 	}
 	mcps := make([]agentMCPModel, 0, len(agent.MCPIDs))
 	for _, mcpID := range agent.MCPIDs {
@@ -463,13 +513,18 @@ func fromBizAgent(agent biz.Agent) (agentModel, []agentSkillModel, []agentMCPMod
 		ID: agent.ID, UserID: agent.UserID, Name: agent.Name, Description: agent.Description, Mode: string(agent.Mode),
 		ModelPolicyID: agent.ModelPolicyID, ModelPolicyVersion: agent.ModelPolicyVersion, Version: agent.Version,
 		ConfigSnapshot: datatypes.JSON(snapshot), Status: string(agent.Status),
-	}, skills, mcps, nil
+	}, skills, userSkills, mcps, nil
 }
 
-// createAgentBindings 在同一事务内批量写入 Skill 与 MCP 绑定。
-func createAgentBindings(tx *gorm.DB, skills []agentSkillModel, mcps []agentMCPModel) error {
+// createAgentBindings 在同一事务内批量写入 Skill、用户技能与 MCP 绑定。
+func createAgentBindings(tx *gorm.DB, skills []agentSkillModel, userSkills []agentUserSkillModel, mcps []agentMCPModel) error {
 	if len(skills) > 0 {
 		if err := tx.Create(&skills).Error; err != nil {
+			return err
+		}
+	}
+	if len(userSkills) > 0 {
+		if err := tx.Create(&userSkills).Error; err != nil {
 			return err
 		}
 	}
@@ -482,7 +537,7 @@ func createAgentBindings(tx *gorm.DB, skills []agentSkillModel, mcps []agentMCPM
 }
 
 // toBizAgent 将主记录与绑定 ID 组装为领域聚合，并解码配置快照 JSON。
-func toBizAgent(record agentModel, skillIDs, mcpIDs []uuid.UUID) (biz.Agent, error) {
+func toBizAgent(record agentModel, skillIDs, userSkillIDs, mcpIDs []uuid.UUID) (biz.Agent, error) {
 	var snapshot map[string]any
 	if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
 		return biz.Agent{}, err
@@ -490,7 +545,7 @@ func toBizAgent(record agentModel, skillIDs, mcpIDs []uuid.UUID) (biz.Agent, err
 	return biz.Agent{
 		ID: record.ID, UserID: record.UserID, Name: record.Name, Description: record.Description, Mode: biz.AgentMode(record.Mode),
 		ModelPolicyID: record.ModelPolicyID, ModelPolicyVersion: record.ModelPolicyVersion, Version: record.Version,
-		ConfigSnapshot: snapshot, SkillIDs: skillIDs, MCPIDs: mcpIDs, Status: biz.AgentStatus(record.Status),
+		ConfigSnapshot: snapshot, SkillIDs: skillIDs, UserSkillIDs: userSkillIDs, MCPIDs: mcpIDs, Status: biz.AgentStatus(record.Status),
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}, nil
 }

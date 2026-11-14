@@ -95,6 +95,7 @@ export function statusTone(status: string | null | undefined): Tone {
     case "queued":
     case "pending":
     case "draft":
+    case "auto_generated":
     case "waiting_approval":
     case "reconciliation_required":
     case "planning":
@@ -128,6 +129,7 @@ export function statusLabel(status: string | null | undefined): string {
     archived: "已归档",
     deleted: "已删除",
     draft: "草稿",
+    auto_generated: "待确认",
     published: "已发布",
     disabled: "已停用",
     enabled: "启用",

@@ -1,0 +1,413 @@
+// 我的技能：展示每日对话提炼与手动创建的用户级技能，支持编辑草稿、发布、停用与删除。
+import { useEffect, useRef, useState } from "react";
+import { FormDrawer } from "../components/FormDrawer";
+import { SkillBundlePanel } from "../components/SkillBundlePanel";
+import { useToast } from "../components/Toast";
+import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../components/ui";
+import { mutate, requestJSON, uploadSkillPackage } from "../lib/api";
+import { describeError } from "../lib/errors";
+import { formatDateTime, statusLabel, statusTone } from "../lib/format";
+import { useClientPage, useRemote } from "../lib/hooks";
+import type { UserSkill, UserSkillInput, UserSkillOrigin, UserSkillSynthesisPolicy, UserSkillSynthesisSettings, UserSkillSynthesisSettingsInput } from "../lib/types";
+
+interface UserSkillList {
+  items: UserSkill[];
+}
+
+interface UserSkillFormState {
+  name: string;
+  description: string;
+  promptTemplate: string;
+  parameters: string;
+}
+
+const emptyForm: UserSkillFormState = { name: "", description: "", promptTemplate: "", parameters: "{}" };
+
+// originLabel 把技能来源翻译成用户语言。
+function originLabel(origin: UserSkillOrigin): string {
+  return origin === "auto" ? "自动提炼" : "手动创建";
+}
+
+function UserSkillForm({ initial, onSaved, onCancel }: { initial: UserSkill | null; onSaved: () => void; onCancel: () => void }) {
+  const initialForm: UserSkillFormState = initial
+    ? {
+        name: initial.name,
+        description: initial.description,
+        promptTemplate: initial.prompt_template,
+        parameters: JSON.stringify(initial.parameters ?? {}, null, 2),
+      }
+    : emptyForm;
+  const [form, setForm] = useState(initialForm);
+  const toast = useToast();
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      let parameters: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(form.parameters || "{}");
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("参数必须是 JSON 对象");
+        }
+        parameters = parsed as Record<string, unknown>;
+      } catch (parseError) {
+        throw new Error(parseError instanceof Error && parseError.message === "参数必须是 JSON 对象" ? parseError.message : "参数 JSON 格式错误");
+      }
+      const body: UserSkillInput = {
+        name: form.name.trim(),
+        description: form.description.trim(),
+        prompt_template: form.promptTemplate,
+        parameters,
+      };
+      if (initial) {
+        // 名称由服务端保留，编辑只提交正文与参数。
+        await mutate<UserSkill>(`/api/v1/user-skills/${initial.id}`, "PUT", body, crypto.randomUUID());
+      } else {
+        await mutate<UserSkill>("/api/v1/user-skills", "POST", body, crypto.randomUUID());
+      }
+      toast.show(initial ? "修改已保存" : "已创建技能草稿", "success");
+      onSaved();
+    } catch (submitError) {
+      setError(submitError instanceof Error && (submitError.message === "参数 JSON 格式错误" || submitError.message === "参数必须是 JSON 对象")
+        ? submitError.message
+        : describeError(submitError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <FormDrawer
+      title={initial ? `编辑技能：${initial.name}` : "新建技能"}
+      description="技能会作为额外说明交给助手。待确认的草稿可以修改，发布后正文不可原地编辑。"
+      submitLabel={initial ? "保存修改" : "创建草稿"}
+      busy={busy}
+      dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
+      error={error}
+      onSubmit={submit}
+      onCancel={onCancel}
+    >
+      <Field label="技能名称" hint={initial ? "名称创建后保持不变。" : "例如“周报整理”“需求结构化”。"}>
+        <Input
+          value={form.name}
+          onChange={(event) => setForm({ ...form, name: event.target.value })}
+          required
+          maxLength={128}
+          disabled={initial !== null}
+        />
+      </Field>
+      <Field label="来源">
+        <Input value={initial ? originLabel(initial.origin) : "手动创建"} disabled />
+      </Field>
+      <div className="sm:col-span-2">
+        <Field label="一句话说明" hint="告诉使用者在什么场景下选这个技能。">
+          <Input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} maxLength={512} placeholder="例如：把零散需求整理成带优先级的清单" />
+        </Field>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="技能说明（会发给助手）" hint="用自然语言写做事步骤、输出格式和禁忌。">
+          <Textarea className="min-h-40 text-xs" value={form.promptTemplate} onChange={(event) => setForm({ ...form, promptTemplate: event.target.value })} required spellCheck={false} />
+        </Field>
+      </div>
+      <div className="sm:col-span-2">
+        <Field label="参数定义（高级，可保持 {}）" hint="需要动态参数时才填写 JSON 对象。">
+          <Textarea className="min-h-28 font-mono text-xs" value={form.parameters} onChange={(event) => setForm({ ...form, parameters: event.target.value })} spellCheck={false} />
+        </Field>
+      </div>
+    </FormDrawer>
+  );
+}
+
+// formatSavedAt 过滤未保存记录的零值时间，避免显示公元 1 年。
+function formatSavedAt(value: string | null | undefined): string {
+  return value && !value.startsWith("0001-01-01") ? formatDateTime(value) : "";
+}
+
+// SynthesisSettingsCard 配置每日技能提炼开关与执行提炼的模型策略。
+function SynthesisSettingsCard() {
+  const settings = useRemote(() => requestJSON<UserSkillSynthesisSettings>("/api/v1/user-skill-synthesis/settings"), []);
+  const policies = useRemote(() => requestJSON<{ items: UserSkillSynthesisPolicy[] }>("/api/v1/user-skill-synthesis/policies"), []);
+  const toast = useToast();
+  const [enabled, setEnabled] = useState(false);
+  const [policyID, setPolicyID] = useState("");
+  const [initialized, setInitialized] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState("");
+
+  useEffect(() => {
+    if (!settings.data || initialized) return;
+    setEnabled(settings.data.enabled);
+    setPolicyID(settings.data.model_policy_id ?? "");
+    setSavedAt(formatSavedAt(settings.data.updated_at));
+    setInitialized(true);
+  }, [settings.data, initialized]);
+
+  const publishedPolicies = policies.data?.items ?? [];
+  const selectedPolicy = policyID ? publishedPolicies.find((policy) => policy.id === policyID) : undefined;
+  const staleSelection = policyID !== "" && policies.data !== null && selectedPolicy === undefined;
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (staleSelection) {
+        throw new Error("当前选择的策略已不可用，请重新选择后再保存。");
+      }
+      const policy = publishedPolicies.find((item) => item.id === policyID);
+      const body: UserSkillSynthesisSettingsInput = {
+        enabled,
+        model_policy_id: policy?.id ?? null,
+        model_policy_version: policy?.version ?? null,
+      };
+      const updated = await mutate<UserSkillSynthesisSettings>("/api/v1/user-skill-synthesis/settings", "PUT", body, crypto.randomUUID());
+      setEnabled(updated.enabled);
+      setPolicyID(updated.model_policy_id ?? "");
+      setSavedAt(formatSavedAt(updated.updated_at));
+      toast.show("自动提炼设置已保存", "success");
+    } catch (failure) {
+      setError(failure instanceof Error && failure.message === "当前选择的策略已不可用，请重新选择后再保存。"
+        ? failure.message
+        : describeError(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card title="自动提炼设置" description="每天从有效对话中提炼技能草稿。这里决定是否分析你的对话，以及由哪个已发布的模型策略执行提炼。">
+      {settings.loading && !settings.data ? (
+        <LoadingState />
+      ) : settings.error ? (
+        <ErrorBanner message={settings.error} onRetry={settings.reload} />
+      ) : (
+        <div className="flex flex-col gap-4">
+          <label className="flex items-start gap-3 rounded-lg border border-line bg-paper-deep/40 p-3">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => setEnabled(event.target.checked)}
+              className="mt-0.5 size-4 accent-[var(--color-accent)]"
+            />
+            <span className="min-w-0">
+              <span className="block text-sm font-medium text-ink">开启每日技能自动提炼</span>
+              <span className="mt-0.5 block text-xs leading-5 text-muted">关闭后系统不再分析你的对话，已生成的草稿仍会保留。</span>
+            </span>
+          </label>
+          <Field label="提炼模型策略" hint="只能选择已发布的策略；留空时跟随管理员配置的平台默认策略。">
+            <Select value={policyID} onChange={(event) => setPolicyID(event.target.value)}>
+              <option value="">跟随平台默认策略</option>
+              {publishedPolicies.map((policy) => (
+                <option key={policy.id} value={policy.id}>{policy.name} · v{policy.version}</option>
+              ))}
+              {staleSelection ? (
+                <option value={policyID}>当前策略（已失效）</option>
+              ) : null}
+            </Select>
+          </Field>
+          {policies.error ? <ErrorBanner message={policies.error} onRetry={policies.reload} /> : null}
+          {!policies.loading && publishedPolicies.length === 0 ? (
+            <Callout tone="warning" title="暂无可选策略">
+              目前没有已发布的模型策略。可以跟随平台默认策略；如需指定策略，请联系管理员在“平台设置 · 选模规则”中发布。
+            </Callout>
+          ) : null}
+          {staleSelection ? <Callout tone="warning">当前选择的策略已不可用，请重新选择后再保存。</Callout> : null}
+          {error ? <ErrorBanner message={error} /> : null}
+          <div className="flex flex-wrap items-center gap-3">
+            <Button loading={busy} disabled={!initialized || busy} onClick={() => void save()}>保存设置</Button>
+            <span className="text-xs text-muted">{savedAt ? `上次保存于 ${savedAt}` : "尚未保存过设置"}</span>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+export default function UserSkillsPage() {
+  const skills = useRemote(() => requestJSON<UserSkillList>("/api/v1/user-skills?limit=200"), []);
+  const toast = useToast();
+  const [editing, setEditing] = useState<UserSkill | null | "new">(null);
+  const [deleting, setDeleting] = useState<UserSkill | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busyID, setBusyID] = useState<string | null>(null);
+  const [bundleSkill, setBundleSkill] = useState<UserSkill | null>(null);
+  const [importing, setImporting] = useState(false);
+  const importRef = useRef<HTMLInputElement | null>(null);
+  const skillItems = skills.data?.items ?? [];
+  const paging = useClientPage(skillItems, 10);
+
+  // importBundle 上传标准 SKILL 包 zip，后端保留完整目录树与脚本。
+  const importBundle = async (file: File) => {
+    setImporting(true);
+    setActionError(null);
+    try {
+      const created = await uploadSkillPackage<UserSkill>("/api/v1/user-skills/import", file);
+      toast.show(`已导入技能「${created.name}」，确认后可发布`, "success");
+      skills.reload();
+    } catch (failure) {
+      setActionError(describeError(failure));
+    } finally {
+      setImporting(false);
+      if (importRef.current) {
+        importRef.current.value = "";
+      }
+    }
+  };
+
+  // runAction 统一串行动作状态，避免同一行重复提交。
+  const runAction = async (skill: UserSkill, action: "publish" | "disable", successMessage: string) => {
+    setBusyID(skill.id);
+    setActionError(null);
+    try {
+      await mutate<UserSkill>(`/api/v1/user-skills/${skill.id}/${action}`, "POST", undefined, crypto.randomUUID());
+      toast.show(successMessage, "success");
+      skills.reload();
+    } catch (failure) {
+      setActionError(describeError(failure));
+    } finally {
+      setBusyID(null);
+    }
+  };
+
+  const remove = async () => {
+    if (!deleting) {
+      return;
+    }
+    setBusyID(deleting.id);
+    setActionError(null);
+    try {
+      await mutate<void>(`/api/v1/user-skills/${deleting.id}`, "DELETE");
+      setDeleting(null);
+      toast.show("技能已删除", "success");
+      skills.reload();
+    } catch (failure) {
+      setActionError(describeError(failure));
+    } finally {
+      setBusyID(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        eyebrow="工作区 · 能力"
+        title="我的技能"
+        description="这里是你私有的技能库。开启每日技能提炼后，系统会从有效对话中生成待确认草稿；也可以手动创建或导入标准 SKILL 包。发布后即可在助手中勾选使用。"
+        actions={
+          <>
+            <input
+              ref={importRef}
+              type="file"
+              accept=".zip,application/zip"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void importBundle(file);
+                }
+              }}
+            />
+            <Button variant="secondary" loading={importing} onClick={() => importRef.current?.click()}>导入技能包</Button>
+            <Button onClick={() => setEditing("new")}>新建技能</Button>
+          </>
+        }
+      />
+      {skills.error ? <ErrorBanner message={skills.error} onRetry={skills.reload} /> : null}
+      {actionError ? <ErrorBanner message={actionError} /> : null}
+      <SynthesisSettingsCard />
+      {editing ? (
+        <UserSkillForm
+          initial={editing === "new" ? null : editing}
+          onCancel={() => setEditing(null)}
+          onSaved={() => { setEditing(null); skills.reload(); }}
+        />
+      ) : null}
+      <Card title="技能列表" description={`共 ${skillItems.length} 个技能`}>
+        {skills.loading && !skills.data ? (
+          <LoadingState />
+        ) : skillItems.length > 0 ? (
+          <div className="flex flex-col gap-3">
+            {paging.pageItems.map((skill) => {
+              const busy = busyID === skill.id;
+              return (
+                <article key={skill.id} className="rounded-lg border border-line bg-paper-deep/40 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-semibold text-ink">{skill.name}</h3>
+                        <Badge tone="neutral">v{skill.version}</Badge>
+                        <Badge tone={statusTone(skill.status)}>{statusLabel(skill.status)}</Badge>
+                        <Badge tone={skill.origin === "auto" ? "info" : "neutral"}>{originLabel(skill.origin)}</Badge>
+                        {skill.origin === "auto" ? <Badge tone="neutral">置信度 {Math.round(skill.confidence * 100)}%</Badge> : null}
+                        {skill.bundle ? <Badge tone="info">技能包 · {skill.bundle.file_count} 文件</Badge> : null}
+                        {skill.bundle?.has_scripts ? <Badge tone={skill.bundle.execution_enabled ? "warning" : "neutral"}>{skill.bundle.execution_enabled ? "脚本可执行" : "含脚本"}</Badge> : null}
+                      </div>
+                      <p className="mt-1 text-xs text-muted">{skill.description || "无描述"}</p>
+                      <p className="mt-1 text-[11px] text-muted">更新于 {formatDateTime(skill.updated_at)}</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {skill.bundle ? (
+                        <Button size="sm" variant="secondary" onClick={() => setBundleSkill(skill)}>文件</Button>
+                      ) : null}
+                      {skill.status !== "published" ? (
+                        <Button size="sm" variant="secondary" loading={busy} disabled={busyID !== null && !busy} onClick={() => void runAction(skill, "publish", "技能已发布")}>发布</Button>
+                      ) : null}
+                      {skill.status !== "disabled" ? (
+                        <Button size="sm" variant="secondary" loading={busy} disabled={busyID !== null && !busy} onClick={() => void runAction(skill, "disable", "技能已停用")}>停用</Button>
+                      ) : null}
+                      <RowMenu name={skill.name}>
+                        {skill.status === "auto_generated" ? (
+                          <MenuItem icon="edit" onClick={() => setEditing(skill)}>编辑草稿</MenuItem>
+                        ) : null}
+                        <MenuItem icon="trash" danger onClick={() => { setDeleting(skill); setActionError(null); }}>删除</MenuItem>
+                      </RowMenu>
+                    </div>
+                  </div>
+                  <details className="mt-3 text-xs text-muted">
+                    <summary className="cursor-pointer text-muted">查看技能说明</summary>
+                    <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded border border-line bg-paper-raised p-3 font-mono text-[11px] text-ink-soft">{skill.prompt_template}</pre>
+                    {skill.source_session_ids.length > 0 ? (
+                      <p className="mt-2 break-all text-[11px] text-muted">来源会话：{skill.source_session_ids.join("、")}</p>
+                    ) : null}
+                  </details>
+                  {skill.bundle && bundleSkill?.id === skill.id ? (
+                    <div className="mt-3">
+                      <SkillBundlePanel
+                        basePath="/api/v1/user-skills"
+                        skillId={skill.id}
+                        skillName={skill.name}
+                        bundle={skill.bundle}
+                        onClose={() => setBundleSkill(null)}
+                        onExecutionChanged={() => skills.reload()}
+                      />
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyState
+            title="还没有技能"
+            description="开启每日技能提炼后，有效对话会在第二天生成待确认草稿；也可以现在手动创建或导入标准 SKILL 包。"
+            action={<Button size="sm" onClick={() => setEditing("new")}>新建技能</Button>}
+          />
+        )}
+        <Pager page={paging.page} totalPages={paging.totalPages} total={skillItems.length} busy={skills.loading} onChange={paging.setPage} />
+      </Card>
+      <ConfirmDialog
+        open={deleting !== null}
+        title={`删除技能 ${deleting?.name ?? ""}？`}
+        description="删除后无法恢复；已绑定该技能的助手需要重新选择技能。"
+        confirmLabel="确认删除"
+        busy={busyID !== null}
+        onCancel={() => setDeleting(null)}
+        onConfirm={() => void remove()}
+      />
+    </div>
+  );
+}
