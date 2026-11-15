@@ -53,8 +53,8 @@ type MCPRepository interface {
 	ListMCPs(ctx context.Context) ([]MCP, error)
 }
 
-// MCPCredentialRepository 在执行层读取 MCP 鉴权凭证，仅允许 Worker 内部使用。
-// 读取结果不得进入事件、日志、HTTP/gRPC 响应或审计载荷。
+// MCPCredentialRepository 读取 MCP 鉴权凭证，仅供 Worker、连通性探测与显式授权查看使用。
+// 密文不得进入事件、日志、HTTP/gRPC 响应或审计载荷；明文仅可由 RevealCredential 按需返回。
 type MCPCredentialRepository interface {
 	// GetMCPCredential 返回 MCP 元数据与加密凭证；none 鉴权时密文为空。
 	GetMCPCredential(ctx context.Context, mcpID uuid.UUID) (MCP, ProviderCredential, error)
@@ -93,6 +93,7 @@ type MCPService struct {
 	credentials MCPCredentialRepository
 	opener      CredentialOpener
 	prober      MCPProber
+	revealAudit OutboxAppender
 }
 
 // NewMCPService 构造 MCP 服务。
@@ -109,6 +110,46 @@ func (s *MCPService) WithProber(credentials MCPCredentialRepository, opener Cred
 	s.opener = opener
 	s.prober = prober
 	return s
+}
+
+// WithRevealAudit 启用显式凭据查看所需的审计写入。
+func (s *MCPService) WithRevealAudit(audit OutboxAppender) *MCPService {
+	s.revealAudit = audit
+	return s
+}
+
+// RevealCredential 由管理员显式查看已保存鉴权凭据，并写入不含秘密的审计事件。
+func (s *MCPService) RevealCredential(ctx context.Context, principal Principal, mcpID uuid.UUID) (RevealedCredential, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return RevealedCredential{}, err
+	}
+	if s.credentials == nil || s.opener == nil || s.revealAudit == nil {
+		return RevealedCredential{}, invalid("MCP credential reveal is not configured")
+	}
+	live, credential, err := s.credentials.GetMCPCredential(ctx, mcpID)
+	if err != nil {
+		return RevealedCredential{}, err
+	}
+	result := RevealedCredential{}
+	if live.AuthType != "none" && len(credential.Encrypted) > 0 {
+		plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+		if err != nil {
+			return RevealedCredential{}, invalid("MCP credentials cannot be decrypted")
+		}
+		defer func() {
+			for index := range plaintext {
+				plaintext[index] = 0
+			}
+		}()
+		result.Configured = len(plaintext) > 0
+		result.Value = string(plaintext)
+	}
+	event := mutationEvent(principal.UserID, "mcp.credential.revealed", "mcp", mcpID)
+	event.Payload["auth_type"] = live.AuthType
+	if err := s.revealAudit.AppendOutboxEvent(ctx, event); err != nil {
+		return RevealedCredential{}, err
+	}
+	return result, nil
 }
 
 // Create 创建 MCP，端点通过 SSRF 准入且凭证加密后落库。

@@ -127,6 +127,13 @@ func NewCatalogRepository(db *gorm.DB) *CatalogRepository {
 	return &CatalogRepository{db: db}
 }
 
+// AppendOutboxEvent 追加敏感操作审计，不修改对应资源配置或凭据。
+func (r *CatalogRepository) AppendOutboxEvent(ctx context.Context, event biz.OutboxEvent) error {
+	return WithScope(ctx, r.db, Scope{System: true, UserID: event.UserID}, func(tx *gorm.DB) error {
+		return appendOutbox(tx, event)
+	})
+}
+
 // CreateProvider 在 system scope 事务内写入供应商密文并追加审计 Outbox 事件。
 func (r *CatalogRepository) CreateProvider(ctx context.Context, actorID uuid.UUID, provider biz.Provider, credential biz.ProviderCredential, event biz.OutboxEvent) (biz.Provider, error) {
 	model := providerModel{
@@ -203,7 +210,7 @@ func (r *CatalogRepository) GetProvider(ctx context.Context, providerID uuid.UUI
 	return toBizProvider(model), nil
 }
 
-// GetProviderCredential 读取供应商元数据与加密凭证，仅供执行 Worker 解密使用。
+// GetProviderCredential 读取供应商元数据与加密凭证，仅供 Worker、远程模型目录与显式授权查看使用。
 // 密文与密钥版本绝不返回给 HTTP/gRPC 调用方，也不得写入事件载荷。
 func (r *CatalogRepository) GetProviderCredential(ctx context.Context, providerID uuid.UUID) (biz.Provider, biz.ProviderCredential, error) {
 	var record providerModel

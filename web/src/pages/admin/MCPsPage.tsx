@@ -1,5 +1,5 @@
-// MCP 接入管理：仅允许 HTTPS 公网端点，凭证只写不读，风险等级决定审批策略。
-import { useState } from "react";
+// MCP 接入管理：仅允许 HTTPS 公网端点，普通查询不返回凭证，风险等级决定审批策略。
+import { useCallback, useState } from "react";
 import { FormDrawer } from "../../components/FormDrawer";
 import { useToast } from "../../components/Toast";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select, Textarea } from "../../components/ui";
@@ -44,6 +44,14 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const needsCredential = form.authType !== "none";
+  const revealCredential = useCallback(
+    () => requestJSON<{ configured: boolean; value?: string }>(`/api/v1/mcps/${initial?.id}/reveal-credential`, {
+      method: "POST",
+      cache: "no-store",
+      body: JSON.stringify({}),
+    }),
+    [initial?.id],
+  );
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -115,12 +123,14 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
         <div className="sm:col-span-2">
           <Field
             label="请求头 JSON"
-            hint={initial ? "留空保留现有请求头；填写则整体替换，必须是 JSON 对象。" : '按 JSON 对象填写，例如 {"X-Api-Key":"your-key","X-Tenant":"team-a"}。'}
+            hint={initial ? "留空保留现有请求头；可点击眼睛授权查看，填写则整体替换，必须是 JSON 对象。" : '按 JSON 对象填写，例如 {"X-Api-Key":"your-key","X-Tenant":"team-a"}。普通查询不返回明文。'}
           >
             <Textarea
+              key="header"
               className="min-h-28 font-mono text-xs"
               value={form.credentials}
               onChange={(event) => setForm({ ...form, credentials: event.target.value })}
+              onRevealSaved={initial ? revealCredential : undefined}
               required={!initial}
               spellCheck={false}
               placeholder={'{\n  "X-Api-Key": "your-key"\n}'}
@@ -128,8 +138,8 @@ function MCPForm({ initial, onSaved, onCancel }: { initial: MCP | null; onSaved:
           </Field>
         </div>
       ) : form.authType === "none" ? null : (
-        <Field label={form.authType === "bearer" ? "Bearer Token" : "OAuth 凭证"} hint={initial ? "留空保留现有凭证；填写则替换。" : "保存后不再显示明文。"}>
-          <Input type="password" autoComplete="off" value={form.credentials} onChange={(event) => setForm({ ...form, credentials: event.target.value })} required={!initial} />
+        <Field label={form.authType === "bearer" ? "Bearer Token" : "OAuth 凭证"} hint={initial ? "留空保留现有凭证；可点击眼睛授权查看，填写则替换。" : "普通查询不返回明文，编辑已保存工具时可授权查看。"}>
+          <Input key={form.authType} type="password" autoComplete="off" value={form.credentials} onChange={(event) => setForm({ ...form, credentials: event.target.value })} onRevealSaved={initial ? revealCredential : undefined} required={!initial} />
         </Field>
       )}
       <Field label="风险等级" hint="中高风险工具在每次执行前都会请求你审批。">

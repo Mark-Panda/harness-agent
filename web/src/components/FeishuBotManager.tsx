@@ -1,5 +1,5 @@
 // 飞书机器人管理：管理员登记平台机器人，普通用户自助管理归属自己的机器人。
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { FormDrawer } from "./FormDrawer";
 import { useToast } from "./Toast";
 import { Badge, Button, Callout, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select } from "./ui";
@@ -58,6 +58,17 @@ function BotForm({ basePath, initial, onSaved, onCancel }: {
   const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const revealCredential = useCallback(
+    (field: "app_secret" | "verification_token" | "encrypt_key") => requestJSON<{ configured: boolean; value?: string }>(`${basePath}/${initial?.id}/reveal-credential`, {
+      method: "POST",
+      cache: "no-store",
+      body: JSON.stringify({ field }),
+    }),
+    [basePath, initial?.id],
+  );
+  const revealAppSecret = useCallback(() => revealCredential("app_secret"), [revealCredential]);
+  const revealVerificationToken = useCallback(() => revealCredential("verification_token"), [revealCredential]);
+  const revealEncryptKey = useCallback(() => revealCredential("encrypt_key"), [revealCredential]);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -90,7 +101,7 @@ function BotForm({ basePath, initial, onSaved, onCancel }: {
   return (
     <FormDrawer
       title={initial ? `编辑机器人：${initial.name}` : "登记飞书机器人"}
-      description={initial ? "应用密钥、Verification Token 与 Encrypt Key 留空时保留原值。" : "在飞书开放平台创建自建应用并启用机器人，然后填写应用凭据。"}
+      description={initial ? "应用密钥、Verification Token 与 Encrypt Key 留空时保留原值，点击眼睛可授权查看已保存凭据。" : "在飞书开放平台创建自建应用并启用机器人，然后填写应用凭据。"}
       submitLabel={initial ? "保存修改" : "登记机器人"}
       busy={busy}
       dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
@@ -113,14 +124,14 @@ function BotForm({ basePath, initial, onSaved, onCancel }: {
       <Field label="机器人 open_id" hint="用于群聊 @ 判断；可在开放平台或事件日志中获取。">
         <Input value={form.botOpenId} onChange={(event) => setForm({ ...form, botOpenId: event.target.value })} maxLength={128} />
       </Field>
-      <Field label="App Secret" hint={initial ? "留空保留原密钥。" : "只写入一次，保存后任何接口都不返回。"}>
-        <Input type="password" value={form.appSecret} onChange={(event) => setForm({ ...form, appSecret: event.target.value })} required={!initial} autoComplete="new-password" />
+      <Field label="App Secret" hint={initial ? "留空保留原密钥；可点击眼睛授权查看。" : "普通查询不返回明文，编辑已保存机器人时可授权查看。"}>
+        <Input type="password" value={form.appSecret} onChange={(event) => setForm({ ...form, appSecret: event.target.value })} onRevealSaved={initial ? revealAppSecret : undefined} required={!initial} autoComplete="new-password" />
       </Field>
-      <Field label="Verification Token" hint="事件订阅校验串，可留空；填写时会加密保存。">
-        <Input type="password" value={form.verificationToken} onChange={(event) => setForm({ ...form, verificationToken: event.target.value })} autoComplete="new-password" />
+      <Field label="Verification Token" hint={initial ? "留空保留原值；可点击眼睛授权查看。" : "事件订阅校验串，可留空；普通查询不返回明文，编辑时可授权查看。"}>
+        <Input type="password" value={form.verificationToken} onChange={(event) => setForm({ ...form, verificationToken: event.target.value })} onRevealSaved={initial ? revealVerificationToken : undefined} autoComplete="new-password" />
       </Field>
-      <Field label="Encrypt Key" hint="事件加密密钥，可留空；填写时会加密保存。">
-        <Input type="password" value={form.encryptKey} onChange={(event) => setForm({ ...form, encryptKey: event.target.value })} autoComplete="new-password" />
+      <Field label="Encrypt Key" hint={initial ? "留空保留原值；可点击眼睛授权查看。" : "事件加密密钥，可留空；普通查询不返回明文，编辑时可授权查看。"}>
+        <Input type="password" value={form.encryptKey} onChange={(event) => setForm({ ...form, encryptKey: event.target.value })} onRevealSaved={initial ? revealEncryptKey : undefined} autoComplete="new-password" />
       </Field>
     </FormDrawer>
   );

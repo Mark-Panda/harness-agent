@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -283,6 +284,103 @@ func TestFeishuBotServiceAdminLifecycleAndCredentialRetention(t *testing.T) {
 	if err := service.Delete(context.Background(), admin, bot.ID); err != nil || len(repo.bots) != 0 {
 		t.Fatalf("delete error = %v", err)
 	}
+}
+
+func TestFeishuBotServiceRevealCredential(t *testing.T) {
+	repo := newFakeFeishuBotRepository()
+	audit := &fakeOutboxAppender{}
+	service, err := biz.NewFeishuBotService(repo, fixedCipher{}, jsonOpener{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithLongConnection().WithRevealAudit(audit)
+	owner := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+	bot, err := service.Create(context.Background(), owner, biz.FeishuBotInput{
+		Name: "可查看机器人", AppID: "cli_reveal", AppSecret: "app-secret", VerificationToken: "verification-secret", Status: biz.FeishuBotEnabled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	revealed, err := service.RevealCredential(context.Background(), owner, bot.ID, "app_secret")
+	if err != nil || !revealed.Configured || revealed.Value != "app-secret" {
+		t.Fatalf("owner reveal = %#v, %v", revealed, err)
+	}
+	revealed, err = service.RevealCredential(context.Background(), admin, bot.ID, "verification_token")
+	if err != nil || !revealed.Configured || revealed.Value != "verification-secret" {
+		t.Fatalf("admin reveal = %#v, %v", revealed, err)
+	}
+	revealed, err = service.RevealCredential(context.Background(), owner, bot.ID, "encrypt_key")
+	if err != nil || revealed.Configured || revealed.Value != "" {
+		t.Fatalf("unconfigured reveal = %#v, %v", revealed, err)
+	}
+	if len(audit.events) != 3 {
+		t.Fatalf("reveal audit count = %d", len(audit.events))
+	}
+	for index, field := range []string{"app_secret", "verification_token", "encrypt_key"} {
+		event := audit.events[index]
+		if event.EventType != "feishu_bot.credential.revealed" || event.Payload["field"] != field {
+			t.Fatalf("reveal audit = %#v", event)
+		}
+		if serialized := fmt.Sprintf("%#v", event); strings.Contains(serialized, "app-secret") || strings.Contains(serialized, "verification-secret") || strings.Contains(serialized, "sealed:") {
+			t.Fatalf("audit contains credential material: %s", serialized)
+		}
+	}
+	if _, err := service.RevealCredential(context.Background(), owner, bot.ID, "unknown"); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("invalid field error = %v", err)
+	}
+	other := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	if _, err := service.RevealCredential(context.Background(), other, bot.ID, "app_secret"); !errors.Is(err, biz.ErrForbidden) {
+		t.Fatalf("cross-tenant reveal error = %v", err)
+	}
+	if len(audit.events) != 3 {
+		t.Fatalf("failed reveal must not append success audit: %#v", audit.events)
+	}
+}
+
+func TestFeishuBotServiceRevealCredentialFailures(t *testing.T) {
+	repo := newFakeFeishuBotRepository()
+	owner := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	botID := uuid.New()
+	repo.bots[botID] = biz.FeishuBot{ID: botID, OwnerUserID: owner.UserID, Status: biz.FeishuBotEnabled}
+	repo.credentials[botID] = biz.ProviderCredential{Encrypted: []byte("sealed:{\"app_secret\":\"app-secret\"}"), KeyVersion: "v1"}
+
+	t.Run("decrypt failure", func(t *testing.T) {
+		audit := &fakeOutboxAppender{}
+		service, _ := biz.NewFeishuBotService(repo, fixedCipher{}, fakeMCPOpener{err: errors.New("decrypt failed")})
+		service.WithRevealAudit(audit)
+		if _, err := service.RevealCredential(context.Background(), owner, botID, "app_secret"); !errors.Is(err, biz.ErrInvalidConfig) || len(audit.events) != 0 {
+			t.Fatalf("decrypt failure = %v, audit=%#v", err, audit.events)
+		}
+	})
+
+	t.Run("invalid stored JSON", func(t *testing.T) {
+		audit := &fakeOutboxAppender{}
+		service, _ := biz.NewFeishuBotService(repo, fixedCipher{}, fakeMCPOpener{plain: []byte("not-json")})
+		service.WithRevealAudit(audit)
+		if _, err := service.RevealCredential(context.Background(), owner, botID, "app_secret"); !errors.Is(err, biz.ErrInvalidConfig) || len(audit.events) != 0 {
+			t.Fatalf("invalid JSON failure = %v, audit=%#v", err, audit.events)
+		}
+	})
+
+	t.Run("audit failure returns no credential", func(t *testing.T) {
+		auditErr := errors.New("audit unavailable")
+		audit := &fakeOutboxAppender{err: auditErr}
+		service, _ := biz.NewFeishuBotService(repo, fixedCipher{}, jsonOpener{})
+		service.WithRevealAudit(audit)
+		revealed, err := service.RevealCredential(context.Background(), owner, botID, "app_secret")
+		if !errors.Is(err, auditErr) || revealed.Configured || revealed.Value != "" {
+			t.Fatalf("audit failure = %#v, %v", revealed, err)
+		}
+	})
+
+	t.Run("missing audit dependency", func(t *testing.T) {
+		service, _ := biz.NewFeishuBotService(repo, fixedCipher{}, jsonOpener{})
+		if _, err := service.RevealCredential(context.Background(), owner, botID, "app_secret"); !errors.Is(err, biz.ErrInvalidConfig) {
+			t.Fatalf("missing audit error = %v", err)
+		}
+	})
 }
 
 // TestFeishuBotBindingEnforcesPublishedOwnershipAndExclusivity 验证绑定仅限已发布助手且机器人全局唯一。

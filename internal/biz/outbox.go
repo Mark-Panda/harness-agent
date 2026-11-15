@@ -1,6 +1,10 @@
 package biz
 
-import "github.com/google/uuid"
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
 
 // OutboxEvent 是业务事务内写入的审计事件，由 Outbox Dispatcher 异步发布到审计链。
 type OutboxEvent struct {
@@ -16,4 +20,9 @@ type OutboxEvent struct {
 	DedupeKey string
 	// Payload 审计元数据白名单载荷，不得包含明文密钥或正文。
 	Payload map[string]any
+}
+
+// OutboxAppender 为无资源写入的敏感操作追加独立审计事件。
+type OutboxAppender interface {
+	AppendOutboxEvent(ctx context.Context, event OutboxEvent) error
 }

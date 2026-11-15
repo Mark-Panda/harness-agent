@@ -1,5 +1,5 @@
 // 共用界面组件，统一操作样式、焦点与可访问语义。
-import type { ComponentPropsWithRef, FormEvent, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
+import type { ComponentPropsWithRef, FormEvent, MouseEvent, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
 import { cloneElement, isValidElement, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, NavLink } from "react-router-dom";
@@ -123,31 +123,162 @@ export function HelpTip({ children }: { children: ReactNode }) {
 
 const controlClass = "form-control min-w-0 w-full rounded-lg px-3 py-2 text-base text-ink sm:text-sm";
 
-export function Input({ className, type, disabled, ...rest }: ComponentPropsWithRef<"input">) {
+type SavedRevealResult = { configured: boolean; value?: string };
+type SavedRevealProps = { onRevealSaved?: () => Promise<SavedRevealResult> };
+
+// useSavedReveal 将已保存凭据保存在受控草稿之外，隐藏或失效的请求不得回写界面。
+function useSavedReveal(onRevealSaved?: () => Promise<SavedRevealResult>) {
   const [visible, setVisible] = useState(false);
+  const [savedValue, setSavedValue] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const operation = useRef(0);
+  const pending = useRef(false);
+  const mounted = useRef(true);
+
+  const clear = () => {
+    operation.current += 1;
+    pending.current = false;
+    setVisible(false);
+    setSavedValue(null);
+    setLoading(false);
+    setError(null);
+  };
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      operation.current += 1;
+      pending.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    operation.current += 1;
+    pending.current = false;
+    setVisible(false);
+    setSavedValue(null);
+    setLoading(false);
+    setError(null);
+  }, [onRevealSaved]);
+
+  const toggle = async (draft: string) => {
+    if (pending.current) return;
+    if (savedValue !== null || visible) {
+      clear();
+      return;
+    }
+    if (draft || !onRevealSaved) {
+      setError(null);
+      setVisible(true);
+      return;
+    }
+
+    const requestID = ++operation.current;
+    pending.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await onRevealSaved();
+      if (!mounted.current || operation.current !== requestID) return;
+      setSavedValue(result.configured ? result.value ?? "" : "未配置");
+      setVisible(true);
+    } catch {
+      if (mounted.current && operation.current === requestID) {
+        setError("读取已保存凭据失败，请点击眼睛重试。");
+      }
+    } finally {
+      if (mounted.current && operation.current === requestID) {
+        pending.current = false;
+        setLoading(false);
+      }
+    }
+  };
+
+  return { visible, savedValue, loading, error, toggle };
+}
+
+function controlDraft(event: MouseEvent<HTMLButtonElement>): string {
+  return event.currentTarget.parentElement?.querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea")?.value ?? "";
+}
+
+export function Input({ className, type, disabled, onRevealSaved, ...rest }: ComponentPropsWithRef<"input"> & SavedRevealProps) {
+  const reveal = useSavedReveal(onRevealSaved);
+  const revealErrorID = useId();
   if (type !== "password") {
     return <input {...rest} type={type} disabled={disabled} className={cn(controlClass, className)} />;
   }
+  const description = [rest["aria-describedby"], reveal.error ? revealErrorID : undefined].filter(Boolean).join(" ") || undefined;
   return (
-    <div className="relative min-w-0">
-      <input {...rest} type={visible ? "text" : "password"} disabled={disabled} className={cn(controlClass, "pr-12", className)} />
-      <button
-        type="button"
-        aria-label={visible ? "隐藏密码或密钥" : "显示密码或密钥"}
-        aria-controls={rest.id}
-        title={visible ? "隐藏内容" : "显示内容"}
-        disabled={disabled}
-        className="absolute inset-y-1 right-1 grid w-10 place-items-center rounded-md text-muted transition-colors hover:bg-paper-deep hover:text-ink disabled:opacity-50"
-        onClick={() => setVisible((value) => !value)}
-      >
-        <Icon name={visible ? "eyeOff" : "eye"} />
-      </button>
-    </div>
+    <>
+      <div className="relative min-w-0">
+        <input
+          {...rest}
+          value={reveal.savedValue !== null ? reveal.savedValue : rest.value}
+          type={reveal.visible ? "text" : "password"}
+          disabled={disabled}
+          readOnly={rest.readOnly || reveal.loading || reveal.savedValue !== null}
+          aria-describedby={description}
+          aria-busy={reveal.loading || undefined}
+          className={cn(controlClass, "pr-12", className)}
+        />
+        <button
+          type="button"
+          aria-label={reveal.visible ? "隐藏密码或密钥" : "显示密码或密钥"}
+          aria-controls={rest.id}
+          aria-busy={reveal.loading || undefined}
+          title={reveal.visible ? "隐藏内容" : "显示内容"}
+          disabled={disabled || reveal.loading}
+          className="absolute inset-y-1 right-1 grid w-10 place-items-center rounded-md text-muted transition-colors hover:bg-paper-deep hover:text-ink disabled:opacity-50"
+          onClick={(event) => void reveal.toggle(controlDraft(event))}
+        >
+          <Icon name={reveal.visible ? "eyeOff" : "eye"} />
+        </button>
+      </div>
+      {reveal.error ? <span id={revealErrorID} role="alert" className="text-xs leading-5 text-rust">{reveal.error}</span> : null}
+    </>
   );
 }
 
-export function Textarea({ className, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea {...rest} className={cn(controlClass, "min-h-24 resize-y", className)} />;
+export function Textarea({ className, onRevealSaved, ...rest }: TextareaHTMLAttributes<HTMLTextAreaElement> & SavedRevealProps) {
+  const reveal = useSavedReveal(onRevealSaved);
+  const revealErrorID = useId();
+  if (!onRevealSaved) {
+    return <textarea {...rest} className={cn(controlClass, "min-h-24 resize-y", className)} />;
+  }
+  const hasDraft = String(rest.value ?? rest.defaultValue ?? "").length > 0;
+  const masked = reveal.savedValue === null && hasDraft && !reveal.visible;
+  const shown = reveal.savedValue !== null || (reveal.visible && hasDraft);
+  const displayValue = reveal.savedValue !== null ? reveal.savedValue : masked ? "••••••••" : rest.value;
+  const description = [rest["aria-describedby"], reveal.error ? revealErrorID : undefined].filter(Boolean).join(" ") || undefined;
+  return (
+    <>
+      <div className="relative min-w-0">
+        <textarea
+          {...rest}
+          value={displayValue}
+          readOnly={rest.readOnly || reveal.loading || reveal.savedValue !== null || masked}
+          aria-describedby={description}
+          aria-busy={reveal.loading || undefined}
+          className={cn(controlClass, "min-h-24 resize-y pr-12", className)}
+        />
+        <button
+          type="button"
+          aria-label={shown ? "隐藏密码或密钥" : "显示密码或密钥"}
+          aria-controls={rest.id}
+          aria-busy={reveal.loading || undefined}
+          title={shown ? "隐藏内容" : "显示内容"}
+          disabled={rest.disabled || reveal.loading}
+          className="absolute right-1 top-1 grid size-10 place-items-center rounded-md bg-paper-raised text-muted transition-colors hover:bg-paper-deep hover:text-ink disabled:opacity-50"
+          onClick={(event) => void reveal.toggle(controlDraft(event))}
+        >
+          <Icon name={shown ? "eyeOff" : "eye"} />
+        </button>
+      </div>
+      {reveal.error ? <span id={revealErrorID} role="alert" className="text-xs leading-5 text-rust">{reveal.error}</span> : null}
+    </>
+  );
 }
 
 export function Select({ className, ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {

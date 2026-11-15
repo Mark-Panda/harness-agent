@@ -1,5 +1,5 @@
-// 供应商管理：密钥只写不读，删除需二次确认。
-import { useState } from "react";
+// 供应商管理：普通查询不返回密钥，编辑时可授权查看，删除需二次确认。
+import { useCallback, useState } from "react";
 import { FormDrawer } from "../../components/FormDrawer";
 import { useToast } from "../../components/Toast";
 import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, Input, LoadingState, MenuItem, PageHeader, Pager, RowMenu, Select } from "../../components/ui";
@@ -28,6 +28,14 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
   const toast = useToast();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const revealCredential = useCallback(
+    () => requestJSON<{ configured: boolean; value?: string }>(`/api/v1/providers/${initial?.id}/reveal-credential`, {
+      method: "POST",
+      cache: "no-store",
+      body: JSON.stringify({}),
+    }),
+    [initial?.id],
+  );
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -57,7 +65,7 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
 
   return (
     <FormDrawer
-      title={initial ? `编辑服务：${initial.name}` : "接入模型服务"} description="通常只需配置一次。密钥会加密保存，保存后不再显示明文。"
+      title={initial ? `编辑服务：${initial.name}` : "接入模型服务"} description="通常只需配置一次。密钥会加密保存，普通查询不返回明文，编辑时可授权查看。"
       submitLabel={initial ? "保存修改" : "接入服务"}
       busy={busy}
       dirty={JSON.stringify(form) !== JSON.stringify(initialForm)}
@@ -71,8 +79,8 @@ function ProviderForm({ initial, onSaved, onCancel }: { initial: Provider | null
       <Field label="接口地址" hint="模型服务的 OpenAI 兼容地址，通常以 /v1 结尾。必须使用 HTTPS。">
         <Input type="url" value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} required placeholder="https://api.example.com/v1" />
       </Field>
-      <Field label="访问密钥" hint={initial ? "留空表示保留现有密钥；填写则替换并轮换。" : "从模型服务商控制台复制，只保存一次。"}>
-        <Input type="password" autoComplete="off" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} required={!initial} placeholder="sk-..." />
+      <Field label="访问密钥" hint={initial ? "留空表示保留现有密钥；可点击眼睛授权查看，填写则替换并轮换。" : "从模型服务商控制台复制，普通查询不返回明文。"}>
+        <Input type="password" autoComplete="off" value={form.apiKey} onChange={(event) => setForm({ ...form, apiKey: event.target.value })} onRevealSaved={initial ? revealCredential : undefined} required={!initial} placeholder="sk-..." />
       </Field>
       <Field label="数据区域" hint="标记数据存放地区，例如 cn / us，用于合规筛选。">
         <Input value={form.dataRegion} onChange={(event) => setForm({ ...form, dataRegion: event.target.value })} required maxLength={64} placeholder="例如：cn" />

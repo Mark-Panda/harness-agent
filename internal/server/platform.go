@@ -32,10 +32,19 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite := func(pattern, resourceType string, endpoint http.HandlerFunc) {
 		mux.HandleFunc(pattern, auth.requireAuth(withIdempotency(platform.Idempotency, resourceType, endpoint)))
 	}
+	// 凭据显式查看禁止缓存与幂等回放；no-store 必须先于鉴权设置，确保错误响应同样不可缓存。
+	handleReveal := func(pattern string, endpoint http.HandlerFunc) {
+		authenticated := auth.requireAuth(endpoint)
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			authenticated(w, r)
+		})
+	}
 	// 管理员接口：Provider、模型目录、路由策略、Skill 与 MCP。
 	handleWrite("POST /api/v1/providers", "llm_provider", handler.createProvider)
 	handle("GET /api/v1/providers", handler.listProviders)
 	handle("GET /api/v1/providers/{id}", handler.getProvider)
+	handleReveal("POST /api/v1/providers/{id}/reveal-credential", handler.revealProviderCredential)
 	handle("GET /api/v1/providers/{id}/models", handler.listRemoteModels)
 	handle("PUT /api/v1/providers/{id}", handler.updateProvider)
 	handle("DELETE /api/v1/providers/{id}", handler.deleteProvider)
@@ -73,6 +82,7 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("POST /api/v1/mcps", "mcp", handler.createMCP)
 	handle("GET /api/v1/mcps", handler.listMCPs)
 	handle("GET /api/v1/mcps/{id}", handler.getMCP)
+	handleReveal("POST /api/v1/mcps/{id}/reveal-credential", handler.revealMCPCredential)
 	handle("PUT /api/v1/mcps/{id}", handler.updateMCP)
 	handle("DELETE /api/v1/mcps/{id}", handler.deleteMCP)
 	handleWrite("POST /api/v1/mcps/{id}/test", "mcp", handler.testMCP)
@@ -183,6 +193,7 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		handle("GET /api/v1/admin/feishu-bots", handler.listFeishuBots)
 		handleWrite("POST /api/v1/admin/feishu-bots", "feishu_bot", handler.createFeishuBot)
 		handle("GET /api/v1/admin/feishu-bots/{id}", handler.getFeishuBot)
+		handleReveal("POST /api/v1/admin/feishu-bots/{id}/reveal-credential", handler.revealFeishuBotCredential)
 		handleWrite("PUT /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.updateFeishuBot)
 		handleWrite("DELETE /api/v1/admin/feishu-bots/{id}", "feishu_bot", handler.deleteFeishuBot)
 		handleWrite("POST /api/v1/admin/feishu-bots/{id}/test", "feishu_bot", handler.testFeishuBot)
@@ -191,6 +202,7 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		// 租户自助视图：只返回归属当前用户的机器人，管理员返回全部。
 		handle("GET /api/v1/feishu/my-bots", handler.listMyFeishuBots)
 		handle("GET /api/v1/feishu/bots", handler.listFeishuBotOptions)
+		handleReveal("POST /api/v1/feishu/bots/{id}/reveal-credential", handler.revealFeishuBotCredential)
 		handleWrite("PUT /api/v1/feishu/bots/{id}", "feishu_bot", handler.updateFeishuBot)
 		handleWrite("DELETE /api/v1/feishu/bots/{id}", "feishu_bot", handler.deleteFeishuBot)
 		handleWrite("POST /api/v1/feishu/bots/{id}/test", "feishu_bot", handler.testFeishuBot)
@@ -356,6 +368,11 @@ type feishuBotRequest struct {
 	OwnerUserID uuid.UUID `json:"owner_user_id"`
 }
 
+// feishuBotRevealCredentialRequest 指定单次显式查看的机器人凭据字段。
+type feishuBotRevealCredentialRequest struct {
+	Field string `json:"field"`
+}
+
 // feishuBotBindRequest 是助手绑定机器人的请求体。
 type feishuBotBindRequest struct {
 	// BotID 目标机器人 ID。
@@ -504,6 +521,16 @@ func (h *platformHTTPHandler) getMCP(w http.ResponseWriter, r *http.Request) {
 	writePlatformResult(w, http.StatusOK, mcpResponse(mcp), err)
 }
 
+// revealMCPCredential 处理 POST /api/v1/mcps/{id}/reveal-credential：仅返回本次显式授权查看的凭据。
+func (h *platformHTTPHandler) revealMCPCredential(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	credential, err := h.service.MCPs.RevealCredential(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, credential, err)
+}
+
 // listMCPs 处理 GET /api/v1/mcps：列出全部 MCP。
 func (h *platformHTTPHandler) listMCPs(w http.ResponseWriter, r *http.Request) {
 	mcps, err := h.service.MCPs.List(r.Context(), requestPrincipal(r))
@@ -589,6 +616,20 @@ func (h *platformHTTPHandler) getFeishuBot(w http.ResponseWriter, r *http.Reques
 	}
 	bot, err := h.service.FeishuBots.Get(r.Context(), requestPrincipal(r), id)
 	writePlatformResult(w, http.StatusOK, feishuBotResponse(bot), err)
+}
+
+// revealFeishuBotCredential 处理两个飞书机器人凭据查看路径，每次只返回请求指定的字段。
+func (h *platformHTTPHandler) revealFeishuBotCredential(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	var request feishuBotRevealCredentialRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	credential, err := h.service.FeishuBots.RevealCredential(r.Context(), requestPrincipal(r), id, request.Field)
+	writePlatformResult(w, http.StatusOK, credential, err)
 }
 
 // testFeishuBot 处理 POST /api/v1/admin/feishu-bots/{id}/test：验证应用凭据与飞书连通性。
@@ -691,6 +732,16 @@ func (h *platformHTTPHandler) getProvider(w http.ResponseWriter, r *http.Request
 	}
 	provider, err := h.service.Providers.Get(r.Context(), requestPrincipal(r), id)
 	writePlatformResult(w, http.StatusOK, providerResponse(provider), err)
+}
+
+// revealProviderCredential 处理 POST /api/v1/providers/{id}/reveal-credential：仅返回本次显式授权查看的 API Key。
+func (h *platformHTTPHandler) revealProviderCredential(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	credential, err := h.service.Providers.RevealCredential(r.Context(), requestPrincipal(r), id)
+	writePlatformResult(w, http.StatusOK, credential, err)
 }
 
 // listProviders 处理 GET /api/v1/providers：列出全部供应商。

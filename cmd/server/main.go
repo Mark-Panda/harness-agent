@@ -319,7 +319,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	providerService.WithRemoteModelCatalog(catalogRepository, credentialKeys, remoteModelLister{})
+	providerService.WithRemoteModelCatalog(catalogRepository, credentialKeys, remoteModelLister{}).WithRevealAudit(catalogRepository)
 	modelService, err := biz.NewModelService(catalogRepository)
 	if err != nil {
 		return err
@@ -340,7 +340,7 @@ func run() error {
 	mcpService.WithProber(catalogRepository, credentialKeys, mcpProber{
 		allowPrivate: cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 		timeout:      cfg.Agent.Worker.MCPTimeout.Duration,
-	})
+	}).WithRevealAudit(catalogRepository)
 	quotaLimits := biz.QuotaLimits{MaxAgentsPerUser: cfg.Quotas.MaxAgentsPerUser, MaxSessionsPerUser: cfg.Quotas.MaxSessionsPerUser}
 	agentRepository := data.NewAgentRepository(appDB)
 	agentService, err := biz.NewAgentService(agentRepository, quotaLimits)
@@ -353,7 +353,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	feishuBotService.WithTester(feishuBotTester{})
+	feishuBotService.WithTester(feishuBotTester{}).WithRevealAudit(feishuBotRepository)
 	if cfg.Feishu.NormalizedEventMode() == config.FeishuEventModeLongConnection {
 		feishuBotService.WithLongConnection()
 	}

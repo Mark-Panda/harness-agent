@@ -20,7 +20,7 @@ const (
 	FeishuBotDisabled FeishuBotStatus = "disabled"
 )
 
-// FeishuBotSecret 是机器人应用凭据明文，只在写入与验签路径短暂存在，绝不落库或返回响应。
+// FeishuBotSecret 是机器人应用凭据明文，只在写入、验签和显式授权查看路径短暂存在，绝不落库；普通查询不返回。
 type FeishuBotSecret struct {
 	// AppSecret 飞书应用 App Secret。
 	AppSecret string `json:"app_secret"`
@@ -118,10 +118,11 @@ type FeishuBotTestResult struct {
 // FeishuBotService 实现机器人注册管理。
 // 多租户 SaaS：机器人归属单个用户，归属用户与管理员可管理；普通用户可创建自己的机器人。
 type FeishuBotService struct {
-	repo   FeishuBotRepository
-	cipher CredentialCipher
-	opener CredentialOpener
-	tester FeishuBotTester
+	repo        FeishuBotRepository
+	cipher      CredentialCipher
+	opener      CredentialOpener
+	tester      FeishuBotTester
+	revealAudit OutboxAppender
 	// longConnection 为 true 表示事件通过长连接推送，无需 Webhook 验签凭据。
 	longConnection bool
 }
@@ -143,6 +144,12 @@ func (s *FeishuBotService) WithTester(tester FeishuBotTester) *FeishuBotService 
 // WithLongConnection 标记事件接入模式为长连接；此时不再强制要求 Webhook 验签凭据。
 func (s *FeishuBotService) WithLongConnection() *FeishuBotService {
 	s.longConnection = true
+	return s
+}
+
+// WithRevealAudit 启用显式凭据查看所需的审计写入。
+func (s *FeishuBotService) WithRevealAudit(audit OutboxAppender) *FeishuBotService {
+	s.revealAudit = audit
 	return s
 }
 
@@ -282,6 +289,53 @@ func (s *FeishuBotService) Get(ctx context.Context, principal Principal, botID u
 		return FeishuBot{}, err
 	}
 	return bot, nil
+}
+
+// RevealCredential 由归属租户或管理员按字段显式查看一个已保存秘密，并写入不含秘密的审计事件。
+func (s *FeishuBotService) RevealCredential(ctx context.Context, principal Principal, botID uuid.UUID, field string) (RevealedCredential, error) {
+	if s.revealAudit == nil {
+		return RevealedCredential{}, invalid("feishu bot credential reveal is not configured")
+	}
+	bot, credential, err := s.repo.GetFeishuBotCredential(ctx, botID)
+	if err != nil {
+		return RevealedCredential{}, err
+	}
+	if err := requireOwnerOrAdmin(principal, bot); err != nil {
+		return RevealedCredential{}, err
+	}
+	if field != "app_secret" && field != "verification_token" && field != "encrypt_key" {
+		return RevealedCredential{}, invalid("unsupported feishu bot credential field")
+	}
+	plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+	if err != nil {
+		return RevealedCredential{}, invalid("feishu bot credentials cannot be decrypted")
+	}
+	defer func() {
+		for index := range plaintext {
+			plaintext[index] = 0
+		}
+	}()
+	var secret FeishuBotSecret
+	if err := json.Unmarshal(plaintext, &secret); err != nil {
+		return RevealedCredential{}, invalid("feishu bot credentials are invalid")
+	}
+	defer func() { secret = FeishuBotSecret{} }()
+	result := RevealedCredential{}
+	switch field {
+	case "app_secret":
+		result.Value = secret.AppSecret
+	case "verification_token":
+		result.Value = secret.VerificationToken
+	case "encrypt_key":
+		result.Value = secret.EncryptKey
+	}
+	result.Configured = result.Value != ""
+	event := mutationEvent(principal.UserID, "feishu_bot.credential.revealed", "feishu_bot", botID)
+	event.Payload["field"] = field
+	if err := s.revealAudit.AppendOutboxEvent(ctx, event); err != nil {
+		return RevealedCredential{}, err
+	}
+	return result, nil
 }
 
 // Test 使用机器人应用凭据请求飞书 Tenant Access Token，验证凭据与网络连通性。

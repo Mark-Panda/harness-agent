@@ -80,6 +80,13 @@ func NewFeishuBotRepository(db *gorm.DB) *FeishuBotRepository {
 	return &FeishuBotRepository{db: db}
 }
 
+// AppendOutboxEvent 追加敏感操作审计，不修改机器人配置或凭据。
+func (r *FeishuBotRepository) AppendOutboxEvent(ctx context.Context, event biz.OutboxEvent) error {
+	return WithScope(ctx, r.db, Scope{System: true, UserID: event.UserID}, func(tx *gorm.DB) error {
+		return appendOutbox(tx, event)
+	})
+}
+
 // CreateFeishuBot 在系统作用域内创建机器人并写入审计事件。
 func (r *FeishuBotRepository) CreateFeishuBot(ctx context.Context, actorID uuid.UUID, bot biz.FeishuBot, credential biz.ProviderCredential, event biz.OutboxEvent) (biz.FeishuBot, error) {
 	record := feishuBotModel{

@@ -3,6 +3,8 @@ package biz_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,109 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/mock/gomock"
 )
+
+// fakeOutboxAppender 记录敏感操作审计，并可模拟审计写入失败。
+type fakeOutboxAppender struct {
+	events []biz.OutboxEvent
+	err    error
+}
+
+func (f *fakeOutboxAppender) AppendOutboxEvent(_ context.Context, event biz.OutboxEvent) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.events = append(f.events, event)
+	return nil
+}
+
+func TestProviderServiceRevealCredential(t *testing.T) {
+	t.Run("admin reveals configured credential with safe audit", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		credentials := mocks.NewMockProviderCredentialRepository(ctrl)
+		opener := mocks.NewMockCredentialOpener(ctrl)
+		audit := &fakeOutboxAppender{}
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		service.WithRemoteModelCatalog(credentials, opener, mocks.NewMockRemoteModelLister(ctrl)).WithRevealAudit(audit)
+		admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+		providerID := uuid.New()
+		credentials.EXPECT().GetProviderCredential(gomock.Any(), providerID).Return(
+			biz.Provider{ID: providerID}, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil,
+		)
+		opener.EXPECT().Open("v1", []byte("ciphertext")).Return([]byte("provider-secret"), nil)
+		revealed, err := service.RevealCredential(context.Background(), admin, providerID)
+		if err != nil || !revealed.Configured || revealed.Value != "provider-secret" {
+			t.Fatalf("RevealCredential() = %#v, %v", revealed, err)
+		}
+		if len(audit.events) != 1 || audit.events[0].EventType != "provider.credential.revealed" || audit.events[0].UserID != admin.UserID {
+			t.Fatalf("reveal audit = %#v", audit.events)
+		}
+		if serialized := fmt.Sprintf("%#v", audit.events[0]); strings.Contains(serialized, "provider-secret") || strings.Contains(serialized, "ciphertext") {
+			t.Fatalf("audit contains credential material: %s", serialized)
+		}
+	})
+
+	t.Run("empty stored credential is unconfigured", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		credentials := mocks.NewMockProviderCredentialRepository(ctrl)
+		audit := &fakeOutboxAppender{}
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		service.WithRemoteModelCatalog(credentials, mocks.NewMockCredentialOpener(ctrl), mocks.NewMockRemoteModelLister(ctrl)).WithRevealAudit(audit)
+		providerID := uuid.New()
+		credentials.EXPECT().GetProviderCredential(gomock.Any(), providerID).Return(biz.Provider{ID: providerID}, biz.ProviderCredential{}, nil)
+		revealed, err := service.RevealCredential(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, providerID)
+		if err != nil || revealed.Configured || revealed.Value != "" || len(audit.events) != 1 {
+			t.Fatalf("unconfigured reveal = %#v, %v, audit=%#v", revealed, err, audit.events)
+		}
+	})
+
+	t.Run("rejects non admin", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		if _, err := service.RevealCredential(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}, uuid.New()); !errors.Is(err, biz.ErrForbidden) {
+			t.Fatalf("non-admin reveal error = %v", err)
+		}
+	})
+
+	t.Run("decrypt failure is sanitized and not audited as success", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		credentials := mocks.NewMockProviderCredentialRepository(ctrl)
+		opener := mocks.NewMockCredentialOpener(ctrl)
+		audit := &fakeOutboxAppender{}
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		service.WithRemoteModelCatalog(credentials, opener, mocks.NewMockRemoteModelLister(ctrl)).WithRevealAudit(audit)
+		providerID := uuid.New()
+		credentials.EXPECT().GetProviderCredential(gomock.Any(), providerID).Return(biz.Provider{ID: providerID}, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil)
+		opener.EXPECT().Open("v1", []byte("ciphertext")).Return(nil, errors.New("decrypt failed"))
+		if _, err := service.RevealCredential(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, providerID); !errors.Is(err, biz.ErrInvalidConfig) || len(audit.events) != 0 {
+			t.Fatalf("decrypt failure = %v, audit=%#v", err, audit.events)
+		}
+	})
+
+	t.Run("audit failure returns no credential", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		credentials := mocks.NewMockProviderCredentialRepository(ctrl)
+		opener := mocks.NewMockCredentialOpener(ctrl)
+		auditErr := errors.New("audit unavailable")
+		audit := &fakeOutboxAppender{err: auditErr}
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		service.WithRemoteModelCatalog(credentials, opener, mocks.NewMockRemoteModelLister(ctrl)).WithRevealAudit(audit)
+		providerID := uuid.New()
+		credentials.EXPECT().GetProviderCredential(gomock.Any(), providerID).Return(biz.Provider{ID: providerID}, biz.ProviderCredential{Encrypted: []byte("ciphertext"), KeyVersion: "v1"}, nil)
+		opener.EXPECT().Open("v1", []byte("ciphertext")).Return([]byte("provider-secret"), nil)
+		revealed, err := service.RevealCredential(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, providerID)
+		if !errors.Is(err, auditErr) || revealed.Configured || revealed.Value != "" {
+			t.Fatalf("audit failure = %#v, %v", revealed, err)
+		}
+	})
+
+	t.Run("missing reveal dependencies", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		service, _ := biz.NewProviderService(mocks.NewMockProviderRepository(ctrl), mocks.NewMockCredentialCipher(ctrl))
+		if _, err := service.RevealCredential(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, uuid.New()); !errors.Is(err, biz.ErrInvalidConfig) {
+			t.Fatalf("missing reveal dependencies error = %v", err)
+		}
+	})
+}
 
 func TestProviderServiceLifecycleAndValidation(t *testing.T) {
 	ctrl := gomock.NewController(t)

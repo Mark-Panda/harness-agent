@@ -83,8 +83,8 @@ type ProviderRepository interface {
 	ListProviders(ctx context.Context) ([]Provider, error)
 }
 
-// ProviderCredentialRepository 在执行层读取供应商密文凭证，仅允许 Worker 内部使用。
-// 读取结果不得进入事件、日志、HTTP/gRPC 响应或审计载荷。
+// ProviderCredentialRepository 读取供应商密文凭证，仅供 Worker、远程模型目录与显式授权查看使用。
+// 密文不得进入事件、日志、HTTP/gRPC 响应或审计载荷；明文仅可由 RevealCredential 按需返回。
 type ProviderCredentialRepository interface {
 	// GetProviderCredential 返回供应商元数据与加密凭证；供应商不存在时返回未找到。
 	GetProviderCredential(ctx context.Context, providerID uuid.UUID) (Provider, ProviderCredential, error)
@@ -96,14 +96,23 @@ type CredentialOpener interface {
 	Open(keyVersion string, ciphertext []byte) ([]byte, error)
 }
 
-// ProviderService 实现供应商管理用例：仅管理员可写，凭证只写不读。
+// RevealedCredential 是一次显式授权查看的凭据结果，不会出现在普通查询中。
+type RevealedCredential struct {
+	// Configured 表示对应凭据是否已配置。
+	Configured bool `json:"configured"`
+	// Value 是仅在本次显式查看响应中返回的明文。
+	Value string `json:"value,omitempty"`
+}
+
+// ProviderService 实现供应商管理用例：仅管理员可写，普通查询不返回凭据。
 type ProviderService struct {
 	repo   ProviderRepository
 	cipher CredentialCipher
-	// credentials 与 opener 仅在配置远程模型目录时启用。
+	// credentials 与 opener 仅供远程模型目录和显式凭据查看使用。
 	credentials  ProviderCredentialRepository
 	opener       CredentialOpener
 	remoteModels RemoteModelLister
+	revealAudit  OutboxAppender
 }
 
 // RemoteModel 是供应商站点返回的可用模型摘要。
@@ -130,6 +139,12 @@ func (s *ProviderService) WithRemoteModelCatalog(credentials ProviderCredentialR
 	return s
 }
 
+// WithRevealAudit 启用显式凭据查看所需的审计写入。
+func (s *ProviderService) WithRevealAudit(audit OutboxAppender) *ProviderService {
+	s.revealAudit = audit
+	return s
+}
+
 // ListRemoteModels 由管理员读取供应商站点可用模型；密钥只在内存中短暂解密。
 func (s *ProviderService) ListRemoteModels(ctx context.Context, principal Principal, providerID uuid.UUID) ([]RemoteModel, error) {
 	if err := RequireAdmin(principal); err != nil {
@@ -152,6 +167,39 @@ func (s *ProviderService) ListRemoteModels(ctx context.Context, principal Princi
 		}
 	}()
 	return s.remoteModels.ListModels(ctx, provider.BaseURL, string(secret))
+}
+
+// RevealCredential 由管理员显式查看已保存 API Key，并在返回前写入不含秘密的审计事件。
+func (s *ProviderService) RevealCredential(ctx context.Context, principal Principal, providerID uuid.UUID) (RevealedCredential, error) {
+	if err := RequireAdmin(principal); err != nil {
+		return RevealedCredential{}, err
+	}
+	if s.credentials == nil || s.opener == nil || s.revealAudit == nil {
+		return RevealedCredential{}, invalid("provider credential reveal is not configured")
+	}
+	_, credential, err := s.credentials.GetProviderCredential(ctx, providerID)
+	if err != nil {
+		return RevealedCredential{}, err
+	}
+	result := RevealedCredential{}
+	if len(credential.Encrypted) > 0 {
+		plaintext, err := s.opener.Open(credential.KeyVersion, credential.Encrypted)
+		if err != nil {
+			return RevealedCredential{}, invalid("provider credential cannot be decrypted")
+		}
+		defer func() {
+			for index := range plaintext {
+				plaintext[index] = 0
+			}
+		}()
+		result.Configured = len(plaintext) > 0
+		result.Value = string(plaintext)
+	}
+	event := mutationEvent(principal.UserID, "provider.credential.revealed", "llm_provider", providerID)
+	if err := s.revealAudit.AppendOutboxEvent(ctx, event); err != nil {
+		return RevealedCredential{}, err
+	}
+	return result, nil
 }
 
 // NewProviderService 构造供应商服务，依赖仓库与凭证加密器。
