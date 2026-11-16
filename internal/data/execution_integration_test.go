@@ -116,7 +116,7 @@ func TestJobAndRunLeaseFencing(t *testing.T) {
 	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunFailed, nil, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("expired fence submitted a terminal outcome: %v", err)
 	}
-	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, nil, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("expired fence requeued a run: %v", err)
 	}
 	steps := NewExecutionStepRepository(appDB)

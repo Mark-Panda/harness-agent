@@ -263,33 +263,69 @@ func TestRunServiceTraceViewsEnforceTenantAndAdminAccess(t *testing.T) {
 	}
 }
 
-func TestRunServiceCancelRevokesOnlyPendingApprovals(t *testing.T) {
+type atomicCancelRunRepository struct {
+	biz.RunRepository
+	run         biz.Run
+	atomicErr   error
+	atomicCalls int
+	legacyCalls int
+}
+
+func (r *atomicCancelRunRepository) GetRun(_ context.Context, _, _ uuid.UUID) (biz.Run, error) {
+	return r.run, nil
+}
+
+func (r *atomicCancelRunRepository) TransitionRun(_ context.Context, _, _ uuid.UUID, _, _ biz.RunStatus, _ map[string]any) (biz.Run, error) {
+	r.legacyCalls++
+	r.run.Status = biz.RunCancelled
+	return r.run, nil
+}
+
+func (r *atomicCancelRunRepository) CancelRunAndDenyPendingApprovals(_ context.Context, _, _ uuid.UUID, now time.Time) (biz.Run, error) {
+	r.atomicCalls++
+	if r.atomicErr != nil {
+		return biz.Run{}, r.atomicErr
+	}
+	r.run.Status = biz.RunCancelled
+	r.run.FinishedAt = &now
+	return r.run, nil
+}
+
+func TestRunServiceCancelUsesAtomicApprovalRevocation(t *testing.T) {
 	ctx := context.Background()
-	ctrl := gomock.NewController(t)
-	runs := mocks.NewMockRunRepository(ctrl)
-	approvals := mocks.NewMockToolApprovalRepository(ctrl)
-	service, err := biz.NewRunService(runs, mocks.NewMockSessionRepository(ctrl), biz.WithToolApprovals(approvals))
-	if err != nil {
-		t.Fatal(err)
-	}
 	user := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
-	run := biz.Run{ID: uuid.New(), UserID: user.UserID, Status: biz.RunWaitingApproval}
-	cancelled := run
-	cancelled.Status = biz.RunCancelled
-	pending := uuid.New()
-	runs.EXPECT().GetRun(ctx, user.UserID, run.ID).Return(run, nil)
-	runs.EXPECT().TransitionRun(ctx, user.UserID, run.ID, biz.RunWaitingApproval, biz.RunCancelled, gomock.Any()).Return(cancelled, nil)
-	approvals.EXPECT().ListApprovals(ctx, user.UserID, run.ID).Return([]biz.ToolApproval{
-		{ID: pending, Status: biz.ApprovalPending},
-		{ID: uuid.New(), Status: biz.ApprovalExecuting},
-		{ID: uuid.New(), Status: biz.ApprovalExecuted},
-	}, nil)
-	approvals.EXPECT().DecideApproval(ctx, user.UserID, pending, biz.ApprovalDecisionDeny, user.UserID, gomock.Any()).
-		Return(biz.ToolApproval{ID: pending, Status: biz.ApprovalDenied}, nil)
-	got, err := service.Cancel(ctx, user, run.ID)
-	if err != nil || got.Status != biz.RunCancelled {
-		t.Fatalf("Cancel = %+v, %v", got, err)
+	newService := func(t *testing.T, runs *atomicCancelRunRepository) *biz.RunService {
+		t.Helper()
+		service, err := biz.NewRunService(runs, mocks.NewMockSessionRepository(gomock.NewController(t)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return service
 	}
+
+	t.Run("commit run cancellation and pending denial together", func(t *testing.T) {
+		runs := &atomicCancelRunRepository{run: biz.Run{ID: uuid.New(), UserID: user.UserID, Status: biz.RunWaitingApproval}}
+		got, err := newService(t, runs).Cancel(ctx, user, runs.run.ID)
+		if err != nil || got.Status != biz.RunCancelled || got.FinishedAt == nil {
+			t.Fatalf("Cancel = %+v, %v", got, err)
+		}
+		if runs.atomicCalls != 1 || runs.legacyCalls != 0 {
+			t.Fatalf("atomic calls = %d, legacy transition calls = %d", runs.atomicCalls, runs.legacyCalls)
+		}
+	})
+
+	t.Run("propagate atomic revocation failure without a fallback transition", func(t *testing.T) {
+		writeErr := errors.New("approval update unavailable")
+		runs := &atomicCancelRunRepository{
+			run: biz.Run{ID: uuid.New(), UserID: user.UserID, Status: biz.RunWaitingApproval}, atomicErr: writeErr,
+		}
+		if _, err := newService(t, runs).Cancel(ctx, user, runs.run.ID); !errors.Is(err, writeErr) {
+			t.Fatalf("Cancel error = %v, want %v", err, writeErr)
+		}
+		if runs.atomicCalls != 1 || runs.legacyCalls != 0 {
+			t.Fatalf("atomic calls = %d, legacy transition calls = %d", runs.atomicCalls, runs.legacyCalls)
+		}
+	})
 }
 
 func TestRunServiceRefusesResumeWithoutQueueOrApprovalStore(t *testing.T) {

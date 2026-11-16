@@ -198,12 +198,18 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	streamCtx := context.WithoutCancel(r.Context())
 	// 长任务的 Plan/Supervisor 执行可能远超 5 分钟；连接上限应覆盖 Run 的最长执行窗口，
 	// 而不是在任务仍活跃时直接截断事件流。终态检测仍会立即关闭连接。
-	deadline := time.Now().Add(30 * time.Minute)
+	deadline := time.Now().Add(currentSSEStreamTimeout())
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 	// 事件写入会经 Redis 通知立即唤醒；3 秒兜底轮询覆盖 Redis 故障与漏通知。
 	failover := time.NewTicker(3 * time.Second)
 	defer failover.Stop()
+	// 请求 Context 被全局 Timeout 取消，无法用来判断客户端断开；
+	// CloseNotifier 的通道只在客户端关闭连接时触发，可及时释放连接槽位。
+	var clientGone <-chan bool
+	if notifier, ok := w.(http.CloseNotifier); ok {
+		clientGone = notifier.CloseNotify()
+	}
 
 	// 进入循环前订阅，避免首轮查询与订阅之间的事件通知丢失（漏通知仍由兜底轮询覆盖）。
 	var notify <-chan struct{}
@@ -246,11 +252,16 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if time.Now().After(deadline) {
+			// 主动告知客户端流被截断及最后游标，避免前端误判 Run 已结束而停止刷新。
+			writeSSE(w, 0, "stream.truncated", map[string]any{"last_seq": after, "reason": "stream_deadline"})
+			flusher.Flush()
 			return
 		}
 		select {
+		case <-clientGone:
+			return
 		case <-heartbeat.C:
-			// 心跳写失败说明客户端已断开；这是脱离请求 Context 后主要的断连检测手段。
+			// 写入失败说明客户端已断开；作为 CloseNotifier 不可用时的兜底检测。
 			if !writeSSE(w, 0, "heartbeat", map[string]any{"status": "ok"}) {
 				return
 			}

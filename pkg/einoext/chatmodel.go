@@ -66,9 +66,6 @@ func (m *ChatModel) WithTools(tools []*schema.ToolInfo) (einomodel.ToolCallingCh
 // 收尾调用不携带工具定义，避免模型继续请求无法执行的工具。
 const stepLimitInstruction = "已达到工具调用步数上限。请不要再调用任何工具，直接基于上面已获得的信息给出最终结论；若关键信息缺失，请明确说明缺少什么。"
 
-// continuationInstruction 要求模型在输出被长度截断后从中断处继续，不要重复已有内容。
-const continuationInstruction = "上一条回答因输出长度限制被截断。请从中断处继续，不要重复已经输出的内容，也不要调用工具。"
-
 // streamSender 统一处理 StreamWriter 写入错误：
 // 一旦读取端关闭就停止后续发送，避免向已关闭的流重复写入并放大事件。
 type streamSender struct {
@@ -330,7 +327,7 @@ func (m *ChatModel) continueCompletion(ctx context.Context, messages []react.Mes
 	return m.mergeContinuation(partial, continued)
 }
 
-// continueStream 以流式方式续写截断答案，增量直接写入同一个 StreamReader。
+// continueStream 以流式方式续写截断答案，去重后的增量写入同一个 StreamReader。
 func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message, step int, partial react.Completion, sender *streamSender) (react.Completion, error) {
 	if err := m.continuationAllowed(partial); err != nil {
 		return partial, err
@@ -338,15 +335,20 @@ func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message
 	if m.emitter != nil {
 		m.emitter.Emit("message.truncated", map[string]any{"step": step, "has_partial": true})
 	}
+	filter := react.NewContinuationDeltaFilter(partial.Content)
 	continued, err := m.router.CompleteStream(ctx, m.continuationMessages(messages, partial), nil, func(delta string) {
 		if delta == "" {
 			return
 		}
-		if !sender.send(&schema.Message{Role: schema.Assistant, Content: delta}, nil) {
+		filtered := filter.Push(delta)
+		if filtered == "" {
+			return
+		}
+		if !sender.send(&schema.Message{Role: schema.Assistant, Content: filtered}, nil) {
 			return
 		}
 		if m.emitter != nil {
-			m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": delta, "continuation": true})
+			m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": filtered, "continuation": true})
 		}
 	})
 	m.recordUsage(continued)
@@ -357,7 +359,20 @@ func (m *ChatModel) continueStream(ctx context.Context, messages []react.Message
 	if sendErr := sender.Err(); sendErr != nil {
 		return partial, sendErr
 	}
-	return m.mergeContinuation(partial, continued)
+	merged, mergeErr := m.mergeContinuation(partial, continued)
+	if mergeErr != nil {
+		return merged, mergeErr
+	}
+	// 短续写只有在路由与最终响应校验都成功后才补发，失败路径不得额外输出。
+	if filtered := filter.Flush(); filtered != "" {
+		if !sender.send(&schema.Message{Role: schema.Assistant, Content: filtered}, nil) {
+			return partial, sender.Err()
+		}
+		if m.emitter != nil {
+			m.emitter.Emit("message.delta", map[string]any{"step": step, "delta": filtered, "continuation": true})
+		}
+	}
+	return merged, nil
 }
 
 // continuationAllowed 校验续写不会突破步数上限且存在可续写的半截内容。
@@ -374,37 +389,17 @@ func (m *ChatModel) continuationAllowed(partial react.Completion) error {
 
 // continuationMessages 把半截回答与续写指令追加到原上下文后。
 func (m *ChatModel) continuationMessages(messages []react.Message, partial react.Completion) []react.Message {
-	result := make([]react.Message, 0, len(messages)+2)
-	result = append(result, messages...)
-	result = append(result,
-		react.Message{Role: react.RoleAssistant, Content: partial.Content},
-		react.Message{Role: react.RoleUser, Content: continuationInstruction},
-	)
-	return result
+	return react.ContinuationMessages(messages, partial)
 }
 
 // mergeContinuation 合并续写结果与用量；调用次数已在 recordUsage 中按真实调用累计。
 func (m *ChatModel) mergeContinuation(partial, continued react.Completion) (react.Completion, error) {
-	if err := completionError(continued); err != nil {
-		return partial, err
-	}
-	if len(continued.ToolCalls) > 0 {
-		return partial, fmt.Errorf("%w: continuation returned tool calls", react.ErrIncompleteToolCall)
-	}
-	partial.Content += continued.Content
-	partial.Usage.InputTokens += continued.Usage.InputTokens
-	partial.Usage.OutputTokens += continued.Usage.OutputTokens
-	partial.EstimatedCost += continued.EstimatedCost
-	partial.FinishReason = continued.FinishReason
-	if isLengthFinish(continued) {
-		return partial, fmt.Errorf("%w: continuation truncated", react.ErrStepLimit)
-	}
-	return partial, nil
+	return react.MergeContinuation(partial, continued)
 }
 
 // isLengthFinish 判断供应商是否因输出长度截断而结束。
 func isLengthFinish(completion react.Completion) bool {
-	return strings.EqualFold(strings.TrimSpace(completion.FinishReason), "length")
+	return react.IsLengthFinish(completion)
 }
 
 func (m *ChatModel) setLastContent(content string) {
@@ -508,34 +503,9 @@ func completionToMessage(completion react.Completion) *schema.Message {
 }
 
 // completionResponseError 把异常结束原因与空回答统一转换为执行错误。
-// 只有推理内容、没有最终回答的响应同样不能视为成功，否则用户会拿到空白答案。
+// ReAct 轮次允许无正文的工具调用，其余校验与文本专用路径共享。
 func completionResponseError(completion react.Completion) error {
-	if err := completionError(completion); err != nil {
-		return err
-	}
-	// 携带工具调用的轮次允许正文为空，模型会在拿到工具结果后继续生成。
-	if len(completion.ToolCalls) > 0 || strings.TrimSpace(completion.Content) != "" {
-		return nil
-	}
-	if strings.TrimSpace(completion.ReasoningContent) != "" {
-		return fmt.Errorf("%w", react.ErrReasoningOnly)
-	}
-	return fmt.Errorf("%w", react.ErrEmptyResponse)
-}
-
-// completionError 把供应商结束原因转换为统一执行错误。
-// 内容审核与工具调用截断不能继续执行工具，否则可能产生非预期副作用。
-func completionError(completion react.Completion) error {
-	reason := strings.ToLower(strings.TrimSpace(completion.FinishReason))
-	switch reason {
-	case "content_filter":
-		return fmt.Errorf("%w: finish_reason=content_filter", react.ErrContentFiltered)
-	case "length":
-		if len(completion.ToolCalls) > 0 {
-			return fmt.Errorf("%w: tool calls truncated", react.ErrIncompleteToolCall)
-		}
-	}
-	return nil
+	return react.ValidateCompletion(completion, true)
 }
 
 // errorSecretPatterns 用于在执行事件中脱敏凭证，避免供应商错误回显密钥。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,24 @@ func (r *memorySupervisorRepo) RetryTask(_ context.Context, userID, _ uuid.UUID,
 	r.tasks[taskID] = task
 	return task, nil
 }
+func (r *memorySupervisorRepo) ReopenTaskForApproval(_ context.Context, userID, _ uuid.UUID, taskID uuid.UUID, _ time.Time, _ RunFence) (SupervisorTask, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	task, ok := r.tasks[taskID]
+	if !ok || task.UserID != userID || task.Status != SupervisorTaskRunning {
+		return SupervisorTask{}, ErrResourceConflict
+	}
+	task.Status = SupervisorTaskPending
+	if task.Attempts > 0 {
+		task.Attempts--
+	}
+	task.StartedAt = nil
+	task.FinishedAt = nil
+	task.ErrorCode = ""
+	task.ErrorMessage = ""
+	r.tasks[taskID] = task
+	return task, nil
+}
 func (r *memorySupervisorRepo) FinishTask(_ context.Context, userID, _ uuid.UUID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, code, message string, now time.Time, _ RunFence) (SupervisorTask, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -127,8 +146,23 @@ func (s *memorySupervisorSessions) CreateSession(_ context.Context, session Sess
 	if session.ID == uuid.Nil {
 		session.ID = uuid.New()
 	}
+	for _, existing := range s.sessions {
+		if existing.ID == session.ID {
+			return Session{}, ErrResourceConflict
+		}
+	}
 	s.sessions = append(s.sessions, session)
 	return session, nil
+}
+func (s *memorySupervisorSessions) GetSession(_ context.Context, userID, sessionID uuid.UUID) (Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, session := range s.sessions {
+		if session.ID == sessionID && session.UserID == userID {
+			return session, nil
+		}
+	}
+	return Session{}, ErrResourceNotFound
 }
 func (s *memorySupervisorSessions) AppendMessage(_ context.Context, message Message, _ OutboxEvent) (Message, error) {
 	s.mu.Lock()
@@ -567,7 +601,7 @@ func TestPlanSupervisorDraftRepairsInvalidToolOnce(t *testing.T) {
 		}
 		return react.Completion{Content: second}, nil
 	}
-	draft, _, err := planSupervisorDraft([]react.Message{{Role: react.RoleUser, Content: "请处理"}}, complete, 4, registry)
+	draft, _, err := planSupervisorDraft(context.Background(), []react.Message{{Role: react.RoleUser, Content: "请处理"}}, complete, 4, registry)
 	if err != nil {
 		t.Fatalf("repair failed: %v", err)
 	}
@@ -593,7 +627,7 @@ func TestPlanSupervisorDraftRejectsApprovalRequiredTool(t *testing.T) {
 	complete := func([]react.Message) (react.Completion, error) {
 		return react.Completion{Content: invalid}, nil
 	}
-	if _, _, err := planSupervisorDraft(nil, complete, 4, registry); !errors.Is(err, ErrSupervisorInvalid) {
+	if _, _, err := planSupervisorDraft(context.Background(), nil, complete, 4, registry); !errors.Is(err, ErrSupervisorInvalid) {
 		t.Fatalf("approval-required tool error = %v", err)
 	}
 }
@@ -709,6 +743,128 @@ func TestSupervisorPropagatesUncertainToolResultWithoutRetry(t *testing.T) {
 				t.Fatalf("Supervisor error=%v worker model calls=%d; want %v after exactly one call", err, workerCalls.Load(), tc.wantError)
 			}
 		})
+	}
+}
+
+// TestAggregateSupervisorBoundsTokensWithoutDroppingWorkers 验证汇总请求有明确 Token 上限，
+// 且每个 Worker 的真实状态、错误码和结果入口都不会因长结果被删除。
+func TestAggregateSupervisorBoundsTokensWithoutDroppingWorkers(t *testing.T) {
+	const promptBudget = 1500
+	var aggregateRequest struct {
+		Messages []model.ChatMessage `json:"messages"`
+	}
+	worker, _, _, candidates, _ := supervisorFixture(t, func(body string, w http.ResponseWriter) {
+		if strings.Contains(body, "请汇总以下 Worker 结果") {
+			if err := json.Unmarshal([]byte(body), &aggregateRequest); err != nil {
+				t.Errorf("decode aggregate request: %v", err)
+			}
+		}
+		supervisorReply(t, w, "汇总完成", http.StatusOK)
+	})
+	worker.config.PromptTokenBudget = promptBudget
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	tasks := []SupervisorTask{
+		{ID: uuid.New(), WorkerName: "first", WorkerIndex: 1, Status: SupervisorTaskCompleted, Result: map[string]any{"content": "WORKER-HEAD-MARKER" + strings.Repeat("头", 1800)}},
+		{ID: uuid.New(), WorkerName: "failed", WorkerIndex: 2, Status: SupervisorTaskFailed, ErrorCode: "worker_error_unique", ErrorMessage: "失败"},
+		{ID: uuid.New(), WorkerName: "unknown", WorkerIndex: 3, Status: SupervisorTaskUnknown, ErrorCode: supervisorUnknownToolCode, ErrorMessage: "需要对账"},
+		{ID: uuid.New(), WorkerName: "last", WorkerIndex: 4, Status: SupervisorTaskCompleted, Result: map[string]any{"content": strings.Repeat("尾", 1800) + "WORKER-TAIL-MARKER"}},
+	}
+	result, err := worker.aggregateSupervisor(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
+		&atomic.Int64{}, []react.Message{{Role: react.RoleUser, Content: "任务"}}, worker.newSupervisorBudget(supervisorUsage{}), tasks)
+	if err != nil || result.Content != "汇总完成" {
+		t.Fatalf("aggregateSupervisor() = %#v, %v", result, err)
+	}
+	if got := model.EstimateRequestTokens(aggregateRequest.Messages, nil); got > promptBudget {
+		t.Fatalf("aggregate prompt tokens = %d, want <= %d", got, promptBudget)
+	}
+	if len(aggregateRequest.Messages) != 2 {
+		t.Fatalf("aggregate messages = %#v", aggregateRequest.Messages)
+	}
+	bundle := aggregateRequest.Messages[1].Content
+	for _, task := range tasks {
+		for _, want := range []string{fmt.Sprintf("worker_index=%d", task.WorkerIndex), "status=" + string(task.Status)} {
+			if !strings.Contains(bundle, want) {
+				t.Errorf("aggregate bundle missing %q:\n%s", want, bundle)
+			}
+		}
+		if task.ErrorCode != "" && !strings.Contains(bundle, "error_code="+task.ErrorCode) {
+			t.Errorf("aggregate bundle missing error code %q", task.ErrorCode)
+		}
+	}
+	for _, want := range []string{"WORKER-HEAD-MARKER", "WORKER-TAIL-MARKER", "省略"} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("aggregate bundle missing %q", want)
+		}
+	}
+}
+
+// panicSupervisorSessions 在 Worker 启动后制造崩溃，用于验证 panic 的对账分类。
+type panicSupervisorSessions struct{ SessionRepository }
+
+func (panicSupervisorSessions) ListMessages(context.Context, uuid.UUID, uuid.UUID, int, string) (Page[Message], error) {
+	panic("worker crashed after start")
+}
+
+func runSupervisorPanicCase(t *testing.T, repo SupervisorTaskRepository, toolScope []string) (SupervisorTask, error) {
+	t.Helper()
+	worker, _, _, candidates, _ := supervisorFixture(t, func(_ string, w http.ResponseWriter) {
+		supervisorReply(t, w, "unexpected model call", http.StatusOK)
+	})
+	worker.supervisor = repo
+	worker.sessions = panicSupervisorSessions{}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	task := SupervisorTask{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, ChildSessionID: uuid.New(),
+		WorkerName: "panic", WorkerIndex: 1, Task: "work", ToolScope: toolScope, Status: SupervisorTaskPending, MaxAttempts: 2, Depth: 1}
+	switch memoryRepo := repo.(type) {
+	case *memorySupervisorRepo:
+		memoryRepo.tasks[task.ID] = task
+	case *failingFinishSupervisorRepo:
+		memoryRepo.tasks[task.ID] = task
+	default:
+		t.Fatalf("unsupported panic repository %T", repo)
+	}
+	_, err := worker.runPendingSupervisorTasks(context.Background(), run, RunFence{Owner: "supervisor-worker", Token: 1}, candidates, nil,
+		&atomic.Int64{}, []react.Message{{Role: react.RoleUser, Content: "work"}}, emptyToolRegistry{}, worker.newSupervisorBudget(supervisorUsage{}), []SupervisorTask{task})
+	stored, listErr := repo.ListTasks(context.Background(), run.UserID, run.ID)
+	if listErr != nil || len(stored) != 1 {
+		t.Fatalf("list panic task = %#v, %v", stored, listErr)
+	}
+	return stored[0], err
+}
+
+func TestSupervisorPanicWithToolScopeRequiresReconciliation(t *testing.T) {
+	repo := newMemorySupervisorRepo()
+	task, err := runSupervisorPanicCase(t, repo, []string{"tool"})
+	if !errors.Is(err, ErrToolResultPersistence) {
+		t.Fatalf("panic error = %v, want ErrToolResultPersistence", err)
+	}
+	if task.Status != SupervisorTaskUnknown || task.ErrorCode != supervisorUnknownToolCode || task.Attempts != 1 {
+		t.Fatalf("panic task = %#v, want one attempt and durable Unknown", task)
+	}
+	worker := &ExecutionWorker{supervisor: repo, clock: time.Now}
+	if _, recoverErr := worker.recoverSupervisorTasks(context.Background(), Run{ID: task.ParentRunID, UserID: task.UserID}, RunFence{}, []SupervisorTask{task}); !errors.Is(recoverErr, ErrToolResultPersistence) {
+		t.Fatalf("recovery resumed unknown side effects: %v", recoverErr)
+	}
+	if stored := repo.tasks[task.ID]; stored.Attempts != 1 {
+		t.Fatalf("recovery duplicated execution: attempts = %d", stored.Attempts)
+	}
+}
+
+func TestSupervisorPanicWithoutToolsRemainsFailed(t *testing.T) {
+	task, err := runSupervisorPanicCase(t, newMemorySupervisorRepo(), nil)
+	if err != nil {
+		t.Fatalf("model-only panic error = %v", err)
+	}
+	if task.Status != SupervisorTaskFailed || task.ErrorCode != "worker_panic" {
+		t.Fatalf("model-only panic task = %#v", task)
+	}
+}
+
+func TestSupervisorUnknownPanicSettlementFailureIsVisible(t *testing.T) {
+	repo := &failingFinishSupervisorRepo{memorySupervisorRepo: newMemorySupervisorRepo()}
+	_, err := runSupervisorPanicCase(t, repo, []string{"tool"})
+	if !errors.Is(err, ErrSupervisorTaskSettlement) || !errors.Is(err, ErrToolResultPersistence) {
+		t.Fatalf("unknown settlement error = %v, want settlement and reconciliation classifications", err)
 	}
 }
 

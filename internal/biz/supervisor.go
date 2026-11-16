@@ -91,8 +91,11 @@ type SupervisorTaskRepository interface {
 	ListTasks(ctx context.Context, userID, parentRunID uuid.UUID) ([]SupervisorTask, error)
 	// StartTask 以 pending 状态为前置条件领取任务，写入 attempts 与开始时间。
 	StartTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence RunFence) (SupervisorTask, error)
-	// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于审批恢复与瞬时故障重试。
+	// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于瞬时故障重试。
 	RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence RunFence) (SupervisorTask, error)
+	// ReopenTaskForApproval 把因人工审批暂停的 running 任务复位为 pending，并退回本次领取消耗的重试次数。
+	// 审批等待是暂停续跑而不是执行失败，不能占用任务重试预算，否则连续审批会让任务被误判为失败。
+	ReopenTaskForApproval(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence RunFence) (SupervisorTask, error)
 	// FinishTask 以 running 状态为前置条件推进终态，阻止迟到结果回写。
 	FinishTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, status SupervisorTaskStatus, result map[string]any, errorCode, errorMessage string, now time.Time, fence RunFence) (SupervisorTask, error)
 	// CancelPendingTasks 取消主 Run 下所有待执行任务，用于预算超限或父取消。

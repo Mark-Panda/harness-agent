@@ -85,6 +85,28 @@ func factCandidate(key, value string, confidence float64, correction bool) biz.F
 	}
 }
 
+// TestFactServiceSkipsInvalidCorrectionWithoutDroppingBatch 验证单个非法纠正候选不会导致整批事实被丢弃。
+func TestFactServiceSkipsInvalidCorrectionWithoutDroppingBatch(t *testing.T) {
+	repo := &fakeFactRepository{applied: true, active: map[string]biz.MemoryFact{}}
+	service, err := biz.NewFactService(repo, biz.FactPolicy{MinConfidence: 0.6}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sessionID := uuid.New(), uuid.New()
+	result, err := service.Apply(context.Background(), userID, sessionID, []biz.FactCandidate{
+		factCandidate("profile.city", `"上海"`, 0.9, false),
+		// 缺少来源消息的纠正候选必须被跳过，而不是让整批返回错误。
+		factCandidate("preference.language", `"英文"`, 0.9, true),
+		factCandidate("profile.role", `"工程师"`, 0.9, false),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied != 2 || result.Invalid != 1 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want applied=2 invalid=1 skipped=1", result)
+	}
+}
+
 // TestFactServiceConflictPolicy 验证低置信度与显式纠正保护规则。
 func TestFactServiceConflictPolicy(t *testing.T) {
 	repo := &fakeFactRepository{applied: true, active: map[string]biz.MemoryFact{}}
@@ -140,10 +162,11 @@ func TestFactServiceConflictPolicy(t *testing.T) {
 	if err != nil || result.Skipped != 1 {
 		t.Fatalf("correction guard result = %#v err=%v", result, err)
 	}
-	// 新的显式纠正允许覆盖。
-	result, err = service.Apply(context.Background(), userID, sessionID, []biz.FactCandidate{
-		factCandidate("preference.language", `"中文"`, 0.7, true),
-	})
+	// 新的显式纠正必须携带来源消息，允许覆盖。
+	correction := factCandidate("preference.language", `"中文"`, 0.7, true)
+	sourceMessageID := uuid.New()
+	correction.SourceMessageID = &sourceMessageID
+	result, err = service.Apply(context.Background(), userID, sessionID, []biz.FactCandidate{correction})
 	if err != nil || result.Applied != 1 {
 		t.Fatalf("explicit correction result = %#v err=%v", result, err)
 	}
@@ -519,5 +542,68 @@ func TestFactExtractionWorkerWritesSpeakerOwnership(t *testing.T) {
 	}
 	if jobs.completed != 2 || jobs.failed != 0 || len(repo.saved) != 1 {
 		t.Fatalf("invalid owner completed=%d failed=%d saved=%d", jobs.completed, jobs.failed, len(repo.saved))
+	}
+}
+
+// TestFactExtractionWorkerValidatesCorrectionAgainstCurrentSources 验证 Apply 不信任提取器伪造的纠正来源。
+func TestFactExtractionWorkerValidatesCorrectionAgainstCurrentSources(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		role           biz.MessageRole
+		unknownSource  bool
+		messageSpeaker string
+		taskSpeaker    string
+		wantSaved      int
+	}{
+		{name: "assistant", role: biz.MessageAssistant},
+		{name: "tool", role: biz.MessageTool},
+		{name: "system", role: biz.MessageSystem},
+		{name: "message outside current source set", role: biz.MessageUser, unknownSource: true},
+		{name: "unauthorized group speaker", role: biz.MessageUser, messageSpeaker: "ou_other", taskSpeaker: "ou_a"},
+		{name: "valid private user", role: biz.MessageUser, wantSaved: 1},
+		{name: "valid group speaker", role: biz.MessageUser, messageSpeaker: "ou_a", taskSpeaker: "ou_a", wantSaved: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ownerID, speakerID, sessionID := uuid.New(), uuid.New(), uuid.New()
+			message := biz.Message{
+				ID: uuid.New(), UserID: ownerID, SessionID: sessionID, Role: test.role,
+				SpeakerOpenID: test.messageSpeaker, Content: "纠正偏好", CreatedAt: time.Now().UTC(),
+			}
+			task := biz.FactTask{
+				UserID: ownerID, SessionID: sessionID, MessageIDs: []uuid.UUID{message.ID},
+				SpeakerOpenID: test.taskSpeaker, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+			}
+			if test.taskSpeaker != "" {
+				task.FactOwnerID = speakerID
+			}
+			job := biz.Job{ID: uuid.New(), Type: biz.FactExtractJobType, Payload: factJobPayloadWithOwner(task), Attempts: 1, FencingToken: 1}
+			jobs := &fakeSummaryJobs{job: job}
+			repo := &fakeFactRepository{applied: true, active: map[string]biz.MemoryFact{
+				"preference.language": {Key: "preference.language", Value: json.RawMessage(`"旧值"`), Confidence: 0.98, Corrected: true, Version: 2},
+			}}
+			factService, err := biz.NewFactService(repo, biz.FactPolicy{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := factCandidate("preference.language", `"新值"`, 0.7, true)
+			sourceID := message.ID
+			if test.unknownSource {
+				sourceID = uuid.New()
+			}
+			candidate.SourceMessageID = &sourceID
+			worker, err := biz.NewFactExtractionWorker(biz.FactExtractionWorkerDependencies{
+				Jobs: jobs, Messages: &fakeSummaryReader{byIDs: []biz.Message{message}}, Facts: factService,
+				Extractor: &fakeFactExtractor{candidates: []biz.FactCandidate{candidate}},
+			}, biz.FactExtractionWorkerConfig{WorkerID: "fact-correction-test", Heartbeat: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(repo.saved) != test.wantSaved || jobs.completed != 1 || jobs.failed != 0 {
+				t.Fatalf("saved=%d want=%d completed=%d failed=%d", len(repo.saved), test.wantSaved, jobs.completed, jobs.failed)
+			}
+		})
 	}
 }

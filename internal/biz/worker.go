@@ -134,6 +134,9 @@ type WorkerConfig struct {
 	MCPAllowPrivateNetwork bool
 	// ApprovalPoll 等待人工审批时的任务轮询间隔，默认 5 秒。
 	ApprovalPoll time.Duration
+	// PausedPoll 计划人工暂停时的任务轮询间隔，默认 30 秒。
+	// 暂停不是失败，但也不能按审批的高频间隔反复认领、重建上下文。
+	PausedPoll time.Duration
 	// ApprovalTimeout 人工审批等待的独立超时，默认 24 小时。
 	// 审批等待不计入 Run 的执行时长预算，但必须有上界，否则无人处理的审批会让会话永久不可用。
 	ApprovalTimeout time.Duration
@@ -202,6 +205,9 @@ func (c WorkerConfig) normalize() WorkerConfig {
 	}
 	if c.ApprovalPoll <= 0 {
 		c.ApprovalPoll = 5 * time.Second
+	}
+	if c.PausedPoll <= 0 {
+		c.PausedPoll = 30 * time.Second
 	}
 	if c.ApprovalTimeout <= 0 {
 		c.ApprovalTimeout = 24 * time.Hour
@@ -510,6 +516,15 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 		return
 	}
 	if run.Status == RunWaitingApproval {
+		paused, pauseErr := w.planPaused(ctx, run)
+		if pauseErr != nil {
+			w.releaseJob(ctx, job, w.config.PollInterval, "read paused plan: "+pauseErr.Error())
+			return
+		}
+		if paused {
+			w.releaseJob(ctx, job, w.config.PausedPoll, "plan is paused")
+			return
+		}
 		// 审批等待不消耗 Run 的执行时长预算：deadline_at 在暂停期间保持不变，
 		// 恢复时由 ResumeRun 按暂停时长整体顺延，因此这里只能按独立的审批超时回收。
 		// 否则默认 5 分钟的执行预算会让几乎所有人工审批在决策前就被判为超时。
@@ -658,9 +673,10 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 
 	if executionErr != nil {
 		// 计划暂停：把 Run 退回队列并释放任务等待人工恢复，不写失败终态。
+		// 暂停轮询间隔必须显著大于审批轮询，避免用户长时间暂停时持续重建上下文。
 		if errors.Is(executionErr, ErrPlanPaused) || errors.Is(executionErr, ErrPlanRevisionConflict) {
 			if err := w.requeuePausedRun(ctx, run, fence); err == nil {
-				w.releaseJob(ctx, job, w.config.ApprovalPoll, executionErr.Error())
+				w.releaseJob(ctx, job, w.config.PausedPoll, executionErr.Error())
 			}
 			return
 		}
@@ -1416,6 +1432,17 @@ func markStreamedFromContext(ctx context.Context) {
 
 // execute 构建上下文与路由模型并运行 ReAct 循环，事件通过栅栏写入 run_events。
 func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) (react.Result, bool, error) {
+	// 计划暂停时不做任何上下文、记忆与工具准备：每轮都重建历史既昂贵，也会让暂停计划
+	// 以审批频率持续空转。人工暂停只能由用户显式恢复，审批完成不得自动越过这里。
+	if run.Mode == AgentModePlan && w.plans != nil {
+		plan, planErr := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
+		if planErr == nil && plan.Status == PlanPaused {
+			return react.Result{}, false, ErrPlanPaused
+		}
+		if planErr != nil && !errors.Is(planErr, ErrResourceNotFound) {
+			return react.Result{}, false, planErr
+		}
+	}
 	// 事件落库失败会取消该上下文，让 Runner 立即停止而不是继续产生副作用。
 	ctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
@@ -1438,6 +1465,10 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	if skillTools != nil {
 		// 内置技能工具优先于外部 MCP 工具，避免同名工具被外部实现覆盖。
 		tools = combineToolRegistries(skillTools, tools)
+	}
+	if isFeishuSharedGroup(run) {
+		// 共享群聊的工具面必须在审批与执行前收窄，避免高风险工具被群内任意成员触发。
+		tools = restrictSharedGroupTools(tools)
 	}
 	if strings.TrimSpace(resourcePrompt) != "" {
 		// 把技能资源清单写回本次 Run 的本地快照，供系统提示注入；不落库。
@@ -2533,7 +2564,7 @@ func (w *ExecutionWorker) expireWaitingApprovalRun(ctx context.Context, job Job,
 				continue
 			}
 			// 系统以 Run 属主身份拒绝，避免审批中心继续对已超时的 Run 决策。
-			if _, err := w.approvals.DecideApproval(writeContext, run.UserID, approval.ID, ApprovalDecisionDeny, run.UserID, w.clock()); err != nil && !errors.Is(err, ErrResourceConflict) {
+			if _, err := w.approvals.DecideApproval(writeContext, run.UserID, run.ID, approval.ID, ApprovalDecisionDeny, run.UserID, w.clock()); err != nil && !errors.Is(err, ErrResourceConflict) {
 				w.releaseJob(writeContext, job, w.config.PollInterval, "deny approval for expired run: "+err.Error())
 				return
 			}
@@ -3099,14 +3130,8 @@ func (w *ExecutionWorker) runnerRegistry(base react.Registry, run Run) react.Reg
 // 导致用户后续消息永远无法被认领。
 func (w *ExecutionWorker) requeuePausedRun(ctx context.Context, run Run, fence RunFence) error {
 	now := w.clock()
-	var deadline *time.Time
-	// 暂停期间不计入执行窗口：把本轮排队耗时补回截止时间，否则暂停超过 RunDeadline
-	// 后用户恢复计划会被直接判定 run_deadline_exceeded。
-	if run.DeadlineAt != nil && !run.UpdatedAt.IsZero() {
-		extended := run.DeadlineAt.Add(now.Sub(run.UpdatedAt))
-		deadline = &extended
-	}
-	err := w.runs.RequeuePausedRun(context.WithoutCancel(ctx), run.UserID, run.ID, fence, deadline, now)
+	// 这里只记录退队时刻；queued 等待统一由 ClaimRun 补偿，避免同一暂停区间延期两次。
+	err := w.runs.RequeuePausedRun(context.WithoutCancel(ctx), run.UserID, run.ID, fence, now)
 	if err != nil && !errors.Is(err, ErrResourceConflict) {
 		w.logger.Warn("requeue paused run failed", "run_id", run.ID, "error", err)
 	}
@@ -3148,6 +3173,20 @@ func (w *ExecutionWorker) emitApprovalRequired(ctx context.Context, run Run, fen
 	}
 }
 
+func (w *ExecutionWorker) planPaused(ctx context.Context, run Run) (bool, error) {
+	if run.Mode != AgentModePlan || w.plans == nil {
+		return false, nil
+	}
+	plan, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
+	if errors.Is(err, ErrResourceNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return plan.Status == PlanPaused, nil
+}
+
 // pauseForApproval 把 Run 推进到 waiting_approval，并在审批已全部决策时立即恢复。
 // 决策与暂停存在竞态：若暂停后发现没有待决策审批，立即恢复可避免 Run 永久卡住。
 func (w *ExecutionWorker) pauseForApproval(ctx context.Context, run Run, fence RunFence) {
@@ -3162,6 +3201,14 @@ func (w *ExecutionWorker) pauseForApproval(ctx context.Context, run Run, fence R
 		}
 	}
 	if w.approvals == nil {
+		return
+	}
+	paused, pauseErr := w.planPaused(writeContext, run)
+	if pauseErr != nil {
+		w.logger.Error("read paused plan before approval resume failed", "run_id", run.ID, "error", pauseErr)
+		return
+	}
+	if paused {
 		return
 	}
 	pending, err := w.approvals.CountPendingApprovals(writeContext, run.UserID, run.ID)
@@ -3183,6 +3230,10 @@ func (w *ExecutionWorker) pauseForApproval(ctx context.Context, run Run, fence R
 func (w *ExecutionWorker) resumeDecidedApprovalRun(ctx context.Context, run Run) (bool, error) {
 	if w.approvals == nil {
 		return false, nil
+	}
+	paused, err := w.planPaused(ctx, run)
+	if err != nil || paused {
+		return false, err
 	}
 	pending, err := w.approvals.CountPendingApprovals(ctx, run.UserID, run.ID)
 	if err != nil {
@@ -3347,6 +3398,9 @@ func lookupApprovedTool(tools react.Registry, target mcp.ToolIdentity) (react.To
 // deliverApprovalResult 通过单个事务回填审批消息、Outbox、Run 事件、投递时间与执行步骤。
 // 消息和事件 ID 均由 Run 与审批 ID 确定性生成，Worker 重试不会产生重复事实。
 func (w *ExecutionWorker) deliverApprovalResult(ctx context.Context, run Run, fence RunFence, approval ToolApproval) error {
+	if isPlanStepApproval(approval) {
+		return w.deliverPlanApprovalResult(ctx, run, fence, approval)
+	}
 	writeContext := context.WithoutCancel(ctx)
 	content := approvalDeliveryContent(approval)
 	// Supervisor 子任务发起的审批必须回填到子会话，否则模型无法在续跑时看到审批结果。
@@ -3391,6 +3445,59 @@ func (w *ExecutionWorker) deliverApprovalResult(ctx context.Context, run Run, fe
 	}
 	w.appendHotMessage(writeContext, run, stored)
 	return nil
+}
+
+// deliverPlanApprovalResult 只写审批终态事件、执行步骤与已投递标记，不向会话写入孤立 tool 消息。
+// 计划步骤结果由 resolvePlanApprovals 从审批记录读取；在会话里插入没有对应 assistant tool_call
+// 的 tool 消息会污染热窗口、摘要与导出。操作按幂等顺序执行，重试不会重复事件。
+func (w *ExecutionWorker) deliverPlanApprovalResult(ctx context.Context, run Run, fence RunFence, approval ToolApproval) error {
+	writeContext := context.WithoutCancel(ctx)
+	now := w.clock()
+	stepPayload, stepUpdate := w.approvalStepOutcome(run, approval, now)
+	if stepPayload != nil && w.steps != nil {
+		if _, err := w.steps.SavePayload(writeContext, *stepPayload); err != nil && !errors.Is(err, ErrResourceConflict) {
+			return err
+		}
+	}
+	if stepUpdate != nil && w.steps != nil && approval.StepID != nil {
+		if _, err := w.steps.FinishStep(writeContext, run.UserID, *approval.StepID, *stepUpdate); err != nil && !errors.Is(err, ErrResourceConflict) {
+			return err
+		}
+	}
+	delivered, err := w.planApprovalEventAppended(writeContext, run, approval)
+	if err != nil {
+		return err
+	}
+	if !delivered {
+		if _, err := w.runs.AppendEventFenced(writeContext, RunEvent{
+			RunID: run.ID, UserID: run.UserID, EventID: deterministicApprovalEventID(run.ID, approval.ID), EventType: "tool.completed",
+			Payload: map[string]any{
+				"tool": approval.ToolName, "tool_call_id": approval.ToolCallID,
+				"approval_id": approval.ID.String(), "status": approvalDeliveryStatus(approval),
+				"delivery": "step_only",
+			},
+		}, fence); err != nil && !errors.Is(err, ErrResourceConflict) {
+			return err
+		}
+	}
+	if _, err := w.approvals.MarkApprovalDelivered(writeContext, run.UserID, approval.ID, now); err != nil {
+		return err
+	}
+	return nil
+}
+
+// planApprovalEventAppended 判断计划审批的 tool.completed 事件是否已写入，避免重试重复追加。
+func (w *ExecutionWorker) planApprovalEventAppended(ctx context.Context, run Run, approval ToolApproval) (bool, error) {
+	events, err := w.listAllRunEvents(ctx, run, "tool.completed")
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.EventType == "tool.completed" && event.Payload["approval_id"] == approval.ID.String() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // approvalStepOutcome 构造与核心投递事实同事务提交的步骤载荷和终态。
@@ -3612,9 +3719,9 @@ func (w *ExecutionWorker) invokeSandboxTool(ctx context.Context, request sandbox
 func normalizeToolOutcome(output json.RawMessage, err error) (json.RawMessage, error) {
 	switch {
 	case errors.Is(err, ErrToolResultPersistence):
-		return nil, react.NewInfrastructureError("tool_result", err)
+		return output, react.NewInfrastructureError("tool_result", err)
 	case errors.Is(err, mcp.ErrToolOutcomeUnknown), errors.Is(err, sandbox.ErrToolOutcomeUnknown):
-		return nil, errors.Join(ErrToolResultPersistence, react.NewInfrastructureError("tool_outcome_unknown", err))
+		return output, errors.Join(ErrToolResultPersistence, react.NewInfrastructureError("tool_outcome_unknown", err))
 	default:
 		return output, err
 	}
@@ -3785,9 +3892,21 @@ func (t observedTool) Invoke(ctx context.Context, arguments json.RawMessage) (js
 	}
 	if invokeErr != nil {
 		if errors.Is(invokeErr, ErrToolResultPersistence) {
-			_, _ = t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
+			if len(output) > 0 {
+				text, truncated := captureExecutionText(string(output), t.worker.config.MaxPayloadBytes)
+				if _, err := t.worker.steps.SavePayload(writeContext, ExecutionPayload{
+					RunID: t.run.ID, UserID: t.run.UserID, StepID: &step.ID, Type: PayloadToolError,
+					ContentText: text, CaptureMode: CaptureRedacted,
+					OriginalSizeBytes: int64(len(output)), Truncated: truncated,
+				}); err != nil {
+					invokeErr = errors.Join(invokeErr, react.NewInfrastructureError("save_tool_error", err))
+				}
+			}
+			if _, err := t.worker.steps.FinishStep(writeContext, t.run.UserID, step.ID, StepUpdate{
 				Status: StepReconciliationRequired, ErrorCode: "tool_execution_unknown", FinishedAt: t.worker.clock(),
-			})
+			}); err != nil {
+				invokeErr = errors.Join(invokeErr, react.NewInfrastructureError("finish_step", err))
+			}
 			return nil, invokeErr
 		}
 		// 父上下文取消与 MCP 传输故障属于基础设施问题，必须上抛而不是回填模型。

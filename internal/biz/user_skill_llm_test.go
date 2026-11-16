@@ -105,6 +105,18 @@ type fakeSkillUsageRecorder struct {
 	records []skillUsageRecord
 }
 
+type fakeSkillBudgetChecker struct {
+	providers []uuid.UUID
+	err       error
+}
+
+func (f *fakeSkillBudgetChecker) Check(_ context.Context, _ uuid.UUID, _ *uuid.UUID, providerID *uuid.UUID) ([]BudgetAlert, error) {
+	if providerID != nil {
+		f.providers = append(f.providers, *providerID)
+	}
+	return nil, f.err
+}
+
 func (f *fakeSkillUsageRecorder) RecordUsage(_ context.Context, userID uuid.UUID, _, providerID *uuid.UUID, inputTokens, outputTokens int64, cost float64, _ time.Time) error {
 	f.records = append(f.records, skillUsageRecord{userID: userID, providerID: providerID, inputTokens: inputTokens, outputTokens: outputTokens, cost: cost})
 	return nil
@@ -316,6 +328,8 @@ func TestSkillLLMExtractorUsesCandidatePriorityAndRecordsActualProvider(t *testi
 		t.Fatal(err)
 	}
 	extractor.WithUsageRecorder(usage)
+	budgets := &fakeSkillBudgetChecker{}
+	extractor.WithBudgetChecker(budgets)
 	sessions, messages := skillLLMConversations()
 	if _, err := extractor.Extract(context.Background(), userID, sessions, messages); err != nil {
 		t.Fatalf("Extract() error = %v", err)
@@ -323,8 +337,41 @@ func TestSkillLLMExtractorUsesCandidatePriorityAndRecordsActualProvider(t *testi
 	if len(requests.models) != 2 || requests.models[0] != "first-model" || requests.models[1] != "second-model" {
 		t.Fatalf("unexpected candidate order: %#v", requests.models)
 	}
+	if len(budgets.providers) != 2 || budgets.providers[0] != firstProviderID || budgets.providers[1] != secondProviderID {
+		t.Fatalf("budget checks do not match paid candidate order: %#v", budgets.providers)
+	}
 	if len(usage.records) != 1 || usage.records[0].providerID == nil || *usage.records[0].providerID != secondProviderID {
 		t.Fatalf("expected usage for successful second provider, got %#v", usage.records)
+	}
+}
+
+func TestSkillLLMExtractorBudgetExceededSkipsPaidRequest(t *testing.T) {
+	server, requests := newSkillLLMServer(t, nil)
+	providerID := uuid.New()
+	catalogModel := skillLLMModel(providerID, "first-model")
+	policyID := uuid.New()
+	version := 1
+	policies := &fakeSkillPolicyRepository{
+		policies: map[uuid.UUID]ModelPolicy{policyID: skillLLMPolicy(policyID, PolicyCandidate{ModelID: catalogModel.ID, Priority: 1})},
+		models:   map[uuid.UUID]Model{catalogModel.ID: catalogModel},
+	}
+	providers := &fakeSkillProviderCredentials{items: map[uuid.UUID]fakeSkillProviderCredential{
+		providerID: {provider: Provider{ID: providerID, Status: ProviderEnabled, BaseURL: server.URL}},
+	}}
+	userID := uuid.New()
+	settings := &fakeSkillSynthesisSettingsStore{items: map[uuid.UUID]UserSkillSynthesisSettings{
+		userID: {UserID: userID, Enabled: true, ModelPolicyID: &policyID, ModelPolicyVersion: &version},
+	}}
+	extractor, err := NewSkillLLMExtractor(settings, policies, providers, skillLLMOpener{}, UserSkillLLMConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgets := &fakeSkillBudgetChecker{err: ErrBudgetExceeded}
+	extractor.WithBudgetChecker(budgets)
+	sessions, messages := skillLLMConversations()
+	_, err = extractor.Extract(context.Background(), userID, sessions, messages)
+	if !errors.Is(err, ErrBudgetExceeded) || len(requests.models) != 0 || len(budgets.providers) != 1 || budgets.providers[0] != providerID {
+		t.Fatalf("Extract() requests=%#v checks=%#v err=%v", requests.models, budgets.providers, err)
 	}
 }
 

@@ -13,14 +13,23 @@ import (
 // planServiceRunRepo 是 PlanService 测试用 Run 仓储。
 type planServiceRunRepo struct {
 	RunRepository
-	mu  sync.Mutex
-	run Run
+	mu                  sync.Mutex
+	run                 Run
+	extendDeadlineCalls int
 }
 
 // GetRun 返回当前 Run。
 func (r *planServiceRunRepo) GetRun(_ context.Context, _ uuid.UUID, _ uuid.UUID) (Run, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.run, nil
+}
+
+func (r *planServiceRunRepo) ExtendRunDeadline(_ context.Context, _, _ uuid.UUID, deadline time.Time) (Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.extendDeadlineCalls++
+	r.run.DeadlineAt = &deadline
 	return r.run, nil
 }
 
@@ -32,6 +41,15 @@ func (r *planServiceRunRepo) TransitionRun(_ context.Context, _ uuid.UUID, _ uui
 	if finished, ok := fields["finished_at"].(time.Time); ok {
 		r.run.FinishedAt = &finished
 	}
+	return r.run, nil
+}
+
+// CancelRunAndDenyPendingApprovals 模拟 Run 与待审批记录的原子取消端口。
+func (r *planServiceRunRepo) CancelRunAndDenyPendingApprovals(_ context.Context, _, _ uuid.UUID, now time.Time) (Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.run.Status = RunCancelled
+	r.run.FinishedAt = &now
 	return r.run, nil
 }
 
@@ -139,6 +157,12 @@ func TestPlanServicePauseResume(t *testing.T) {
 	queue.mu.Unlock()
 	if enqueued != 1 {
 		t.Fatalf("resume enqueue count = %d", enqueued)
+	}
+	repo.mu.Lock()
+	extendDeadlineCalls := repo.extendDeadlineCalls
+	repo.mu.Unlock()
+	if extendDeadlineCalls != 0 {
+		t.Fatalf("Run deadline extensions = %d, want 0", extendDeadlineCalls)
 	}
 	// 执行中的计划不能恢复。
 	if _, err := service.Resume(context.Background(), principal, repo.run.ID); !errors.Is(err, ErrResourceConflict) {

@@ -132,6 +132,8 @@ type RunRepository interface {
 	ListAllRuns(ctx context.Context, filter AdminRunFilter, limit int, cursor string) (Page[RunSummary], error)
 	// TransitionRun 以状态 CAS 推进 Run 状态。
 	TransitionRun(ctx context.Context, userID, runID uuid.UUID, from, to RunStatus, fields map[string]any) (Run, error)
+	// CancelRunAndDenyPendingApprovals 在同一事务中取消 Run 并拒绝其全部待决策审批。
+	CancelRunAndDenyPendingApprovals(ctx context.Context, userID, runID uuid.UUID, now time.Time) (Run, error)
 	// AppendEvent 追加事件并分配单调 seq。
 	AppendEvent(ctx context.Context, event RunEvent) (RunEvent, error)
 	// AppendEventFenced 仅在租约栅栏有效时追加事件，防止过期 Worker 写入幽灵事件。
@@ -145,7 +147,7 @@ type RunRepository interface {
 	// AuthorizeToolDispatch checks a live Run lease and marks the pending tool step as dispatched.
 	AuthorizeToolDispatch(ctx context.Context, userID, runID uuid.UUID, stepID *uuid.UUID, fence RunFence, now time.Time) error
 	// RequeuePausedRun releases the current worker's lease after a Plan pause.
-	RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, deadline *time.Time, now time.Time) error
+	RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) error
 	// PauseRun 在栅栏有效时把运行中的 Run 推进到 waiting_approval，并清空租约。
 	PauseRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) (Run, error)
 	// ResumeRun 在无待决策审批时把 waiting_approval 推进到 running，并清空租约。
@@ -552,12 +554,23 @@ func (s *RunService) hasPlanResumeIntent(ctx context.Context, userID uuid.UUID, 
 }
 
 // isPlanResumeIntent 识别简短的显式续跑指令，避免把包含“继续”一词的新任务误判为恢复计划。
+// 允许常见礼貌前缀与句末语气词（“请继续吧”“那就接着做”），但仍要求去掉修饰后是完整指令。
 func isPlanResumeIntent(content string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(content))
-	normalized = strings.Trim(normalized, " 。！!．. ")
+	normalized = strings.Trim(normalized, " 。！!．.，,、~～:：")
+	for _, negative := range []string{"不要继续", "别继续", "不用继续", "不要恢复", "别恢复", "取消继续", "停止继续"} {
+		if strings.Contains(normalized, negative) {
+			return false
+		}
+	}
+	normalized = strings.TrimLeft(normalized, "请麻烦帮我那就你们")
+	normalized = strings.TrimLeft(normalized, " ，,、:：")
+	normalized = strings.TrimRight(normalized, "吧啊呀哦了呢嘛")
+	normalized = strings.TrimSpace(normalized)
 	switch normalized {
-	case "继续", "继续执行", "接着", "接着执行", "恢复", "恢复执行", "续跑",
-		"continue", "continue plan", "resume", "resume plan":
+	case "继续", "继续执行", "继续做", "继续干", "继续跑", "继续计划", "继续任务",
+		"接着", "接着执行", "接着做", "接着干", "恢复", "恢复执行", "恢复计划", "恢复任务", "续跑",
+		"continue", "continue plan", "continue execution", "resume", "resume plan", "resume execution":
 		return true
 	default:
 		return false
@@ -911,45 +924,13 @@ func (s *RunService) ResolveReconciliation(
 	return s.repo.FinishRunWithEvent(ctx, principal.UserID, runID, RunReconciliationRequired, outcome, fields, event, fence, now)
 }
 
-// Cancel 取消排队、执行中或等待审批的 Run；终态 Run 返回冲突。
+// Cancel 在同一事务中取消排队、执行中或等待审批的 Run，并拒绝全部待决策审批。
+// 计划不在此处取消：暂停中的计划会被新 Run 重新绑定并恢复，取消 Run 只是释放旧执行窗口。
 func (s *RunService) Cancel(ctx context.Context, principal Principal, runID uuid.UUID) (Run, error) {
-	run, err := s.Get(ctx, principal, runID)
-	if err != nil {
-		return Run{}, err
+	if principal.UserID == uuid.Nil {
+		return Run{}, ErrForbidden
 	}
-	if RunTerminal(run.Status) {
-		return Run{}, fmt.Errorf("%w: run is already terminal", ErrResourceConflict)
-	}
-	if err := TransitionRunStatus(run.Status, RunCancelled); err != nil {
-		return Run{}, err
-	}
-	now := s.clock()
-	cancelled, err := s.repo.TransitionRun(ctx, principal.UserID, runID, run.Status, RunCancelled, map[string]any{"finished_at": now})
-	if err != nil {
-		return Run{}, err
-	}
-	// 取消会联动拒绝该 Run 上仍待决策的工具审批，避免审批列表残留永远无法执行的请求。
-	// 计划不在此处取消：暂停中的计划会被新 Run 重新绑定并恢复，取消 Run 只是释放旧执行窗口。
-	s.cancelLinkedArtifacts(ctx, principal.UserID, runID, now)
-	return cancelled, nil
-}
-
-// cancelLinkedArtifacts 尽力收敛取消 Run 关联的待审批记录。
-// Run 已经是终态，清理失败不应把用户的取消操作变成错误，因此这里只做 best-effort 收敛。
-func (s *RunService) cancelLinkedArtifacts(ctx context.Context, userID, runID uuid.UUID, now time.Time) {
-	if s.approvals == nil {
-		return
-	}
-	approvals, err := s.approvals.ListApprovals(ctx, userID, runID)
-	if err != nil {
-		return
-	}
-	for _, approval := range approvals {
-		if approval.Status != ApprovalPending {
-			continue
-		}
-		_, _ = s.approvals.DecideApproval(ctx, userID, approval.ID, ApprovalDecisionDeny, userID, now)
-	}
+	return s.repo.CancelRunAndDenyPendingApprovals(ctx, principal.UserID, runID, s.clock())
 }
 
 // ListSteps 读取 Run 的执行步骤；调用方须先通过 GetRun 校验归属。
@@ -1153,7 +1134,7 @@ func (s *RunService) DecideApproval(ctx context.Context, principal Principal, ru
 	if approval.RunID != runID {
 		return ToolApproval{}, fmt.Errorf("%w: approval does not belong to the run", ErrResourceConflict)
 	}
-	updated, err := s.approvals.DecideApproval(ctx, principal.UserID, approvalID, decision, principal.UserID, s.clock())
+	updated, err := s.approvals.DecideApproval(ctx, principal.UserID, runID, approvalID, decision, principal.UserID, s.clock())
 	if err != nil {
 		return ToolApproval{}, err
 	}
@@ -1174,15 +1155,27 @@ func (s *RunService) DecideApproval(ctx context.Context, principal Principal, ru
 	if pending > 0 {
 		return updated, nil
 	}
+	// PlanPaused 只代表人工暂停及其恢复失败状态，审批完成不得越过该门禁。
+	// 正常工具审批使用 PlanWaitingApproval，仍按原链路自动恢复。
+	if s.plans != nil {
+		plan, planErr := s.plans.GetPlanByRun(ctx, principal.UserID, runID)
+		if planErr != nil && !errors.Is(planErr, ErrResourceNotFound) {
+			return ToolApproval{}, planErr
+		}
+		if planErr == nil && plan.Status == PlanPaused {
+			return updated, nil
+		}
+	}
 	// 全部决策完成：把等待审批的 Run 推回 running；已由 Worker 恢复的 Run 保持原状态。
 	if run.Status == RunWaitingApproval {
 		if _, err := s.repo.ResumeRun(ctx, principal.UserID, runID, s.clock()); err != nil && !errors.Is(err, ErrResourceConflict) {
 			return ToolApproval{}, err
 		}
 	}
-	// 唤醒任务只是加速恢复；任务已由 Worker 退回队列，入队失败不影响已提交的决策。
 	if s.enqueuer != nil {
-		_ = s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock())
+		if err := s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock()); err != nil {
+			return ToolApproval{}, err
+		}
 	}
 	return updated, nil
 }

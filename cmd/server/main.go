@@ -374,6 +374,7 @@ func run() error {
 	var summaryPlanner *biz.SummaryPlanner
 	var memoryIndexer *biz.MemoryIndexer
 	var memoryRetriever *biz.MemoryRetriever
+	var memoryReranker *biz.LLMReranker
 	var embeddingGenerator *biz.LLMEmbeddingGenerator
 	var factService *biz.FactService
 	var factIndexer *biz.FactIndexer
@@ -400,10 +401,11 @@ func run() error {
 		}
 		var reranker biz.Reranker
 		if cfg.Agent.Memory.Vector.RerankEnabled {
-			reranker, err = biz.NewLLMReranker(catalogRepository, memoryRepository, credentialKeys, cfg.Agent.Memory.Vector.EmbeddingTimeout.Duration)
+			memoryReranker, err = biz.NewLLMReranker(catalogRepository, memoryRepository, credentialKeys, cfg.Agent.Memory.Vector.EmbeddingTimeout.Duration)
 			if err != nil {
 				return err
 			}
+			reranker = memoryReranker
 		}
 		memoryRetriever, err = biz.NewMemoryRetriever(memoryRepository, memoryRepository, embeddingGenerator, reranker, biz.MemoryRetrieverConfig{
 			TopK: cfg.Agent.Memory.Vector.RetrieverTopK, MMRTop: cfg.Agent.Memory.Vector.MMRTop,
@@ -474,7 +476,10 @@ func run() error {
 		return err
 	}
 	if memoryRetriever != nil {
-		memoryRetriever.WithUsageRecorder(budgetRepository)
+		memoryRetriever.WithUsageRecorder(budgetRepository).WithBudgetChecker(budgetService)
+	}
+	if memoryReranker != nil {
+		memoryReranker.WithBudgetChecker(budgetService)
 	}
 	runService, err := biz.NewRunService(runRepository, sessionRepository,
 		biz.WithRunSnapshots(data.NewRunSnapshotRepository(agentRepository, catalogRepository)),
@@ -897,7 +902,7 @@ func run() error {
 	if cfg.Agent.Memory.Vector.Enabled {
 		memoryEmbedWorker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
 			Jobs: jobRepository, Messages: memoryRepository, Indexes: memoryRepository,
-			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Logger: slog.Default(),
+			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Budgets: budgetService, Logger: slog.Default(),
 		}, biz.MemoryEmbedWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Vector.Concurrency,
 			PollInterval: cfg.Agent.Memory.Vector.PollInterval.Duration, Lease: cfg.Agent.Memory.Vector.Lease.Duration,
@@ -937,7 +942,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		factExtractor.WithUsageRecorder(budgetRepository)
+		factExtractor.WithUsageRecorder(budgetRepository).WithBudgetChecker(budgetService)
 		factWorker, err := biz.NewFactExtractionWorker(biz.FactExtractionWorkerDependencies{
 			Jobs: jobRepository, Messages: sessionRepository, Facts: factService, Extractor: factExtractor,
 			Logger: slog.Default(),
@@ -975,7 +980,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		skillExtractor.WithUsageRecorder(budgetRepository)
+		skillExtractor.WithUsageRecorder(budgetRepository).WithBudgetChecker(budgetService)
 		skillSynthesisWorker, err := biz.NewSkillSynthesisWorker(biz.SkillSynthesisWorkerDependencies{
 			Jobs: jobRepository, Settings: userSkillRepository, Sessions: sessionRepository, UserSkills: userSkillService,
 			Extractor: skillExtractor, Logger: slog.Default(),

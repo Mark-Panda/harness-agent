@@ -311,6 +311,7 @@ func (r *RunRepository) ListAllRuns(ctx context.Context, filter biz.AdminRunFilt
 // TransitionRun 以状态 CAS 推进 Run，非法迁移由领域状态机拒绝。
 func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UUID, from, to biz.RunStatus, fields map[string]any) (biz.Run, error) {
 	var record runModel
+	now := time.Now().UTC()
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		if err := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
 			return err
@@ -321,7 +322,7 @@ func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UU
 		if err := biz.TransitionRunStatus(from, to); err != nil {
 			return err
 		}
-		updates := map[string]any{"status": string(to), "updated_at": time.Now().UTC()}
+		updates := map[string]any{"status": string(to), "updated_at": now}
 		for key, value := range fields {
 			updates[key] = value
 		}
@@ -332,10 +333,64 @@ func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UU
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: run status changed concurrently", biz.ErrResourceConflict)
 		}
+		// Run 进入终态时同事务终止仍存活的 Plan/Supervisor 子状态，
+		// 避免执行树残留 pending/running 的孤儿记录。
+		if biz.RunTerminal(to) {
+			if err := cancelRunChildren(tx, userID, runID, "run_terminal", now); err != nil {
+				return err
+			}
+		}
 		return tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error
 	})
 	if err != nil {
 		return biz.Run{}, catalogError("transition run", err)
+	}
+	return toBizRun(record)
+}
+
+// CancelRunAndDenyPendingApprovals 在父 Run 行锁内串行化取消、审批决策与审批创建。
+// Run 状态与 Pending 审批拒绝在同一事务提交，任一步失败都不会留下半取消状态。
+func (r *RunRepository) CancelRunAndDenyPendingApprovals(ctx context.Context, userID, runID uuid.UUID, now time.Time) (biz.Run, error) {
+	var record runModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&record, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+			return err
+		}
+		from := biz.RunStatus(record.Status)
+		if biz.RunTerminal(from) {
+			return fmt.Errorf("%w: run is already terminal", biz.ErrResourceConflict)
+		}
+		if err := biz.TransitionRunStatus(from, biz.RunCancelled); err != nil {
+			return err
+		}
+		result := tx.Model(&runModel{}).
+			Where("id = ? AND user_id = ? AND status = ?", runID, userID, string(from)).
+			Updates(map[string]any{
+				"status": string(biz.RunCancelled), "finished_at": now, "updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: run status changed concurrently", biz.ErrResourceConflict)
+		}
+		// 取消是终态，必须在同一事务内终止 Plan/Supervisor 子状态；
+		// 仅拒绝待审批记录会留下 pending 子任务与 waiting_approval 步骤。
+		if err := cancelRunChildren(tx, userID, runID, "run_cancelled", now); err != nil {
+			return err
+		}
+		if err := tx.Model(&toolApprovalModel{}).
+			Where("user_id = ? AND run_id = ? AND status = ?", userID, runID, string(biz.ApprovalPending)).
+			Updates(map[string]any{
+				"status": string(biz.ApprovalDenied), "decided_by": userID, "decided_at": now, "updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error
+	})
+	if err != nil {
+		return biz.Run{}, catalogError("cancel run and deny pending approvals", err)
 	}
 	return toBizRun(record)
 }
@@ -412,12 +467,14 @@ func (r *RunRepository) ClaimRun(ctx context.Context, userID, runID uuid.UUID, o
 			"fencing_token": gorm.Expr("fencing_token + 1"),
 			"started_at":    gorm.Expr("COALESCE(started_at, ?)", now), "updated_at": now,
 		}
-		if biz.RunStatus(record.Status) == biz.RunQueued && record.DeadlineAt != nil && record.StartedAt == nil {
-			// 排队等待不计入执行窗口：首次认领时把排队时长补回截止时间，
-			// 避免前序 Run 长时间执行导致后续 Run 一被认领就判定超时。
-			// 只在从未执行过的 Run 上补偿，避免计划暂停反复退回队列时把截止时间越推越远。
-			extended := record.DeadlineAt.Add(now.Sub(record.CreatedAt))
-			updates["deadline_at"] = extended
+		if biz.RunStatus(record.Status) == biz.RunQueued && record.DeadlineAt != nil {
+			// 首次排队从 CreatedAt 起算；暂停退队后的再次排队从本次 UpdatedAt 起算。
+			// deadline 与 queued->running 在同一个 CAS 中更新，并发认领只会补偿一次。
+			queuedAt := record.CreatedAt
+			if record.StartedAt != nil {
+				queuedAt = record.UpdatedAt
+			}
+			updates["deadline_at"] = record.DeadlineAt.Add(now.Sub(queuedAt))
 		}
 		result := tx.Model(&runModel{}).
 			Where("id = ? AND user_id = ? AND (status = ? OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at < ?)))",
@@ -516,15 +573,12 @@ func (r *RunRepository) AuthorizeToolDispatch(ctx context.Context, userID, runID
 }
 
 // RequeuePausedRun clears only the live lease held by the worker that observed the pause.
-func (r *RunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, deadline *time.Time, now time.Time) error {
+func (r *RunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			return err
 		}
 		fields := map[string]any{"status": biz.RunQueued, "lease_owner": "", "lease_expires_at": nil, "updated_at": now}
-		if deadline != nil {
-			fields["deadline_at"] = *deadline
-		}
 		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).Updates(fields).Error
 	})
 	return catalogError("requeue paused run", err)
@@ -696,6 +750,12 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: run lease or status changed concurrently", biz.ErrResourceConflict)
 		}
+		// 终态与子状态清理必须原子提交，防止 Run 已结束但 Plan/Supervisor 仍显示执行中。
+		if biz.RunTerminal(to) {
+			if err := cancelRunChildren(tx, userID, runID, "run_terminal", now); err != nil {
+				return err
+			}
+		}
 		// 事件与状态同事务写入；任何事件写入失败都会回滚终态，避免幽灵事件。
 		if event != nil {
 			if _, err := appendRunEvent(tx, *event); err != nil {
@@ -710,6 +770,38 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 	// 终态已提交，通知 SSE 立即拉取最后一批事件并关闭连接（无事件时也能立即感知终态）。
 	r.notifyEvent(ctx, runID)
 	return toBizRun(record)
+}
+
+// cancelRunChildren 在 Run 进入取消/失败等终态时，同事务终止仍存活的 Plan 与 Supervisor 子状态。
+// 已处于终态的子记录保持不变；reason 写入错误码，便于审计区分用户取消与普通终态。
+// 暂停中的计划是允许被新 Run 重新绑定的可恢复状态，不能随父 Run 终止，否则“继续”会丢失全部进度。
+func cancelRunChildren(tx *gorm.DB, userID, runID uuid.UUID, reason string, now time.Time) error {
+	if err := tx.Model(&supervisorTaskModel{}).
+		Where("user_id = ? AND parent_run_id = ? AND status IN ?", userID, runID,
+			[]string{string(biz.SupervisorTaskPending), string(biz.SupervisorTaskRunning)}).
+		Updates(map[string]any{
+			"status": string(biz.SupervisorTaskCancelled), "error_code": reason, "error_message": "父 Run 已终止，子任务取消",
+			"finished_at": now.UTC(), "updated_at": now.UTC(),
+		}).Error; err != nil {
+		return err
+	}
+	if err := tx.Model(&planStepModel{}).
+		Where("user_id = ? AND plan_id IN (SELECT id FROM plans WHERE run_id = ? AND user_id = ? AND status <> ?) AND status IN ?",
+			userID, runID, userID, string(biz.PlanPaused),
+			[]string{string(biz.PlanStepPending), string(biz.PlanStepRunning), string(biz.PlanStepWaitingApproval)}).
+		Updates(map[string]any{
+			"status": string(biz.PlanStepCancelled), "error_code": reason, "error_message": "父 Run 已终止，计划步骤取消",
+			"finished_at": now.UTC(), "updated_at": now.UTC(),
+		}).Error; err != nil {
+		return err
+	}
+	return tx.Model(&planModel{}).
+		Where("user_id = ? AND run_id = ? AND status IN ?", userID, runID,
+			[]string{string(biz.PlanPlanning), string(biz.PlanExecuting), string(biz.PlanWaitingApproval)}).
+		Updates(map[string]any{
+			"status": string(biz.PlanCancelled), "error_code": reason, "error_message": "父 Run 已终止，计划取消",
+			"finished_at": now.UTC(), "updated_at": now.UTC(),
+		}).Error
 }
 
 // SetRunAttempt 在栅栏有效时更新当前 Attempt 序号，保证崩溃恢复后序号连续。

@@ -425,7 +425,7 @@ func TestWorkerExpiresApprovalWithoutLosingRunnableJob(t *testing.T) {
 				{ID: approvalID, Status: biz.ApprovalPending},
 				{ID: uuid.New(), Status: biz.ApprovalDenied},
 			}, nil)
-			approvals.EXPECT().DecideApproval(gomock.Any(), userID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).
+			approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).
 				Return(biz.ToolApproval{ID: approvalID, Status: biz.ApprovalDenied}, nil)
 			runs.EXPECT().FinishRunWithEvent(gomock.Any(), userID, runID, biz.RunWaitingApproval, biz.RunFailed,
 				gomock.Cond(func(value any) bool {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/google/uuid"
 )
 
@@ -49,6 +50,7 @@ type SkillLLMExtractor struct {
 	policies  PolicyRepository
 	providers ProviderCredentialRepository
 	opener    CredentialOpener
+	budgets   BudgetChecker
 	usage     UsageRecorder
 	config    UserSkillLLMConfig
 }
@@ -65,6 +67,12 @@ func NewSkillLLMExtractor(settings UserSkillSynthesisSettingsReader, policies Po
 		return nil, invalid("default skill synthesis policy requires a valid id and positive version")
 	}
 	return &SkillLLMExtractor{settings: settings, policies: policies, providers: providers, opener: opener, config: config.normalize()}, nil
+}
+
+// WithBudgetChecker 注入后台技能提炼预算门禁。
+func (e *SkillLLMExtractor) WithBudgetChecker(checker BudgetChecker) *SkillLLMExtractor {
+	e.budgets = checker
+	return e
 }
 
 // WithUsageRecorder 注入后台技能提炼用量记录器。
@@ -165,35 +173,44 @@ func (e *SkillLLMExtractor) Extract(ctx context.Context, userID uuid.UUID, sessi
 		if catalogModel.MaxOutputTokens > 0 && maxOutput > catalogModel.MaxOutputTokens {
 			maxOutput = catalogModel.MaxOutputTokens
 		}
-		response, chatErr := client.Chat(ctx, model.ChatRequest{
+		request := model.ChatRequest{
 			Model: model.ModelRef{
 				ProviderID: provider.ID.String(), ModelID: catalogModel.ID.String(),
 				RemoteModelName: catalogModel.RemoteModelName, ContextWindowTokens: catalogModel.ContextWindowTokens,
 				MaxOutputTokens: catalogModel.MaxOutputTokens,
 			},
-			Messages:    []model.ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
 			Temperature: e.config.Temperature, MaxOutputTokens: maxOutput,
+		}
+		completion, completeErr := completeText(ctx, []react.Message{
+			{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user},
+		}, func(callCtx context.Context, messages []react.Message) (react.Completion, error) {
+			if err := checkBackgroundBudget(callCtx, e.budgets, userID, provider.ID); err != nil {
+				return react.Completion{}, err
+			}
+			request.Messages = chatMessagesFromReact(messages)
+			response, chatErr := client.Chat(callCtx, request)
+			e.recordUsage(callCtx, userID, provider.ID, catalogModel, response)
+			return completionFromChatResponse(response), chatErr
 		})
-		e.recordUsage(ctx, userID, provider.ID, catalogModel, response)
-		if chatErr != nil {
+		if completeErr != nil {
+			if errors.Is(completeErr, ErrBudgetExceeded) {
+				return SkillCandidate{}, completeErr
+			}
 			if ctx.Err() != nil {
 				return SkillCandidate{}, ctx.Err()
 			}
-			if errors.Is(chatErr, model.ErrPermanent) || errors.Is(chatErr, model.ErrAuthentication) ||
-				errors.Is(chatErr, model.ErrCapability) || errors.Is(chatErr, model.ErrContextExceeded) {
-				lastPermanent = chatErr
+			if isCompletionGuardError(completeErr) || errors.Is(completeErr, model.ErrPermanent) ||
+				errors.Is(completeErr, model.ErrAuthentication) || errors.Is(completeErr, model.ErrCapability) ||
+				errors.Is(completeErr, model.ErrContextExceeded) {
+				lastPermanent = completeErr
 			} else {
-				lastTemporary = chatErr
+				lastTemporary = completeErr
 			}
 			continue
 		}
-		if strings.TrimSpace(response.Content) == "" || len(response.ToolCalls) > 0 {
-			return SkillCandidate{ShouldCreate: false}, nil
-		}
-		result, parseErr := parseSkillCandidate(response.Content)
+		result, parseErr := parseSkillCandidate(completion.Content)
 		if parseErr != nil {
-			// 模型输出无法解析时不重试，视为不值得生成。
-			return SkillCandidate{ShouldCreate: false}, nil
+			return SkillCandidate{}, fmt.Errorf("%w: invalid skill response: %v", ErrUserSkillSynthesisUnavailable, parseErr)
 		}
 		return result, nil
 	}

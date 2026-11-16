@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 )
 
 // SummarySystemPrompt 是摘要模型的系统约束。
@@ -133,6 +135,166 @@ func SplitSummaryMessages(messages []SummaryMessage, maxBytes int) [][]SummaryMe
 		chunks = append(chunks, current)
 	}
 	return chunks
+}
+
+// summaryPromptTokens 估算包含系统指令与协议开销的完整 Prompt Token。
+func summaryPromptTokens(system, user string) int {
+	return EstimateMessagesTokens([]react.Message{{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user}})
+}
+
+// SplitSummaryMessagesByTokens 按完整 Prompt Token 预算切分消息。
+// 超过单条字节上限或 Token 上限的消息会拆成连续片段，不经过 FormatSummaryTranscript 的静默截断。
+func SplitSummaryMessagesByTokens(messages []SummaryMessage, maxMessageBytes, maxTokens int) ([][]SummaryMessage, error) {
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("summary requires at least one message")
+	}
+	if maxTokens <= 0 {
+		return nil, fmt.Errorf("summary prompt token budget must be positive")
+	}
+	if maxMessageBytes <= 0 {
+		maxMessageBytes = 8 * 1024
+	}
+	queue := make([]SummaryMessage, 0, len(messages))
+	for _, message := range messages {
+		remaining := message.Content
+		for len(remaining) > maxMessageBytes {
+			prefix := truncateUTF8(remaining, maxMessageBytes)
+			if prefix == "" {
+				return nil, fmt.Errorf("summary message byte budget cannot retain one UTF-8 character")
+			}
+			piece := message
+			piece.Content = prefix
+			queue = append(queue, piece)
+			remaining = remaining[len(prefix):]
+		}
+		message.Content = remaining
+		queue = append(queue, message)
+	}
+
+	fits := func(chunk []SummaryMessage) bool {
+		system, user, err := BuildSummaryPrompt("", chunk, maxMessageBytes)
+		return err == nil && summaryPromptTokens(system, user) <= maxTokens
+	}
+	chunks := make([][]SummaryMessage, 0, len(queue))
+	current := make([]SummaryMessage, 0, 8)
+	flush := func() {
+		if len(current) > 0 {
+			chunks = append(chunks, current)
+			current = make([]SummaryMessage, 0, 8)
+		}
+	}
+	for len(queue) > 0 {
+		message := queue[0]
+		queue = queue[1:]
+		if len(current) > 0 {
+			candidate := append(append([]SummaryMessage(nil), current...), message)
+			if fits(candidate) {
+				current = candidate
+				continue
+			}
+			flush()
+		}
+		if fits([]SummaryMessage{message}) {
+			current = append(current, message)
+			continue
+		}
+		runes := []rune(message.Content)
+		if len(runes) < 2 {
+			return nil, fmt.Errorf("summary prompt token budget %d cannot retain message metadata and one character", maxTokens)
+		}
+		middle := len(runes) / 2
+		left, right := message, message
+		left.Content = string(runes[:middle])
+		right.Content = string(runes[middle:])
+		// 后半仍按原顺序位于前半之后，并先于队列中的后续消息处理。
+		queue = append([]SummaryMessage{left, right}, queue...)
+	}
+	flush()
+	return chunks, nil
+}
+
+// BuildSummaryMergeBatches 构造有序、可归约的分层归并批次。
+// previous 作为最早片段进入归并树；过大条目会无损拆分，任何两个条目都能在当前预算内归并。
+func BuildSummaryMergeBatches(previous string, partials []string, maxTokens int) ([][]string, error) {
+	if maxTokens <= 0 {
+		return nil, fmt.Errorf("summary merge token budget must be positive")
+	}
+	items := make([]string, 0, len(partials)+1)
+	if strings.TrimSpace(previous) != "" {
+		items = append(items, previous)
+	}
+	for _, partial := range partials {
+		if strings.TrimSpace(partial) != "" {
+			items = append(items, partial)
+		}
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("summary merge requires partial summaries")
+	}
+	system, emptyUser, err := BuildMergeSummaryPrompt("", []string{"", ""})
+	if err != nil {
+		return nil, err
+	}
+	baseTokens := summaryPromptTokens(system, emptyUser)
+	itemBudget := (maxTokens - baseTokens) / 2
+	if itemBudget < 1 {
+		return nil, fmt.Errorf("summary merge token budget %d cannot fit two fragments", maxTokens)
+	}
+
+	pieces := make([]string, 0, len(items))
+	for _, item := range items {
+		for len(item) > 0 && EstimateTokens(item) > itemBudget {
+			runes := []rune(item)
+			low, high := 1, len(runes)
+			best := 0
+			for low <= high {
+				middle := low + (high-low)/2
+				if EstimateTokens(string(runes[:middle])) <= itemBudget {
+					best = middle
+					low = middle + 1
+				} else {
+					high = middle - 1
+				}
+			}
+			if best == 0 {
+				return nil, fmt.Errorf("summary merge token budget cannot retain one character")
+			}
+			pieces = append(pieces, string(runes[:best]))
+			item = string(runes[best:])
+		}
+		if item != "" {
+			pieces = append(pieces, item)
+		}
+	}
+
+	batches := make([][]string, 0, (len(pieces)+1)/2)
+	current := make([]string, 0, 4)
+	for _, piece := range pieces {
+		candidate := append(append([]string(nil), current...), piece)
+		_, user, buildErr := BuildMergeSummaryPrompt("", candidate)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		if len(current) > 0 && summaryPromptTokens(system, user) > maxTokens {
+			batches = append(batches, current)
+			current = []string{piece}
+			continue
+		}
+		current = candidate
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	for _, batch := range batches {
+		_, user, buildErr := BuildMergeSummaryPrompt("", batch)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		if summaryPromptTokens(system, user) > maxTokens {
+			return nil, fmt.Errorf("summary merge prompt exceeds %d tokens", maxTokens)
+		}
+	}
+	return batches, nil
 }
 
 // ValidateSummaryText 校验摘要文本长度与空内容；超长摘要拒绝落库。

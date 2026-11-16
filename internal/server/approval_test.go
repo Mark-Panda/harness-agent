@@ -76,7 +76,7 @@ func TestRunApprovalDecisionAPI(t *testing.T) {
 		ToolName: "mcp_admin_delete", Status: biz.ApprovalPending,
 	}, nil)
 	approved := biz.ToolApproval{ID: approvalID, RunID: runID, UserID: principal.UserID, Status: biz.ApprovalApproved}
-	approvals.EXPECT().DecideApproval(gomock.Any(), principal.UserID, approvalID, biz.ApprovalDecisionApprove, principal.UserID, gomock.Any()).Return(approved, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), principal.UserID, runID, approvalID, biz.ApprovalDecisionApprove, principal.UserID, gomock.Any()).Return(approved, nil)
 	runRepo.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
 	approvals.EXPECT().CountPendingApprovals(gomock.Any(), principal.UserID, runID).Return(0, nil)
 	runRepo.EXPECT().ResumeRun(gomock.Any(), principal.UserID, runID, gomock.Any()).Return(biz.Run{ID: runID, Status: biz.RunRunning}, nil)

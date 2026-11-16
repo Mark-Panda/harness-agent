@@ -306,6 +306,8 @@ type MemoryEmbedWorkerDependencies struct {
 	Generator EmbeddingGenerator
 	// Usage 后台向量化用量记录器，可为空。
 	Usage UsageRecorder
+	// Budgets 后台向量化预算门禁，可为空。
+	Budgets BudgetChecker
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -320,6 +322,7 @@ type MemoryEmbedWorker struct {
 	vectors   MemoryJobVectorRepository
 	generator EmbeddingGenerator
 	usage     UsageRecorder
+	budgets   BudgetChecker
 	config    MemoryEmbedWorkerConfig
 	clock     func() time.Time
 	logger    *slog.Logger
@@ -344,7 +347,7 @@ func NewMemoryEmbedWorker(dependencies MemoryEmbedWorkerDependencies, config Mem
 	}
 	return &MemoryEmbedWorker{
 		jobs: dependencies.Jobs, messages: dependencies.Messages, indexes: dependencies.Indexes,
-		vectors: dependencies.Vectors, generator: dependencies.Generator, usage: dependencies.Usage,
+		vectors: dependencies.Vectors, generator: dependencies.Generator, usage: dependencies.Usage, budgets: dependencies.Budgets,
 		config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -518,6 +521,9 @@ func (w *MemoryEmbedWorker) embedMessages(ctx context.Context, userID, sessionID
 		inputs := make([]string, 0, len(batch))
 		for _, message := range batch {
 			inputs = append(inputs, message.Content)
+		}
+		if err := checkBackgroundBudget(ctx, w.budgets, userID, index.ProviderID); err != nil {
+			return err
 		}
 		result, err := w.generator.Embed(ctx, index, inputs)
 		if err != nil {

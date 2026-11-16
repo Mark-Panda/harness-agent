@@ -105,6 +105,25 @@ func TestSupervisorTaskRepositoryLifecycle(t *testing.T) {
 	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence); err != nil {
 		t.Fatal(err)
 	}
+	// 审批恢复不应消耗重试预算：达到最大尝试次数时仍可复位，并退还本次领取次数。
+	reopened, err := repo.ReopenTaskForApproval(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence)
+	if err != nil || reopened.Status != biz.SupervisorTaskPending || reopened.Attempts != 1 {
+		t.Fatalf("ReopenTaskForApproval() = %#v, %v", reopened, err)
+	}
+	restarted, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence)
+	if err != nil || restarted.Attempts != 2 {
+		t.Fatalf("StartTask after approval = %#v, %v", restarted, err)
+	}
+	reopened, err = repo.ReopenTaskForApproval(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence)
+	if err != nil || reopened.Attempts != 1 {
+		t.Fatalf("second ReopenTaskForApproval() = %#v, %v", reopened, err)
+	}
+	if _, err := repo.StartTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, nextFence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.ReopenTaskForApproval(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime.Add(time.Second), biz.RunFence{}); err == nil {
+		t.Fatal("reopen without lease must fail")
+	}
 	if _, err := repo.RetryTask(ctx, user.ID, run.ID, tasks[0].ID, reclaimTime, fence); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("stale retry error = %v", err)
 	}

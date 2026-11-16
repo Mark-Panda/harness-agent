@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,11 +148,11 @@ func TestSkillRunScriptTimeoutAndTruncate(t *testing.T) {
 	tool, _ := registry.Lookup("skill_run_script")
 
 	output, err := tool.Invoke(context.Background(), json.RawMessage(`{"path":"scripts/slow.sh"}`))
-	if err != nil {
-		t.Fatalf("timeout run: %v", err)
+	if !errors.Is(err, ErrToolResultPersistence) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout must require reconciliation: output=%s error=%v", output, err)
 	}
 	if !strings.Contains(string(output), `"status":"timeout"`) {
-		t.Fatalf("expected timeout result: %s", output)
+		t.Fatalf("expected bounded timeout diagnostics: %s", output)
 	}
 
 	output, err = tool.Invoke(context.Background(), json.RawMessage(`{"path":"scripts/loud.sh"}`))
@@ -160,6 +161,108 @@ func TestSkillRunScriptTimeoutAndTruncate(t *testing.T) {
 	}
 	if !strings.Contains(string(output), `"truncated":true`) {
 		t.Fatalf("expected truncated result: %s", output)
+	}
+}
+
+func TestSkillRunScriptCancellationAfterStartRequiresReconciliation(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh is unavailable")
+	}
+	skillID := uuid.New()
+	registry, cleanup := newSkillTestRegistry(t, []SkillBundleFile{
+		skillFile(skillID, "scripts/slow.sh", "#!/bin/sh\nprintf started > started.marker\nsleep 5\n"),
+	}, SkillExecutionConfig{AllowLocalExecution: true, Timeout: 10 * time.Second, MaxOutputBytes: 1024})
+	defer cleanup()
+	tool := registry.bindings["skill_run_script"].(*skillTool)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type invocation struct {
+		output json.RawMessage
+		err    error
+	}
+	done := make(chan invocation, 1)
+	go func() {
+		output, err := tool.Invoke(ctx, json.RawMessage(`{"path":"scripts/slow.sh"}`))
+		done <- invocation{output: output, err: err}
+	}()
+	marker := filepath.Join(tool.skills[0].Root, "started.marker")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			result := <-done
+			t.Fatalf("script did not start: output=%s error=%v", result.output, result.err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	result := <-done
+	if !errors.Is(result.err, ErrToolResultPersistence) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("cancelled script must require reconciliation: output=%s error=%v", result.output, result.err)
+	}
+	if !strings.Contains(string(result.output), `"status":"cancelled"`) {
+		t.Fatalf("expected bounded cancellation diagnostics: %s", result.output)
+	}
+}
+
+func TestSkillRunScriptCancellationWhileWaitingDoesNotRequireReconciliation(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh is unavailable")
+	}
+	for _, scope := range []string{"local", "global"} {
+		t.Run(scope, func(t *testing.T) {
+			skillID := uuid.New()
+			registry, cleanup := newSkillTestRegistry(t, []SkillBundleFile{
+				skillFile(skillID, "scripts/run.sh", "#!/bin/sh\nexit 0\n"),
+			}, SkillExecutionConfig{AllowLocalExecution: true, Timeout: time.Second})
+			defer cleanup()
+			tool := registry.bindings["skill_run_script"].(*skillTool)
+			switch scope {
+			case "local":
+				tool.sem <- struct{}{}
+				defer func() { <-tool.sem }()
+			case "global":
+				for len(tool.globalSem) < cap(tool.globalSem) {
+					tool.globalSem <- struct{}{}
+				}
+				defer func() {
+					for len(tool.globalSem) > 0 {
+						<-tool.globalSem
+					}
+				}()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			output, err := tool.Invoke(ctx, json.RawMessage(`{"path":"scripts/run.sh"}`))
+			if output != nil || !errors.Is(err, context.Canceled) || errors.Is(err, ErrToolResultPersistence) {
+				t.Fatalf("cancellation before start: output=%s error=%v", output, err)
+			}
+		})
+	}
+}
+
+func TestSkillRunScriptDeterministicFailuresDoNotRequireReconciliation(t *testing.T) {
+	skillID := uuid.New()
+	registry, cleanup := newSkillTestRegistry(t, []SkillBundleFile{
+		skillFile(skillID, "scripts/fail.sh", "#!/bin/sh\nexit 7\n"),
+		skillFile(skillID, "scripts/missing.py", "print('unreachable')\n"),
+	}, SkillExecutionConfig{AllowLocalExecution: true, Timeout: time.Second})
+	defer cleanup()
+	tool := registry.bindings["skill_run_script"].(*skillTool)
+
+	output, err := tool.Invoke(context.Background(), json.RawMessage(`{"path":"scripts/fail.sh"}`))
+	if err != nil || errors.Is(err, ErrToolResultPersistence) ||
+		!strings.Contains(string(output), `"status":"failed"`) || !strings.Contains(string(output), `"exit_code":7`) {
+		t.Fatalf("ordinary non-zero exit: output=%s error=%v", output, err)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	output, err = tool.Invoke(context.Background(), json.RawMessage(`{"path":"scripts/missing.py"}`))
+	if err != nil || errors.Is(err, ErrToolResultPersistence) || !strings.Contains(string(output), `"status":"unavailable"`) {
+		t.Fatalf("interpreter start failure: output=%s error=%v", output, err)
 	}
 }
 

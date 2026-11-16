@@ -131,6 +131,76 @@ func TestSummaryRepositoryLifecycle(t *testing.T) {
 	}
 }
 
+// TestSummaryRepositoryToolOnlyCheckpoint 验证无模型 checkpoint 仍能原子推进版本、覆盖边界和 Outbox。
+func TestSummaryRepositoryToolOnlyCheckpoint(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	sessions := NewSessionRepository(appDB)
+	users := NewUserRepository(appDB, authDB)
+	summaries := NewSummaryRepository(appDB)
+	userID, sessionID, messages := summaryIntegrationSetup(t, ctx, sessions, users)
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", userID).Error })
+
+	first := biz.SessionSummary{
+		ID: uuid.New(), SessionID: sessionID, UserID: userID, Version: 1, SummaryText: "保留既有摘要",
+		SourceMessageIDs: []uuid.UUID{messages[0].ID}, SourceFingerprint: biz.SummarySourceFingerprint(messages[:1]),
+		SourceStartMessageID: &messages[0].ID, SourceEndMessageID: &messages[0].ID, SourceEndAt: &messages[0].CreatedAt,
+		CoveredMessageCount: 1, Status: biz.SummaryActive,
+	}
+	firstSaved, applied, err := summaries.SaveSummary(ctx, first, 0, testOutboxEvent(userID, "memory.summary.created"))
+	if err != nil || !applied {
+		t.Fatalf("save base summary: applied=%v err=%v", applied, err)
+	}
+	for index := 1; index < len(messages); index++ {
+		messages[index].Role = biz.MessageTool
+		if err := adminDB.Exec("UPDATE messages SET role = ? WHERE id = ?", biz.MessageTool, messages[index].ID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := biz.SessionSummary{
+		ID: uuid.New(), SessionID: sessionID, UserID: userID, Version: 2, SummaryText: first.SummaryText,
+		SourceMessageIDs: []uuid.UUID{messages[1].ID, messages[2].ID}, SourceFingerprint: biz.SummarySourceFingerprint(messages[1:]),
+		SourceStartMessageID: &messages[1].ID, SourceEndMessageID: &messages[2].ID, SourceEndAt: &messages[2].CreatedAt,
+		CoveredMessageCount: 3, ParentSummaryID: &firstSaved.ID, Status: biz.SummaryActive,
+	}
+	event := testOutboxEvent(userID, "memory.summary.created")
+	event.AggregateType = "session_summary"
+	event.AggregateID = checkpoint.ID.String()
+	event.DedupeKey = "memory.summary.created:" + checkpoint.ID.String()
+	event.Payload = map[string]any{
+		"session_id": sessionID.String(), "version": 2, "covered_messages": 3,
+		"source_messages": 2, "checkpoint": true, "reason": "tool_only_source",
+	}
+	saved, applied, err := summaries.SaveSummary(ctx, checkpoint, 1, event)
+	if err != nil || !applied {
+		t.Fatalf("save checkpoint: applied=%v err=%v", applied, err)
+	}
+	if saved.SummaryText != first.SummaryText || saved.ModelID != "" || saved.ModelProviderID != nil ||
+		saved.InputTokens != 0 || saved.OutputTokens != 0 || saved.CoveredMessageCount != 3 {
+		t.Fatalf("checkpoint metadata = %#v", saved)
+	}
+	active, found, err := summaries.GetActiveSummary(ctx, userID, sessionID)
+	if err != nil || !found || active.ID != checkpoint.ID || active.SourceEndMessageID == nil ||
+		*active.SourceEndMessageID != messages[2].ID || active.ParentSummaryID == nil || *active.ParentSummaryID != firstSaved.ID {
+		t.Fatalf("active checkpoint = %#v found=%v err=%v", active, found, err)
+	}
+	history, err := summaries.ListSummaries(ctx, userID, sessionID, 10)
+	if err != nil || len(history) != 2 || history[1].Status != biz.SummarySuperseded {
+		t.Fatalf("checkpoint history = %#v err=%v", history, err)
+	}
+	var events int64
+	if err := adminDB.Model(&outboxEventModel{}).
+		Where("aggregate_id = ? AND payload ->> 'checkpoint' = ? AND payload ->> 'reason' = ?", checkpoint.ID.String(), "true", "tool_only_source").
+		Count(&events).Error; err != nil || events != 1 {
+		t.Fatalf("checkpoint outbox events = %d, err=%v", events, err)
+	}
+}
+
 // TestSummaryRepositoryRejectsMissingSource 验证来源消息缺失时拒绝写入摘要。
 func TestSummaryRepositoryRejectsMissingSource(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {

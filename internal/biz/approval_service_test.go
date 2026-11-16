@@ -27,6 +27,20 @@ func newApprovalRunService(t *testing.T, ctrl *gomock.Controller) (*biz.RunServi
 	return service, runs, sessions, approvals, queue
 }
 
+func newApprovalRunServiceWithPlans(t *testing.T, ctrl *gomock.Controller) (*biz.RunService, *mocks.MockRunRepository, *mocks.MockToolApprovalRepository, *mocks.MockJobQueue, *mocks.MockPlanRepository) {
+	t.Helper()
+	runs := mocks.NewMockRunRepository(ctrl)
+	approvals := mocks.NewMockToolApprovalRepository(ctrl)
+	queue := mocks.NewMockJobQueue(ctrl)
+	plans := mocks.NewMockPlanRepository(ctrl)
+	service, err := biz.NewRunService(runs, mocks.NewMockSessionRepository(ctrl),
+		biz.WithToolApprovals(approvals), biz.WithRunEnqueuer(queue), biz.WithPlanResume(plans))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, runs, approvals, queue, plans
+}
+
 // TestDecideApprovalResumesRunWhenAllDecided 验证最后一条审批决策会恢复 Run 并唤醒任务。
 func TestDecideApprovalResumesRunWhenAllDecided(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -41,7 +55,7 @@ func TestDecideApprovalResumesRunWhenAllDecided(t *testing.T) {
 	approved.Status = biz.ApprovalApproved
 	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
 	approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
-	approvals.EXPECT().DecideApproval(gomock.Any(), userID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
 	runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, event biz.RunEvent) (biz.RunEvent, error) {
 			if event.EventType != "tool.approval.decided" || event.Payload["approval_id"] != approvalID.String() {
@@ -77,7 +91,7 @@ func TestDecideApprovalKeepsRunWaitingWhenOthersPending(t *testing.T) {
 	denied.Status = biz.ApprovalDenied
 	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(run, nil)
 	approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
-	approvals.EXPECT().DecideApproval(gomock.Any(), userID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).Return(denied, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionDeny, userID, gomock.Any()).Return(denied, nil)
 	runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
 	approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(1, nil)
 
@@ -87,6 +101,91 @@ func TestDecideApprovalKeepsRunWaitingWhenOthersPending(t *testing.T) {
 	}
 	if result.Status != biz.ApprovalDenied {
 		t.Fatalf("approval status = %s", result.Status)
+	}
+}
+
+func TestDecideApprovalNeverAutoResumesPausedPlan(t *testing.T) {
+	for _, errorCode := range []string{"plan_paused", "plan_resume_failed", "run_enqueue_failed", ""} {
+		t.Run("error_code="+errorCode, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
+			service, runs, approvals, _, plans := newApprovalRunServiceWithPlans(t, ctrl)
+			pending := biz.ToolApproval{ID: approvalID, RunID: runID, UserID: userID, ToolCallID: "call-1", Status: biz.ApprovalPending}
+			approved := pending
+			approved.Status = biz.ApprovalApproved
+			runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval}, nil)
+			approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
+			approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
+			runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
+			approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(0, nil)
+			plans.EXPECT().GetPlanByRun(gomock.Any(), userID, runID).Return(biz.Plan{Status: biz.PlanPaused, ErrorCode: errorCode}, nil)
+
+			result, err := service.DecideApproval(context.Background(), biz.Principal{UserID: userID}, runID, approvalID, "approve")
+			if err != nil || result.Status != biz.ApprovalApproved {
+				t.Fatalf("DecideApproval() = %#v, %v", result, err)
+			}
+		})
+	}
+}
+
+func TestDecideApprovalResumesWaitingApprovalPlan(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
+	service, runs, approvals, queue, plans := newApprovalRunServiceWithPlans(t, ctrl)
+	pending := biz.ToolApproval{ID: approvalID, RunID: runID, UserID: userID, Status: biz.ApprovalPending}
+	approved := pending
+	approved.Status = biz.ApprovalApproved
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval}, nil)
+	approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
+	runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
+	approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(0, nil)
+	plans.EXPECT().GetPlanByRun(gomock.Any(), userID, runID).Return(biz.Plan{Status: biz.PlanWaitingApproval}, nil)
+	runs.EXPECT().ResumeRun(gomock.Any(), userID, runID, gomock.Any()).Return(biz.Run{Status: biz.RunRunning}, nil)
+	queue.EXPECT().EnqueueRun(gomock.Any(), userID, runID, gomock.Any()).Return(nil)
+	if _, err := service.DecideApproval(context.Background(), biz.Principal{UserID: userID}, runID, approvalID, "approve"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecideApprovalReturnsEnqueueFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
+	service, runs, _, approvals, queue := newApprovalRunService(t, ctrl)
+	pending := biz.ToolApproval{ID: approvalID, RunID: runID, UserID: userID, Status: biz.ApprovalPending}
+	approved := pending
+	approved.Status = biz.ApprovalApproved
+	enqueueErr := errors.New("queue unavailable")
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval}, nil)
+	approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
+	runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
+	approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(0, nil)
+	runs.EXPECT().ResumeRun(gomock.Any(), userID, runID, gomock.Any()).Return(biz.Run{Status: biz.RunRunning}, nil)
+	queue.EXPECT().EnqueueRun(gomock.Any(), userID, runID, gomock.Any()).Return(enqueueErr)
+	if _, err := service.DecideApproval(context.Background(), biz.Principal{UserID: userID}, runID, approvalID, "approve"); !errors.Is(err, enqueueErr) {
+		t.Fatalf("DecideApproval() error = %v, want %v", err, enqueueErr)
+	}
+}
+
+func TestDecideApprovalReturnsPlanReadFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	userID, runID, approvalID := uuid.New(), uuid.New(), uuid.New()
+	service, runs, approvals, queue, plans := newApprovalRunServiceWithPlans(t, ctrl)
+	pending := biz.ToolApproval{ID: approvalID, RunID: runID, UserID: userID, Status: biz.ApprovalPending}
+	approved := pending
+	approved.Status = biz.ApprovalApproved
+	planErr := errors.New("plan store unavailable")
+	runs.EXPECT().GetRun(gomock.Any(), userID, runID).Return(biz.Run{ID: runID, UserID: userID, Status: biz.RunWaitingApproval}, nil)
+	approvals.EXPECT().GetApproval(gomock.Any(), userID, approvalID).Return(pending, nil)
+	approvals.EXPECT().DecideApproval(gomock.Any(), userID, runID, approvalID, biz.ApprovalDecisionApprove, userID, gomock.Any()).Return(approved, nil)
+	runs.EXPECT().AppendEvent(gomock.Any(), gomock.Any()).Return(biz.RunEvent{}, nil)
+	approvals.EXPECT().CountPendingApprovals(gomock.Any(), userID, runID).Return(0, nil)
+	plans.EXPECT().GetPlanByRun(gomock.Any(), userID, runID).Return(biz.Plan{}, planErr)
+	runs.EXPECT().ResumeRun(gomock.Any(), userID, runID, gomock.Any()).Return(biz.Run{Status: biz.RunRunning}, nil).AnyTimes()
+	queue.EXPECT().EnqueueRun(gomock.Any(), userID, runID, gomock.Any()).Return(nil).AnyTimes()
+	if _, err := service.DecideApproval(context.Background(), biz.Principal{UserID: userID}, runID, approvalID, "approve"); !errors.Is(err, planErr) {
+		t.Fatalf("DecideApproval() error = %v, want %v", err, planErr)
 	}
 }
 

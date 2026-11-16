@@ -2,12 +2,14 @@ package biz_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/service/mocks"
@@ -159,19 +161,16 @@ func TestSummaryGeneratorRecordsUsageWhenLaterCallFails(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			generator, _, _ := newSummaryGenerator(t, ctrl, server.URL, providerID, modelID, nil, nil,
 				biz.SummaryLLMConfig{MaxInputBytes: 30, MaxOutputTokens: 512})
-			inputTokens := (test.failCall-1)*3 + 5
-			outputTokens := (test.failCall-1)*4 + 2
-			estimatedCost := 0.0
+			usage := mocks.NewMockUsageRecorder(ctrl)
 			for call := 1; call <= test.failCall; call++ {
 				input, output := 3, 4
 				if call == test.failCall {
 					input, output = 5, 2
 				}
-				estimatedCost += float64(input)/1_000_000 + float64(output)*2/1_000_000
+				cost := float64(input)/1_000_000 + float64(output)*2/1_000_000
+				usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID),
+					int64(input), int64(output), cost, gomock.Any()).Return(nil)
 			}
-			usage := mocks.NewMockUsageRecorder(ctrl)
-			usage.EXPECT().RecordUsage(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID),
-				int64(inputTokens), int64(outputTokens), estimatedCost, gomock.Any()).Return(nil)
 			generator.WithUsageRecorder(usage)
 			_, err := generator.Summarize(context.Background(), userID, uuid.New(), "", []biz.Message{
 				{ID: uuid.New(), Role: biz.MessageUser, Content: "第一段"},
@@ -197,6 +196,9 @@ func TestSummaryGeneratorErrorClassification(t *testing.T) {
 		{name: "auth", status: http.StatusUnauthorized, body: `{"error":{"message":"auth"}}`, want: biz.ErrSummaryPermanent},
 		{name: "server", status: http.StatusInternalServerError, body: `{"error":{"message":"oops"}}`, want: model.ErrRetryable},
 		{name: "empty", status: http.StatusOK, body: `{"choices":[{"message":{"content":" "}}]}`, want: biz.ErrSummaryPermanent},
+		{name: "reasoning only", status: http.StatusOK, body: `{"choices":[{"message":{"content":"","reasoning_content":"hidden"},"finish_reason":"stop"}]}`, want: biz.ErrSummaryPermanent},
+		{name: "content filtered", status: http.StatusOK, body: `{"choices":[{"message":{"content":"partial"},"finish_reason":"content_filter"}]}`, want: biz.ErrSummaryPermanent},
+		{name: "unexpected tools", status: http.StatusOK, body: `{"choices":[{"message":{"content":"summary","tool_calls":[{"id":"call","function":{"name":"bad","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`, want: biz.ErrSummaryPermanent},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -278,5 +280,175 @@ func TestSummaryGeneratorValidatesEmptyInput(t *testing.T) {
 	_, err := generator.Summarize(context.Background(), uuid.New(), uuid.New(), "", nil)
 	if !errors.Is(err, biz.ErrSummaryPermanent) || !strings.Contains(err.Error(), "at least one message") {
 		t.Fatalf("empty input error = %v", err)
+	}
+}
+
+type summaryBudgetEvents struct {
+	events     []string
+	userID     uuid.UUID
+	providerID uuid.UUID
+	invalid    bool
+}
+
+func (f *summaryBudgetEvents) Check(_ context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID) ([]biz.BudgetAlert, error) {
+	f.events = append(f.events, "check")
+	if userID != f.userID || agentID != nil || providerID == nil || *providerID != f.providerID {
+		f.invalid = true
+	}
+	return nil, nil
+}
+
+func (f *summaryBudgetEvents) RecordUsage(_ context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID, _, _ int64, _ float64, _ time.Time) error {
+	f.events = append(f.events, "record")
+	if userID != f.userID || agentID != nil || providerID == nil || *providerID != f.providerID {
+		f.invalid = true
+	}
+	return nil
+}
+
+func TestSummaryGeneratorChecksAndRecordsEachPaidCallInOrder(t *testing.T) {
+	providerID, modelID, userID := uuid.New(), uuid.New(), uuid.New()
+	events := &summaryBudgetEvents{userID: userID, providerID: providerID}
+	server := summaryProviderServer(t, func(w http.ResponseWriter, r *http.Request) {
+		events.events = append(events.events, "chat")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"摘要"}}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+	})
+	defer server.Close()
+	generator, _, _ := newSummaryGenerator(t, gomock.NewController(t), server.URL, providerID, modelID, events, nil,
+		biz.SummaryLLMConfig{MaxInputBytes: 30, MaxOutputTokens: 512})
+	generator.WithUsageRecorder(events)
+	_, err := generator.Summarize(context.Background(), userID, uuid.New(), "", []biz.Message{
+		{ID: uuid.New(), Role: biz.MessageUser, Content: "第一段"},
+		{ID: uuid.New(), Role: biz.MessageAssistant, Content: "第二段"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"check", "chat", "record", "check", "chat", "record", "check", "chat", "record"}
+	if len(events.events) != len(want) {
+		t.Fatalf("events = %#v, want %#v", events.events, want)
+	}
+	for index := range want {
+		if events.events[index] != want[index] {
+			t.Fatalf("events = %#v, want %#v", events.events, want)
+		}
+	}
+	if events.invalid {
+		t.Fatal("budget check or usage record used the wrong user/provider identity")
+	}
+}
+
+func TestSummaryGeneratorContinuesTruncatedTextOnlyOnce(t *testing.T) {
+	providerID, modelID := uuid.New(), uuid.New()
+	calls := 0
+	server := summaryProviderServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"前半"},"finish_reason":"length"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"后半"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`)
+	})
+	defer server.Close()
+	generator, _, _ := newSummaryGenerator(t, gomock.NewController(t), server.URL, providerID, modelID, nil, nil, biz.SummaryLLMConfig{})
+	generation, err := generator.Summarize(context.Background(), uuid.New(), uuid.New(), "", []biz.Message{{Role: biz.MessageUser, Content: "问题"}})
+	if err != nil || generation.Text != "前半后半" || calls != 2 || generation.InputTokens != 7 || generation.OutputTokens != 10 {
+		t.Fatalf("Summarize() = %#v, %v, calls=%d", generation, err, calls)
+	}
+}
+
+// summaryRequestPrompt 返回请求中的用户 Prompt，用于验证上下文超限后的输入确实缩小。
+func summaryRequestPrompt(t *testing.T, r *http.Request) string {
+	t.Helper()
+	var request struct {
+		Messages []model.ChatMessage `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Messages) != 2 {
+		t.Fatalf("messages = %d, want system and user", len(request.Messages))
+	}
+	return request.Messages[1].Content
+}
+
+// TestSummaryGeneratorRetriesContextExceededWithStrictlySmallerChunks 验证首轮及连续多轮
+// context_length_exceeded 都不会用相同 Payload 原地重试。
+func TestSummaryGeneratorRetriesContextExceededWithStrictlySmallerChunks(t *testing.T) {
+	providerID, modelID := uuid.New(), uuid.New()
+	calls := 0
+	prompts := []string{}
+	server := summaryProviderServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		prompts = append(prompts, summaryRequestPrompt(t, r))
+		w.Header().Set("Content-Type", "application/json")
+		if calls <= 2 {
+			_, _ = io.WriteString(w, `{"error":{"code":"context_length_exceeded","message":"too large"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"缩小后的摘要"}}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+	})
+	defer server.Close()
+	generator, _, _ := newSummaryGenerator(t, gomock.NewController(t), server.URL, providerID, modelID, nil, nil, biz.SummaryLLMConfig{})
+	generation, err := generator.Summarize(context.Background(), uuid.New(), uuid.New(), "", []biz.Message{{Role: biz.MessageUser, Content: strings.Repeat("中文片段", 100)}})
+	if err != nil || generation.Text != "缩小后的摘要" {
+		t.Fatalf("Summarize() = %#v, %v, calls=%d", generation, err, calls)
+	}
+	if calls < 3 {
+		t.Fatalf("calls = %d, want reduced retries after the initial request", calls)
+	}
+	for index := 1; index < 3; index++ {
+		if len(prompts[index]) >= len(prompts[index-1]) {
+			t.Fatalf("prompt did not strictly shrink at request %d", index+1)
+		}
+	}
+}
+
+// TestSummaryGeneratorRetriesContextExceededDuringMerge 验证归并超限只重建更小的归并批次，
+// 已成功分块不会用相同 Prompt 重发。
+func TestSummaryGeneratorRetriesContextExceededDuringMerge(t *testing.T) {
+	providerID, modelID := uuid.New(), uuid.New()
+	calls := 0
+	prompts := []string{}
+	server := summaryProviderServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		prompts = append(prompts, summaryRequestPrompt(t, r))
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 3 {
+			_, _ = io.WriteString(w, `{"error":{"code":"context_length_exceeded","message":"merge too large"}}`)
+			return
+		}
+		content := "最终摘要"
+		if calls <= 2 {
+			content = strings.Repeat("分段摘要", 80)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"`+content+`"}}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+	})
+	defer server.Close()
+	generator, _, _ := newSummaryGenerator(t, gomock.NewController(t), server.URL, providerID, modelID, nil, nil,
+		biz.SummaryLLMConfig{MaxInputBytes: 30, MaxOutputTokens: 512})
+	generation, err := generator.Summarize(context.Background(), uuid.New(), uuid.New(), "", []biz.Message{
+		{Role: biz.MessageUser, Content: "第一段"},
+		{Role: biz.MessageAssistant, Content: "第二段"},
+	})
+	if err != nil || generation.Text != "最终摘要" {
+		t.Fatalf("Summarize() = %#v, %v, calls=%d", generation, err, calls)
+	}
+	if calls < 5 {
+		t.Fatalf("calls = %d, want reduced merge requests", calls)
+	}
+	for index := 3; index < len(prompts); index++ {
+		if len(prompts[index]) >= len(prompts[2]) {
+			t.Fatalf("retry prompt %d was not smaller than rejected merge", index+1)
+		}
+	}
+	for index, prompt := range prompts[:2] {
+		for later := index + 1; later < len(prompts); later++ {
+			if prompts[later] == prompt {
+				t.Fatalf("successful chunk %d was retried with identical payload", index+1)
+			}
+		}
 	}
 }

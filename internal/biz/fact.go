@@ -148,6 +148,8 @@ type FactApplyResult struct {
 	Skipped int
 	// Conflicts 因并发版本冲突跳过的候选数。
 	Conflicts int
+	// Invalid 因纠正是非法来源被跳过的候选数。
+	Invalid int
 }
 
 // FactService 执行事实冲突策略与写入。
@@ -170,16 +172,44 @@ func NewFactService(repo FactRepository, policy FactPolicy, clock func() time.Ti
 
 // Apply 按冲突策略写入候选事实；低置信度候选不得覆盖高置信度或显式纠正事实。
 func (s *FactService) Apply(ctx context.Context, userID, sessionID uuid.UUID, candidates []FactCandidate) (FactApplyResult, error) {
-	return s.apply(ctx, userID, sessionID, candidates, s.repo.SaveFact)
+	return s.apply(ctx, userID, sessionID, candidates, nil, s.repo.SaveFact)
 }
 
-func (s *FactService) applyExtracted(ctx context.Context, source FactTask, candidates []FactCandidate, fence JobWriteFence) (FactApplyResult, error) {
-	return s.apply(ctx, source.Owner(), source.SessionID, candidates, func(ctx context.Context, fact MemoryFact, expected int64) (MemoryFact, bool, error) {
+type factCorrectionScope struct {
+	userID        uuid.UUID
+	sessionID     uuid.UUID
+	speakerOpenID string
+	messages      []Message
+}
+
+func (s *FactService) applyExtracted(ctx context.Context, source FactTask, messages []Message, candidates []FactCandidate, fence JobWriteFence) (FactApplyResult, error) {
+	scope := &factCorrectionScope{userID: source.UserID, sessionID: source.SessionID, speakerOpenID: source.SpeakerOpenID, messages: messages}
+	return s.apply(ctx, source.Owner(), source.SessionID, candidates, scope, func(ctx context.Context, fact MemoryFact, expected int64) (MemoryFact, bool, error) {
 		return s.repo.SaveExtractedFact(ctx, fact, expected, source, fence)
 	})
 }
 
-func (s *FactService) apply(ctx context.Context, userID, sessionID uuid.UUID, candidates []FactCandidate, save func(context.Context, MemoryFact, int64) (MemoryFact, bool, error)) (FactApplyResult, error) {
+func validateFactCorrectionCandidate(candidate FactCandidate, scope *factCorrectionScope) error {
+	marked := candidate.Correction || candidate.SourceKind == FactSourceCorrection
+	if !marked {
+		return nil
+	}
+	if !candidate.Correction || candidate.SourceMessageID == nil || *candidate.SourceMessageID == uuid.Nil {
+		return ErrFactSourceInvalid
+	}
+	if scope == nil {
+		return nil
+	}
+	for _, message := range scope.messages {
+		if message.ID == *candidate.SourceMessageID && message.UserID == scope.userID && message.SessionID == scope.sessionID &&
+			message.Role == MessageUser && (scope.speakerOpenID == "" || message.SpeakerOpenID == scope.speakerOpenID) {
+			return nil
+		}
+	}
+	return ErrFactSourceInvalid
+}
+
+func (s *FactService) apply(ctx context.Context, userID, sessionID uuid.UUID, candidates []FactCandidate, correctionScope *factCorrectionScope, save func(context.Context, MemoryFact, int64) (MemoryFact, bool, error)) (FactApplyResult, error) {
 	result := FactApplyResult{}
 	if userID == uuid.Nil {
 		return result, ErrForbidden
@@ -188,6 +218,13 @@ func (s *FactService) apply(ctx context.Context, userID, sessionID uuid.UUID, ca
 		candidates = candidates[:20]
 	}
 	for _, candidate := range candidates {
+		if err := validateFactCorrectionCandidate(candidate, correctionScope); err != nil {
+			// 单个非法纠正候选不能拖垮整批提取结果：跳过该候选，
+			// 继续应用同批中来源合法的其它事实。
+			result.Invalid++
+			result.Skipped++
+			continue
+		}
 		candidate.Key = strings.TrimSpace(candidate.Key)
 		if candidate.Key == "" || len(candidate.Value) == 0 || !json.Valid(candidate.Value) || len(candidate.Value) > 8*1024 {
 			result.Skipped++
@@ -658,8 +695,9 @@ func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
 		logLeaseLost(err)
 		return
 	}
-	result, err := w.facts.applyExtracted(runCtx, task, candidates, newJobWriteFence(job, w.config.WorkerID))
+	result, err := w.facts.applyExtracted(runCtx, task, messages, candidates, newJobWriteFence(job, w.config.WorkerID))
 	if err != nil {
+		// 兼容历史行为：若未来 applyExtracted 再次以整批错误返回，任务不应无限重试。
 		if errors.Is(err, ErrFactSourceInvalid) {
 			complete()
 			return
@@ -669,7 +707,7 @@ func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
 	}
 	w.logger.Info("facts applied", "session_id", task.SessionID, "fact_user_id", task.Owner(),
 		"speaker_open_id", task.SpeakerOpenID, "applied", result.Applied,
-		"skipped", result.Skipped, "conflicts", result.Conflicts)
+		"skipped", result.Skipped, "invalid", result.Invalid, "conflicts", result.Conflicts)
 	complete()
 }
 
@@ -739,6 +777,10 @@ func ParseFactModelOutput(text string, messages []Message) ([]FactCandidate, err
 	}
 	candidates := make([]FactCandidate, 0, len(parsed))
 	for _, candidate := range parsed {
+		if candidate.Correction && (candidate.SourceIndex <= 0 || candidate.SourceIndex > len(messages) ||
+			messages[candidate.SourceIndex-1].Role != MessageUser || messages[candidate.SourceIndex-1].ID == uuid.Nil) {
+			return nil, ErrFactSourceInvalid
+		}
 		sourceKind := FactSourceAssistant
 		var sourceID *uuid.UUID
 		if candidate.SourceIndex > 0 && candidate.SourceIndex <= len(messages) {

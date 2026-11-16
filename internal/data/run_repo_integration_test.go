@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -311,6 +312,150 @@ func TestRunRepositorySerializesSessionRuns(t *testing.T) {
 	// 排队时长要补回截止时间，避免后续 Run 一被认领就超时。
 	if claimedSecond.DeadlineAt == nil || claimedSecond.DeadlineAt.Before(secondDeadline.Add(time.Minute)) {
 		t.Fatalf("queued wait was not compensated: %#v", claimedSecond.DeadlineAt)
+	}
+}
+
+// TestRunRepositoryCompensatesQueuedDeadlineOnce 验证首次排队、重复暂停和并发认领均不会重复补偿执行预算。
+func TestRunRepositoryCompensatesQueuedDeadlineOnce(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	user, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "run_deadline_" + strings.ReplaceAll(uuid.NewString(), "-", ""), PasswordHash: "hash",
+		Role: biz.RoleUser, Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", user.ID).Error })
+	session, err := NewSessionRepository(appDB).CreateSession(ctx, biz.Session{
+		ID: uuid.New(), UserID: user.ID, Title: "deadline compensation", Source: biz.SessionSourceWeb,
+		Status: biz.SessionActive, Version: 1,
+	}, testOutboxEvent(user.ID, "test.session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := NewRunRepository(appDB)
+	// 租约校验同时参考数据库 clock_timestamp，测试时间线从当前时刻开始，避免使用已过期租约。
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	initialDeadline := base.Add(30 * time.Minute)
+	run, err := runs.CreateRun(ctx, biz.Run{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan,
+		Status: biz.RunQueued, DeadlineAt: &initialDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adminDB.Exec("UPDATE agent_runs SET created_at = ?, updated_at = ? WHERE id = ?", base, base, run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	firstClaimAt := base.Add(2 * time.Minute)
+	claimed, fence, err := runs.ClaimRun(ctx, user.ID, run.ID, "worker-a", time.Minute, firstClaimAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline := initialDeadline.Add(2 * time.Minute)
+	if claimed.DeadlineAt == nil || !claimed.DeadlineAt.Equal(wantDeadline) {
+		t.Fatalf("first queued deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
+	}
+
+	requeueAt := firstClaimAt.Add(30 * time.Second)
+	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, requeueAt); err != nil {
+		t.Fatal(err)
+	}
+	requeued, err := runs.GetRun(ctx, user.ID, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued.Status != biz.RunQueued || requeued.DeadlineAt == nil || !requeued.DeadlineAt.Equal(wantDeadline) {
+		t.Fatalf("requeue changed deadline: %#v", requeued)
+	}
+	if !requeued.UpdatedAt.Equal(requeueAt) {
+		t.Fatalf("requeue updated_at = %v, want %v", requeued.UpdatedAt, requeueAt)
+	}
+
+	secondClaimAt := requeueAt.Add(3 * time.Minute)
+	claimed, fence, err = runs.ClaimRun(ctx, user.ID, run.ID, "worker-b", time.Minute, secondClaimAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline = wantDeadline.Add(3 * time.Minute)
+	if claimed.DeadlineAt == nil || !claimed.DeadlineAt.Equal(wantDeadline) {
+		t.Fatalf("second queued deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
+	}
+
+	secondRequeueAt := secondClaimAt.Add(30 * time.Second)
+	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, secondRequeueAt); err != nil {
+		t.Fatal(err)
+	}
+	thirdClaimAt := secondRequeueAt.Add(4 * time.Minute)
+	claimed, fence, err = runs.ClaimRun(ctx, user.ID, run.ID, "worker-c", time.Minute, thirdClaimAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDeadline = wantDeadline.Add(4 * time.Minute)
+	if claimed.DeadlineAt == nil || !claimed.DeadlineAt.Equal(wantDeadline) {
+		t.Fatalf("repeated pause deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
+	}
+	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunCompleted, nil, fence, thirdClaimAt.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	concurrentBase := base.Add(10 * time.Minute)
+	concurrentDeadline := concurrentBase.Add(30 * time.Minute)
+	concurrentRun, err := runs.CreateRun(ctx, biz.Run{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModeReact,
+		Status: biz.RunQueued, DeadlineAt: &concurrentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adminDB.Exec("UPDATE agent_runs SET created_at = ?, updated_at = ? WHERE id = ?", concurrentBase, concurrentBase, concurrentRun.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	claimAt := concurrentBase.Add(5 * time.Minute)
+	type claimResult struct {
+		run   biz.Run
+		fence biz.RunFence
+		err   error
+	}
+	results := make(chan claimResult, 2)
+	var wg sync.WaitGroup
+	for _, owner := range []string{"worker-d", "worker-e"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claimed, fence, err := runs.ClaimRun(ctx, user.ID, concurrentRun.ID, owner, time.Minute, claimAt)
+			results <- claimResult{run: claimed, fence: fence, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for result := range results {
+		if result.err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(result.err, biz.ErrResourceConflict) {
+			t.Fatalf("concurrent ClaimRun error = %v", result.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent ClaimRun successes = %d, want 1", successes)
+	}
+	finalRun, err := runs.GetRun(ctx, user.ID, concurrentRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantConcurrentDeadline := concurrentDeadline.Add(5 * time.Minute)
+	if finalRun.DeadlineAt == nil || !finalRun.DeadlineAt.Equal(wantConcurrentDeadline) {
+		t.Fatalf("concurrent claim deadline = %v, want %v", finalRun.DeadlineAt, wantConcurrentDeadline)
 	}
 }
 

@@ -224,6 +224,7 @@ type MemoryRetriever struct {
 	generator EmbeddingGenerator
 	reranker  Reranker
 	usage     UsageRecorder
+	budgets   BudgetChecker
 	config    MemoryRetrieverConfig
 	logger    *slog.Logger
 }
@@ -241,6 +242,12 @@ func NewMemoryRetriever(indexes EmbeddingIndexRepository, vectors MemoryVectorRe
 		reranker = nil
 	}
 	return &MemoryRetriever{indexes: indexes, vectors: vectors, generator: generator, reranker: reranker, config: config.normalize(), logger: logger}, nil
+}
+
+// WithBudgetChecker 注入长期记忆查询预算门禁。
+func (r *MemoryRetriever) WithBudgetChecker(checker BudgetChecker) *MemoryRetriever {
+	r.budgets = checker
+	return r
 }
 
 // WithUsageRecorder 注入长期记忆查询 embedding 与 rerank 用量记录器。
@@ -267,6 +274,9 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 	}
 	if active == nil {
 		return nil, nil
+	}
+	if err := checkBackgroundBudget(ctx, r.budgets, userID, active.ProviderID); err != nil {
+		return nil, err
 	}
 	result, err := r.generator.Embed(ctx, *active, []string{query})
 	// 查询向量与后台索引任务使用同一 UsageRecorder 口径：绑定 active 索引的
@@ -305,7 +315,7 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 		var rerankErr error
 		if scoped, ok := r.reranker.(RerankerWithUsage); ok {
 			var usage RerankUsage
-			scores, usage, rerankErr = scoped.RerankWithUsage(ctx, query, memoryContents(filtered))
+			scores, usage, rerankErr = scoped.RerankWithUsage(ctx, userID, query, memoryContents(filtered))
 			// 重排结果校验失败或调用方降级前，Provider 已返回的输入 Token 仍须入账。
 			if r.usage != nil && usage.InputTokens > 0 {
 				providerID := usage.ProviderID
@@ -314,7 +324,7 @@ func (r *MemoryRetriever) Retrieve(ctx context.Context, userID, sessionID uuid.U
 				}
 			}
 		} else {
-			scores, rerankErr = r.reranker.Rerank(ctx, query, memoryContents(filtered))
+			scores, rerankErr = r.reranker.Rerank(ctx, userID, query, memoryContents(filtered))
 		}
 		if rerankErr != nil {
 			r.logger.Warn("long-term memory rerank failed", "session_id", sessionID, "error", rerankErr)

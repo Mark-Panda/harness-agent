@@ -15,6 +15,12 @@ import (
 	"go.uber.org/mock/gomock"
 )
 
+type memoryBudgetCheckerFunc func(context.Context, uuid.UUID, *uuid.UUID, *uuid.UUID) ([]biz.BudgetAlert, error)
+
+func (f memoryBudgetCheckerFunc) Check(ctx context.Context, userID uuid.UUID, agentID, providerID *uuid.UUID) ([]biz.BudgetAlert, error) {
+	return f(ctx, userID, agentID, providerID)
+}
+
 // fakeMemoryIndexes 是索引与维护统计端口的测试替身。
 type fakeMemoryIndexes struct {
 	indexes    []biz.EmbeddingIndex
@@ -235,6 +241,41 @@ func TestMemoryRetrieverMMRSemantics(t *testing.T) {
 
 // TestMemoryRetrieverRecordsQueryEmbeddingUsage 验证查询 embedding 的输入 Token
 // 在后续向量检索失败前已按 active 索引 Provider 记录，且不虚构输出 Token 或费用。
+func TestMemoryRetrieverChecksQueryEmbeddingBudget(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		checkErr  error
+		wantCalls int
+		wantErr   error
+	}{
+		{name: "exceeded", checkErr: biz.ErrBudgetExceeded, wantCalls: 0, wantErr: biz.ErrBudgetExceeded},
+		{name: "storage failure remains open", checkErr: errors.New("budget store unavailable"), wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			index := activeMemoryIndex()
+			generator := &fakeEmbeddingGenerator{}
+			retriever, err := biz.NewMemoryRetriever(&fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{index}},
+				&fakeMemoryVectors{}, generator, nil, biz.MemoryRetrieverConfig{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			userID := uuid.New()
+			checks := 0
+			retriever.WithBudgetChecker(memoryBudgetCheckerFunc(func(_ context.Context, gotUser uuid.UUID, agentID, providerID *uuid.UUID) ([]biz.BudgetAlert, error) {
+				checks++
+				if gotUser != userID || agentID != nil || providerID == nil || *providerID != index.ProviderID {
+					t.Fatalf("wrong budget identity: user=%s agent=%v provider=%v", gotUser, agentID, providerID)
+				}
+				return nil, test.checkErr
+			}))
+			_, err = retriever.Retrieve(context.Background(), userID, uuid.New(), "查询")
+			if !errors.Is(err, test.wantErr) || generator.calls != test.wantCalls || checks != 1 {
+				t.Fatalf("Retrieve() calls=%d checks=%d err=%v", generator.calls, checks, err)
+			}
+		})
+	}
+}
+
 func TestMemoryRetrieverRecordsQueryEmbeddingUsage(t *testing.T) {
 	index := activeMemoryIndex()
 	searchErr := errors.New("search failed")
@@ -264,13 +305,15 @@ type fakeReranker struct {
 	usage     biz.RerankUsage
 	err       error
 	calls     int
+	userID    uuid.UUID
 	query     string
 	documents []string
 }
 
 // Rerank 返回预置分数或错误。
-func (f *fakeReranker) Rerank(_ context.Context, query string, documents []string) ([]float64, error) {
+func (f *fakeReranker) Rerank(_ context.Context, userID uuid.UUID, query string, documents []string) ([]float64, error) {
 	f.calls++
+	f.userID = userID
 	f.query = query
 	f.documents = append([]string(nil), documents...)
 	if f.err != nil {
@@ -280,8 +323,8 @@ func (f *fakeReranker) Rerank(_ context.Context, query string, documents []strin
 }
 
 // RerankWithUsage 模拟 Provider 在失败响应中仍返回已发生的输入 Token。
-func (f *fakeReranker) RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, biz.RerankUsage, error) {
-	scores, err := f.Rerank(ctx, query, documents)
+func (f *fakeReranker) RerankWithUsage(ctx context.Context, userID uuid.UUID, query string, documents []string) ([]float64, biz.RerankUsage, error) {
+	scores, err := f.Rerank(ctx, userID, query, documents)
 	return scores, f.usage, err
 }
 
@@ -337,6 +380,9 @@ func TestMemoryRetrieverReranksBeforeMMR(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].Content != "重排最高" {
 		t.Fatalf("rerank did not reorder matches: %#v", matches)
+	}
+	if reranker.userID == uuid.Nil {
+		t.Fatal("reranker did not receive the billing user id")
 	}
 	if reranker.calls != 1 || reranker.query != "查询" || len(reranker.documents) != 2 || reranker.documents[1] != "重排最高" {
 		t.Fatalf("rerank inputs = %#v", reranker)
@@ -601,6 +647,43 @@ func TestMemoryEmbedWorkerErrorClassification(t *testing.T) {
 	}
 	if jobs.failed != 1 {
 		t.Fatalf("retryable: failed=%d", jobs.failed)
+	}
+}
+
+func TestMemoryEmbedWorkerChecksEveryBatchAndRetriesBudgetExceeded(t *testing.T) {
+	userID, sessionID := uuid.New(), uuid.New()
+	messages := []biz.Message{
+		{ID: uuid.New(), UserID: userID, SessionID: sessionID, Role: biz.MessageUser, Content: "第一批", CreatedAt: time.Now().UTC()},
+		{ID: uuid.New(), UserID: userID, SessionID: sessionID, Role: biz.MessageUser, Content: "第二批", CreatedAt: time.Now().UTC()},
+	}
+	task := biz.MemoryTask{UserID: userID, SessionID: sessionID, MessageIDs: []uuid.UUID{messages[0].ID, messages[1].ID}, Versions: []string{"v1"}}
+	job := biz.Job{ID: uuid.New(), Type: biz.MemoryEmbedJobType, Payload: memoryJobPayload(task), Attempts: 1, FencingToken: 1}
+	jobs := &fakeSummaryJobs{job: job}
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{activeMemoryIndex()}}
+	generator := &fakeEmbeddingGenerator{}
+	checks := 0
+	budgets := memoryBudgetCheckerFunc(func(_ context.Context, gotUser uuid.UUID, agentID, providerID *uuid.UUID) ([]biz.BudgetAlert, error) {
+		checks++
+		if gotUser != userID || agentID != nil || providerID == nil || *providerID != indexes.indexes[0].ProviderID {
+			t.Fatalf("wrong embedding budget identity")
+		}
+		if checks == 2 {
+			return nil, biz.ErrBudgetExceeded
+		}
+		return nil, nil
+	})
+	worker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
+		Jobs: jobs, Messages: &batchMemoryReader{messages: messages}, Indexes: indexes,
+		Vectors: &fakeMemoryVectors{}, Generator: generator, Budgets: budgets,
+	}, biz.MemoryEmbedWorkerConfig{WorkerID: "memory-budget-test", Heartbeat: time.Hour, BatchSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 2 || generator.calls != 1 || jobs.failed != 1 || jobs.completed != 0 {
+		t.Fatalf("checks=%d provider=%d failed=%d completed=%d", checks, generator.calls, jobs.failed, jobs.completed)
 	}
 }
 

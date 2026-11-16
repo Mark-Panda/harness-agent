@@ -142,6 +142,21 @@ func (mr *MockRunRepositoryMockRecorder) ClaimRun(ctx, userID, runID, owner, lea
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClaimRun", reflect.TypeOf((*MockRunRepository)(nil).ClaimRun), ctx, userID, runID, owner, lease, now)
 }
 
+// CancelRunAndDenyPendingApprovals mocks base method.
+func (m *MockRunRepository) CancelRunAndDenyPendingApprovals(ctx context.Context, userID, runID uuid.UUID, now time.Time) (biz.Run, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CancelRunAndDenyPendingApprovals", ctx, userID, runID, now)
+	ret0, _ := ret[0].(biz.Run)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CancelRunAndDenyPendingApprovals indicates an expected call of CancelRunAndDenyPendingApprovals.
+func (mr *MockRunRepositoryMockRecorder) CancelRunAndDenyPendingApprovals(ctx, userID, runID, now any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelRunAndDenyPendingApprovals", reflect.TypeOf((*MockRunRepository)(nil).CancelRunAndDenyPendingApprovals), ctx, userID, runID, now)
+}
+
 // CreateRun mocks base method.
 func (m *MockRunRepository) CreateRun(ctx context.Context, run biz.Run) (biz.Run, error) {
 	m.ctrl.T.Helper()
@@ -307,17 +322,17 @@ func (mr *MockRunRepositoryMockRecorder) RenewRunLease(ctx, userID, runID, fence
 }
 
 // RequeuePausedRun mocks base method.
-func (m *MockRunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, deadline *time.Time, now time.Time) error {
+func (m *MockRunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RequeuePausedRun", ctx, userID, runID, fence, deadline, now)
+	ret := m.ctrl.Call(m, "RequeuePausedRun", ctx, userID, runID, fence, now)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // RequeuePausedRun indicates an expected call of RequeuePausedRun.
-func (mr *MockRunRepositoryMockRecorder) RequeuePausedRun(ctx, userID, runID, fence, deadline, now any) *gomock.Call {
+func (mr *MockRunRepositoryMockRecorder) RequeuePausedRun(ctx, userID, runID, fence, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RequeuePausedRun", reflect.TypeOf((*MockRunRepository)(nil).RequeuePausedRun), ctx, userID, runID, fence, deadline, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RequeuePausedRun", reflect.TypeOf((*MockRunRepository)(nil).RequeuePausedRun), ctx, userID, runID, fence, now)
 }
 
 // ResumeRun mocks base method.

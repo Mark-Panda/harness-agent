@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
 	"github.com/google/uuid"
@@ -22,6 +23,44 @@ type feishuGroupRunHistoryReader interface {
 func isFeishuSharedGroup(run Run) bool {
 	shared, _ := run.ConfigSnapshot["feishu_shared_group"].(bool)
 	return shared
+}
+
+// lowRiskOnlyRegistry 只暴露低风险工具，用于共享群聊等无法确定审批责任人的场景。
+type lowRiskOnlyRegistry struct {
+	inner react.Registry
+}
+
+func (r lowRiskOnlyRegistry) Lookup(name string) (react.Tool, bool) {
+	tool, ok := r.inner.Lookup(name)
+	if !ok || tool.RiskLevel() != "low" {
+		return nil, false
+	}
+	return tool, true
+}
+
+func (r lowRiskOnlyRegistry) List() []react.ToolSpec {
+	specs := make([]react.ToolSpec, 0)
+	for _, spec := range r.inner.List() {
+		if _, ok := r.Lookup(spec.Name); !ok {
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	return specs
+}
+
+// restrictSharedGroupTools 把共享群聊的工具集合收窄到低风险工具。
+// 群内任一成员都能触发调用，高风险工具等价于把凭据与副作用共享给整个群；
+// 共享群也没有明确的审批责任人，因此在工具发现阶段直接剔除，而不是依赖审批兜底。
+func restrictSharedGroupTools(tools react.Registry) react.Registry {
+	if tools == nil {
+		return nil
+	}
+	filtered := lowRiskOnlyRegistry{inner: tools}
+	if len(filtered.List()) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func (w *FeishuEventWorker) processSharedChat(ctx context.Context, record FeishuEventRecord, event feishu.MessageEvent,

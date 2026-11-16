@@ -209,14 +209,14 @@ func TestPlanAPICancelPlan(t *testing.T) {
 	planID := uuid.New()
 
 	runningRun := biz.Run{ID: runID, UserID: fixture.principal.UserID, Status: biz.RunRunning}
-	fixture.runRepo.EXPECT().GetRun(gomock.Any(), fixture.principal.UserID, runID).Return(runningRun, nil).Times(2)
+	fixture.runRepo.EXPECT().GetRun(gomock.Any(), fixture.principal.UserID, runID).Return(runningRun, nil)
 	fixture.planRepo.EXPECT().GetPlanByRun(gomock.Any(), fixture.principal.UserID, runID).Return(
 		biz.Plan{ID: planID, UserID: fixture.principal.UserID, RunID: runID, Status: biz.PlanExecuting, Revision: 1}, nil,
 	)
 	fixture.planRepo.EXPECT().UpdatePlan(gomock.Any(), fixture.principal.UserID, planID, biz.PlanExecuting, biz.PlanCancelled, int64(1), gomock.Any(), gomock.Any()).Return(
 		biz.Plan{ID: planID, RunID: runID, Status: biz.PlanCancelled, Revision: 2, ErrorCode: "plan_cancelled"}, nil,
 	)
-	fixture.runRepo.EXPECT().TransitionRun(gomock.Any(), fixture.principal.UserID, runID, biz.RunRunning, biz.RunCancelled, gomock.Any()).Return(
+	fixture.runRepo.EXPECT().CancelRunAndDenyPendingApprovals(gomock.Any(), fixture.principal.UserID, runID, gomock.Any()).Return(
 		biz.Run{ID: runID, Status: biz.RunCancelled}, nil,
 	)
 	recorder := fixture.doPlanRequest(t, http.MethodPost, "/api/v1/runs/"+runID.String()+"/plan/cancel", "")

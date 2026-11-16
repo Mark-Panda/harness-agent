@@ -145,7 +145,7 @@ func TestLLMRerankerSuccess(t *testing.T) {
 	defer server.Close()
 	reranker := newReranker(t, gomock.NewController(t), server.URL, providerID, biz.ProviderEnabled,
 		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
-	scores, err := reranker.Rerank(context.Background(), "查询", []string{"a", "b"})
+	scores, err := reranker.Rerank(context.Background(), uuid.New(), "查询", []string{"a", "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,9 +164,34 @@ func TestLLMRerankerReturnsUsageOnInvalidResults(t *testing.T) {
 	defer server.Close()
 	reranker := newReranker(t, gomock.NewController(t), server.URL, providerID, biz.ProviderEnabled,
 		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
-	_, usage, err := reranker.RerankWithUsage(context.Background(), "查询", []string{"a", "b"})
+	_, usage, err := reranker.RerankWithUsage(context.Background(), uuid.New(), "查询", []string{"a", "b"})
 	if err == nil || usage.InputTokens != 11 || usage.ProviderID != providerID {
 		t.Fatalf("RerankWithUsage() usage=%#v error=%v", usage, err)
+	}
+}
+
+func TestLLMRerankerChecksResolvedProviderBudgetBeforeRequest(t *testing.T) {
+	providerID, userID := uuid.New(), uuid.New()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[{"index":0,"relevance_score":0.9}]}`)
+	}))
+	defer server.Close()
+	reranker := newReranker(t, gomock.NewController(t), server.URL, providerID, biz.ProviderEnabled,
+		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
+	checks := 0
+	reranker.WithBudgetChecker(memoryBudgetCheckerFunc(func(_ context.Context, gotUser uuid.UUID, agentID, gotProvider *uuid.UUID) ([]biz.BudgetAlert, error) {
+		checks++
+		if gotUser != userID || agentID != nil || gotProvider == nil || *gotProvider != providerID {
+			t.Fatalf("wrong rerank budget identity")
+		}
+		return nil, biz.ErrBudgetExceeded
+	}))
+	_, err := reranker.Rerank(context.Background(), userID, "查询", []string{"a"})
+	if !errors.Is(err, biz.ErrBudgetExceeded) || checks != 1 || calls != 0 {
+		t.Fatalf("Rerank() checks=%d calls=%d err=%v", checks, calls, err)
 	}
 }
 
@@ -175,15 +200,15 @@ func TestLLMRerankerGuards(t *testing.T) {
 	providerID := uuid.New()
 	reranker := newReranker(t, gomock.NewController(t), "https://example.com", providerID, biz.ProviderEnabled,
 		fakeRerankModelSource{err: errors.New("no model")})
-	if _, err := reranker.Rerank(context.Background(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
+	if _, err := reranker.Rerank(context.Background(), uuid.New(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
 		t.Fatalf("missing model error = %v", err)
 	}
 	reranker = newReranker(t, gomock.NewController(t), "https://example.com", providerID, biz.ProviderDisabled,
 		fakeRerankModelSource{providerID: providerID, model: "rerank-model"})
-	if _, err := reranker.Rerank(context.Background(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
+	if _, err := reranker.Rerank(context.Background(), uuid.New(), "查询", []string{"a"}); !errors.Is(err, biz.ErrRerankModelUnavailable) {
 		t.Fatalf("disabled provider error = %v", err)
 	}
-	if _, err := reranker.Rerank(context.Background(), "查询", nil); !errors.Is(err, biz.ErrInvalidConfig) {
+	if _, err := reranker.Rerank(context.Background(), uuid.New(), "查询", nil); !errors.Is(err, biz.ErrInvalidConfig) {
 		t.Fatalf("empty documents error = %v", err)
 	}
 	if _, err := biz.NewLLMReranker(nil, nil, nil, 0); !errors.Is(err, biz.ErrInvalidConfig) {

@@ -130,6 +130,17 @@ func (r *ToolApprovalRepository) CreateApproval(ctx context.Context, approval bi
 	}
 	var stored toolApprovalModel
 	err := WithScope(ctx, r.db, Scope{UserID: approval.UserID}, func(tx *gorm.DB) error {
+		// 与取消、审批决策保持 Run -> Approval 的固定锁顺序，取消提交后不得再插入 Pending。
+		var parent runModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&parent, "id = ? AND user_id = ?", approval.RunID, approval.UserID).Error; err != nil {
+			return err
+		}
+		switch biz.RunStatus(parent.Status) {
+		case biz.RunQueued, biz.RunRunning, biz.RunWaitingApproval:
+		default:
+			return fmt.Errorf("%w: run is not accepting new approvals", biz.ErrResourceConflict)
+		}
 		// 唯一键 (run_id, tool_call_id) 保证模型重放同一调用时不会产生多条审批。
 		result := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "run_id"}, {Name: "tool_call_id"}},
@@ -214,7 +225,7 @@ func (r *ToolApprovalRepository) CountPendingApprovals(ctx context.Context, user
 }
 
 // DecideApproval 以 CAS 方式把 pending 推进到目标状态；重复相同决策幂等返回。
-func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, approvalID uuid.UUID, decision biz.ApprovalDecision, decidedBy uuid.UUID, now time.Time) (biz.ToolApproval, error) {
+func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, runID, approvalID uuid.UUID, decision biz.ApprovalDecision, decidedBy uuid.UUID, now time.Time) (biz.ToolApproval, error) {
 	if decidedBy != userID {
 		return biz.ToolApproval{}, biz.ErrForbidden
 	}
@@ -229,7 +240,17 @@ func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, app
 	}
 	var record toolApprovalModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		if err := tx.First(&record, "id = ? AND user_id = ?", approvalID, userID).Error; err != nil {
+		// 先锁父 Run，确保 Decide 与 Cancel/CreateApproval 按相同顺序串行化。
+		var parent runModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&parent, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+			return err
+		}
+		if status := biz.RunStatus(parent.Status); status != biz.RunRunning && status != biz.RunWaitingApproval {
+			return fmt.Errorf("%w: run is not accepting approval decisions", biz.ErrResourceConflict)
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&record, "id = ? AND user_id = ? AND run_id = ?", approvalID, userID, runID).Error; err != nil {
 			return err
 		}
 		if biz.ApprovalStatus(record.Status) == target {
@@ -240,7 +261,7 @@ func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, app
 			return fmt.Errorf("%w: approval is already %s", biz.ErrResourceConflict, record.Status)
 		}
 		result := tx.Model(&toolApprovalModel{}).
-			Where("id = ? AND user_id = ? AND status = ?", approvalID, userID, string(biz.ApprovalPending)).
+			Where("id = ? AND user_id = ? AND run_id = ? AND status = ?", approvalID, userID, runID, string(biz.ApprovalPending)).
 			Updates(map[string]any{
 				"status": string(target), "decided_by": decidedBy, "decided_at": now, "updated_at": now,
 			})
@@ -250,7 +271,7 @@ func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, app
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: approval status changed concurrently", biz.ErrResourceConflict)
 		}
-		return tx.First(&record, "id = ? AND user_id = ?", approvalID, userID).Error
+		return tx.First(&record, "id = ? AND user_id = ? AND run_id = ?", approvalID, userID, runID).Error
 	})
 	if err != nil {
 		return biz.ToolApproval{}, catalogError("decide tool approval", err)

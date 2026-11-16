@@ -22,7 +22,7 @@ type RerankModelSource interface {
 // Reranker 对候选记忆重新打分，返回与 documents 顺序一致的分数。
 type Reranker interface {
 	// Rerank 返回 len(documents) 个分数；调用失败时由检索方降级。
-	Rerank(ctx context.Context, query string, documents []string) ([]float64, error)
+	Rerank(ctx context.Context, userID uuid.UUID, query string, documents []string) ([]float64, error)
 }
 
 // RerankUsage 是 rerank 调用的计量信息，用于后台预算累计。
@@ -37,7 +37,7 @@ type RerankUsage struct {
 
 // RerankerWithUsage 是可选能力：在返回分数的同时暴露计量信息。
 type RerankerWithUsage interface {
-	RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, RerankUsage, error)
+	RerankWithUsage(ctx context.Context, userID uuid.UUID, query string, documents []string) ([]float64, RerankUsage, error)
 }
 
 // LLMReranker 使用平台启用的 rerank 模型为候选记忆重新排序。
@@ -45,6 +45,7 @@ type LLMReranker struct {
 	providers ProviderCredentialRepository
 	models    RerankModelSource
 	opener    CredentialOpener
+	budgets   BudgetChecker
 	timeout   time.Duration
 }
 
@@ -59,14 +60,20 @@ func NewLLMReranker(providers ProviderCredentialRepository, models RerankModelSo
 	return &LLMReranker{providers: providers, models: models, opener: opener, timeout: timeout}, nil
 }
 
+// WithBudgetChecker 注入 rerank 预算门禁。
+func (r *LLMReranker) WithBudgetChecker(checker BudgetChecker) *LLMReranker {
+	r.budgets = checker
+	return r
+}
+
 // Rerank 调用启用的 rerank 模型并校验返回下标与文档数量。
-func (r *LLMReranker) Rerank(ctx context.Context, query string, documents []string) ([]float64, error) {
-	scores, _, err := r.RerankWithUsage(ctx, query, documents)
+func (r *LLMReranker) Rerank(ctx context.Context, userID uuid.UUID, query string, documents []string) ([]float64, error) {
+	scores, _, err := r.RerankWithUsage(ctx, userID, query, documents)
 	return scores, err
 }
 
 // RerankWithUsage 在返回分数时一并暴露供应商、模型与输入 Token，供后台预算累计。
-func (r *LLMReranker) RerankWithUsage(ctx context.Context, query string, documents []string) ([]float64, RerankUsage, error) {
+func (r *LLMReranker) RerankWithUsage(ctx context.Context, userID uuid.UUID, query string, documents []string) ([]float64, RerankUsage, error) {
 	if len(documents) == 0 {
 		return nil, RerankUsage{}, fmt.Errorf("%w: rerank documents are empty", ErrInvalidConfig)
 	}
@@ -80,6 +87,9 @@ func (r *LLMReranker) RerankWithUsage(ctx context.Context, query string, documen
 	}
 	if provider.Status != ProviderEnabled {
 		return nil, RerankUsage{}, fmt.Errorf("%w: provider is disabled", ErrRerankModelUnavailable)
+	}
+	if err := checkBackgroundBudget(ctx, r.budgets, userID, providerID); err != nil {
+		return nil, RerankUsage{}, err
 	}
 	plaintext, err := r.opener.Open(credential.KeyVersion, credential.Encrypted)
 	if err != nil || len(plaintext) == 0 {

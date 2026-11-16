@@ -88,6 +88,8 @@ type SSEConfig struct {
 	MaxConnections int `yaml:"max_connections"`
 	// WriteTimeout 单次 SSE 写入超时，0 表示使用默认值。
 	WriteTimeout Duration `yaml:"write_timeout"`
+	// StreamTimeout 单条 SSE 事件流的最长持续时长，0 表示使用默认值。
+	StreamTimeout Duration `yaml:"stream_timeout"`
 }
 
 // GRPCServerConfig 是 gRPC 监听配置。

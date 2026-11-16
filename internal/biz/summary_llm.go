@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/memory"
 	"github.com/google/uuid"
 )
@@ -87,24 +88,17 @@ type resolvedSummaryModel struct {
 	outputPrice     float64
 }
 
-// Summarize 解析模型候选、分块生成并归并摘要。
+// summaryContextSafetyMarginTokens 为 Token 估算误差与供应商协议开销预留固定安全余量。
+const summaryContextSafetyMarginTokens = 256
+
+// Summarize 解析模型候选、按 Token 分块生成并进行分层归并。
 func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID uuid.UUID, previous string, messages []Message) (SummaryGeneration, error) {
-	// 空来源无法生成有意义摘要，直接永久拒绝，避免后续分块索引越界。
 	if len(messages) == 0 {
 		return SummaryGeneration{}, fmt.Errorf("%w: summary requires at least one message", ErrSummaryPermanent)
 	}
 	resolved, err := resolveSessionModel(ctx, g.runs, g.providers, g.opener, userID, sessionID)
 	if err != nil {
 		return SummaryGeneration{}, err
-	}
-	if g.budgets != nil {
-		providerID := resolved.providerID
-		if _, err := g.budgets.Check(ctx, userID, nil, &providerID); err != nil {
-			if errors.Is(err, ErrBudgetExceeded) {
-				return SummaryGeneration{}, fmt.Errorf("%w: daily budget exhausted", ErrSummaryModelUnavailable)
-			}
-			// 预算存储故障时降级放行，避免摘要功能被缓存故障阻断。
-		}
 	}
 	if g.limiter != nil {
 		release, acquired, err := g.limiter.TryAcquire(ctx, "provider:"+resolved.providerID.String())
@@ -120,89 +114,222 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 	if err != nil {
 		return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryModelUnavailable, err)
 	}
-	chunks := memory.SplitSummaryMessages(toSummaryMessages(messages), g.config.MaxInputBytes)
-	partials := make([]string, 0, len(chunks))
+	inputBudget := int(resolved.contextWindow) - summaryOutputBudget(g.config, resolved) - summaryContextSafetyMarginTokens
+	if inputBudget <= 0 {
+		return SummaryGeneration{}, fmt.Errorf("%w: model context leaves no summary input budget", ErrSummaryPermanent)
+	}
+	byteChunks := memory.SplitSummaryMessages(toSummaryMessages(messages), g.config.MaxInputBytes)
+	chunks := make([][]memory.SummaryMessage, 0, len(byteChunks))
+	for _, chunk := range byteChunks {
+		bounded, splitErr := memory.SplitSummaryMessagesByTokens(chunk, g.config.MaxMessageBytes, inputBudget)
+		if splitErr != nil {
+			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, splitErr)
+		}
+		chunks = append(chunks, bounded...)
+	}
+
 	inputTokens, outputTokens := 0, 0
-	estimatedCost := 0.0
-	defer func() {
-		// 所有已返回 usage 的调用先进入累计值；即使后续分块、归并或输出校验
-		// 失败，也要记录前序及本次已发生的用量。无 usage 的状态/传输错误不虚构计量。
-		if g.usage == nil || (inputTokens == 0 && outputTokens == 0) {
-			return
+	partials := make([]string, 0, len(chunks))
+	previousForMerge := previous
+	chunkBackground := ""
+	if len(chunks) == 1 && strings.TrimSpace(previous) != "" {
+		system, user, buildErr := memory.BuildSummaryPrompt(previous, chunks[0], g.config.MaxMessageBytes)
+		if buildErr != nil {
+			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, buildErr)
 		}
-		providerID := resolved.providerID
-		if err := g.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(inputTokens), int64(outputTokens), estimatedCost, time.Now().UTC()); err != nil {
-			// 用量记录失败不阻断摘要结果或原始错误。
-			_ = err
+		requestTokens := model.EstimateRequestTokens(chatMessagesFromReact([]react.Message{
+			{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user},
+		}), nil)
+		if requestTokens <= int64(inputBudget) {
+			chunkBackground = previous
 		}
-	}()
-	carried := previous
-	for _, chunk := range chunks {
-		system, user, err := memory.BuildSummaryPrompt(carried, chunk, g.config.MaxMessageBytes)
-		if err != nil {
-			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
+	}
+	for index := 0; index < len(chunks); {
+		system, user, buildErr := memory.BuildSummaryPrompt(chunkBackground, chunks[index], g.config.MaxMessageBytes)
+		if buildErr != nil {
+			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, buildErr)
 		}
-		response, err := g.call(ctx, client, resolved, system, user)
+		response, callErr := g.call(ctx, client, resolved, userID, system, user)
 		inputTokens += response.InputTokens
 		outputTokens += response.OutputTokens
-		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
-		if err != nil {
-			return SummaryGeneration{}, err
+		if errors.Is(callErr, model.ErrContextExceeded) {
+			if chunkBackground != "" {
+				chunkBackground = ""
+				continue
+			}
+			smaller, ok := splitSummaryChunkForRetry(chunks[index])
+			if !ok {
+				return SummaryGeneration{}, callErr
+			}
+			chunks = append(chunks[:index], append(smaller, chunks[index+1:]...)...)
+			continue
+		}
+		if callErr != nil {
+			return SummaryGeneration{}, callErr
+		}
+		if chunkBackground != "" {
+			previousForMerge = ""
 		}
 		partials = append(partials, response.Content)
-		// 后续分块携带上一片段摘要，保持跨分块的指代与事实连续。
-		carried = response.Content
+		index++
 	}
-	finalText := partials[0]
-	if len(partials) > 1 {
-		system, user, err := memory.BuildMergeSummaryPrompt(previous, partials)
-		if err != nil {
-			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
+
+	mergeItems := partials
+	for strings.TrimSpace(previousForMerge) != "" || len(mergeItems) > 1 {
+		before := len(mergeItems)
+		if strings.TrimSpace(previousForMerge) != "" {
+			before++
 		}
-		response, err := g.call(ctx, client, resolved, system, user)
-		inputTokens += response.InputTokens
-		outputTokens += response.OutputTokens
-		estimatedCost += estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
-		if err != nil {
-			return SummaryGeneration{}, err
+		batches, buildErr := memory.BuildSummaryMergeBatches(previousForMerge, mergeItems, inputBudget)
+		if buildErr != nil {
+			return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, buildErr)
 		}
-		finalText = response.Content
+		queue := make([]summaryMergeBatch, 0, len(batches))
+		for _, batch := range batches {
+			queue = append(queue, summaryMergeBatch{items: batch})
+		}
+		next := make([]string, 0, len(batches))
+		retriedContext := false
+		for index := 0; index < len(queue); {
+			batch := queue[index]
+			if len(batch.items) == 1 && !batch.forceSingle {
+				next = append(next, batch.items[0])
+				index++
+				continue
+			}
+			system, user, promptErr := memory.BuildMergeSummaryPrompt("", batch.items)
+			if promptErr != nil {
+				return SummaryGeneration{}, fmt.Errorf("%w: %v", ErrSummaryPermanent, promptErr)
+			}
+			response, callErr := g.call(ctx, client, resolved, userID, system, user)
+			inputTokens += response.InputTokens
+			outputTokens += response.OutputTokens
+			if errors.Is(callErr, model.ErrContextExceeded) {
+				smaller, ok := splitSummaryMergeBatchForRetry(batch)
+				if !ok {
+					return SummaryGeneration{}, callErr
+				}
+				queue = append(queue[:index], append(smaller, queue[index+1:]...)...)
+				retriedContext = true
+				continue
+			}
+			if callErr != nil {
+				return SummaryGeneration{}, callErr
+			}
+			next = append(next, response.Content)
+			index++
+		}
+		if !retriedContext && before > 1 && len(next) >= before {
+			return SummaryGeneration{}, fmt.Errorf("%w: summary merge made no reduction", ErrSummaryPermanent)
+		}
+		mergeItems = next
+		previousForMerge = ""
+	}
+	if len(mergeItems) != 1 {
+		return SummaryGeneration{}, fmt.Errorf("%w: summary merge produced no final text", ErrSummaryPermanent)
 	}
 	providerID := resolved.providerID
 	return SummaryGeneration{
-		Text: strings.TrimSpace(finalText), ProviderID: &providerID, ModelID: resolved.modelID,
+		Text: strings.TrimSpace(mergeItems[0]), ProviderID: &providerID, ModelID: resolved.modelID,
 		InputTokens: inputTokens, OutputTokens: outputTokens,
 	}, nil
 }
 
-// call 执行一次非流式摘要调用并分类错误；流式与工具能力不参与摘要。
-func (g *SummaryLLMGenerator) call(ctx context.Context, client *model.Client, resolved resolvedSummaryModel, system, user string) (model.ChatResponse, error) {
-	maxOutput := g.config.MaxOutputTokens
+// summaryMergeBatch 标记归并批次；上下文超限拆出的单片段也必须经模型压缩，不能直接当作最终摘要。
+type summaryMergeBatch struct {
+	items       []string
+	forceSingle bool
+}
+
+// splitSummaryChunkForRetry 将被拒绝的分块严格拆小，禁止相同 Payload 原地重试。
+func splitSummaryChunkForRetry(chunk []memory.SummaryMessage) ([][]memory.SummaryMessage, bool) {
+	if len(chunk) > 1 {
+		middle := len(chunk) / 2
+		return [][]memory.SummaryMessage{chunk[:middle], chunk[middle:]}, true
+	}
+	if len(chunk) != 1 {
+		return nil, false
+	}
+	runes := []rune(chunk[0].Content)
+	if len(runes) < 2 {
+		return nil, false
+	}
+	middle := len(runes) / 2
+	left, right := chunk[0], chunk[0]
+	left.Content = string(runes[:middle])
+	right.Content = string(runes[middle:])
+	return [][]memory.SummaryMessage{{left}, {right}}, true
+}
+
+// splitSummaryMergeBatchForRetry 将被拒绝的归并输入严格拆小，并保持所有片段顺序。
+func splitSummaryMergeBatchForRetry(batch summaryMergeBatch) ([]summaryMergeBatch, bool) {
+	if len(batch.items) > 1 {
+		middle := len(batch.items) / 2
+		return []summaryMergeBatch{{items: batch.items[:middle], forceSingle: true}, {items: batch.items[middle:], forceSingle: true}}, true
+	}
+	if len(batch.items) != 1 {
+		return nil, false
+	}
+	runes := []rune(batch.items[0])
+	if len(runes) < 2 {
+		return nil, false
+	}
+	middle := len(runes) / 2
+	return []summaryMergeBatch{{items: []string{string(runes[:middle])}, forceSingle: true}, {items: []string{string(runes[middle:])}, forceSingle: true}}, true
+}
+
+// summaryOutputBudget 返回配置与模型快照共同约束后的实际输出预算。
+func summaryOutputBudget(config SummaryLLMConfig, resolved resolvedSummaryModel) int {
+	maxOutput := config.MaxOutputTokens
 	if resolved.maxOutput > 0 && maxOutput > resolved.maxOutput {
 		maxOutput = resolved.maxOutput
 	}
-	response, err := client.Chat(ctx, model.ChatRequest{
+	return maxOutput
+}
+
+// call 执行一次非流式摘要调用并分类错误；流式与工具能力不参与摘要。
+func (g *SummaryLLMGenerator) call(ctx context.Context, client *model.Client, resolved resolvedSummaryModel, userID uuid.UUID, system, user string) (model.ChatResponse, error) {
+	maxOutput := summaryOutputBudget(g.config, resolved)
+	request := model.ChatRequest{
 		Model: model.ModelRef{
 			ProviderID: resolved.providerID.String(), ModelID: resolved.modelID,
 			RemoteModelName: resolved.remoteModelName, ContextWindowTokens: resolved.contextWindow,
 			MaxOutputTokens: resolved.maxOutput,
 		},
-		Messages: []model.ChatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
 		Temperature: g.config.Temperature, MaxOutputTokens: maxOutput,
+	}
+	completion, err := completeText(ctx, []react.Message{
+		{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user},
+	}, func(callCtx context.Context, messages []react.Message) (react.Completion, error) {
+		if err := checkBackgroundBudget(callCtx, g.budgets, userID, resolved.providerID); err != nil {
+			return react.Completion{}, err
+		}
+		request.Messages = chatMessagesFromReact(messages)
+		response, chatErr := client.Chat(callCtx, request)
+		if g.usage != nil && (response.InputTokens > 0 || response.OutputTokens > 0) {
+			providerID := resolved.providerID
+			cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
+			if recordErr := g.usage.RecordUsage(context.WithoutCancel(callCtx), userID, nil, &providerID,
+				int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); recordErr != nil {
+				_ = recordErr
+			}
+		}
+		return completionFromChatResponse(response), chatErr
 	})
+	response := model.ChatResponse{
+		Content: completion.Content, FinishReason: completion.FinishReason,
+		InputTokens: completion.Usage.InputTokens, OutputTokens: completion.Usage.OutputTokens,
+	}
 	if err != nil {
-		// 认证失败、参数错误与上下文超限重试无意义；其余错误交给任务退避重试。
-		// 保留 Provider 已返回的 usage，由 Summarize 在错误返回前纳入累计。
-		if errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) || errors.Is(err, model.ErrCapability) || errors.Is(err, model.ErrContextExceeded) {
-			return response, fmt.Errorf("%w: %v", ErrSummaryPermanent, err)
+		if errors.Is(err, ErrBudgetExceeded) {
+			return response, fmt.Errorf("%w: %w", ErrSummaryModelUnavailable, err)
+		}
+		// 认证失败、参数错误、上下文超限及响应守卫错误均不能作为有效摘要。
+		if isCompletionGuardError(err) || errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) ||
+			errors.Is(err, model.ErrCapability) || errors.Is(err, model.ErrContextExceeded) {
+			return response, fmt.Errorf("%w: %w", ErrSummaryPermanent, err)
 		}
 		return response, err
-	}
-	if strings.TrimSpace(response.Content) == "" || len(response.ToolCalls) > 0 {
-		return response, fmt.Errorf("%w: provider returned an empty or unexpected summary", ErrSummaryPermanent)
 	}
 	return response, nil
 }

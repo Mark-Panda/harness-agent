@@ -129,21 +129,21 @@ func TestToolApprovalRepositoryLifecycle(t *testing.T) {
 		t.Fatalf("cross-user approval read error = %v", err)
 	}
 
-	approved, err := approvals.DecideApproval(ctx, userA.ID, created.ID, biz.ApprovalDecisionApprove, userA.ID, time.Now().UTC())
+	_, fence, err := runs.ClaimRun(ctx, userA.ID, runID, "approval-worker", time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved, err := approvals.DecideApproval(ctx, userA.ID, runID, created.ID, biz.ApprovalDecisionApprove, userA.ID, time.Now().UTC())
 	if err != nil || approved.Status != biz.ApprovalApproved || approved.DecidedAt == nil {
 		t.Fatalf("DecideApproval() = %#v, %v", approved, err)
 	}
 	// 同一决策重复提交幂等返回。
-	if repeated, err := approvals.DecideApproval(ctx, userA.ID, created.ID, biz.ApprovalDecisionApprove, userA.ID, time.Now().UTC()); err != nil || repeated.Status != biz.ApprovalApproved {
+	if repeated, err := approvals.DecideApproval(ctx, userA.ID, runID, created.ID, biz.ApprovalDecisionApprove, userA.ID, time.Now().UTC()); err != nil || repeated.Status != biz.ApprovalApproved {
 		t.Fatalf("repeated decision = %#v, %v", repeated, err)
 	}
 	// 已批准的审批不能被反向拒绝。
-	if _, err := approvals.DecideApproval(ctx, userA.ID, created.ID, biz.ApprovalDecisionDeny, userA.ID, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
+	if _, err := approvals.DecideApproval(ctx, userA.ID, runID, created.ID, biz.ApprovalDecisionDeny, userA.ID, time.Now().UTC()); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("reverse decision error = %v", err)
-	}
-	_, fence, err := runs.ClaimRun(ctx, userA.ID, runID, "approval-worker", time.Minute, time.Now().UTC())
-	if err != nil {
-		t.Fatal(err)
 	}
 	executing, err := approvals.ClaimApprovalExecution(ctx, userA.ID, runID, created.ID, fence, time.Now().UTC())
 	if err != nil || executing.Status != biz.ApprovalExecuting {
@@ -249,7 +249,7 @@ func TestToolApprovalRepositoryDeliverAtomicallyRollbackAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := approvals.DecideApproval(ctx, user.ID, approval.ID, biz.ApprovalDecisionApprove, user.ID, time.Now().UTC()); err != nil {
+	if _, err := approvals.DecideApproval(ctx, user.ID, runID, approval.ID, biz.ApprovalDecisionApprove, user.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := approvals.ClaimApprovalExecution(ctx, user.ID, runID, approval.ID, fence, time.Now().UTC()); err != nil {

@@ -90,18 +90,18 @@ func (mr *MockToolApprovalRepositoryMockRecorder) CreateApproval(ctx, approval a
 }
 
 // DecideApproval mocks base method.
-func (m *MockToolApprovalRepository) DecideApproval(ctx context.Context, userID, approvalID uuid.UUID, decision biz.ApprovalDecision, decidedBy uuid.UUID, now time.Time) (biz.ToolApproval, error) {
+func (m *MockToolApprovalRepository) DecideApproval(ctx context.Context, userID, runID, approvalID uuid.UUID, decision biz.ApprovalDecision, decidedBy uuid.UUID, now time.Time) (biz.ToolApproval, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DecideApproval", ctx, userID, approvalID, decision, decidedBy, now)
+	ret := m.ctrl.Call(m, "DecideApproval", ctx, userID, runID, approvalID, decision, decidedBy, now)
 	ret0, _ := ret[0].(biz.ToolApproval)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // DecideApproval indicates an expected call of DecideApproval.
-func (mr *MockToolApprovalRepositoryMockRecorder) DecideApproval(ctx, userID, approvalID, decision, decidedBy, now any) *gomock.Call {
+func (mr *MockToolApprovalRepositoryMockRecorder) DecideApproval(ctx, userID, runID, approvalID, decision, decidedBy, now any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DecideApproval", reflect.TypeOf((*MockToolApprovalRepository)(nil).DecideApproval), ctx, userID, approvalID, decision, decidedBy, now)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DecideApproval", reflect.TypeOf((*MockToolApprovalRepository)(nil).DecideApproval), ctx, userID, runID, approvalID, decision, decidedBy, now)
 }
 
 // FinishApprovalExecution mocks base method.

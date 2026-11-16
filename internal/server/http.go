@@ -37,6 +37,7 @@ func NewHTTPServer(cfg config.ServerConfig, assets fs.FS, authService AuthApplic
 func NewHTTPServerWithLimits(cfg config.ServerConfig, assets fs.FS, authService AuthApplication, limiter AuthRateLimiter, apiLimits APILimiters, platform ...*service.PlatformService) (*kratoshttp.Server, error) {
 	// SSE 容量与写入超时来自配置，避免慢消费者无限占用实例资源。
 	SetSSELimits(cfg.SSE.MaxConnections, cfg.SSE.WriteTimeout.Duration)
+	SetSSEStreamTimeout(cfg.SSE.StreamTimeout.Duration)
 	options := []kratoshttp.ServerOption{
 		kratoshttp.Address(cfg.HTTP.Address),
 		kratoshttp.Timeout(cfg.HTTP.Timeout.Duration),

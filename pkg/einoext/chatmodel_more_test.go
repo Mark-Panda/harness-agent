@@ -217,3 +217,185 @@ func TestToolInfoRoundTripWithSchema(t *testing.T) {
 		t.Fatalf("tool info = %#v", info)
 	}
 }
+
+func writeChatModelStreamDelta(w io.Writer, content, finishReason string, inputTokens, outputTokens int) {
+	choice := map[string]any{"delta": map[string]any{"content": content}}
+	if finishReason != "" {
+		choice["finish_reason"] = finishReason
+	}
+	chunk := map[string]any{"choices": []any{choice}}
+	if inputTokens != 0 || outputTokens != 0 {
+		chunk["usage"] = map[string]any{"prompt_tokens": inputTokens, "completion_tokens": outputTokens}
+	}
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+func receiveChatModelMessages(reader *schema.StreamReader[*schema.Message]) ([]*schema.Message, error) {
+	defer reader.Close()
+	var messages []*schema.Message
+	for {
+		message, err := reader.Recv()
+		if errors.Is(err, io.EOF) {
+			return messages, nil
+		}
+		if err != nil {
+			return messages, err
+		}
+		messages = append(messages, message)
+	}
+}
+
+func TestChatModelStreamContinuationDeltasMatchFinalContent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		partial string
+		deltas  []string
+		want    string
+	}{
+		{
+			name: "overlap resolved across deltas", partial: "已输出：重复🙂",
+			deltas: []string{"重", "复🙂", "，真正", "后半"}, want: "已输出：重复🙂，真正后半",
+		},
+		{
+			name: "short continuation flushed after validation", partial: "已输出：重复🙂",
+			deltas: []string{"复", "🙂，后", "半"}, want: "已输出：重复🙂，后半",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			router := newChatModelTestRouter(t, func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				if calls == 1 {
+					writeChatModelStreamDelta(w, tc.partial, "length", 3, 2)
+				} else {
+					for index, delta := range tc.deltas {
+						finishReason := ""
+						inputTokens, outputTokens := 0, 0
+						if index == len(tc.deltas)-1 {
+							finishReason = "stop"
+							inputTokens, outputTokens = 5, 4
+						}
+						writeChatModelStreamDelta(w, delta, finishReason, inputTokens, outputTokens)
+					}
+				}
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			})
+			emitter := &testEmitter{}
+			m := NewChatModel(router, emitter, 4, 0, 0)
+			reader, err := m.Stream(WithEmitter(context.Background(), emitter), []*schema.Message{schema.UserMessage("hi")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			frames, err := receiveChatModelMessages(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			merged, err := schema.ConcatMessages(frames)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if merged.Content != tc.want || m.LastContent() != tc.want {
+				t.Fatalf("stream content = %q, LastContent = %q, want %q; frames=%#v", merged.Content, m.LastContent(), tc.want, frames)
+			}
+			if merged.ResponseMeta == nil || merged.ResponseMeta.FinishReason != "stop" ||
+				merged.ResponseMeta.Usage == nil || merged.ResponseMeta.Usage.PromptTokens != 8 || merged.ResponseMeta.Usage.CompletionTokens != 6 {
+				t.Fatalf("merged response metadata = %#v", merged.ResponseMeta)
+			}
+			if len(emitter.messages) != 1 || emitter.messages[0]["content"] != tc.want {
+				t.Fatalf("message.created events = %#v, want content %q", emitter.messages, tc.want)
+			}
+			usedCalls, input, output, _ := m.Usage()
+			if usedCalls != 2 || input != 8 || output != 6 {
+				t.Fatalf("usage = %d/%d/%d, want 2/8/6", usedCalls, input, output)
+			}
+		})
+	}
+}
+
+func TestChatModelStreamContinuationDoesNotFlushOnFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		writeSecond func(http.ResponseWriter)
+		want        error
+	}{
+		{
+			name: "router error", want: react.ErrStepLimit,
+			writeSecond: func(w http.ResponseWriter) {
+				writeChatModelStreamDelta(w, "abc", "", 0, 0)
+				fmt.Fprint(w, "data: {\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n")
+			},
+		},
+		{
+			name: "content filter", want: react.ErrContentFiltered,
+			writeSecond: func(w http.ResponseWriter) {
+				writeChatModelStreamDelta(w, "abc", "", 0, 0)
+				writeChatModelStreamDelta(w, "", "content_filter", 0, 0)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			const partial = "0123456789"
+			router := newChatModelTestRouter(t, func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				if calls == 1 {
+					writeChatModelStreamDelta(w, partial, "length", 0, 0)
+					fmt.Fprint(w, "data: [DONE]\n\n")
+					return
+				}
+				tc.writeSecond(w)
+			})
+			emitter := &testEmitter{}
+			m := NewChatModel(router, emitter, 4, 0, 0)
+			reader, err := m.Stream(WithEmitter(context.Background(), emitter), []*schema.Message{schema.UserMessage("hi")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			frames, err := receiveChatModelMessages(reader)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("stream error = %v, want %v", err, tc.want)
+			}
+			var streamed strings.Builder
+			for _, frame := range frames {
+				streamed.WriteString(frame.Content)
+			}
+			if streamed.String() != partial {
+				t.Fatalf("streamed content after failure = %q, want only partial %q", streamed.String(), partial)
+			}
+			if m.LastContent() != "" || len(emitter.messages) != 0 {
+				t.Fatalf("failure produced final content: last=%q messages=%#v", m.LastContent(), emitter.messages)
+			}
+		})
+	}
+}
+
+func TestChatModelContinuationSendFailurePropagates(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delta string
+	}{
+		{name: "filtered delta", delta: "0123456789"},
+		{name: "flushed delta", delta: "tail"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router := newChatModelTestRouter(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				writeChatModelStreamDelta(w, tc.delta, "stop", 0, 0)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			})
+			m := NewChatModel(router, nil, 4, 0, 0)
+			reader, writer := schema.Pipe[*schema.Message](16)
+			reader.Close()
+			sender := &streamSender{writer: writer}
+			_, err := m.continueStream(context.Background(), nil, 0, react.Completion{Content: "prefix", FinishReason: "length"}, sender)
+			writer.Close()
+			if err == nil || !strings.Contains(err.Error(), "stream reader closed") {
+				t.Fatalf("continueStream() error = %v, want stream reader closed", err)
+			}
+		})
+	}
+}

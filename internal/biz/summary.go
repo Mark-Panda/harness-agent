@@ -580,64 +580,82 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
-
-	// 生成期间持续续约；租约丢失时取消调用，避免过期 Worker 提交结果。
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	leaseLost := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(w.config.Heartbeat)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
-			}
-			if err := w.jobs.Renew(runCtx, job.ID, w.config.WorkerID, job.FencingToken, w.config.Lease, w.clock()); err != nil {
-				// 主流程结束时主动 cancel 会让在途续约返回 context.Canceled；
-				// 只有上下文仍有效时的续约失败才代表租约真的丢失。
-				if runCtx.Err() == nil {
-					close(leaseLost)
-					cancel()
+	// 工具消息是不可信数据，也可能是提示注入的载体；摘要只消费用户与助手对话。
+	// 指纹与覆盖数量仍按原始来源校验，因此不会破坏任务幂等性与已覆盖区间。
+	dialogSource := summaryDialogMessages(source)
+	toolOnlySource := len(dialogSource) == 0
+	// 纯工具来源只保存覆盖边界 checkpoint：继承现有正文，不调用模型、不启动生成心跳，也不要求正文非空。
+	generation := SummaryGeneration{Text: previous}
+	if !toolOnlySource {
+		// 生成期间持续续约；租约丢失时取消调用，避免过期 Worker 提交结果。
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		leaseLost := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(w.config.Heartbeat)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
 				}
+				if err := w.jobs.Renew(runCtx, job.ID, w.config.WorkerID, job.FencingToken, w.config.Lease, w.clock()); err != nil {
+					// 主流程结束时主动 cancel 会让在途续约返回 context.Canceled；
+					// 只有上下文仍有效时的续约失败才代表租约真的丢失。
+					if runCtx.Err() == nil {
+						close(leaseLost)
+						cancel()
+					}
+					return
+				}
+			}
+		}()
+
+		generated, generateErr := w.generator.Summarize(runCtx, task.UserID, task.SessionID, previous, dialogSource)
+		generation = generated
+		cancel()
+		// 先等待心跳协程退出再判定租约：心跳可能在 cancel 之后才写入 leaseLost，
+		// 提前判定会把正常结束误判为丢租约并跳过摘要落库。
+		<-done
+		select {
+		case <-leaseLost:
+			w.logger.Warn("summary job lease lost", "job_id", job.ID)
+			return
+		default:
+		}
+		if generateErr != nil {
+			// 模型不可用、预算耗尽或供应商永久拒绝等错误重试无意义：
+			// 继续重试只会耗尽任务次数并进入死信，下一次摘要触发会重新入队。
+			if errors.Is(generateErr, ErrSummaryModelUnavailable) || errors.Is(generateErr, ErrSummaryPermanent) ||
+				errors.Is(generateErr, ErrBudgetExceeded) {
+				w.logger.Warn("summary generation is not retryable; completing job", "job_id", job.ID, "error", generateErr)
+				_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+				failureClass = "generation_unretryable"
 				return
 			}
-		}
-	}()
-
-	generation, generateErr := w.generator.Summarize(runCtx, task.UserID, task.SessionID, previous, source)
-	cancel()
-	// 先等待心跳协程退出再判定租约：心跳可能在 cancel 之后才写入 leaseLost，
-	// 提前判定会把正常结束误判为丢租约并跳过摘要落库。
-	<-done
-	select {
-	case <-leaseLost:
-		w.logger.Warn("summary job lease lost", "job_id", job.ID)
-		return
-	default:
-	}
-	if generateErr != nil {
-		if errors.Is(generateErr, ErrSummaryModelUnavailable) || errors.Is(generateErr, ErrSummaryPermanent) {
-			w.logger.Warn("summary generation is not retryable; completing job", "job_id", job.ID, "error", generateErr)
-			_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+			w.logger.Warn("summary generation failed; scheduling retry", "job_id", job.ID, "error", generateErr)
+			w.failJob(ctx, job, generateErr)
+			failureClass = "generation_failure"
 			return
 		}
-		w.failJob(ctx, job, generateErr)
-		failureClass = "retryable_failure"
-		return
-	}
-	if err := memory.ValidateSummaryText(generation.Text, w.config.MaxSummaryBytes); err != nil {
-		w.logger.Warn("summary text rejected", "job_id", job.ID, "error", err)
-		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
-		return
+		if err := memory.ValidateSummaryText(generation.Text, w.config.MaxSummaryBytes); err != nil {
+			w.logger.Warn("summary text rejected; scheduling retry", "job_id", job.ID, "error", err)
+			w.failJob(ctx, job, err)
+			failureClass = "invalid_generation"
+			return
+		}
 	}
 
+	summaryText := strings.TrimSpace(generation.Text)
+	if toolOnlySource {
+		summaryText = previous
+	}
 	summary := SessionSummary{
 		ID: uuid.New(), SessionID: task.SessionID, UserID: task.UserID, Version: task.BaseVersion + 1,
-		SummaryText: strings.TrimSpace(generation.Text), SourceMessageIDs: task.SourceMessageIDs,
+		SummaryText: summaryText, SourceMessageIDs: task.SourceMessageIDs,
 		SourceFingerprint: task.Fingerprint, CoveredMessageCount: task.CoveredMessageCount,
 		Status: SummaryActive, ModelProviderID: generation.ProviderID, ModelID: generation.ModelID,
 		InputTokens: generation.InputTokens, OutputTokens: generation.OutputTokens,
@@ -660,6 +678,10 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 			"session_id": task.SessionID.String(), "version": summary.Version,
 			"covered_messages": summary.CoveredMessageCount, "source_messages": len(task.SourceMessageIDs),
 		},
+	}
+	if toolOnlySource {
+		event.Payload["checkpoint"] = true
+		event.Payload["reason"] = "tool_only_source"
 	}
 	saved, applied, err := w.summaries.SaveSummary(context.WithoutCancel(ctx), summary, task.BaseVersion, event)
 	if err != nil {
@@ -688,6 +710,18 @@ func (w *SummaryWorker) failJob(ctx context.Context, job Job, cause error) {
 		w.clock().Add(delay), sanitizeExecutionError(cause), w.clock()); err != nil {
 		w.logger.Warn("fail summary job failed", "job_id", job.ID, "error", err)
 	}
+}
+
+// summaryDialogMessages 过滤工具角色消息，避免工具输出进入长期摘要。
+func summaryDialogMessages(messages []Message) []Message {
+	dialog := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == MessageTool {
+			continue
+		}
+		dialog = append(dialog, message)
+	}
+	return dialog
 }
 
 // validateSummarySource 校验任务来源：消息数量、内容指纹与结束边界必须完全匹配。

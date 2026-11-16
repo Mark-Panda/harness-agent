@@ -10,11 +10,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/einoext"
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
+	"github.com/Mark-Panda/harness-agent/pkg/memory"
 	"github.com/google/uuid"
 )
 
@@ -184,12 +186,17 @@ func (w *ExecutionWorker) generateSupervision(ctx context.Context, run Run, fenc
 		messages = trimRunnerContext(messages, w.config.PromptTokenBudget)
 		return w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, budget, messages, nil)
 	}
-	return planSupervisorDraft(planMessages, complete, w.config.SupervisorMaxWorkers, tools)
+	return planSupervisorDraft(ctx, planMessages, complete, w.config.SupervisorMaxWorkers, tools)
 }
 
 // planSupervisorDraft 生成并校验委派；工具校验失败时把具体原因回传模型修正一次，仍失败才终止。
-func planSupervisorDraft(planMessages []react.Message, complete func([]react.Message) (react.Completion, error), maxWorkers int, tools react.Registry) (SupervisorDraft, react.Completion, error) {
-	completion, err := complete(planMessages)
+func planSupervisorDraft(ctx context.Context, planMessages []react.Message, complete func([]react.Message) (react.Completion, error), maxWorkers int, tools react.Registry) (SupervisorDraft, react.Completion, error) {
+	textComplete := func(messages []react.Message) (react.Completion, error) {
+		return completeText(ctx, messages, func(_ context.Context, current []react.Message) (react.Completion, error) {
+			return complete(current)
+		})
+	}
+	completion, err := textComplete(planMessages)
 	if err != nil {
 		return SupervisorDraft{}, react.Completion{}, err
 	}
@@ -208,7 +215,7 @@ func planSupervisorDraft(planMessages []react.Message, complete func([]react.Mes
 		react.Message{Role: react.RoleUser, Content: "委派校验失败：" + validationErr.Error() +
 			"\n请只输出修正后的 JSON；workers[].tools 必须逐字使用系统消息中的完整工具名。"},
 	)
-	repairCompletion, err := complete(repairMessages)
+	repairCompletion, err := textComplete(repairMessages)
 	if err != nil {
 		return SupervisorDraft{}, react.Completion{}, err
 	}
@@ -306,6 +313,43 @@ func supervisorToolSuggestions(requested string, available map[string]string) st
 	return "；可能是: " + strings.Join(matches, ", ")
 }
 
+// supervisorChildSessionID 为 Supervisor 子会话生成确定性 ID。
+// 同一 Run 的重试必须复用同一条子会话，否则 CreateTasks 失败重试会产生孤儿会话与重复规划费用。
+func supervisorChildSessionID(runID uuid.UUID, workerIndex int) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("run:%s:supervisor:worker:%d:session", runID, workerIndex)))
+}
+
+// ensureSupervisorChildSession 幂等创建子会话；已存在时直接复用，避免重试产生孤儿会话。
+func (w *ExecutionWorker) ensureSupervisorChildSession(ctx context.Context, run Run, sessionID uuid.UUID, workerName string, now time.Time) (Session, bool, error) {
+	existing, err := w.sessions.GetSession(ctx, run.UserID, sessionID)
+	if err == nil {
+		if existing.Status != SessionActive {
+			return Session{}, false, fmt.Errorf("%w: supervisor child session is not active", ErrResourceConflict)
+		}
+		return existing, true, nil
+	}
+	if !errors.Is(err, ErrResourceNotFound) {
+		return Session{}, false, err
+	}
+	childSession, err := w.sessions.CreateSession(ctx, Session{
+		ID: sessionID, UserID: run.UserID, AgentID: run.AgentID,
+		ParentSessionID: &run.SessionID, ParentRunID: &run.ID,
+		Title: "Supervisor/" + workerName, Source: SessionSourceAPI, Status: SessionActive, Version: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}, OutboxEvent{
+		UserID: run.UserID, EventType: "session.created", AggregateType: "session", AggregateID: sessionID.String(),
+		DedupeKey: "session.created:" + sessionID.String(), Payload: map[string]any{"parent_run_id": run.ID.String()},
+	})
+	if err == nil {
+		return childSession, false, nil
+	}
+	if errors.Is(err, ErrResourceConflict) {
+		existing, getErr := w.sessions.GetSession(ctx, run.UserID, sessionID)
+		return existing, true, getErr
+	}
+	return Session{}, false, err
+}
+
 // persistSupervisorTasks 创建子会话、持久化子任务并写入审计事件。
 func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, fence RunFence, tools react.Registry, draft SupervisorDraft) ([]SupervisorTask, error) {
 	// 持久化前再次校验，防止修复后的委派被绕过或注册表在生成期间发生变化。
@@ -319,28 +363,31 @@ func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, f
 		for _, name := range worker.Tools {
 			scope = append(scope, name)
 		}
-		sessionID := uuid.New()
-		childSession, err := w.sessions.CreateSession(ctx, Session{
-			ID: sessionID, UserID: run.UserID, AgentID: run.AgentID,
-			ParentSessionID: &run.SessionID, ParentRunID: &run.ID,
-			Title: "Supervisor/" + worker.Name, Source: SessionSourceAPI, Status: SessionActive, Version: 1,
-			CreatedAt: now, UpdatedAt: now,
-		}, OutboxEvent{
-			UserID: run.UserID, EventType: "session.created", AggregateType: "session", AggregateID: sessionID.String(),
-			DedupeKey: "session.created:" + sessionID.String(), Payload: map[string]any{"parent_run_id": run.ID.String()},
-		})
+		sessionID := supervisorChildSessionID(run.ID, index+1)
+		childSession, reused, err := w.ensureSupervisorChildSession(ctx, run, sessionID, worker.Name, now)
 		if err != nil {
 			return nil, err
 		}
-		taskMessage := Message{
-			ID: deterministicMessageID(childSession.ID, 0), SessionID: childSession.ID, UserID: run.UserID,
-			Role: MessageUser, Content: worker.Task,
+		persistPrompt := true
+		if reused {
+			// 已存在会话只在缺少任务消息时补写；上次重试可能已完成消息写入。
+			page, listErr := w.sessions.ListMessages(ctx, run.UserID, sessionID, 1, "")
+			if listErr != nil {
+				return nil, listErr
+			}
+			persistPrompt = len(page.Items) == 0
 		}
-		if _, err := w.sessions.AppendMessage(ctx, taskMessage, OutboxEvent{
-			UserID: run.UserID, EventType: "message.created", AggregateType: "message", AggregateID: taskMessage.ID.String(),
-			DedupeKey: "message.created:" + taskMessage.ID.String(), Payload: map[string]any{"parent_run_id": run.ID.String()},
-		}); err != nil {
-			return nil, err
+		if persistPrompt {
+			taskMessage := Message{
+				ID: deterministicMessageID(childSession.ID, 0), SessionID: childSession.ID, UserID: run.UserID,
+				Role: MessageUser, Content: worker.Task,
+			}
+			if _, err := w.sessions.AppendMessage(ctx, taskMessage, OutboxEvent{
+				UserID: run.UserID, EventType: "message.created", AggregateType: "message", AggregateID: taskMessage.ID.String(),
+				DedupeKey: "message.created:" + taskMessage.ID.String(), Payload: map[string]any{"parent_run_id": run.ID.String()},
+			}); err != nil {
+				return nil, err
+			}
 		}
 		tasks = append(tasks, SupervisorTask{
 			ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, ChildSessionID: childSession.ID,
@@ -399,7 +446,8 @@ func (w *ExecutionWorker) recoverSupervisorTasks(ctx context.Context, run Run, f
 	return w.supervisor.ListTasks(ctx, run.UserID, run.ID)
 }
 
-// supervisorTaskMaxAttempts 是子任务的最大执行次数：1 次正常执行 + 1 次基础设施失败/审批恢复重试。
+// supervisorTaskMaxAttempts 是子任务的最大执行次数：1 次正常执行 + 1 次基础设施失败重试。
+// 人工审批恢复不计入该预算，由 ReopenTaskForApproval 退回本次领取消耗的次数。
 const supervisorTaskMaxAttempts = 2
 
 // supervisorRunOutcome 是并发执行 Worker 后的状态快照。
@@ -451,6 +499,10 @@ func (w *ExecutionWorker) runPendingSupervisorTasks(ctx context.Context, run Run
 		if _, err := w.supervisor.FinishTask(context.WithoutCancel(taskCtx), run.UserID, run.ID, taskID, status, usage, code, message, w.clock(), fence); err != nil {
 			w.logger.Error("finish supervisor task failed", "run_id", run.ID, "task_id", taskID,
 				"status", string(status), "error", err)
+			if status == SupervisorTaskUnknown {
+				// Unknown 本身要求人工对账；若连该状态都无法落库，两类错误都必须向上可见。
+				err = errors.Join(fmt.Errorf("%w: %v", ErrSupervisorTaskSettlement, err), ErrToolResultPersistence)
+			}
 			recordSettlementError(err)
 			return false
 		}
@@ -467,11 +519,17 @@ schedule:
 		go func() {
 			defer wait.Done()
 			defer func() { <-semaphore }()
-			// 子任务 panic 不得终止进程：标记任务失败由主 Run 汇总，其余任务继续执行。
+			// 子任务 panic 不得终止进程。具备工具权限时无法证明副作用未发生，必须持久化 Unknown 并禁止自动重跑。
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					w.logger.Error("supervisor worker panicked", "run_id", run.ID, "task_id", task.ID,
 						"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+					if len(task.ToolScope) > 0 {
+						if settle(task.ID, SupervisorTaskUnknown, nil, supervisorUnknownToolCode, "子任务异常退出，工具副作用未知，需人工对账") {
+							recordSettlementError(fmt.Errorf("%w: supervisor task %s panicked with tool access", ErrToolResultPersistence, task.ID))
+						}
+						return
+					}
 					settle(task.ID, SupervisorTaskFailed, nil, "worker_panic", "子任务执行异常")
 				}
 			}()
@@ -514,7 +572,7 @@ schedule:
 							approvalError = runErr
 						}
 						approvalMu.Unlock()
-						if _, retryErr := w.supervisor.RetryTask(context.WithoutCancel(taskCtx), run.UserID, run.ID, task.ID, w.clock(), fence); retryErr != nil {
+						if _, retryErr := w.supervisor.ReopenTaskForApproval(context.WithoutCancel(taskCtx), run.UserID, run.ID, task.ID, w.clock(), fence); retryErr != nil {
 							settle(task.ID, SupervisorTaskFailed, usageResult, "approval_required", "子任务触发人工审批，需主 Run 暂停")
 						}
 						w.emitPlanEvent(context.WithoutCancel(taskCtx), run, fence, "supervisor.task.approval_required", map[string]any{
@@ -632,11 +690,27 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 	}
 	// 审批恢复或基础设施重试时，子会话已有此前的助手/工具消息；
 	// 回放它们才能从中断点继续，避免重复执行已完成的工具调用。
-	history, historyErr := w.loadChildHistory(ctx, run, task)
+	// persisted 是子会话中全部助手/工具消息数量，用于生成不会与历史消息冲突的确定性消息 ID；
+	// history 只保留最近窗口，并由调用方按候选模型预算按工具块裁剪。
+	history, persistedMessages, historyErr := w.loadChildHistory(ctx, run, task)
 	if historyErr != nil {
 		return react.Result{}, 0, 0, 0, historyErr
 	}
+	// 子会话没有用户消息边界，memory.Trim 会把全部历史视为当前轮而无法裁剪；
+	// 这里按助手消息及其工具结果成块丢弃最旧历史，保证模型上下文不超过候选窗口。
+	contextBudget := w.promptBudgetFor(candidates, int(model.EstimateToolTokens(registry.List())))
+	if contextBudget > 0 {
+		available := contextBudget - memory.EstimateMessagesTokens(childMessages)
+		if available < 1 {
+			// 系统提示与当前任务本身已超预算时仍要丢弃全部可裁剪历史，避免继续放大上下文。
+			available = 1
+		}
+		history = trimChildHistory(history, available)
+	}
 	childMessages = append(childMessages, history...)
+	// baseIndex 必须基于已持久化消息总数而不是本次回放长度：
+	// 历史窗口可能被截断，按回放长度编号会与既有消息 ID 重合并被幂等写入静默丢弃。
+	messageBaseIndex := 2 + persistedMessages
 	// 子 Worker 的尝试预算随步数配置放大，保证长调查不会在第 6 次模型调用时提前耗尽。
 	childAttempts := w.config.ReactMaxSteps + 10
 	if childAttempts < 6 {
@@ -716,7 +790,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			workerStatus = StepWaitingApproval
 			workerCode = "approval_required"
 			// 先保存助手工具调用消息，审批结果回填子会话后重建上下文即可继续。
-			if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, len(childMessages)); persistErr != nil {
+			if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, messageBaseIndex); persistErr != nil {
 				workerStatus = StepFailed
 				workerCode = "worker_message_persist_failed"
 				w.recordWorkerFailure(ctx, run, fence, task, persistErr, recorded)
@@ -736,7 +810,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 			replayable := truncateUnfinishedToolCalls(recorded)
 			if hasSupervisorToolResult(recorded[len(replayable):]) {
 				err = errors.Join(ErrToolResultPersistence, err)
-			} else if persistErr := w.persistWorkerMessages(ctx, run, fence, task, replayable, len(childMessages)); persistErr != nil {
+			} else if persistErr := w.persistWorkerMessages(ctx, run, fence, task, replayable, messageBaseIndex); persistErr != nil {
 				err = errors.Join(err, persistErr)
 			}
 		}
@@ -744,7 +818,7 @@ func (w *ExecutionWorker) executeWorkerTask(ctx context.Context, run Run, fence 
 		// Eino 会保留失败前已成功模型步的用量，调用方必须把它计入共享预算与任务事实。
 		return result, int64(result.InputTokens), int64(result.OutputTokens), result.EstimatedCost, err
 	}
-	if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, len(childMessages)); persistErr != nil {
+	if persistErr := w.persistWorkerMessages(ctx, run, fence, task, recorded, messageBaseIndex); persistErr != nil {
 		workerStatus = StepFailed
 		workerCode = "worker_message_persist_failed"
 		w.recordWorkerFailure(ctx, run, fence, task, persistErr, recorded)
@@ -779,8 +853,8 @@ func truncateUnfinishedToolCalls(messages []react.Message) []react.Message {
 }
 
 // persistWorkerMessages 把 Worker 产生的助手与工具消息幂等写入子会话。
-// 消息 ID 以任务 ID 与上下文基底序号派生，重试时不会覆盖既有消息。
-func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, fence RunFence, task SupervisorTask, recorded []react.Message, baseIndex int) error {
+// 消息 ID 以任务 ID 与已持久化消息总数派生，重试时不会覆盖既有消息。
+func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, fence RunFence, task SupervisorTask, recorded []react.Message, messageBaseIndex int) error {
 	if w.sessions == nil {
 		return nil
 	}
@@ -797,7 +871,7 @@ func (w *ExecutionWorker) persistWorkerMessages(ctx context.Context, run Run, fe
 			toolCalls = append(toolCalls, map[string]any{"id": call.ID, "name": call.Name, "arguments": string(call.Arguments)})
 		}
 		stored := Message{
-			ID: deterministicMessageID(task.ID, index+baseIndex), SessionID: task.ChildSessionID, UserID: run.UserID,
+			ID: deterministicMessageID(task.ID, index+messageBaseIndex), SessionID: task.ChildSessionID, UserID: run.UserID,
 			Role: MessageRole(string(message.Role)), Content: message.Content, ToolCalls: toolCalls,
 			ToolCallID: message.ToolCallID, ToolName: message.Name, RunID: &run.ID,
 		}
@@ -827,22 +901,44 @@ func supervisorToolResultUncertain(err error) bool {
 	return errors.Is(err, ErrToolResultPersistence) || errors.Is(err, ErrApprovalExecutionUnknown)
 }
 
+// supervisorChildHistoryLimit 是回放到 Worker 上下文中的最大历史消息数。
+// 超过该窗口时仍会继续分页统计历史总数，用于生成稳定的消息 ID 基底。
+const supervisorChildHistoryLimit = 1000
+
 // loadChildHistory 读取子会话中此前的助手与工具消息，供审批恢复或重试时续跑。
-func (w *ExecutionWorker) loadChildHistory(ctx context.Context, run Run, task SupervisorTask) ([]react.Message, error) {
+// 返回的 persistedMessages 是子会话中助手/工具消息的总数（不受上下文窗口截断影响），
+// 调用方必须用它推导新消息 ID，避免截断后与既有消息主键冲突。
+func (w *ExecutionWorker) loadChildHistory(ctx context.Context, run Run, task SupervisorTask) ([]react.Message, int, error) {
 	if w.sessions == nil || task.ChildSessionID == uuid.Nil {
-		return nil, nil
+		return nil, 0, nil
 	}
-	page, err := w.sessions.ListMessages(ctx, run.UserID, task.ChildSessionID, 50, "")
-	if err != nil {
-		return nil, err
-	}
-	history := make([]react.Message, 0, len(page.Items))
-	// ListMessages 按时间倒序返回，这里反转为模型需要的正序。
-	for index := len(page.Items) - 1; index >= 0; index-- {
-		item := page.Items[index]
-		if item.Role != MessageAssistant && item.Role != MessageTool {
-			continue
+	// ListMessages 按时间倒序分页返回；保留最近的窗口，同时统计全部助手/工具消息。
+	retained := make([]Message, 0, supervisorChildHistoryLimit)
+	persisted := 0
+	cursor := ""
+	for {
+		page, err := w.sessions.ListMessages(ctx, run.UserID, task.ChildSessionID, 200, cursor)
+		if err != nil {
+			return nil, 0, err
 		}
+		for _, item := range page.Items {
+			if item.Role != MessageAssistant && item.Role != MessageTool {
+				continue
+			}
+			persisted++
+			if len(retained) < supervisorChildHistoryLimit {
+				retained = append(retained, item)
+			}
+		}
+		if page.NextCursor == "" || page.NextCursor == cursor {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	// retained 是倒序窗口，反转为模型需要的正序。
+	history := make([]react.Message, 0, len(retained))
+	for index := len(retained) - 1; index >= 0; index-- {
+		item := retained[index]
 		message := react.Message{
 			Role: react.Role(item.Role), Content: item.Content, ToolCallID: item.ToolCallID, Name: item.ToolName,
 		}
@@ -854,7 +950,45 @@ func (w *ExecutionWorker) loadChildHistory(ctx context.Context, run Run, task Su
 		}
 		history = append(history, message)
 	}
-	return history, nil
+	return sanitizeChildHistory(history), persisted, nil
+}
+
+// trimChildHistory 按“助手消息 + 紧随其后的工具结果”为块，从最旧块开始丢弃，
+// 保证裁剪后仍以 assistant 开头且不会破坏工具调用协议。budget <= 0 表示不裁剪。
+func trimChildHistory(messages []react.Message, budget int) []react.Message {
+	if budget <= 0 || len(messages) == 0 {
+		return messages
+	}
+	total := memory.EstimateMessagesTokens(messages)
+	start := 0
+	for start < len(messages) && total > budget {
+		end := start + 1
+		if messages[start].Role == react.RoleAssistant {
+			for end < len(messages) && messages[end].Role == react.RoleTool {
+				end++
+			}
+		}
+		total -= memory.EstimateMessagesTokens(messages[start:end])
+		start = end
+	}
+	for start < len(messages) && messages[start].Role != react.RoleAssistant {
+		start++
+	}
+	return messages[start:]
+}
+
+// sanitizeChildHistory 丢弃窗口起点处孤立的工具消息，避免回放时出现
+// "tool 结果没有对应 assistant.tool_calls" 的非法消息序列。
+func sanitizeChildHistory(messages []react.Message) []react.Message {
+	for index, message := range messages {
+		if message.Role == react.RoleAssistant {
+			if index == 0 {
+				return messages
+			}
+			return messages[index:]
+		}
+	}
+	return nil
 }
 
 // recordWorkerFailure 把 Worker 失败前的助手与工具消息写入运行事件，避免失败现场只剩错误码。
@@ -941,22 +1075,33 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 	usage := budget.usage()
 	var builder strings.Builder
 	builder.WriteString("Worker 执行结果：\n")
+	entries := make([]aggregatePromptEntry, 0, len(tasks))
 	for _, task := range tasks {
+		header := fmt.Sprintf("worker_index=%d status=%s worker=%s", task.WorkerIndex, task.Status, aggregateHeaderText(task.WorkerName, 64))
+		if task.ErrorCode != "" {
+			header += " error_code=" + aggregateHeaderText(task.ErrorCode, 64)
+		}
+		body := task.ErrorMessage
 		switch task.Status {
 		case SupervisorTaskCompleted:
 			completed++
-			content := supervisorResultText(task)
-			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=completed：\n%s\n", task.WorkerIndex, task.WorkerName, content))
-		case SupervisorTaskFailed, SupervisorTaskUnknown:
+			body = supervisorResultText(task)
+			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=completed：\n%s\n", task.WorkerIndex, task.WorkerName, body))
+		case SupervisorTaskFailed:
 			failed++
 			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=failed：%s %s\n", task.WorkerIndex, task.WorkerName, task.ErrorCode, task.ErrorMessage))
+		case SupervisorTaskUnknown:
+			failed++
+			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=unknown：%s %s\n", task.WorkerIndex, task.WorkerName, task.ErrorCode, task.ErrorMessage))
 		case SupervisorTaskCancelled:
 			cancelled++
 			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=cancelled：%s\n", task.WorkerIndex, task.WorkerName, task.ErrorMessage))
 		default:
 			failed++
+			body = "结果缺失"
 			builder.WriteString(fmt.Sprintf("\nWorker %d「%s」状态=pending：结果缺失\n", task.WorkerIndex, task.WorkerName))
 		}
+		entries = append(entries, aggregatePromptEntry{Header: header, Body: body})
 	}
 	if len(messages) > 0 {
 		last := messages[len(messages)-1]
@@ -975,9 +1120,21 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 	}
 	partial := failed > 0 || cancelled > 0
 	originalQuery := lastUserMessageContent(messages)
-	aggregatePrompt := "请汇总以下 Worker 结果，明确区分事实、推断与缺失结果：\n" + builder.String()
+	prefix := "请汇总以下 Worker 结果，明确区分事实、推断与缺失结果：\n"
 	if strings.TrimSpace(originalQuery) != "" {
-		aggregatePrompt = "原始用户任务：\n" + originalQuery + "\n\n" + aggregatePrompt
+		prefix = "原始用户任务：\n" + fitTextHeadTailTokens(originalQuery, 256) + "\n\n" + prefix
+	}
+	var minWindow int64
+	for _, candidate := range candidates {
+		window := candidate.Ref.ContextWindowTokens
+		if window > 0 && (minWindow == 0 || window < minWindow) {
+			minWindow = window
+		}
+	}
+	promptBudget := boundedTextAggregateBudget(w.promptBudgetFor(candidates, 0), minWindow, w.config.ReserveOutputTokens, w.config.SafetyMarginTokens)
+	aggregatePrompt, promptErr := boundedAggregateUserPrompt(supervisorAggregatorInstruction, prefix, entries, promptBudget)
+	if promptErr != nil {
+		return react.Result{}, fmt.Errorf("supervisor aggregation failed: %w", promptErr)
 	}
 	aggregateMessages := []react.Message{
 		{Role: react.RoleSystem, Content: supervisorAggregatorInstruction},
@@ -985,8 +1142,10 @@ func (w *ExecutionWorker) aggregateSupervisor(ctx context.Context, run Run, fenc
 	}
 	// Fall back to the completed worker results when no aggregation call fits.
 	content := builder.String()
-	completion, aggregateErr := w.supervisorComplete(ctx, run, fence, candidates, policyVersion, attempts, budget,
-		trimRunnerContext(aggregateMessages, w.config.PromptTokenBudget), nil)
+	completion, aggregateErr := completeText(ctx, aggregateMessages,
+		func(callCtx context.Context, current []react.Message) (react.Completion, error) {
+			return w.supervisorComplete(callCtx, run, fence, candidates, policyVersion, attempts, budget, current, nil)
+		})
 	if err := ctx.Err(); err != nil {
 		return react.Result{}, err
 	}

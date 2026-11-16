@@ -72,7 +72,7 @@ func TestFactLLMExtractorRecordsUsageBeforeOutputValidation(t *testing.T) {
 		response string
 		wantErr  bool
 	}{
-		{name: "empty output", response: `{"choices":[{"message":{"content":" "}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`},
+		{name: "empty output", response: `{"choices":[{"message":{"content":" "}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`, wantErr: true},
 		{name: "tool call", response: `{"choices":[{"message":{"content":"{}","tool_calls":[{"id":"call-1","function":{"name":"unexpected","arguments":"{}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -92,10 +92,10 @@ func TestFactLLMExtractorRecordsUsageBeforeOutputValidation(t *testing.T) {
 			candidates, err := extractor.Extract(context.Background(), userID, uuid.New(), []biz.Message{{ID: uuid.New(), Role: biz.MessageUser, Content: "x"}})
 			if test.wantErr {
 				if !errors.Is(err, biz.ErrFactPermanent) {
-					t.Fatalf("tool call error = %v", err)
+					t.Fatalf("invalid response error = %v", err)
 				}
 			} else if err != nil || len(candidates) != 0 {
-				t.Fatalf("empty output candidates=%#v err=%v", candidates, err)
+				t.Fatalf("valid output candidates=%#v err=%v", candidates, err)
 			}
 		})
 	}
@@ -104,7 +104,7 @@ func TestFactLLMExtractorRecordsUsageBeforeOutputValidation(t *testing.T) {
 // TestFactLLMExtractorErrors 验证空输出、不可重试错误与无模型语义。
 func TestFactLLMExtractorErrors(t *testing.T) {
 	providerID, modelID := uuid.New(), uuid.New()
-	// 空输出表示没有事实，不算失败。
+	// 空输出是异常模型响应，不能静默解释为“没有事实”。
 	emptyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":" "}}]}`)
@@ -112,7 +112,7 @@ func TestFactLLMExtractorErrors(t *testing.T) {
 	defer emptyServer.Close()
 	extractor := newFactExtractor(t, gomock.NewController(t), emptyServer.URL, providerID, modelID)
 	candidates, err := extractor.Extract(context.Background(), uuid.New(), uuid.New(), []biz.Message{{ID: uuid.New(), Role: biz.MessageUser, Content: "x"}})
-	if err != nil || len(candidates) != 0 {
+	if !errors.Is(err, biz.ErrFactPermanent) || len(candidates) != 0 {
 		t.Fatalf("empty output candidates=%#v err=%v", candidates, err)
 	}
 
@@ -145,6 +145,40 @@ func TestFactLLMExtractorErrors(t *testing.T) {
 }
 
 // TestFactLLMExtractorRetryable 验证供应商 5xx 保留可重试错误。
+func TestFactLLMExtractorChecksBudgetBeforeEveryPaidCall(t *testing.T) {
+	providerID, modelID := uuid.New(), uuid.New()
+	userID := uuid.New()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"{\"facts\":[]}"},"finish_reason":"length"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`)
+	}))
+	defer server.Close()
+	ctrl := gomock.NewController(t)
+	extractor := newFactExtractor(t, ctrl, server.URL, providerID, modelID)
+	budgets := mocks.NewMockBudgetChecker(ctrl)
+	budgets.EXPECT().Check(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID)).DoAndReturn(
+		func(context.Context, uuid.UUID, *uuid.UUID, *uuid.UUID) ([]biz.BudgetAlert, error) {
+			if calls != 0 {
+				t.Fatalf("first budget check happened after %d paid calls", calls)
+			}
+			return nil, nil
+		})
+	budgets.EXPECT().Check(gomock.Any(), userID, gomock.Nil(), gomock.Eq(&providerID)).DoAndReturn(
+		func(context.Context, uuid.UUID, *uuid.UUID, *uuid.UUID) ([]biz.BudgetAlert, error) {
+			if calls != 1 {
+				t.Fatalf("continuation budget check happened after %d paid calls", calls)
+			}
+			return nil, biz.ErrBudgetExceeded
+		})
+	extractor.WithBudgetChecker(budgets)
+	_, err := extractor.Extract(context.Background(), userID, uuid.New(), []biz.Message{{ID: uuid.New(), Role: biz.MessageUser, Content: "x"}})
+	if !errors.Is(err, biz.ErrBudgetExceeded) || calls != 1 {
+		t.Fatalf("Extract() calls=%d err=%v; want one paid call and budget rejection", calls, err)
+	}
+}
+
 func TestFactLLMExtractorRetryable(t *testing.T) {
 	providerID, modelID := uuid.New(), uuid.New()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,5 +189,34 @@ func TestFactLLMExtractorRetryable(t *testing.T) {
 	_, err := extractor.Extract(context.Background(), uuid.New(), uuid.New(), []biz.Message{{ID: uuid.New(), Role: biz.MessageUser, Content: "x"}})
 	if err == nil || errors.Is(err, biz.ErrFactPermanent) || errors.Is(err, biz.ErrFactExtractionUnavailable) {
 		t.Fatalf("retryable error = %v", err)
+	}
+}
+
+// TestParseFactModelOutputRejectsForgedCorrection 验证纠正只能绑定当前输入中的真实用户消息。
+func TestParseFactModelOutputRejectsForgedCorrection(t *testing.T) {
+	messages := []biz.Message{
+		{ID: uuid.New(), Role: biz.MessageUser, Content: "真实用户纠正"},
+		{ID: uuid.New(), Role: biz.MessageAssistant, Content: "助手归纳"},
+		{ID: uuid.New(), Role: biz.MessageTool, Content: "工具结果"},
+		{ID: uuid.New(), Role: biz.MessageSystem, Content: "系统指令"},
+	}
+	for _, test := range []struct {
+		name        string
+		sourceIndex string
+	}{
+		{name: "negative index", sourceIndex: "-1"},
+		{name: "missing index", sourceIndex: "0"},
+		{name: "assistant", sourceIndex: "2"},
+		{name: "tool", sourceIndex: "3"},
+		{name: "system", sourceIndex: "4"},
+		{name: "out of range", sourceIndex: "5"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := `{"facts":[{"key":"preference.language","value":"英文","confidence":0.9,"correction":true,"source_index":` + test.sourceIndex + `}]}`
+			candidates, err := biz.ParseFactModelOutput(payload, messages)
+			if !errors.Is(err, biz.ErrFactSourceInvalid) || len(candidates) != 0 {
+				t.Fatalf("candidates=%#v err=%v, want correction source rejection", candidates, err)
+			}
+		})
 	}
 }

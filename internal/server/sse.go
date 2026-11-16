@@ -13,6 +13,7 @@ import (
 const (
 	defaultSSEMaxConnections = 500
 	defaultSSEWriteTimeout   = 10 * time.Second
+	defaultSSEStreamTimeout  = 30 * time.Minute
 )
 
 var (
@@ -22,11 +23,14 @@ var (
 	sseMax atomic.Int64
 	// sseWriteTimeout 单次写入超时（纳秒）。
 	sseWriteTimeout atomic.Int64
+	// sseStreamTimeout 单条事件流最长持续时长（纳秒）。
+	sseStreamTimeout atomic.Int64
 )
 
 func init() {
 	sseMax.Store(defaultSSEMaxConnections)
 	sseWriteTimeout.Store(int64(defaultSSEWriteTimeout))
+	sseStreamTimeout.Store(int64(defaultSSEStreamTimeout))
 }
 
 // SetSSELimits 配置单实例 SSE 容量与写入超时；非正值使用安全默认值。
@@ -39,6 +43,19 @@ func SetSSELimits(maxConnections int, writeTimeout time.Duration) {
 	}
 	sseMax.Store(int64(maxConnections))
 	sseWriteTimeout.Store(int64(writeTimeout))
+}
+
+// SetSSEStreamTimeout 配置单条事件流的最长持续时长；非正值使用安全默认值。
+func SetSSEStreamTimeout(streamTimeout time.Duration) {
+	if streamTimeout <= 0 {
+		streamTimeout = defaultSSEStreamTimeout
+	}
+	sseStreamTimeout.Store(int64(streamTimeout))
+}
+
+// currentSSEStreamTimeout 读取单条事件流的最长持续时长。
+func currentSSEStreamTimeout() time.Duration {
+	return time.Duration(sseStreamTimeout.Load())
 }
 
 // RunEventStream 是 Run 事件的本地通知源；未注入时 SSE 仅依赖兜底轮询。

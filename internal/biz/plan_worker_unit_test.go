@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1199,6 +1200,58 @@ func TestExecutePlanFailedAndRecoverModelStep(t *testing.T) {
 	recovered, err := worker.recoverPlanSteps(context.Background(), plan, RunFence{Owner: "plan-worker", Token: 1})
 	if err != nil || recovered.Steps[0].Status != PlanStepFailed {
 		t.Fatalf("model step recovery = %#v, %v", recovered.Steps[0], err)
+	}
+}
+
+// TestSummarizePlanBoundsTokensWithoutDroppingSteps 验证汇总输入按 Token 构造，
+// 即使单步结果超长，也必须保留所有步骤骨架以及首尾结果标记。
+func TestSummarizePlanBoundsTokensWithoutDroppingSteps(t *testing.T) {
+	const promptBudget = 1400
+	var aggregateRequest struct {
+		Messages []model.ChatMessage `json:"messages"`
+	}
+	worker, _, router, _ := planWorkerFixture(t, func(body string, w http.ResponseWriter) {
+		if strings.Contains(body, "最终汇总器") {
+			if err := json.Unmarshal([]byte(body), &aggregateRequest); err != nil {
+				t.Errorf("decode aggregate request: %v", err)
+			}
+		}
+		writeCompletion(t, w, "最终答案", http.StatusOK)
+	})
+	worker.config.PromptTokenBudget = promptBudget
+	plan := Plan{Goal: "保留全部步骤", Steps: []PlanStep{
+		{StepNo: 1, Title: "first", Status: PlanStepCompleted, Result: map[string]any{"content": "PLAN-HEAD-MARKER" + strings.Repeat("头", 1500)}},
+		{StepNo: 2, Title: "failed", Status: PlanStepFailed, ErrorCode: "step_error_unique", ErrorMessage: "确定失败"},
+		{StepNo: 3, Title: "skipped", Status: PlanStepSkipped, ErrorCode: "dependency_failed"},
+		{StepNo: 4, Title: "middle", Status: PlanStepCompleted, Result: map[string]any{"content": strings.Repeat("中", 1500)}},
+		{StepNo: 5, Title: "unknown", Status: PlanStepUnknown, ErrorCode: "tool_execution_unknown", ErrorMessage: "需要对账"},
+		{StepNo: 6, Title: "last", Status: PlanStepCompleted, Result: map[string]any{"content": strings.Repeat("尾", 1500) + "PLAN-TAIL-MARKER"}},
+	}}
+	content, _, err := worker.summarizePlan(context.Background(), router, plan)
+	if err != nil || content != "最终答案" {
+		t.Fatalf("summarizePlan() = %q, %v", content, err)
+	}
+	if got := model.EstimateRequestTokens(aggregateRequest.Messages, nil); got > promptBudget {
+		t.Fatalf("aggregate prompt tokens = %d, want <= %d", got, promptBudget)
+	}
+	if len(aggregateRequest.Messages) != 2 {
+		t.Fatalf("aggregate messages = %#v", aggregateRequest.Messages)
+	}
+	bundle := aggregateRequest.Messages[1].Content
+	for _, step := range plan.Steps {
+		for _, want := range []string{fmt.Sprintf("step_no=%d", step.StepNo), "status=" + string(step.Status)} {
+			if !strings.Contains(bundle, want) {
+				t.Errorf("aggregate bundle missing %q:\n%s", want, bundle)
+			}
+		}
+		if step.ErrorCode != "" && !strings.Contains(bundle, "error_code="+step.ErrorCode) {
+			t.Errorf("aggregate bundle missing error code %q", step.ErrorCode)
+		}
+	}
+	for _, want := range []string{"PLAN-HEAD-MARKER", "PLAN-TAIL-MARKER", "省略"} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("aggregate bundle missing %q", want)
+		}
 	}
 }
 

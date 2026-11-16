@@ -146,7 +146,7 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 			if len(approvals.approvals) != 1 || callsA.Load() != 0 || callsB.Load() != 0 {
 				t.Fatalf("approval request invoked a tool or was not persisted: %+v", approvals.approvals)
 			}
-			if _, err := approvals.DecideApproval(ctx, run.UserID, approvals.approvals[0].ID, ApprovalDecisionApprove, run.UserID, time.Now()); err != nil {
+			if _, err := approvals.DecideApproval(ctx, run.UserID, run.ID, approvals.approvals[0].ID, ApprovalDecisionApprove, run.UserID, time.Now()); err != nil {
 				t.Fatal(err)
 			}
 

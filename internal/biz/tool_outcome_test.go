@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,51 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
+
+type diagnosticOutcomeTool struct {
+	output json.RawMessage
+}
+
+func (t diagnosticOutcomeTool) Spec() react.ToolSpec {
+	return react.ToolSpec{Name: "script", Parameters: json.RawMessage(`{"type":"object"}`)}
+}
+
+func (t diagnosticOutcomeTool) RiskLevel() string { return "low" }
+
+func (t diagnosticOutcomeTool) Invoke(context.Context, json.RawMessage) (json.RawMessage, error) {
+	return t.output, errors.Join(ErrToolResultPersistence, context.DeadlineExceeded)
+}
+
+func TestObservedToolStoresUnknownDiagnosticsOnlyAsRedactedAudit(t *testing.T) {
+	steps := &fakeStepRepository{}
+	worker := newObservedWorker(steps)
+	worker.config.MaxPayloadBytes = 128
+	diagnostic := json.RawMessage(`{"status":"timeout","token":"sk-live-secret","zzz":"` + strings.Repeat("诊断", 100) + `"}`)
+	wrapper := observedTool{
+		inner: diagnosticOutcomeTool{output: diagnostic}, worker: worker,
+		run: Run{ID: uuid.New(), UserID: uuid.New()},
+	}
+	output, err := wrapper.Invoke(context.Background(), json.RawMessage(`{}`))
+	if output != nil || !errors.Is(err, ErrToolResultPersistence) || !errors.Is(err, react.ErrToolInfrastructure) {
+		t.Fatalf("unknown diagnostic reached model: output=%s error=%v", output, err)
+	}
+	if len(steps.finished) != 1 || steps.finished[0].Status != StepReconciliationRequired ||
+		steps.finished[0].ErrorCode != "tool_execution_unknown" {
+		t.Fatalf("unknown settlement = %+v", steps.finished)
+	}
+	if len(steps.payloads) != 2 {
+		t.Fatalf("payloads = %+v, want input and diagnostic audit", steps.payloads)
+	}
+	payload := steps.payloads[1]
+	if payload.Type != PayloadToolError || payload.CaptureMode != CaptureRedacted ||
+		payload.OriginalSizeBytes != int64(len(diagnostic)) || !payload.Truncated ||
+		int64(len(payload.ContentText)) > worker.config.MaxPayloadBytes {
+		t.Fatalf("diagnostic audit = %+v", payload)
+	}
+	if strings.Contains(payload.ContentText, "sk-live-secret") || !strings.Contains(payload.ContentText, "timeout") {
+		t.Fatalf("diagnostic was not redacted: %q", payload.ContentText)
+	}
+}
 
 func TestObservedMCPToolRequiresReconciliationWhenResponseIsLost(t *testing.T) {
 	steps := &fakeStepRepository{}

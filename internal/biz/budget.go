@@ -117,6 +117,17 @@ type UsageRecorder interface {
 		inputTokens, outputTokens int64, estimatedCost float64, now time.Time) error
 }
 
+// checkBackgroundBudget 在真实付费请求前校验用户与 Provider；存储故障保持失败开放。
+func checkBackgroundBudget(ctx context.Context, checker BudgetChecker, userID, providerID uuid.UUID) error {
+	if checker == nil {
+		return nil
+	}
+	if _, err := checker.Check(ctx, userID, nil, &providerID); err != nil && errors.Is(err, ErrBudgetExceeded) {
+		return err
+	}
+	return nil
+}
+
 // estimateBackgroundCost 按模型单价估算后台调用费用。
 func estimateBackgroundCost(inputPrice, outputPrice float64, inputTokens, outputTokens int) float64 {
 	return float64(inputTokens)*inputPrice/1_000_000 + float64(outputTokens)*outputPrice/1_000_000

@@ -140,7 +140,7 @@ RETURNING *`, now.UTC(), now.UTC(), taskID, userID, parentRunID).Scan(&record).E
 	return toBizSupervisorTask(record)
 }
 
-// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于审批恢复与瞬时故障重试。
+// RetryTask 把仍有重试次数的 running 任务重置为 pending，用于瞬时故障重试。
 func (r *SupervisorTaskRepository) RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	var record supervisorTaskModel
 	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
@@ -157,6 +157,30 @@ RETURNING *`, now.UTC(), taskID, userID, parentRunID).Scan(&record).Error
 	}
 	if record.ID == uuid.Nil {
 		return biz.SupervisorTask{}, fmt.Errorf("%w: task is not retryable", biz.ErrResourceConflict)
+	}
+	return toBizSupervisorTask(record)
+}
+
+// ReopenTaskForApproval 把因人工审批暂停的 running 任务复位为 pending。
+// 审批等待不是执行失败，因此不校验 attempts 上限，并退回本次领取消耗的一次重试次数，
+// 保证同一 Worker 经历多次审批后仍能在批准后继续执行。
+func (r *SupervisorTaskRepository) ReopenTaskForApproval(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
+	var record supervisorTaskModel
+	if err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		if err := lockSupervisorRunFence(tx, userID, parentRunID, fence, now, false); err != nil {
+			return err
+		}
+		return tx.Raw(`
+UPDATE supervisor_tasks
+SET status = 'pending', attempts = GREATEST(attempts - 1, 0), started_at = NULL, finished_at = NULL,
+    error_code = '', error_message = '', updated_at = ?
+WHERE id = ? AND user_id = ? AND parent_run_id = ? AND status = 'running'
+RETURNING *`, now.UTC(), taskID, userID, parentRunID).Scan(&record).Error
+	}); err != nil {
+		return biz.SupervisorTask{}, catalogError("reopen supervisor task for approval", err)
+	}
+	if record.ID == uuid.Nil {
+		return biz.SupervisorTask{}, fmt.Errorf("%w: task is not waiting for approval", biz.ErrResourceConflict)
 	}
 	return toBizSupervisorTask(record)
 }

@@ -105,8 +105,8 @@ type ToolApprovalRepository interface {
 	ListApprovals(ctx context.Context, userID, runID uuid.UUID) ([]ToolApproval, error)
 	// CountPendingApprovals 统计 Run 中仍待决策的审批数量。
 	CountPendingApprovals(ctx context.Context, userID, runID uuid.UUID) (int, error)
-	// DecideApproval 以 CAS 方式把 pending 推进到 approved/denied；重复相同决策幂等返回。
-	DecideApproval(ctx context.Context, userID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error)
+	// DecideApproval 锁定父 Run 后以 CAS 方式把 pending 推进到 approved/denied；重复相同决策幂等返回。
+	DecideApproval(ctx context.Context, userID, runID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error)
 	// ClaimApprovalExecution 仅在 Run 租约及当前 Plan 状态允许时领取审批。
 	ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence RunFence, now time.Time) (ToolApproval, error)
 	// FinishApprovalExecution 以 CAS 方式把 executing 推进到 executed/failed，并保存结果或脱敏错误。

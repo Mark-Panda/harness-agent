@@ -219,23 +219,22 @@ func TestRecentAttachmentTexts(t *testing.T) {
 	}
 }
 
-// requeueRunRepository captures the worker fence and deadline for a paused Run.
+// requeueRunRepository captures the worker fence and update time for a paused Run.
 type requeueRunRepository struct {
 	RunRepository
-	calls    int
-	fence    RunFence
-	deadline *time.Time
-	now      time.Time
-	err      error
+	calls int
+	fence RunFence
+	now   time.Time
+	err   error
 }
 
-func (r *requeueRunRepository) RequeuePausedRun(_ context.Context, _, _ uuid.UUID, fence RunFence, deadline *time.Time, now time.Time) error {
+func (r *requeueRunRepository) RequeuePausedRun(_ context.Context, _, _ uuid.UUID, fence RunFence, now time.Time) error {
 	r.calls++
-	r.fence, r.deadline, r.now = fence, deadline, now
+	r.fence, r.now = fence, now
 	return r.err
 }
 
-// TestRequeuePausedRun 验证暂停 Run 退回 queued 并清空租约、顺延截止时间。
+// TestRequeuePausedRun 验证暂停 Run 只退回 queued 并清空租约，排队补偿由 ClaimRun 统一完成。
 func TestRequeuePausedRun(t *testing.T) {
 	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
 	deadline := now.Add(-time.Minute)
@@ -259,10 +258,6 @@ func TestRequeuePausedRun(t *testing.T) {
 	if repo.calls != 1 || repo.fence != fence {
 		t.Fatalf("transition = %d calls with fence %+v", repo.calls, repo.fence)
 	}
-	// 暂停耗时 2 分钟必须补回截止时间，避免恢复后被误判超时。
-	if repo.deadline == nil || !repo.deadline.Equal(deadline.Add(2*time.Minute)) {
-		t.Fatalf("deadline_at = %v, want %v", repo.deadline, deadline.Add(2*time.Minute))
-	}
 	if !repo.now.Equal(now) {
 		t.Fatalf("updated_at = %v, want %v", repo.now, now)
 	}
@@ -276,8 +271,8 @@ func TestRequeuePausedRun(t *testing.T) {
 	if err := workerNoDeadline.requeuePausedRun(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Status: RunRunning}, fence); err != nil {
 		t.Fatal(err)
 	}
-	if repoNoDeadline.deadline != nil {
-		t.Fatal("deadline_at written for run without deadline")
+	if repoNoDeadline.calls != 1 {
+		t.Fatalf("transition calls without deadline = %d, want 1", repoNoDeadline.calls)
 	}
 
 	// 冲突与仓储错误都只记录日志，不得 panic。

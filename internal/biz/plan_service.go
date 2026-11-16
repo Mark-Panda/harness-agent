@@ -89,8 +89,8 @@ func (s *PlanService) Pause(ctx context.Context, principal Principal, runID uuid
 	})
 }
 
-// extendForPause 把暂停期间从 Run 与 Plan 的截止时间中扣除。
-// 暂停不应消耗执行窗口，否则长时间暂停后的恢复会立即触发 deadline_exceeded。
+// extendForPause 只补偿 Plan 的暂停时长。
+// Run 的 queued 等待由 ClaimRun 补偿，审批等待由 ResumeRun 补偿，不能在这里再次延期。
 func (s *PlanService) extendForPause(ctx context.Context, principal Principal, plan Plan) (Plan, error) {
 	pausedFor := s.clock().Sub(plan.UpdatedAt)
 	if pausedFor <= 0 {
@@ -107,9 +107,6 @@ func (s *PlanService) extendForPause(ctx context.Context, principal Principal, p
 		} else {
 			plan.DeadlineAt = &deadline
 		}
-	}
-	if _, err := s.runs.ExtendDeadline(ctx, principal, plan.RunID, pausedFor); err != nil {
-		return Plan{}, err
 	}
 	return plan, nil
 }

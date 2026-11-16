@@ -79,8 +79,7 @@ func TestRunAPIAuthenticationAndCancellation(t *testing.T) {
 	}
 
 	runID := uuid.New()
-	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunRunning}, nil)
-	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, runID, biz.RunRunning, biz.RunCancelled, gomock.Any()).Return(
+	runRepo.EXPECT().CancelRunAndDenyPendingApprovals(gomock.Any(), principal.UserID, runID, gomock.Any()).Return(
 		biz.Run{ID: runID, Status: biz.RunCancelled}, nil,
 	)
 	recorder = httptest.NewRecorder()

@@ -398,7 +398,7 @@ func (t *skillTool) invokeRead(arguments json.RawMessage) (json.RawMessage, erro
 	})
 }
 
-// invokeRun 执行技能包内脚本；失败与超时都作为结果返回，避免被误判为基础设施故障。
+// invokeRun 执行技能包内脚本；启动后的超时或取消表示副作用未知，必须进入人工对账。
 func (t *skillTool) invokeRun(ctx context.Context, arguments json.RawMessage) (json.RawMessage, error) {
 	var request skillRunArguments
 	if err := json.Unmarshal(arguments, &request); err != nil {
@@ -461,31 +461,51 @@ func (t *skillTool) invokeRun(ctx context.Context, arguments json.RawMessage) (j
 	command := exec.CommandContext(runCtx, interpreter, append([]string{target}, request.Args...)...)
 	command.Dir = skill.Root
 	command.Env = skillExecutionEnv(skill.Root)
+	// Shell 的子进程可能继承输出管道；设置有界等待，避免取消后仍阻塞到孙进程退出。
+	command.WaitDelay = 100 * time.Millisecond
 	output := &truncatingBuffer{limit: t.config.MaxOutputBytes}
 	command.Stdout = output
 	command.Stderr = output
 
 	started := time.Now()
-	runErr := command.Run()
-	duration := time.Since(started)
+	startErr := command.Start()
+	if startErr != nil {
+		// 解释器未启动时不存在脚本副作用，维持确定性的 unavailable 结果。
+		return json.Marshal(map[string]any{
+			"skill": skill.Name, "path": file.Path, "duration_ms": time.Since(started).Milliseconds(),
+			"truncated": output.Truncated(), "output": strings.ToValidUTF8(output.String(), "\uFFFD"),
+			"status": "unavailable", "exit_code": -1, "error": startErr.Error(),
+		})
+	}
+	runErr := command.Wait()
 	result := map[string]any{
-		"skill": skill.Name, "path": file.Path, "duration_ms": duration.Milliseconds(),
+		"skill": skill.Name, "path": file.Path, "duration_ms": time.Since(started).Milliseconds(),
 		"truncated": output.Truncated(), "output": strings.ToValidUTF8(output.String(), "\uFFFD"),
 	}
 	switch {
-	case runCtx.Err() == context.DeadlineExceeded:
-		result["status"] = "timeout"
-		result["exit_code"] = -1
 	case runErr == nil:
 		result["status"] = "ok"
 		result["exit_code"] = 0
+	case runCtx.Err() != nil:
+		status := "cancelled"
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			status = "timeout"
+		}
+		result["status"] = status
+		result["exit_code"] = -1
+		result["error"] = runErr.Error()
+		encoded, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			return nil, errors.Join(ErrToolResultPersistence, runCtx.Err(), marshalErr)
+		}
+		return encoded, fmt.Errorf("%w: skill script %s after start; side effects are unknown: %w",
+			ErrToolResultPersistence, status, runCtx.Err())
 	default:
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
 			result["status"] = "failed"
 			result["exit_code"] = exitErr.ExitCode()
 		} else {
-			// 解释器缺失等环境问题：返回可读结果，由模型调整策略而不是反复重试。
 			result["status"] = "unavailable"
 			result["exit_code"] = -1
 			result["error"] = runErr.Error()

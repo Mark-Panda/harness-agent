@@ -56,6 +56,7 @@ type fakeSummaryRepository struct {
 	latest    int64
 	saved     []biz.SessionSummary
 	expected  []int64
+	events    []biz.OutboxEvent
 	applied   bool
 	saveErr   error
 	invalidAt int
@@ -72,9 +73,10 @@ func (f *fakeSummaryRepository) LatestSummaryVersion(context.Context, uuid.UUID,
 }
 
 // SaveSummary 记录写入参数并返回预置结果。
-func (f *fakeSummaryRepository) SaveSummary(_ context.Context, summary biz.SessionSummary, expected int64, _ biz.OutboxEvent) (biz.SessionSummary, bool, error) {
+func (f *fakeSummaryRepository) SaveSummary(_ context.Context, summary biz.SessionSummary, expected int64, event biz.OutboxEvent) (biz.SessionSummary, bool, error) {
 	f.saved = append(f.saved, summary)
 	f.expected = append(f.expected, expected)
+	f.events = append(f.events, event)
 	return summary, f.applied, f.saveErr
 }
 
@@ -396,6 +398,189 @@ func TestSummaryWorkerCreatesVersion(t *testing.T) {
 	}
 }
 
+// TestSummaryWorkerSavesToolOnlyCheckpoint 验证纯工具来源不调用模型，而是继承正文并推进完整来源边界。
+func TestSummaryWorkerSavesToolOnlyCheckpoint(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		baseVersion int64
+		withActive  bool
+	}{
+		{name: "without active", baseVersion: 0},
+		{name: "with active", baseVersion: 4, withActive: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			start := time.Date(2026, 11, 16, 1, 0, 0, 0, time.UTC)
+			source := []biz.Message{
+				{ID: uuid.New(), Role: biz.MessageTool, Content: "工具结果一", CreatedAt: start},
+				{ID: uuid.New(), Role: biz.MessageTool, Content: "工具结果二", CreatedAt: start.Add(time.Second)},
+			}
+			task := biz.SummaryTask{
+				UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: test.baseVersion,
+				SourceMessageIDs: []uuid.UUID{source[0].ID, source[1].ID},
+				Fingerprint:      biz.SummarySourceFingerprint(source),
+				EndMessageID:     source[1].ID, EndAt: source[1].CreatedAt, CoveredMessageCount: 9,
+			}
+			job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+			worker, jobs, repository, reader, generator := newSummaryWorkerTest(t, ctrl, job)
+			reader.byIDs = source
+			activeID := uuid.New()
+			wantText := ""
+			if test.withActive {
+				repository.active = biz.SessionSummary{ID: activeID, SummaryText: "已有摘要正文", Status: biz.SummaryActive}
+				repository.found = true
+				wantText = repository.active.SummaryText
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if jobs.completed != 1 || jobs.failed != 0 || jobs.renewed != 0 {
+				t.Fatalf("completed=%d failed=%d renewed=%d", jobs.completed, jobs.failed, jobs.renewed)
+			}
+			if generator.calls != 0 {
+				t.Fatalf("generator calls = %d, want 0", generator.calls)
+			}
+			if len(repository.saved) != 1 || len(repository.events) != 1 || len(repository.expected) != 1 {
+				t.Fatalf("saved=%d events=%d expected=%d, want one checkpoint save", len(repository.saved), len(repository.events), len(repository.expected))
+			}
+			if repository.expected[0] != test.baseVersion {
+				t.Fatalf("expected version = %d, want %d", repository.expected[0], test.baseVersion)
+			}
+			saved := repository.saved[0]
+			if saved.Version != test.baseVersion+1 || saved.Status != biz.SummaryActive || saved.SummaryText != wantText {
+				t.Fatalf("saved checkpoint = %#v", saved)
+			}
+			if len(saved.SourceMessageIDs) != 2 || saved.SourceMessageIDs[0] != source[0].ID || saved.SourceMessageIDs[1] != source[1].ID {
+				t.Fatalf("source ids = %#v", saved.SourceMessageIDs)
+			}
+			if saved.SourceStartMessageID == nil || *saved.SourceStartMessageID != source[0].ID ||
+				saved.SourceEndMessageID == nil || *saved.SourceEndMessageID != source[1].ID ||
+				saved.SourceEndAt == nil || !saved.SourceEndAt.Equal(source[1].CreatedAt) {
+				t.Fatalf("source boundary = start:%v end:%v at:%v", saved.SourceStartMessageID, saved.SourceEndMessageID, saved.SourceEndAt)
+			}
+			if saved.SourceFingerprint != task.Fingerprint || saved.CoveredMessageCount != task.CoveredMessageCount {
+				t.Fatalf("source metadata = fingerprint:%q covered:%d", saved.SourceFingerprint, saved.CoveredMessageCount)
+			}
+			if saved.ModelProviderID != nil || saved.ModelID != "" || saved.InputTokens != 0 || saved.OutputTokens != 0 {
+				t.Fatalf("checkpoint must not have generation metadata: %#v", saved)
+			}
+			if test.withActive {
+				if saved.ParentSummaryID == nil || *saved.ParentSummaryID != activeID {
+					t.Fatalf("parent summary = %v, want %s", saved.ParentSummaryID, activeID)
+				}
+			} else if saved.ParentSummaryID != nil {
+				t.Fatalf("parent summary = %v, want nil", saved.ParentSummaryID)
+			}
+			event := repository.events[0]
+			if event.EventType != "memory.summary.created" || event.AggregateID != saved.ID.String() || event.UserID != task.UserID {
+				t.Fatalf("outbox event = %#v", event)
+			}
+			if checkpoint, ok := event.Payload["checkpoint"].(bool); !ok || !checkpoint {
+				t.Fatalf("checkpoint payload = %#v", event.Payload["checkpoint"])
+			}
+			if reason, _ := event.Payload["reason"].(string); reason != "tool_only_source" {
+				t.Fatalf("reason payload = %#v", event.Payload["reason"])
+			}
+			if event.Payload["covered_messages"] != task.CoveredMessageCount || event.Payload["source_messages"] != len(source) {
+				t.Fatalf("outbox payload = %#v", event.Payload)
+			}
+		})
+	}
+}
+
+// TestSummaryWorkerToolOnlyCheckpointSaveResults 验证基础设施错误会重试，来源失效与过期写入则幂等完成。
+func TestSummaryWorkerToolOnlyCheckpointSaveResults(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		saveErr       error
+		wantCompleted int
+		wantFailed    int
+	}{
+		{name: "save error", saveErr: errors.New("database unavailable"), wantFailed: 1},
+		{name: "source invalid save error", saveErr: fmt.Errorf("save: %w", biz.ErrSummarySourceInvalid), wantCompleted: 1},
+		{name: "superseded save", wantCompleted: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			message := biz.Message{ID: uuid.New(), Role: biz.MessageTool, Content: "工具结果", CreatedAt: time.Now().UTC()}
+			task := biz.SummaryTask{
+				UserID: uuid.New(), SessionID: uuid.New(), SourceMessageIDs: []uuid.UUID{message.ID},
+				Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}), EndMessageID: message.ID,
+				EndAt: message.CreatedAt, CoveredMessageCount: 1,
+			}
+			job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+			worker, jobs, repository, reader, generator := newSummaryWorkerTest(t, ctrl, job)
+			reader.byIDs = []biz.Message{message}
+			repository.applied = false
+			repository.saveErr = test.saveErr
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(repository.saved) != 1 || len(repository.events) != 1 {
+				t.Fatalf("saved=%d events=%d, want one save attempt", len(repository.saved), len(repository.events))
+			}
+			if jobs.completed != test.wantCompleted || jobs.failed != test.wantFailed {
+				t.Fatalf("completed=%d failed=%d, want completed=%d failed=%d", jobs.completed, jobs.failed, test.wantCompleted, test.wantFailed)
+			}
+			if generator.calls != 0 || jobs.renewed != 0 {
+				t.Fatalf("generator calls=%d renewed=%d", generator.calls, jobs.renewed)
+			}
+		})
+	}
+}
+
+// TestSummaryPlannerContinuesAfterToolOnlyCheckpoint 验证新对话以 checkpoint 边界为游标继续摘要。
+func TestSummaryPlannerContinuesAfterToolOnlyCheckpoint(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	start := time.Date(2026, 11, 16, 2, 0, 0, 0, time.UTC)
+	toolMessage := biz.Message{ID: uuid.New(), Role: biz.MessageTool, Content: "工具结果", CreatedAt: start}
+	task := biz.SummaryTask{
+		UserID: uuid.New(), SessionID: uuid.New(), SourceMessageIDs: []uuid.UUID{toolMessage.ID},
+		Fingerprint: biz.SummarySourceFingerprint([]biz.Message{toolMessage}), EndMessageID: toolMessage.ID,
+		EndAt: toolMessage.CreatedAt, CoveredMessageCount: 1,
+	}
+	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+	worker, _, repository, reader, _ := newSummaryWorkerTest(t, ctrl, job)
+	reader.byIDs = []biz.Message{toolMessage}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repository.saved) != 1 {
+		t.Fatalf("saved checkpoints = %d, want 1", len(repository.saved))
+	}
+	checkpoint := repository.saved[0]
+	repository.active, repository.found, repository.latest = checkpoint, true, checkpoint.Version
+
+	newDialog := []biz.Message{
+		{ID: uuid.New(), Role: biz.MessageUser, Content: "checkpoint 后的问题", CreatedAt: start.Add(time.Second)},
+		{ID: uuid.New(), Role: biz.MessageAssistant, Content: "checkpoint 后的回答", CreatedAt: start.Add(2 * time.Second)},
+		{ID: uuid.New(), Role: biz.MessageUser, Content: "保留在最近窗口的问题", CreatedAt: start.Add(3 * time.Second)},
+	}
+	reader.recent = []biz.Message{newDialog[2], newDialog[1], newDialog[0]}
+	reader.after = newDialog[:2]
+	queue := &fakeSummaryQueue{}
+	planner, err := biz.NewSummaryPlanner(reader, repository, queue, biz.SummaryPlanConfig{TriggerMessages: 2, KeepRecent: 1}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := planner.MaybeEnqueue(context.Background(), task.UserID, task.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if len(queue.tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1", len(queue.tasks))
+	}
+	next := queue.tasks[0]
+	if next.BaseVersion != checkpoint.Version || next.CoveredMessageCount != checkpoint.CoveredMessageCount+2 {
+		t.Fatalf("next task = %#v", next)
+	}
+	if len(next.SourceMessageIDs) != 2 || next.SourceMessageIDs[0] != newDialog[0].ID || next.SourceMessageIDs[1] != newDialog[1].ID {
+		t.Fatalf("next source ids = %#v", next.SourceMessageIDs)
+	}
+	if next.EndMessageID != newDialog[1].ID || !next.EndAt.Equal(newDialog[1].CreatedAt) {
+		t.Fatalf("next end boundary = %s at %s", next.EndMessageID, next.EndAt)
+	}
+}
+
 // TestSummaryWorkerIgnoresCanceledRenewAfterGeneration 验证主流程结束时的主动取消不会被误判为丢租约。
 func TestSummaryWorkerIgnoresCanceledRenewAfterGeneration(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -478,33 +663,56 @@ func TestSummaryWorkerSkipsStaleAndInvalidSource(t *testing.T) {
 	}
 }
 
-// TestSummaryWorkerClassifiesErrors 验证不可重试错误完成、可重试错误退避失败。
-func TestSummaryWorkerClassifiesErrors(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	message := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Now().UTC()}
-	task := biz.SummaryTask{
-		UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: 0,
-		SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
-		EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
-	}
-	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
-	worker, jobs, _, reader, generator := newSummaryWorkerTest(t, ctrl, job)
-	reader.byIDs = []biz.Message{message}
-	generator.err = biz.ErrSummaryModelUnavailable
-	if _, err := worker.ProcessOne(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if jobs.completed != 1 || jobs.failed != 0 {
-		t.Fatalf("unavailable: completed=%d failed=%d", jobs.completed, jobs.failed)
-	}
-
-	jobs.claimed = false
-	generator.err = errors.New("provider timeout")
-	if _, err := worker.ProcessOne(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if jobs.failed != 1 || jobs.completed != 1 {
-		t.Fatalf("retryable: completed=%d failed=%d", jobs.completed, jobs.failed)
+// TestSummaryWorkerClassifiesGenerationFailures 验证永久错误/预算耗尽直接完成，瞬时失败进入退避重试。
+func TestSummaryWorkerClassifiesGenerationFailures(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		generateErr error
+		text        string
+		wantRetry   bool
+	}{
+		{name: "model unavailable", generateErr: biz.ErrSummaryModelUnavailable},
+		{name: "permanent rejection", generateErr: biz.ErrSummaryPermanent},
+		{name: "budget exceeded", generateErr: biz.ErrBudgetExceeded},
+		{name: "provider timeout", generateErr: errors.New("provider timeout"), wantRetry: true},
+		{name: "empty response", text: " ", wantRetry: true},
+		{name: "oversized response", text: "too long", wantRetry: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			message := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Now().UTC()}
+			task := biz.SummaryTask{
+				UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: 0,
+				SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+				EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
+			}
+			job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+			worker, jobs, repository, reader, generator := newSummaryWorkerTest(t, ctrl, job)
+			reader.byIDs = []biz.Message{message}
+			repository.active = biz.SessionSummary{SummaryText: "旧摘要", Status: biz.SummaryActive}
+			repository.found = true
+			generator.err = test.generateErr
+			if test.text != "" {
+				generator.generation.Text = test.text
+			}
+			if test.name == "oversized response" {
+				// 默认上限为 64 KiB，构造超出上限但不含敏感内容的响应。
+				generator.generation.Text = fmt.Sprintf("%070000d", 0)
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantRetry {
+				if jobs.completed != 0 || jobs.failed != 1 || len(repository.saved) != 0 {
+					t.Fatalf("completed=%d failed=%d saved=%d", jobs.completed, jobs.failed, len(repository.saved))
+				}
+			} else if jobs.completed != 1 || jobs.failed != 0 || len(repository.saved) != 0 {
+				t.Fatalf("unretryable failure: completed=%d failed=%d saved=%d", jobs.completed, jobs.failed, len(repository.saved))
+			}
+			if repository.active.SummaryText != "旧摘要" {
+				t.Fatalf("active summary changed: %q", repository.active.SummaryText)
+			}
+		})
 	}
 }
 

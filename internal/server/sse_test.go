@@ -67,6 +67,19 @@ func TestSSEConnectionCapacityAndRelease(t *testing.T) {
 	second()
 }
 
+// TestSSEStreamTimeoutConfigurable 验证事件流时长可配置，非法值回退默认值。
+func TestSSEStreamTimeoutConfigurable(t *testing.T) {
+	t.Cleanup(func() { SetSSEStreamTimeout(defaultSSEStreamTimeout) })
+	SetSSEStreamTimeout(90 * time.Second)
+	if got := currentSSEStreamTimeout(); got != 90*time.Second {
+		t.Fatalf("stream timeout = %v, want 90s", got)
+	}
+	SetSSEStreamTimeout(0)
+	if got := currentSSEStreamTimeout(); got != defaultSSEStreamTimeout {
+		t.Fatalf("stream timeout after reset = %v, want default", got)
+	}
+}
+
 // TestWriteSSEDetectsSlowConsumer 验证写入失败时返回 false，调用方停止推送。
 func TestWriteSSEDetectsSlowConsumer(t *testing.T) {
 	if writeSSE(failingWriter{header: http.Header{}}, 1, "run.completed", map[string]any{"status": "ok"}) {

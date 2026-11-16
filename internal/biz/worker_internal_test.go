@@ -649,10 +649,10 @@ func (f *fakeApprovalRepository) CountPendingApprovals(_ context.Context, userID
 }
 
 // DecideApproval 以 pending 为前置条件推进决策状态。
-func (f *fakeApprovalRepository) DecideApproval(_ context.Context, userID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error) {
+func (f *fakeApprovalRepository) DecideApproval(_ context.Context, userID, runID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error) {
 	for index := range f.approvals {
 		approval := &f.approvals[index]
-		if approval.ID != approvalID || approval.UserID != userID {
+		if approval.ID != approvalID || approval.UserID != userID || approval.RunID != runID {
 			continue
 		}
 		target := ApprovalApproved

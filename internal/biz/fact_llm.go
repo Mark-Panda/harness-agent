@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/model"
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/memory"
 	"github.com/google/uuid"
 )
@@ -43,6 +43,7 @@ type FactLLMExtractor struct {
 	runs      RunRepository
 	providers ProviderCredentialRepository
 	opener    CredentialOpener
+	budgets   BudgetChecker
 	usage     UsageRecorder
 	config    FactLLMConfig
 }
@@ -53,6 +54,12 @@ func NewFactLLMExtractor(runs RunRepository, providers ProviderCredentialReposit
 		return nil, invalid("fact extractor requires runs, providers and credential opener")
 	}
 	return &FactLLMExtractor{runs: runs, providers: providers, opener: opener, config: config.normalize()}, nil
+}
+
+// WithBudgetChecker 注入后台事实提取预算门禁。
+func (e *FactLLMExtractor) WithBudgetChecker(checker BudgetChecker) *FactLLMExtractor {
+	e.budgets = checker
+	return e
 }
 
 // WithUsageRecorder 注入后台事实提取用量记录器。
@@ -85,42 +92,44 @@ func (e *FactLLMExtractor) Extract(ctx context.Context, userID, sessionID uuid.U
 	if resolved.maxOutput > 0 && maxOutput > resolved.maxOutput {
 		maxOutput = resolved.maxOutput
 	}
-	response, err := client.Chat(ctx, model.ChatRequest{
+	request := model.ChatRequest{
 		Model: model.ModelRef{
 			ProviderID: resolved.providerID.String(), ModelID: resolved.modelID,
 			RemoteModelName: resolved.remoteModelName, ContextWindowTokens: resolved.contextWindow,
 			MaxOutputTokens: resolved.maxOutput,
 		},
-		Messages: []model.ChatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
 		Temperature: e.config.Temperature, MaxOutputTokens: maxOutput,
-	})
-	// 响应一旦返回就先记录已发生的用量，空输出、tool call、解析失败及
-	// 携带 usage 的 Provider 错误均不能绕过计量。无 usage 的传输/状态错误保持原口径。
-	if e.usage != nil && (response.InputTokens > 0 || response.OutputTokens > 0) {
-		providerID := resolved.providerID
-		cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
-		if err := e.usage.RecordUsage(context.WithoutCancel(ctx), userID, nil, &providerID, int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); err != nil {
-			// 用量记录失败不阻断事实提取结果。
-			_ = err
-		}
 	}
+	completion, err := completeText(ctx, []react.Message{
+		{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user},
+	}, func(callCtx context.Context, messages []react.Message) (react.Completion, error) {
+		if err := checkBackgroundBudget(callCtx, e.budgets, userID, resolved.providerID); err != nil {
+			return react.Completion{}, err
+		}
+		request.Messages = chatMessagesFromReact(messages)
+		response, chatErr := client.Chat(callCtx, request)
+		// 每次真实请求（包括续写和携带 usage 的错误响应）都立即计量。
+		if e.usage != nil && (response.InputTokens > 0 || response.OutputTokens > 0) {
+			providerID := resolved.providerID
+			cost := estimateBackgroundCost(resolved.inputPrice, resolved.outputPrice, response.InputTokens, response.OutputTokens)
+			if recordErr := e.usage.RecordUsage(context.WithoutCancel(callCtx), userID, nil, &providerID,
+				int64(response.InputTokens), int64(response.OutputTokens), cost, time.Now().UTC()); recordErr != nil {
+				_ = recordErr
+			}
+		}
+		return completionFromChatResponse(response), chatErr
+	})
 	if err != nil {
-		if errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) ||
+		if errors.Is(err, ErrBudgetExceeded) {
+			return nil, err
+		}
+		if isCompletionGuardError(err) || errors.Is(err, model.ErrPermanent) || errors.Is(err, model.ErrAuthentication) ||
 			errors.Is(err, model.ErrCapability) || errors.Is(err, model.ErrContextExceeded) {
-			return nil, fmt.Errorf("%w: %v", ErrFactPermanent, err)
+			return nil, fmt.Errorf("%w: %w", ErrFactPermanent, err)
 		}
 		return nil, err
 	}
-	if strings.TrimSpace(response.Content) == "" {
-		return nil, nil
-	}
-	if len(response.ToolCalls) > 0 {
-		return nil, fmt.Errorf("%w: provider returned tool calls for fact extraction", ErrFactPermanent)
-	}
-	candidates, err := ParseFactModelOutput(response.Content, messages)
+	candidates, err := ParseFactModelOutput(completion.Content, messages)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFactPermanent, err)
 	}

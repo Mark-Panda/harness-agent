@@ -237,3 +237,76 @@ func TestPlanRepositoryResumePaths(t *testing.T) {
 		t.Fatalf("illegal transition error = %v", err)
 	}
 }
+
+// TestPlanRepositoryManualRevisionDoesNotExtendRun 验证人工暂停只延长 Plan，Run 的 queued 等待仍由 ClaimRun 统一补偿。
+func TestPlanRepositoryManualRevisionDoesNotExtendRun(t *testing.T) {
+	if os.Getenv("REQUIRE_DATABASE") != "true" {
+		t.Skip("requires PostgreSQL")
+	}
+	adminDB := openIntegrationDatabase(t, integrationDSN("TEST_ADMIN_DATABASE_URL", "postgres://harness:harness@localhost:5432/harness?sslmode=disable"))
+	appDB := openIntegrationDatabase(t, integrationDSN("TEST_APP_DATABASE_URL", "postgres://harness_app:harness@localhost:5432/harness?sslmode=disable"))
+	authDB := openIntegrationDatabase(t, integrationDSN("TEST_AUTH_DATABASE_URL", "postgres://harness_auth:harness@localhost:5432/harness?sslmode=disable"))
+	ctx := context.Background()
+	user, err := NewUserRepository(appDB, authDB).CreateUser(ctx, biz.User{
+		Username: "plan_revision_deadline_" + strings.ReplaceAll(uuid.NewString(), "-", ""), PasswordHash: "hash",
+		Role: biz.RoleUser, Status: biz.UserStatusActive, CredentialVersion: 1,
+	}, testOutboxEvent(uuid.Nil, "test.register"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = adminDB.Exec("DELETE FROM users WHERE id = ?", user.ID).Error })
+
+	session, err := NewSessionRepository(appDB).CreateSession(ctx, biz.Session{
+		ID: uuid.New(), UserID: user.ID, Title: "manual revision deadline", Source: biz.SessionSourceWeb,
+		Status: biz.SessionActive, Version: 1,
+	}, testOutboxEvent(user.ID, "test.session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := NewRunRepository(appDB)
+	run, err := runs.CreateRun(ctx, biz.Run{
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan, Status: biz.RunQueued,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := NewPlanRepository(appDB)
+	planID := uuid.New()
+	plan, err := repo.CreatePlan(ctx, user.ID, biz.Plan{
+		ID: planID, UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 1,
+		Status: biz.PlanPaused, Goal: "old goal", MaxSteps: 10, Revision: 7,
+	}, testOutboxEvent(user.ID, "plan.created"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	runDeadline := base.Add(30 * time.Minute)
+	planDeadline := base.Add(20 * time.Minute)
+	if err := adminDB.Exec("UPDATE agent_runs SET deadline_at = ?, updated_at = ? WHERE id = ?", runDeadline, base, run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := adminDB.Exec("UPDATE plans SET deadline_at = ?, updated_at = ? WHERE id = ?", planDeadline, base, plan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := repo.ReplacePlan(ctx, user.ID, biz.Plan{
+		ID: uuid.New(), UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 2,
+		ParentPlanID: &planID, Status: biz.PlanExecuting, Goal: "revised goal", MaxSteps: 10,
+	}, plan.Revision, biz.PlanFence{}, testOutboxEvent(user.ID, "plan.revised"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.DeadlineAt == nil || !replacement.DeadlineAt.After(planDeadline) {
+		t.Fatalf("manual revision did not extend only the Plan deadline: %#v", replacement.DeadlineAt)
+	}
+	currentRun, err := runs.GetRun(ctx, user.ID, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentRun.DeadlineAt == nil || !currentRun.DeadlineAt.Equal(runDeadline) {
+		t.Fatalf("Run deadline changed by manual revision: got %v, want %v", currentRun.DeadlineAt, runDeadline)
+	}
+	if !currentRun.UpdatedAt.Equal(base) {
+		t.Fatalf("Run updated_at changed by manual revision: got %v, want %v", currentRun.UpdatedAt, base)
+	}
+}

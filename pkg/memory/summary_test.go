@@ -3,6 +3,7 @@ package memory
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 )
@@ -121,5 +122,110 @@ func TestTrimKeepsLeadingSystemMessages(t *testing.T) {
 	result := Trim(messages, 20)
 	if len(result.Messages) < 2 || result.Messages[0].Content != messages[0].Content || result.Messages[1].Content != messages[1].Content {
 		t.Fatalf("leading system messages were dropped: %#v", result.Messages)
+	}
+}
+
+// TestSplitSummaryMessagesByTokensPreservesContentAndBudget 验证完整 Prompt 受 Token 限制，
+// 超大中文消息按 UTF-8 边界拆分且不丢失、不截断来源内容。
+func TestSplitSummaryMessagesByTokensPreservesContentAndBudget(t *testing.T) {
+	messages := []SummaryMessage{
+		{Role: "user", Speaker: "ou_1", Content: "开头-" + strings.Repeat("中文内容", 80)},
+		{Role: "assistant", Content: strings.Repeat("ascii-", 40)},
+		{Role: "tool", Content: "结尾-" + strings.Repeat("结果", 50)},
+	}
+	const budget = 360
+	chunks, err := SplitSummaryMessagesByTokens(messages, 24, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 3 {
+		t.Fatalf("chunks = %d, want token-aware splitting", len(chunks))
+	}
+	var reconstructed strings.Builder
+	for _, message := range messages {
+		reconstructed.WriteString(message.Content)
+	}
+	var actual strings.Builder
+	for _, chunk := range chunks {
+		system, user, err := BuildSummaryPrompt("", chunk, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tokens := EstimateMessagesTokens([]react.Message{{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user}}); tokens > budget {
+			t.Fatalf("prompt tokens = %d, budget = %d", tokens, budget)
+		}
+		if strings.Contains(user, "[已截断]") {
+			t.Fatal("token-aware splitting silently truncated a message")
+		}
+		for _, message := range chunk {
+			if !utf8.ValidString(message.Content) {
+				t.Fatal("split produced invalid UTF-8")
+			}
+			actual.WriteString(message.Content)
+		}
+	}
+	if actual.String() != reconstructed.String() {
+		t.Fatal("message content was dropped or reordered")
+	}
+}
+
+// TestBuildSummaryMergeBatchesBoundedLosslessAndReducing 验证超长 previous 与 partial
+// 全部进入有序归并树，每批满足完整 Prompt 预算且每轮严格减少条目。
+func TestBuildSummaryMergeBatchesBoundedLosslessAndReducing(t *testing.T) {
+	previous := "旧摘要-" + strings.Repeat("历史", 100)
+	partials := []string{"片段A-" + strings.Repeat("甲", 120), "片段B-短", "片段C-" + strings.Repeat("乙", 100)}
+	original := append([]string{previous}, partials...)
+	const budget = 300
+	assertBatches := func(items []string) [][]string {
+		t.Helper()
+		batches, err := BuildSummaryMergeBatches("", items, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, batch := range batches {
+			system, user, err := BuildMergeSummaryPrompt("", batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tokens := EstimateMessagesTokens([]react.Message{{Role: react.RoleSystem, Content: system}, {Role: react.RoleUser, Content: user}}); tokens > budget {
+				t.Fatalf("merge prompt tokens = %d, budget = %d", tokens, budget)
+			}
+		}
+		return batches
+	}
+
+	batches := assertBatches(original)
+	var flattened string
+	for _, batch := range batches {
+		for _, item := range batch {
+			flattened += item
+		}
+	}
+	if want := strings.Join(original, ""); flattened != want {
+		t.Fatal("merge tree dropped or reordered previous/partial content")
+	}
+
+	items := original
+	for rounds := 0; len(items) > 1; rounds++ {
+		if rounds > 20 {
+			t.Fatal("merge tree failed to reduce")
+		}
+		batches = assertBatches(items)
+		next := make([]string, 0, len(batches))
+		for _, batch := range batches {
+			if len(batch) == 1 {
+				next = append(next, batch[0])
+			} else {
+				next = append(next, "已归并")
+			}
+		}
+		// 首轮可无损展开 oversized item；展开后的每一轮必须严格减少条目。
+		if rounds > 0 && len(next) >= len(items) {
+			t.Fatalf("round did not reduce: before=%d after=%d", len(items), len(next))
+		}
+		items = next
+	}
+	if _, err := BuildSummaryMergeBatches("", []string{"a", "b"}, 1); err == nil {
+		t.Fatal("unusable token budget must be rejected")
 	}
 }

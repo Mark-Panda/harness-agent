@@ -159,7 +159,29 @@ func (r *FactRepository) saveFact(ctx context.Context, fact biz.MemoryFact, expe
 			}
 		}
 		if source != nil {
-			if _, err := loadFactSourceMessages(tx, *source); err != nil {
+			messages, err := loadFactSourceMessages(tx, *source)
+			if err != nil {
+				return err
+			}
+			if err := validateFactCorrectionSource(fact, messages, source.SpeakerOpenID); err != nil {
+				return err
+			}
+		} else if fact.Corrected || fact.SourceKind == biz.FactSourceCorrection {
+			if fact.SessionID == nil || *fact.SessionID == uuid.Nil || fact.SourceMessageID == nil || *fact.SourceMessageID == uuid.Nil ||
+				!fact.Corrected || fact.SourceKind != biz.FactSourceCorrection {
+				return biz.ErrFactSourceInvalid
+			}
+			var records []messageModel
+			if err := tx.Where("user_id = ? AND session_id = ? AND id = ? AND deleted_at IS NULL",
+				fact.UserID, *fact.SessionID, *fact.SourceMessageID).
+				Where(memoryClearedFilter, fact.UserID).Limit(1).Find(&records).Error; err != nil {
+				return err
+			}
+			messages, err := toBizMessages(records)
+			if err != nil {
+				return err
+			}
+			if err := validateFactCorrectionSource(fact, messages, ""); err != nil {
 				return err
 			}
 		}
@@ -261,6 +283,24 @@ func (r *FactRepository) DeleteFact(ctx context.Context, userID uuid.UUID, key s
 		return catalogError("delete fact", result)
 	}
 	return nil
+}
+
+func validateFactCorrectionSource(fact biz.MemoryFact, messages []biz.Message, speakerOpenID string) error {
+	marked := fact.Corrected || fact.SourceKind == biz.FactSourceCorrection
+	if !marked {
+		return nil
+	}
+	if !fact.Corrected || fact.SourceKind != biz.FactSourceCorrection || fact.SessionID == nil || *fact.SessionID == uuid.Nil ||
+		fact.SourceMessageID == nil || *fact.SourceMessageID == uuid.Nil {
+		return biz.ErrFactSourceInvalid
+	}
+	for _, message := range messages {
+		if message.ID == *fact.SourceMessageID && message.SessionID == *fact.SessionID && message.Role == biz.MessageUser &&
+			(speakerOpenID == "" || message.SpeakerOpenID == speakerOpenID) {
+			return nil
+		}
+	}
+	return biz.ErrFactSourceInvalid
 }
 
 // toBizFact 把事实行转换为领域事实。

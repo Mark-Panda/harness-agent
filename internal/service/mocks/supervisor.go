@@ -102,6 +102,21 @@ func (mr *MockSupervisorTaskRepositoryMockRecorder) ListTasks(ctx, userID, paren
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTasks", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).ListTasks), ctx, userID, parentRunID)
 }
 
+// ReopenTaskForApproval mocks base method.
+func (m *MockSupervisorTaskRepository) ReopenTaskForApproval(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReopenTaskForApproval", ctx, userID, parentRunID, taskID, now, fence)
+	ret0, _ := ret[0].(biz.SupervisorTask)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ReopenTaskForApproval indicates an expected call of ReopenTaskForApproval.
+func (mr *MockSupervisorTaskRepositoryMockRecorder) ReopenTaskForApproval(ctx, userID, parentRunID, taskID, now, fence any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReopenTaskForApproval", reflect.TypeOf((*MockSupervisorTaskRepository)(nil).ReopenTaskForApproval), ctx, userID, parentRunID, taskID, now, fence)
+}
+
 // RetryTask mocks base method.
 func (m *MockSupervisorTaskRepository) RetryTask(ctx context.Context, userID, parentRunID, taskID uuid.UUID, now time.Time, fence biz.RunFence) (biz.SupervisorTask, error) {
 	m.ctrl.T.Helper()

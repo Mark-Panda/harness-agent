@@ -466,6 +466,7 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
 
     const consume = async () => {
       for (let attempt = 0; attempt < 8 && !cancelled; attempt += 1) {
+        let truncated = false;
         try {
           await streamRunEvents(runID, {
             signal: controller.signal,
@@ -476,6 +477,19 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
             },
             onEvent: (event) => {
               if (cancelled) return;
+              // 服务端按连接时长主动截断事件流：这不是错误，也不能按序号去重丢弃。
+              // 记录提示后立即用最后游标续订，且不消耗重连次数。
+              if (event.event === "stream.truncated") {
+                truncated = true;
+                setStreamError(null);
+                pushTimeline({
+                  key: `${event.seq}:${event.event}:${Date.now()}`,
+                  label: "事件流达到服务端时长上限，正在自动续订",
+                  detail: `已接收至序号 ${String(event.data?.last_seq ?? "?")}`,
+                  tone: "warning",
+                });
+                return;
+              }
               if (event.seq > 0) {
                 if (event.seq <= streamCursor.current.seq) return;
                 streamCursor.current.seq = event.seq;
@@ -507,6 +521,13 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
           }
         } catch (statusFailure) {
           setStreamError(describeError(statusFailure));
+        }
+        if (truncated) {
+          // 主动截断不是失败：重置重试预算，短暂等待后用最后游标继续订阅。
+          setConnection("reconnecting");
+          attempt = -1;
+          await sleep(1000, controller.signal);
+          continue;
         }
         setConnection("reconnecting");
         await sleep(Math.min(1000 * (attempt + 1), 4000), controller.signal);

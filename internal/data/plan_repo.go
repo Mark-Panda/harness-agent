@@ -282,9 +282,7 @@ func supersedePlan(tx *gorm.DB, userID uuid.UUID, next *planModel, replacement p
 		return biz.Plan{}, err
 	}
 	if manual {
-		if err := extendRevisedPlanDeadline(tx, userID, &parent, &run, now); err != nil {
-			return biz.Plan{}, err
-		}
+		extendRevisedPlanDeadline(&parent, now)
 		next.DeadlineAt = parent.DeadlineAt
 	} else if _, err := lockRunningRunLease(tx, userID, next.RunID, biz.RunFence(replacement.fence), now); err != nil {
 		return biz.Plan{}, planReplacementConflict(err)
@@ -341,21 +339,12 @@ SELECT EXISTS (
 	return nil
 }
 
-func extendRevisedPlanDeadline(tx *gorm.DB, userID uuid.UUID, parent *planModel, run *runModel, now time.Time) error {
+func extendRevisedPlanDeadline(parent *planModel, now time.Time) {
 	pausedFor := now.Sub(parent.UpdatedAt)
-	if pausedFor <= 0 {
-		return nil
-	}
-	if parent.DeadlineAt != nil {
+	if pausedFor > 0 && parent.DeadlineAt != nil {
 		deadline := parent.DeadlineAt.Add(pausedFor)
 		parent.DeadlineAt = &deadline
 	}
-	base := now
-	if run.DeadlineAt != nil {
-		base = *run.DeadlineAt
-	}
-	return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", parent.RunID, userID).
-		Updates(map[string]any{"deadline_at": base.Add(pausedFor), "updated_at": now}).Error
 }
 
 // GetPlanByRun 读取 Run 的最新版本计划及步骤。

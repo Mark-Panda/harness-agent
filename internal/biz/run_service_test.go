@@ -79,20 +79,20 @@ func TestRunServiceCancelAndEvents(t *testing.T) {
 	service, _ := biz.NewRunService(runRepo, sessionRepo)
 	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
 	runID := uuid.New()
-	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, UserID: principal.UserID, Status: biz.RunQueued}, nil)
-	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, runID, biz.RunQueued, biz.RunCancelled, gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, _, _ biz.RunStatus, fields map[string]any) (biz.Run, error) {
-			if _, exists := fields["finished_at"]; !exists {
-				t.Fatal("cancellation must set finished_at")
+	runRepo.EXPECT().CancelRunAndDenyPendingApprovals(gomock.Any(), principal.UserID, runID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, _ uuid.UUID, now time.Time) (biz.Run, error) {
+			if now.IsZero() {
+				t.Fatal("cancellation must provide a finish time")
 			}
-			return biz.Run{ID: runID, Status: biz.RunCancelled}, nil
+			return biz.Run{ID: runID, Status: biz.RunCancelled, FinishedAt: &now}, nil
 		},
 	)
 	cancelled, err := service.Cancel(context.Background(), principal, runID)
 	if err != nil || cancelled.Status != biz.RunCancelled {
 		t.Fatalf("Cancel() = %#v, %v", cancelled, err)
 	}
-	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, Status: biz.RunCompleted}, nil)
+	runRepo.EXPECT().CancelRunAndDenyPendingApprovals(gomock.Any(), principal.UserID, runID, gomock.Any()).
+		Return(biz.Run{}, biz.ErrResourceConflict)
 	if _, err := service.Cancel(context.Background(), principal, runID); !errors.Is(err, biz.ErrResourceConflict) {
 		t.Fatalf("terminal cancel error = %v", err)
 	}
@@ -194,9 +194,7 @@ func TestRunServiceAdoptsPausedPlanOnNewRun(t *testing.T) {
 			return biz.Page[biz.Run]{Items: []biz.Run{{ID: createdRun.ID, Mode: biz.AgentModePlan}, {ID: oldRunID, Mode: biz.AgentModePlan}}}, nil
 		},
 	)
-	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, oldRunID).
-		Return(biz.Run{ID: oldRunID, UserID: principal.UserID, Status: biz.RunRunning}, nil)
-	runRepo.EXPECT().TransitionRun(gomock.Any(), principal.UserID, oldRunID, biz.RunRunning, biz.RunCancelled, gomock.Any()).
+	runRepo.EXPECT().CancelRunAndDenyPendingApprovals(gomock.Any(), principal.UserID, oldRunID, gomock.Any()).
 		Return(biz.Run{ID: oldRunID, UserID: principal.UserID, Status: biz.RunCancelled}, nil)
 	planRepo.EXPECT().RebindPlanRun(gomock.Any(), principal.UserID, plan.ID, gomock.Any(), int64(3), gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ uuid.UUID, _ uuid.UUID, runID uuid.UUID, _ int64, _ *time.Time, _ time.Time) (biz.Plan, error) {
