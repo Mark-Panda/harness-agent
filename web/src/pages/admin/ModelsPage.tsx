@@ -332,6 +332,7 @@ export default function ModelsPage() {
       await mutate<void>(`/api/v1/models/${deleting.id}`, "DELETE");
       setDeleting(null);
       models.reload();
+      health.reload();
     } catch (deleteFailure) {
       setDeleteError(describeError(deleteFailure));
     } finally {
@@ -386,6 +387,7 @@ export default function ModelsPage() {
     setBatchOpen(false);
     setSelected(new Set());
     models.reload();
+    health.reload();
     if (failures.length > 0) {
       setBatchError(`部分模型未能删除：${failures.join("；")}`);
     }
@@ -413,7 +415,7 @@ export default function ModelsPage() {
           initial={editing === "new" ? null : editing}
           providers={providers.data?.items ?? []}
           onCancel={() => setEditing(null)}
-          onSaved={() => { setEditing(null); models.reload(); vectorStatus.reload(); }}
+          onSaved={() => { setEditing(null); models.reload(); vectorStatus.reload(); health.reload(); }}
         />
       ) : null}
       <Card
