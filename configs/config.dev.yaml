@@ -9,6 +9,9 @@ agent:
     # 开发环境允许执行技能脚本，便于本地联调；生产与预发由配置校验强制关闭。
     enable_local_execution: true
   memory:
+    vector:
+      # 本地联调开启结果重排：向量召回后调用已启用的 rerank 模型重新打分；模型不可用时自动降级为向量分数。
+      rerank_enabled: true
     skill_synthesis:
       # 联调验收开启每日技能提炼；生产默认关闭，需显式开启并指定模型策略。
       enabled: true
