@@ -284,3 +284,29 @@ func TestRouterRateLimitRetryWithinBudget(t *testing.T) {
 		t.Fatalf("Complete() = %#v, %v", result, err)
 	}
 }
+
+// TestBudgetWithinWindowShrinksContinuationBudget 验证续写或近满上下文且无更大候选时，
+// 输出预算收紧到剩余窗口，避免第二次请求必然触发 ErrContextExceeded。
+func TestBudgetWithinWindowShrinksContinuationBudget(t *testing.T) {
+	candidate := Candidate{Ref: ModelRef{
+		ProviderID: "p1", ModelID: "m1", RemoteModelName: "m1", ContextWindowTokens: 1_000,
+		MaxOutputTokens: 4_096,
+	}, BaseURL: "http://127.0.0.1:1", APIKey: "test-key"}
+	router, err := NewRouter([]Candidate{candidate}, newFakeHealth(), testConfig(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if budget := router.budgetWithinWindow(candidate, 600, false, 4_096); budget != 400 {
+		t.Fatalf("budget = %d, want remaining window 400", budget)
+	}
+	// 输入本身已超出窗口时保持原预算，让客户端返回明确的上下文错误。
+	if budget := router.budgetWithinWindow(candidate, 1_200, false, 4_096); budget != 4_096 {
+		t.Fatalf("oversized input budget = %d, want 4096", budget)
+	}
+	// 窗口未声明时不做收紧。
+	unbounded := candidate
+	unbounded.Ref.ContextWindowTokens = 0
+	if budget := router.budgetWithinWindow(unbounded, 600, false, 4_096); budget != 4_096 {
+		t.Fatalf("unbounded budget = %d, want 4096", budget)
+	}
+}

@@ -116,8 +116,8 @@ func TestRunEventStreamReplayAndTerminalClose(t *testing.T) {
 	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(2), 200).Return([]biz.RunEvent{
 		{RunID: runID, Seq: 3, EventType: "message.delta", Payload: map[string]any{"text": "hi"}},
 	}, nil)
-	// 终态后事件为空，服务端应主动关闭连接。
-	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(3), 200).Return(nil, nil)
+	// 终态后事件为空，服务端应主动关闭连接；补读会再次查询同一游标。
+	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(3), 200).Return(nil, nil).AnyTimes()
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/runs/"+runID.String()+"/events?after=2", nil)
@@ -146,5 +146,83 @@ func TestRunEventStreamReplayAndTerminalClose(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("invalid cursor returned %d", recorder.Code)
+	}
+}
+
+// TestRunEventsDrainsTerminalEventAfterStatusRace 验证终态检测与事件读取竞态时
+// 客户端仍能收到在两次查询之间提交的 run.completed。
+func TestRunEventsDrainsTerminalEventAfterStatusRace(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	runRepo := mocks.NewMockRunRepository(ctrl)
+	sessionRepo := mocks.NewMockSessionRepository(ctrl)
+	runs, _ := biz.NewRunService(runRepo, sessionRepo)
+	platform, _ := service.NewPlatformService(
+		&biz.ProviderService{}, &biz.ModelService{}, &biz.PolicyService{},
+		&biz.SkillService{}, &biz.MCPService{}, &biz.AgentService{},
+		&biz.SessionService{}, runs, &biz.IdempotencyService{},
+	)
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	handler := NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{principal: principal}, nil, platform)
+	runID := uuid.New()
+
+	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, Status: biz.RunCompleted}, nil).AnyTimes()
+	runRepo.EXPECT().GetRunStatus(gomock.Any(), principal.UserID, runID).Return(biz.RunCompleted, nil).AnyTimes()
+	SetRunEventStream(immediateRunEventStream{})
+	t.Cleanup(func() { SetRunEventStream(nil) })
+	// 第一轮发生在终态事务提交前，看不到事件；状态查询已看到 completed。
+	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(0), 200).Return(nil, nil)
+	// 终态补读必须拿到同一事务提交的 run.completed。
+	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(0), 200).Return([]biz.RunEvent{
+		{RunID: runID, Seq: 1, EventType: "run.completed", Payload: map[string]any{"total_tokens": 3}},
+	}, nil)
+	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(1), 200).Return(nil, nil).AnyTimes()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/runs/"+runID.String()+"/events", nil)
+	request.Header.Set("Authorization", "Bearer access")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(recorder, request)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SSE stream did not terminate after terminal drain")
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "id: 1") || !strings.Contains(body, "event: run.completed") {
+		t.Fatalf("terminal event committed between status and event reads was lost: %s", body)
+	}
+}
+
+// TestRunEventsReportsStreamErrorInsteadOfRunFailed 验证事件读取故障不会伪装成 Run 失败。
+func TestRunEventsReportsStreamErrorInsteadOfRunFailed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	runRepo := mocks.NewMockRunRepository(ctrl)
+	sessionRepo := mocks.NewMockSessionRepository(ctrl)
+	runs, _ := biz.NewRunService(runRepo, sessionRepo)
+	platform, _ := service.NewPlatformService(
+		&biz.ProviderService{}, &biz.ModelService{}, &biz.PolicyService{},
+		&biz.SkillService{}, &biz.MCPService{}, &biz.AgentService{},
+		&biz.SessionService{}, runs, &biz.IdempotencyService{},
+	)
+	principal := biz.Principal{UserID: uuid.New(), Role: biz.RoleUser}
+	handler := NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, &fakeAuthApplication{principal: principal}, nil, platform)
+	runID := uuid.New()
+
+	runRepo.EXPECT().GetRun(gomock.Any(), principal.UserID, runID).Return(biz.Run{ID: runID, Status: biz.RunRunning}, nil).AnyTimes()
+	runRepo.EXPECT().ListEvents(gomock.Any(), principal.UserID, runID, int64(0), 200).Return(nil, context.DeadlineExceeded)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/runs/"+runID.String()+"/events", nil)
+	request.Header.Set("Authorization", "Bearer access")
+	handler.ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: stream.error") {
+		t.Fatalf("event read failure was not reported as stream.error: %s", body)
+	}
+	if strings.Contains(body, "event: run.failed") {
+		t.Fatalf("event read failure must not masquerade as run.failed: %s", body)
 	}
 }

@@ -46,6 +46,16 @@ type MemoryTrigger interface {
 	MaybeEnqueue(ctx context.Context, userID, sessionID uuid.UUID) error
 }
 
+// EmbeddingHealthReporter 接收向量化模型不可用的信号。
+// 维护循环据此暂停回填，避免“入队→立即完成”的任务抖动。
+type EmbeddingHealthReporter interface {
+	// MarkEmbeddingUnavailable 标记在 until 之前不进行回填入队。
+	MarkEmbeddingUnavailable(until time.Time)
+}
+
+// embeddingUnavailableBackoff 是向量化模型不可用时的回填暂停时长。
+const embeddingUnavailableBackoff = 5 * time.Minute
+
 // MemoryContentHash 计算记忆来源内容哈希。
 func MemoryContentHash(content string) string {
 	sum := sha256.Sum256([]byte(content))
@@ -308,6 +318,8 @@ type MemoryEmbedWorkerDependencies struct {
 	Usage UsageRecorder
 	// Budgets 后台向量化预算门禁，可为空。
 	Budgets BudgetChecker
+	// Health 向量化模型可用性上报端口，可为空。
+	Health EmbeddingHealthReporter
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -323,6 +335,7 @@ type MemoryEmbedWorker struct {
 	generator EmbeddingGenerator
 	usage     UsageRecorder
 	budgets   BudgetChecker
+	health    EmbeddingHealthReporter
 	config    MemoryEmbedWorkerConfig
 	clock     func() time.Time
 	logger    *slog.Logger
@@ -348,7 +361,7 @@ func NewMemoryEmbedWorker(dependencies MemoryEmbedWorkerDependencies, config Mem
 	return &MemoryEmbedWorker{
 		jobs: dependencies.Jobs, messages: dependencies.Messages, indexes: dependencies.Indexes,
 		vectors: dependencies.Vectors, generator: dependencies.Generator, usage: dependencies.Usage, budgets: dependencies.Budgets,
-		config: config.normalize(), clock: clock, logger: logger,
+		health: dependencies.Health, config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
 
@@ -475,6 +488,11 @@ func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
 		}
 		if err := w.embedMessages(runCtx, task.UserID, task.SessionID, index, task.MessageIDs, lease, newJobWriteFence(job, w.config.WorkerID)); err != nil {
 			if errors.Is(err, ErrEmbeddingModelUnavailable) {
+				// 确定性不可用：完成任务避免无意义重试，同时通知维护循环暂停回填，
+				// 防止每次维护都重复入队同一批未向量化消息。
+				if w.health != nil {
+					w.health.MarkEmbeddingUnavailable(w.clock().Add(embeddingUnavailableBackoff))
+				}
 				w.logger.Warn("embedding model unavailable; completing job", "job_id", job.ID, "version", version, "error", err)
 				complete()
 				return
@@ -669,6 +687,10 @@ type MemoryIndexService struct {
 	config  MemoryIndexServiceConfig
 	clock   func() time.Time
 	logger  *slog.Logger
+	// breakerMu 保护 unavailableUntil，避免 Worker 上报与维护循环并发读写竞争。
+	breakerMu sync.Mutex
+	// unavailableUntil 是回填暂停截止时间；零值表示未熔断。
+	unavailableUntil time.Time
 }
 
 // NewMemoryIndexService 构造索引维护服务。
@@ -684,6 +706,27 @@ func NewMemoryIndexService(indexes EmbeddingIndexRepository, models EmbeddingMod
 		clock = func() time.Time { return time.Now().UTC() }
 	}
 	return &MemoryIndexService{indexes: indexes, models: models, queue: queue, config: config.normalize(), clock: clock, logger: logger}, nil
+}
+
+// MarkEmbeddingUnavailable 记录向量化模型不可用截止时间，维护循环在该时间前跳过回填。
+func (s *MemoryIndexService) MarkEmbeddingUnavailable(until time.Time) {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	// 只延长熔断，避免过期的并发上报缩短已生效的暂停窗口。
+	if until.After(s.unavailableUntil) {
+		s.unavailableUntil = until
+		s.logger.Warn("embedding backfill paused", "until", until.UTC())
+	}
+}
+
+// embeddingPaused 返回当前熔断截止时间以及是否处于暂停窗口。
+func (s *MemoryIndexService) embeddingPaused(now time.Time) (time.Time, bool) {
+	s.breakerMu.Lock()
+	defer s.breakerMu.Unlock()
+	if s.unavailableUntil.IsZero() || !now.Before(s.unavailableUntil) {
+		return time.Time{}, false
+	}
+	return s.unavailableUntil, true
 }
 
 // Maintain 执行一次索引维护：确保 active 索引存在，校验 staging 覆盖率，必要时切换并回填。
@@ -762,6 +805,11 @@ func (s *MemoryIndexService) Maintain(ctx context.Context) (MaintainResult, erro
 			result.Activated = true
 			s.logger.Info("embedding index switched", "version", activated.Version, "coverage", result.Coverage)
 		}
+	}
+	// 向量化模型不可用期间暂停回填，避免每次维护重复入队同一批消息。
+	if until, paused := s.embeddingPaused(s.clock()); paused {
+		s.logger.Info("embedding backfill skipped by circuit breaker", "until", until.UTC())
+		return result, nil
 	}
 	enqueued, err := s.backfill(ctx, result.Active, result.Staging)
 	if err != nil {

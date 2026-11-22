@@ -165,9 +165,19 @@ func (h *authHTTPHandler) login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	rateLimitKey := "login:" + biz.NormalizeUsername(request.Username) + "|" + h.clientIP(r)
+	username := biz.NormalizeUsername(request.Username)
+	rateLimitKey := "login:" + username + "|" + h.clientIP(r)
 	if !h.allowRequest(w, r, rateLimitKey) {
 		return
+	}
+	// 账号维度限流覆盖分布式撞库：仅按 username+IP 计数时，攻击者可用大量出口 IP
+	// 对同一账号反复尝试。空用户名不参与账号维度，避免共享一个全局桶。
+	accountKey := ""
+	if username != "" {
+		accountKey = "login_account:" + username
+		if !h.allowRequest(w, r, accountKey) {
+			return
+		}
 	}
 	result, err := h.service.Login(r.Context(), request.Username, request.Password)
 	if err != nil {
@@ -176,6 +186,9 @@ func (h *authHTTPHandler) login(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.limiter != nil {
 		_ = h.limiter.Reset(r.Context(), rateLimitKey)
+		if accountKey != "" {
+			_ = h.limiter.Reset(r.Context(), accountKey)
+		}
 	}
 	h.writeSessionResult(w, http.StatusOK, result, request.Transport)
 }
@@ -193,6 +206,13 @@ func (h *authHTTPHandler) refresh(w http.ResponseWriter, r *http.Request) {
 		}
 		result, refreshErr := h.service.Refresh(r.Context(), cookie.Value)
 		if refreshErr != nil {
+			// 并发轮换进行中属于可重试状态：保留 Cookie 并提示客户端稍后重试，
+			// 不能清空会话，否则多标签页正常刷新会被强制登出。
+			if errors.Is(refreshErr, service.ErrRefreshTokenInProgress) {
+				w.Header().Set("Retry-After", "1")
+				writeErrorCode(w, http.StatusConflict, "refresh_in_progress")
+				return
+			}
 			h.clearSessionCookies(w)
 			writeAuthError(w, refreshErr)
 			return
@@ -835,6 +855,10 @@ func writeAuthError(w http.ResponseWriter, err error) {
 		errors.Is(err, service.ErrRefreshTokenReused),
 		errors.Is(err, auth.ErrInvalidAccessToken):
 		writeErrorCode(w, http.StatusUnauthorized, "unauthorized")
+	case errors.Is(err, service.ErrRefreshTokenInProgress):
+		// 并发轮换尚未写入重放记录：客户端应稍后重试，而不是清理本地会话。
+		w.Header().Set("Retry-After", "1")
+		writeErrorCode(w, http.StatusConflict, "refresh_in_progress")
 	case errors.Is(err, biz.ErrUserAlreadyExists):
 		writeErrorCode(w, http.StatusConflict, "user_already_exists")
 	case errors.Is(err, biz.ErrForbidden):

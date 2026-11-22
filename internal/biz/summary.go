@@ -336,6 +336,97 @@ func SummarySourceFingerprint(messages []Message) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+// SummarySessionRef 标识一个需要检查摘要进度的会话。
+type SummarySessionRef struct {
+	// UserID 会话所有者。
+	UserID uuid.UUID
+	// SessionID 会话 ID。
+	SessionID uuid.UUID
+}
+
+// SummarySessionReader 列出近期仍有写入的活跃会话，用于补建丢失的摘要任务。
+type SummarySessionReader interface {
+	// ListSummaryCandidateSessions 按最近消息时间倒序返回候选会话，实现必须限定活跃且未禁用记忆的会话。
+	ListSummaryCandidateSessions(ctx context.Context, limit int) ([]SummarySessionRef, error)
+}
+
+// SummaryMaintenanceConfig 是摘要补建扫描配置。
+type SummaryMaintenanceConfig struct {
+	// Interval 扫描间隔；零值使用 1 分钟。
+	Interval time.Duration
+	// Limit 每轮最多检查的会话数；零值使用 200。
+	Limit int
+}
+
+// SummaryMaintenance 周期性扫描活跃会话，为已达到阈值但没有待处理任务的会话补建摘要任务。
+// 消息写入与 Run 完成路径的触发是尽力而为的，进程崩溃或瞬时数据库错误会漏掉入队，
+// 该扫描保证摘要最终仍能推进，而不是无限停留在旧版本。
+type SummaryMaintenance struct {
+	sessions SummarySessionReader
+	planner  SummaryTrigger
+	config   SummaryMaintenanceConfig
+	logger   *slog.Logger
+}
+
+// NewSummaryMaintenance 构造摘要补建扫描；缺少依赖时返回错误。
+func NewSummaryMaintenance(sessions SummarySessionReader, planner SummaryTrigger, config SummaryMaintenanceConfig, logger *slog.Logger) (*SummaryMaintenance, error) {
+	if sessions == nil || planner == nil {
+		return nil, invalid("summary maintenance requires session reader and summary trigger")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if config.Interval <= 0 {
+		config.Interval = time.Minute
+	}
+	if config.Limit <= 0 {
+		config.Limit = 200
+	}
+	return &SummaryMaintenance{sessions: sessions, planner: planner, config: config, logger: logger}, nil
+}
+
+// Start 周期执行补建扫描直到上下文取消。
+func (m *SummaryMaintenance) Start(ctx context.Context) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		m.RunOnce(ctx)
+		timer.Reset(m.config.Interval)
+	}
+}
+
+// RunOnce 执行一次扫描；单个会话失败只记录日志，不影响其他会话。
+func (m *SummaryMaintenance) RunOnce(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	sessions, err := m.sessions.ListSummaryCandidateSessions(ctx, m.config.Limit)
+	if err != nil {
+		m.logger.Warn("summary maintenance scan failed", "error", err)
+		return
+	}
+	enqueued, failed := 0, 0
+	for _, session := range sessions {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.planner.MaybeEnqueue(ctx, session.UserID, session.SessionID); err != nil {
+			failed++
+			m.logger.Warn("summary maintenance enqueue failed", "session_id", session.SessionID, "error", err)
+			continue
+		}
+		enqueued++
+	}
+	if len(sessions) > 0 {
+		m.logger.Info("summary maintenance completed", "sessions", len(sessions), "checked", enqueued, "failed", failed)
+	}
+}
+
 // SummaryGeneration 是摘要生成结果与模型元数据。
 type SummaryGeneration struct {
 	// Text 摘要正文。
@@ -409,6 +500,8 @@ type SummaryWorkerDependencies struct {
 	Summaries SummaryRepository
 	// Generator 摘要生成器。
 	Generator SummaryGenerator
+	// Queue 在旧版本任务被更新的摘要版本超越时补建未覆盖尾部任务；为空时只完成当前任务。
+	Queue SummaryJobQueue
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -422,6 +515,7 @@ type SummaryWorker struct {
 	messages  SummarySourceReader
 	summaries SummaryRepository
 	generator SummaryGenerator
+	queue     SummaryJobQueue
 	config    SummaryWorkerConfig
 	clock     func() time.Time
 	logger    *slog.Logger
@@ -446,7 +540,7 @@ func NewSummaryWorker(dependencies SummaryWorkerDependencies, config SummaryWork
 	}
 	return &SummaryWorker{
 		jobs: dependencies.Jobs, sessions: dependencies.Sessions, messages: dependencies.Messages,
-		summaries: dependencies.Summaries, generator: dependencies.Generator,
+		summaries: dependencies.Summaries, generator: dependencies.Generator, queue: dependencies.Queue,
 		config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -555,6 +649,11 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 	}
 	if latest != task.BaseVersion {
 		w.logger.Info("summary task is stale", "job_id", job.ID, "base_version", task.BaseVersion, "latest_version", latest)
+		// 版本被超越不代表任务内容已过期：并发任务可能覆盖更远的尾部消息，
+		// 直接完成会永久丢失 (active.End, task.End] 区间，因此先补建未覆盖部分。
+		if err := w.enqueueUncoveredTail(ctx, task); err != nil {
+			w.logger.Warn("enqueue uncovered summary tail failed", "job_id", job.ID, "error", err)
+		}
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
@@ -695,12 +794,71 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 	}
 	if !applied {
 		w.logger.Info("summary version superseded; skipping save", "job_id", job.ID, "base_version", task.BaseVersion)
+		// 并发写入产生了更新的版本时，本任务覆盖的尾部消息可能仍未进入摘要。
+		if err := w.enqueueUncoveredTail(ctx, task); err != nil {
+			w.logger.Warn("enqueue uncovered summary tail failed", "job_id", job.ID, "error", err)
+		}
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
 	w.logger.Info("summary version created", "session_id", task.SessionID, "version", saved.Version,
 		"covered_messages", saved.CoveredMessageCount, "input_tokens", saved.InputTokens, "output_tokens", saved.OutputTokens)
 	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+}
+
+// enqueueUncoveredTail 把当前生效摘要边界之后、本任务结束边界之前的消息补建为新任务。
+// 仅在旧任务因版本落后被跳过时调用，避免并发摘要任务造成尾部消息永久丢失。
+func (w *SummaryWorker) enqueueUncoveredTail(ctx context.Context, task SummaryTask) error {
+	if w.queue == nil {
+		return nil
+	}
+	active, found, err := w.summaries.GetActiveSummary(ctx, task.UserID, task.SessionID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	end := MessagePosition{CreatedAt: task.EndAt, ID: task.EndMessageID}
+	covered := active.Boundary()
+	if !end.After(covered) {
+		return nil
+	}
+	messages, err := w.messages.ListSummarizableMessages(ctx, task.UserID, task.SessionID, task.SourceMessageIDs)
+	if err != nil {
+		return err
+	}
+	tail := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		position := MessagePosition{CreatedAt: message.CreatedAt, ID: message.ID}
+		if position.After(covered) && !position.After(end) {
+			tail = append(tail, message)
+		}
+	}
+	if len(tail) == 0 {
+		return nil
+	}
+	latest, err := w.summaries.LatestSummaryVersion(ctx, task.UserID, task.SessionID)
+	if err != nil {
+		return err
+	}
+	ids := make([]uuid.UUID, 0, len(tail))
+	for _, message := range tail {
+		ids = append(ids, message.ID)
+	}
+	last := tail[len(tail)-1]
+	follow := SummaryTask{
+		UserID: task.UserID, SessionID: task.SessionID, BaseVersion: latest,
+		SourceMessageIDs: ids, Fingerprint: SummarySourceFingerprint(tail),
+		EndMessageID: last.ID, EndAt: last.CreatedAt,
+		CoveredMessageCount: active.CoveredMessageCount + len(tail),
+	}
+	if err := w.queue.EnqueueSummary(ctx, follow, w.clock()); err != nil {
+		return err
+	}
+	w.logger.Info("summary uncovered tail enqueued", "session_id", task.SessionID,
+		"base_version", latest, "tail_messages", len(tail), "covered_messages", follow.CoveredMessageCount)
+	return nil
 }
 
 // failJob 记录可重试失败并在预算内退避；超出预算由队列进入死信等待人工处理。

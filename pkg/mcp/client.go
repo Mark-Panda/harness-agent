@@ -547,16 +547,12 @@ func (c *Client) roundTrip(ctx context.Context, id int64, sessionID, method stri
 	if requireSession {
 		session = response.Header.Get("Mcp-Session-Id")
 	}
-	payload, err := readPayload(response)
+	decoded, err := readPayload(response, id)
 	if err != nil {
 		return rpcResponse{}, "", err
 	}
-	var decoded rpcResponse
-	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return rpcResponse{}, "", fmt.Errorf("%w: decode response", ErrTransport)
-	}
-	if method == "tools/call" && (decoded.JSONRPC != "2.0" || string(decoded.ID) != strconv.FormatInt(id, 10)) {
-		return rpcResponse{}, "", fmt.Errorf("%w: response does not match tools/call request", ErrTransport)
+	if decoded.JSONRPC != "2.0" || !matchesRPCID(decoded.ID, id) {
+		return rpcResponse{}, "", fmt.Errorf("%w: response does not match request", ErrTransport)
 	}
 	if decoded.Error != nil {
 		rpcErr := fmt.Errorf("%w: code %d: %s", ErrRPC, decoded.Error.Code, truncate(decoded.Error.Message, 256))
@@ -585,36 +581,100 @@ func (c *Client) applyAuth(request *http.Request) {
 	}
 }
 
-// readPayload 读取 JSON 或 SSE 单事件响应体，限制总大小。
-func readPayload(response *http.Response) ([]byte, error) {
+// readPayload 读取 JSON 或 SSE 响应体并返回与请求编号匹配的 JSON-RPC 响应。
+// Streamable HTTP 允许服务端在最终响应前发送进度、日志等通知事件；
+// 必须跳过这些无编号事件，否则会把通知当作结果解析。
+func readPayload(response *http.Response, id int64) (rpcResponse, error) {
 	limited := io.LimitReader(response.Body, maxResponseBytes+1)
-	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-		scanner := bufio.NewScanner(limited)
-		scanner.Buffer(make([]byte, 1024), maxResponseBytes)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload == "" || payload == "[DONE]" {
-				continue
-			}
-			return []byte(payload), nil
-		}
-		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("%w: read SSE response", ErrTransport)
-		}
-		return nil, fmt.Errorf("%w: empty SSE response", ErrTransport)
+	if stringContainsFold(response.Header.Get("Content-Type"), "text/event-stream") {
+		return readSSEResponse(limited, id)
 	}
 	payload, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("%w: read response", ErrTransport)
+		return rpcResponse{}, fmt.Errorf("%w: read response", ErrTransport)
 	}
 	if len(payload) > maxResponseBytes {
-		return nil, fmt.Errorf("%w: response too large", ErrTransport)
+		return rpcResponse{}, fmt.Errorf("%w: response too large", ErrTransport)
 	}
-	return payload, nil
+	var decoded rpcResponse
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return rpcResponse{}, fmt.Errorf("%w: decode response", ErrTransport)
+	}
+	return decoded, nil
+}
+
+// readSSEResponse 逐事件扫描 SSE，跳过通知与心跳，返回编号匹配的响应事件。
+func readSSEResponse(reader io.Reader, id int64) (rpcResponse, error) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 1024), maxResponseBytes)
+	var data []string
+	// dispatch 解析累积的 data 行；返回 true 表示已取得目标响应。
+	dispatch := func() (rpcResponse, bool, error) {
+		if len(data) == 0 {
+			return rpcResponse{}, false, nil
+		}
+		payload := strings.TrimSpace(strings.Join(data, "\n"))
+		data = data[:0]
+		if payload == "" || payload == "[DONE]" {
+			return rpcResponse{}, false, nil
+		}
+		var decoded rpcResponse
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			// 无法解析的事件不是有效响应，继续等待后续事件。
+			return rpcResponse{}, false, nil
+		}
+		// 通知事件没有 id、result 与 error，必须跳过。
+		if len(decoded.ID) == 0 && len(decoded.Result) == 0 && decoded.Error == nil {
+			return rpcResponse{}, false, nil
+		}
+		if !matchesRPCID(decoded.ID, id) {
+			// 其他请求的响应或无关事件，跳过并由最终超时/空响应兜底。
+			return rpcResponse{}, false, nil
+		}
+		return decoded, true, nil
+	}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case line == "":
+			if decoded, ok, err := dispatch(); err != nil {
+				return rpcResponse{}, err
+			} else if ok {
+				return decoded, nil
+			}
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return rpcResponse{}, fmt.Errorf("%w: read SSE response", ErrTransport)
+	}
+	// 流结束时最后一段事件可能没有空行分隔。
+	if decoded, ok, err := dispatch(); err != nil {
+		return rpcResponse{}, err
+	} else if ok {
+		return decoded, nil
+	}
+	return rpcResponse{}, fmt.Errorf("%w: empty SSE response", ErrTransport)
+}
+
+// matchesRPCID 兼容数字与字符串两种 JSON-RPC 编号形式。
+func matchesRPCID(raw json.RawMessage, id int64) bool {
+	want := strconv.FormatInt(id, 10)
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return number.String() == want
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text == want
+	}
+	return false
+}
+
+// stringContainsFold 判断 Content-Type 是否包含媒体类型，忽略大小写。
+func stringContainsFold(value, part string) bool {
+	return strings.Contains(strings.ToLower(value), strings.ToLower(part))
 }
 
 // truncate 截断错误信息，避免服务端超长内容进入日志。

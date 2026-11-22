@@ -141,6 +141,11 @@ func TestDecodeEnvelopeAndParseMessageEvent(t *testing.T) {
 	if text := post.Text(); !strings.Contains(text, "标题") || !strings.Contains(text, "正文") {
 		t.Fatalf("post text = %q", text)
 	}
+	// 部分回调使用语言包装，解析必须兼容。
+	localized := MessageEvent{MessageType: "post", Content: `{"zh_cn":{"title":"周报","content":[[{"tag":"text","text":"本周进展"}]]}}`}
+	if text := localized.Text(); !strings.Contains(text, "周报") || !strings.Contains(text, "本周进展") {
+		t.Fatalf("localized post text = %q", text)
+	}
 	// URL 验证请求必须被识别，且缺少消息 ID 的事件应被拒绝。
 	verification, _ := DecodeEnvelope([]byte(`{"type":"url_verification","challenge":"abc","token":"t"}`))
 	if !verification.IsURLVerification() || verification.Challenge != "abc" {

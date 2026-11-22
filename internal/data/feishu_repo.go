@@ -759,7 +759,7 @@ RETURNING feishu_outbound_messages.*`
 	if record.BotID != nil {
 		botID = *record.BotID
 	}
-	return biz.FeishuOutbound{
+	outbound := biz.FeishuOutbound{
 		ID: record.ID, UserID: record.UserID, SessionID: record.SessionID, RunID: record.RunID, AppID: record.AppID,
 		BotID: botID, DefaultRoute: record.DefaultRoute,
 		LeaseOwner: record.LeaseOwner, FencingToken: record.FencingToken, LeaseExpiresAt: *record.LeaseExpiresAt,
@@ -767,7 +767,17 @@ RETURNING feishu_outbound_messages.*`
 		MessageID: record.MessageID, Kind: record.Kind, Status: record.Status, Attempts: record.Attempts,
 		MaxAttempts: record.MaxAttempts, DedupeKey: record.DedupeKey, CardUpdatedAt: cardUpdatedAt,
 		CardFingerprint: record.CardFingerprint, CreatedAt: record.CreatedAt,
-	}, true, nil
+	}
+	// 恢复已持久化的 POST 意图：租约回收后必须复用原请求 UUID，否则飞书无法去重，
+	// 在“飞书已接受但 MessageID 尚未落库”的崩溃窗口内会产生重复回复。
+	if len(record.PostRequestJSON) > 0 {
+		var post biz.FeishuOutboundPost
+		if err := json.Unmarshal(record.PostRequestJSON, &post); err != nil {
+			return biz.FeishuOutbound{}, false, catalogError("decode feishu outbound post", err)
+		}
+		outbound.Post = &post
+	}
+	return outbound, true, nil
 }
 
 // feishuOutboundClaim filters by the durable claim and never matches a legacy claim with token zero.

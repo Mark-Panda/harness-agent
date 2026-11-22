@@ -196,10 +196,29 @@ func (r *JobRepository) EnqueueSummary(ctx context.Context, task biz.SummaryTask
 		return tx.Create(&record).Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		// 同一来源范围的重复触发直接视为成功，任务由已有记录继续处理。
-		return nil
+		// 去重键可能指向已终止但未产出摘要的旧任务（生成被永久拒绝或版本落后被跳过），
+		// 仅“视为成功”会让同一来源范围被永久吸收，摘要再也无法推进；此处按尝试次数重新激活。
+		return r.rearmTerminalSummaryJob(ctx, dedupe, availableAt)
 	}
 	return catalogError("enqueue summary job", err)
+}
+
+// rearmTerminalSummaryJob 把同一来源指纹下已终止的摘要任务重新置为待处理。
+// attempts 保留并由领取流程递增，达到 max_attempts 后不再激活，避免永久失败的会话无限调用模型。
+func (r *JobRepository) rearmTerminalSummaryJob(ctx context.Context, dedupe string, availableAt time.Time) error {
+	now := time.Now().UTC()
+	if availableAt.Before(now) {
+		availableAt = now
+	}
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return tx.Exec(`
+UPDATE jobs SET status = 'pending',
+  available_at = GREATEST(?::timestamptz, ?::timestamptz + (LEAST(attempts, 10) * interval '1 minute')),
+  lease_owner = '', lease_expires_at = NULL, last_error = '', updated_at = ?
+WHERE dedupe_key = ? AND status IN ('completed', 'failed', 'dead') AND attempts < max_attempts`,
+			availableAt, now, now, dedupe).Error
+	})
+	return catalogError("rearm summary job", err)
 }
 
 // EnqueueMemory 幂等写入向量化任务；去重键绑定会话、最后一条消息与索引版本组合。

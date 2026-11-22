@@ -103,6 +103,7 @@ func (w *FeishuEventWorker) processSharedChat(ctx context.Context, record Feishu
 		ExternalMessageID: event.MessageID, SpeakerOpenID: event.SenderOpenID, CreatedAt: event.CreatedAt(w.clock()),
 	})
 	if errors.Is(err, ErrForbidden) || errors.Is(err, ErrResourceConflict) {
+		w.sendNotice(ctx, record, event, threadID, botID, "当前会话状态不允许继续发言，请重新发起对话。")
 		return FeishuEventIgnored, nil
 	}
 	if err != nil {
@@ -117,10 +118,11 @@ func (w *FeishuEventWorker) processSharedChat(ctx context.Context, record Feishu
 		IdempotencyKey:   "feishu.group:" + projected.ID.String(),
 		TriggerMessageID: &projected.ID,
 	})
-	if errors.Is(err, ErrBudgetExceeded) {
-		return FeishuEventIgnored, nil
-	}
 	if err != nil {
+		if notice, terminal := feishuBusinessNotice(err); terminal {
+			w.sendNotice(ctx, record, event, threadID, botID, notice)
+			return FeishuEventIgnored, nil
+		}
 		return "", err
 	}
 	selectedPolicy, _ := run.ModelPolicySnapshot["policy_id"].(string)

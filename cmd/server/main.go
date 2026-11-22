@@ -74,6 +74,49 @@ type feishuBotSender struct {
 	client     *feishu.Client
 }
 
+// feishuNoticeSender 发送与 Run 无关的系统提示，复用回复 Worker 的机器人路由与凭据。
+type feishuNoticeSender struct {
+	defaultAppID  string
+	defaultSender biz.FeishuReplySender
+	senders       *feishuBotSenderResolver
+}
+
+// SendNotice 按事件来源选择默认应用或已登记机器人发送纯文本提示。
+func (s *feishuNoticeSender) SendNotice(ctx context.Context, route biz.FeishuNoticeRoute, text string) error {
+	var sender biz.FeishuReplySender
+	switch {
+	case route.DefaultRoute && route.BotID == uuid.Nil:
+		if route.AppID != "" && route.AppID != s.defaultAppID {
+			return fmt.Errorf("feishu notice app %q does not match default app", route.AppID)
+		}
+		sender = s.defaultSender
+	case route.BotID != uuid.Nil && s.senders != nil:
+		resolved, err := s.senders.ResolveSender(ctx, route.BotID, route.AppID)
+		if err != nil {
+			return err
+		}
+		sender = resolved
+	default:
+		return fmt.Errorf("feishu notice route is unavailable")
+	}
+	if sender == nil {
+		return fmt.Errorf("feishu notice sender is not configured")
+	}
+	content, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
+	inThread := route.ThreadID != "" && route.ThreadID != "p2p"
+	_, err = sender.Reply(ctx, route.ReplyToMessageID, feishu.ReplyRequest{
+		Type: "text", Content: string(content), InThread: inThread,
+	})
+	// 话题能力未开通时退化为普通回复，与回复 Worker 的降级策略保持一致。
+	if err != nil && inThread && feishu.IsThreadReplyUnsupported(err) {
+		_, err = sender.Reply(ctx, route.ReplyToMessageID, feishu.ReplyRequest{Type: "text", Content: string(content)})
+	}
+	return err
+}
+
 // ResolveSender 使用收到入站事件的机器人 UUID 读取当前身份、状态与凭据。
 func (r *feishuBotSenderResolver) ResolveSender(ctx context.Context, botID uuid.UUID, appID string) (biz.FeishuReplySender, error) {
 	bot, credential, err := r.credentials.GetFeishuBotCredential(ctx, botID)
@@ -650,6 +693,7 @@ func run() error {
 			})
 		}
 		feishuMessages := data.NewFeishuMessageRepository(appDB)
+		feishuSenderResolver := &feishuBotSenderResolver{credentials: feishuBotRepository, opener: credentialKeys}
 		feishuWorkerDependencies := biz.FeishuEventWorkerDependencies{
 			Jobs:          jobRepository,
 			Events:        eventRepository,
@@ -660,9 +704,12 @@ func run() error {
 			GroupMessages: feishuMessages,
 			Runs:          runService,
 			Outbound:      data.NewFeishuOutboundRepository(appDB),
-			HotMessages:   hotMessages,
-			Bots:          feishuBotRepository,
-			Logger:        slog.Default(),
+			Notices: &feishuNoticeSender{
+				defaultAppID: defaultAppID, defaultSender: defaultFeishuSender, senders: feishuSenderResolver,
+			},
+			HotMessages: hotMessages,
+			Bots:        feishuBotRepository,
+			Logger:      slog.Default(),
 		}
 		// 群聊个人事实只写发言人私有记忆；事实功能关闭时保持为空，避免 typed-nil 接口调用。
 		if factIndexer != nil {
@@ -684,7 +731,7 @@ func run() error {
 			Outbound: data.NewFeishuOutboundRepository(appDB),
 			Runs:     runRepository,
 			Sender:   defaultFeishuSender,
-			Senders:  &feishuBotSenderResolver{credentials: feishuBotRepository, opener: credentialKeys},
+			Senders:  feishuSenderResolver,
 			Logger:   slog.Default(),
 		}, biz.FeishuReplyWorkerConfig{
 			DefaultAppID: defaultAppID,
@@ -884,7 +931,7 @@ func run() error {
 		generator.WithUsageRecorder(budgetRepository)
 		summaryWorker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
 			Jobs: jobRepository, Sessions: sessionRepository, Messages: sessionRepository,
-			Summaries: summaryRepository, Generator: generator, Logger: slog.Default(),
+			Summaries: summaryRepository, Generator: generator, Queue: jobRepository, Logger: slog.Default(),
 		}, biz.SummaryWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Summary.Concurrency,
 			PollInterval: cfg.Agent.Memory.Summary.PollInterval.Duration, Lease: cfg.Agent.Memory.Summary.Lease.Duration,
@@ -898,11 +945,31 @@ func run() error {
 			defer workers.Done()
 			summaryWorker.Start(workerContext)
 		}()
+		// 补建扫描补偿消息写入与 Run 完成路径中丢失的摘要入队，保证摘要最终推进。
+		summaryMaintenance, err := biz.NewSummaryMaintenance(sessionRepository, summaryPlanner, biz.SummaryMaintenanceConfig{
+			Interval: cfg.Agent.Memory.Summary.MaintenanceInterval.Duration,
+		}, slog.Default())
+		if err != nil {
+			return err
+		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			summaryMaintenance.Start(workerContext)
+		}()
 	}
 	if cfg.Agent.Memory.Vector.Enabled {
+		// 索引服务先于 Worker 构造，供 Worker 上报 embedding 不可用信号以暂停回填。
+		indexService, err := biz.NewMemoryIndexService(memoryRepository, memoryRepository, jobRepository, biz.MemoryIndexServiceConfig{
+			CoverageThreshold: cfg.Agent.Memory.Vector.CoverageThreshold, BackfillBatch: cfg.Agent.Memory.Vector.BackfillBatch,
+		}, slog.Default(), nil)
+		if err != nil {
+			return err
+		}
 		memoryEmbedWorker, err := biz.NewMemoryEmbedWorker(biz.MemoryEmbedWorkerDependencies{
 			Jobs: jobRepository, Messages: memoryRepository, Indexes: memoryRepository,
-			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Budgets: budgetService, Logger: slog.Default(),
+			Vectors: memoryRepository, Generator: embeddingGenerator, Usage: budgetRepository, Budgets: budgetService,
+			Health: indexService, Logger: slog.Default(),
 		}, biz.MemoryEmbedWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Vector.Concurrency,
 			PollInterval: cfg.Agent.Memory.Vector.PollInterval.Duration, Lease: cfg.Agent.Memory.Vector.Lease.Duration,
@@ -916,12 +983,6 @@ func run() error {
 			defer workers.Done()
 			memoryEmbedWorker.Start(workerContext)
 		}()
-		indexService, err := biz.NewMemoryIndexService(memoryRepository, memoryRepository, jobRepository, biz.MemoryIndexServiceConfig{
-			CoverageThreshold: cfg.Agent.Memory.Vector.CoverageThreshold, BackfillBatch: cfg.Agent.Memory.Vector.BackfillBatch,
-		}, slog.Default(), nil)
-		if err != nil {
-			return err
-		}
 		maintenance, err := biz.NewMemoryMaintenance(indexService, biz.MemoryMaintenanceConfig{
 			Enabled: cfg.Agent.Memory.Vector.MaintenanceEnabled, Interval: cfg.Agent.Memory.Vector.MaintenanceInterval.Duration,
 		}, slog.Default())

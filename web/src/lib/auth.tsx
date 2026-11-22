@@ -26,6 +26,23 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+// postRefresh 发送刷新请求；409 表示另一标签页正在并发轮换，稍后重试一次即可。
+// 浏览器共享 Cookie，重试会带上对端刚写入的新刷新令牌。
+async function postRefresh(csrf: string): Promise<Response> {
+  const send = () =>
+    fetch("/api/v1/auth/refresh", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-CSRF-Token": csrf },
+    });
+  let response = await send();
+  if (response.status === 409) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    response = await send();
+  }
+  return response;
+}
+
 // AuthProvider 负责会话恢复、单飞刷新与注销。
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -73,11 +90,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return false;
       }
       try {
-        const response = await fetch("/api/v1/auth/refresh", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "X-CSRF-Token": csrf },
-        });
+        const response = await postRefresh(csrf);
         if (!response.ok) {
           return false;
         }
@@ -126,11 +139,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
       try {
-        const response = await fetch("/api/v1/auth/refresh", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "X-CSRF-Token": csrf },
-        });
+        const response = await postRefresh(csrf);
         if (!response.ok || cancelled) {
           if (!cancelled) {
             setStatus("anonymous");

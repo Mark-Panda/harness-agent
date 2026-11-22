@@ -109,6 +109,64 @@ func TestClientInitializeListAndCall(t *testing.T) {
 	}
 }
 
+// TestClientSkipsSSENotificationsBeforeResult 验证 SSE 先发送进度通知时仍能读取最终结果。
+func TestClientSkipsSSENotificationsBeforeResult(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch body.Method {
+		case "initialize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18"}}`, body.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}\n\n")
+			_, _ = fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n\n", body.ID)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{}}`, body.ID)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server, "none", "")
+	result, err := client.CallTool(context.Background(), "tool", nil)
+	if err != nil {
+		t.Fatalf("CallTool() error = %v", err)
+	}
+	if len(result.Content) != 1 || result.Content[0].Text != "done" {
+		t.Fatalf("CallTool() result = %#v", result)
+	}
+}
+
+// TestClientRejectsMismatchedResponseID 验证响应编号与请求不一致时按传输错误拒绝。
+func TestClientRejectsMismatchedResponseID(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		switch body.Method {
+		case "initialize":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}`))
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":999,"result":{"tools":[]}}`))
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := newTestClient(t, server, "none", "")
+	if _, err := client.ListTools(context.Background()); !errors.Is(err, ErrTransport) {
+		t.Fatalf("ListTools() error = %v, want ErrTransport", err)
+	}
+}
+
 // TestClientParsesSSEAndRPCError 验证 SSE 响应解析与 JSON-RPC 错误分类。
 func TestClientParsesSSEAndRPCError(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -437,7 +495,7 @@ func TestCallToolRetriesAfterSessionExpired(t *testing.T) {
 			count := atomic.AddInt32(&initializes, 1)
 			w.Header().Set("Mcp-Session-Id", fmt.Sprintf("session-%d", count))
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}`))
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18"}}`, body.ID)
 		case "notifications/initialized":
 			w.WriteHeader(http.StatusNoContent)
 		case "tools/call":

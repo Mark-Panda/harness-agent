@@ -140,7 +140,7 @@ func TestRefreshReplayRejectedAfterLogout(t *testing.T) {
 	replayed, successorHash := replayFixture(t, fixture, user)
 	store.records[replayKey(hash)] = replayed
 	fixture.tokens.EXPECT().GetRefreshTokenByHash(gomock.Any(), hash).Return(oldToken, nil)
-	fixture.tokens.EXPECT().GetRefreshTokenByHash(gomock.Any(), successorHash).Return(biz.RefreshToken{ID: uuid.New(), UserID: user.ID, FamilyID: oldToken.FamilyID, TokenHash: successorHash, RevokedAt: &revokedAt}, nil).Times(4)
+	fixture.tokens.EXPECT().GetRefreshTokenByHash(gomock.Any(), successorHash).Return(biz.RefreshToken{ID: uuid.New(), UserID: user.ID, FamilyID: oldToken.FamilyID, TokenHash: successorHash, RevokedAt: &revokedAt}, nil).Times(6)
 	fixture.tokens.EXPECT().RevokeFamily(gomock.Any(), user.ID, oldToken.FamilyID, fixture.clock.Now().UTC(), true, gomock.Any()).Return(nil)
 	if _, err := fixture.service.Refresh(context.Background(), rawToken); !errors.Is(err, ErrRefreshTokenReused) {
 		t.Fatalf("replay after logout error = %v", err)
@@ -224,6 +224,40 @@ func TestWithRefreshReplayDefaultTTL(t *testing.T) {
 	}
 	if service.replayTTL != DefaultRefreshReplayTTL {
 		t.Fatalf("default replay ttl = %s", service.replayTTL)
+	}
+}
+
+// TestRefreshRotatedWithinReplayWindowIsRetryable 验证并发轮换尚未写入重放记录时返回可重试错误，
+// 且不撤销令牌族，避免 Redis 抖动把正常并发刷新误判为重放。
+func TestRefreshRotatedWithinReplayWindowIsRetryable(t *testing.T) {
+	store := newFakeRefreshReplayStore()
+	fixture := replayServiceFixture(t, store)
+	user := activeUser(t)
+	rawToken := "rotation-in-progress"
+	hash, _ := auth.HashOpaqueToken(rawToken, fixture.pepper)
+	rotatedAt := fixture.clock.Now().Add(-500 * time.Millisecond)
+	oldToken := biz.RefreshToken{ID: uuid.New(), UserID: user.ID, FamilyID: uuid.New(), TokenHash: hash, CredentialVersion: 1, RotatedAt: &rotatedAt}
+	fixture.tokens.EXPECT().GetRefreshTokenByHash(gomock.Any(), hash).Return(oldToken, nil)
+	_, err := fixture.service.Refresh(context.Background(), rawToken)
+	if !errors.Is(err, ErrRefreshTokenInProgress) {
+		t.Fatalf("Refresh() error = %v, want ErrRefreshTokenInProgress", err)
+	}
+}
+
+// TestRefreshRotatedBeyondReplayWindowRevokesFamily 验证超出重放窗口的重复使用仍按真实重用撤销整族。
+func TestRefreshRotatedBeyondReplayWindowRevokesFamily(t *testing.T) {
+	store := newFakeRefreshReplayStore()
+	fixture := replayServiceFixture(t, store)
+	user := activeUser(t)
+	rawToken := "real-reuse"
+	hash, _ := auth.HashOpaqueToken(rawToken, fixture.pepper)
+	rotatedAt := fixture.clock.Now().Add(-2 * time.Second)
+	oldToken := biz.RefreshToken{ID: uuid.New(), UserID: user.ID, FamilyID: uuid.New(), TokenHash: hash, CredentialVersion: 1, RotatedAt: &rotatedAt}
+	fixture.tokens.EXPECT().GetRefreshTokenByHash(gomock.Any(), hash).Return(oldToken, nil)
+	fixture.tokens.EXPECT().RevokeFamily(gomock.Any(), user.ID, oldToken.FamilyID, fixture.clock.Now().UTC(), true, gomock.Any()).Return(nil)
+	_, err := fixture.service.Refresh(context.Background(), rawToken)
+	if !errors.Is(err, ErrRefreshTokenReused) {
+		t.Fatalf("Refresh() error = %v, want ErrRefreshTokenReused", err)
 	}
 }
 

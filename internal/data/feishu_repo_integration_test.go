@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
+	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -707,6 +708,17 @@ func TestFeishuOutboundFailureAndLeaseRecovery(t *testing.T) {
 	if claimed.ID != leaseID {
 		t.Fatalf("claimed unexpected outbound %s", claimed.ID)
 	}
+	// 写入 POST 意图后模拟崩溃：租约回收后必须恢复原请求 UUID，否则飞书无法去重。
+	groupText := "群聊共享正文"
+	post := &biz.FeishuOutboundPost{
+		Request: feishu.ReplyRequest{
+			Type: "interactive", Content: `{"card":1}`, UUID: "uuid-" + suffix, InThread: true,
+		},
+		StartedAt: now, CardFingerprint: "fp-" + suffix, GroupText: &groupText,
+	}
+	if err := repository.SetOutboundPost(ctx, claimed, post, now); err != nil {
+		t.Fatalf("set outbound post: %v", err)
+	}
 	// 领取一条后立即把租约置为过期，模拟 Worker 崩溃后的恢复路径。
 	if err := adminDB.Exec("UPDATE feishu_outbound_messages SET lease_expires_at = now() - interval '1 second' WHERE id = ?", claimed.ID).Error; err != nil {
 		t.Fatalf("expire lease: %v", err)
@@ -717,6 +729,11 @@ func TestFeishuOutboundFailureAndLeaseRecovery(t *testing.T) {
 	}
 	if recovered.ID != claimed.ID || recovered.Attempts != claimed.Attempts+1 || recovered.FencingToken != claimed.FencingToken+1 {
 		t.Fatalf("recovered outbound = %#v, first = %#v", recovered, claimed)
+	}
+	if recovered.Post == nil || recovered.Post.Request.UUID != post.Request.UUID ||
+		!recovered.Post.StartedAt.Equal(post.StartedAt) || recovered.Post.CardFingerprint != post.CardFingerprint ||
+		recovered.Post.GroupText == nil || *recovered.Post.GroupText != groupText {
+		t.Fatalf("recovered post = %#v", recovered.Post)
 	}
 	for op, apply := range map[string]func() error{
 		"dispatch":    func() error { return repository.CheckOutboundClaim(ctx, claimed, now) },

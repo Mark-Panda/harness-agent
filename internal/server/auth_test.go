@@ -115,13 +115,19 @@ func authTestHandler(application AuthApplication) http.Handler {
 type fakeRateLimiter struct {
 	result   ratelimit.Result
 	resetKey string
+	// allowedKeys 记录所有被检查的限流键，用于验证多维度限流。
+	allowedKeys []string
+	// resetKeys 记录所有被重置的限流键。
+	resetKeys []string
 }
 
-func (f *fakeRateLimiter) Allow(context.Context, string) (ratelimit.Result, error) {
+func (f *fakeRateLimiter) Allow(_ context.Context, key string) (ratelimit.Result, error) {
+	f.allowedKeys = append(f.allowedKeys, key)
 	return f.result, nil
 }
 func (f *fakeRateLimiter) Reset(_ context.Context, key string) error {
 	f.resetKey = key
+	f.resetKeys = append(f.resetKeys, key)
 	return nil
 }
 
@@ -214,8 +220,23 @@ func TestLoginSuccessResetsRateLimit(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"Alice","password":"correct horse battery"}`))
 	handler.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK || !strings.Contains(limiter.resetKey, "login:alice|") {
-		t.Fatalf("login reset returned %d key=%q", recorder.Code, limiter.resetKey)
+	reset := strings.Join(limiter.resetKeys, ",")
+	if recorder.Code != http.StatusOK || !strings.Contains(reset, "login:alice|") || !strings.Contains(reset, "login_account:alice") {
+		t.Fatalf("login reset returned %d keys=%q", recorder.Code, reset)
+	}
+}
+
+// TestLoginChecksAccountRateLimit 验证登录同时校验账号维度限流，覆盖分布式撞库。
+func TestLoginChecksAccountRateLimit(t *testing.T) {
+	application := &fakeAuthApplication{result: service.AuthResult{}}
+	limiter := &fakeRateLimiter{result: ratelimit.Result{Allowed: true}}
+	handler := NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, application, limiter)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"Alice","password":"correct horse battery"}`))
+	handler.ServeHTTP(recorder, request)
+	keys := strings.Join(limiter.allowedKeys, ",")
+	if !strings.Contains(keys, "login:alice|") || !strings.Contains(keys, "login_account:alice") {
+		t.Fatalf("login checked keys=%q", keys)
 	}
 }
 

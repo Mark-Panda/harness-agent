@@ -795,6 +795,26 @@ func TestMemoryIndexServiceMaintainAndActivate(t *testing.T) {
 	}
 }
 
+// TestMemoryIndexServiceSkipsBackfillWhenEmbeddingUnavailable 验证模型不可用熔断期间不再重复入队回填。
+func TestMemoryIndexServiceSkipsBackfillWhenEmbeddingUnavailable(t *testing.T) {
+	models := &fakeEmbeddingModelSource{providerID: uuid.New(), model: "embedding", dimension: biz.EmbeddingDimension}
+	queue := &fakeMemoryQueue{}
+	indexes := &fakeMemoryIndexes{indexes: []biz.EmbeddingIndex{activeMemoryIndex()}, eligible: 5,
+		unembedded: []biz.Message{{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}}}
+	service, err := biz.NewMemoryIndexService(indexes, models, queue, biz.MemoryIndexServiceConfig{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.MarkEmbeddingUnavailable(time.Now().Add(time.Minute))
+	result, err := service.Maintain(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BackfillEnqueued != 0 || len(queue.tasks) != 0 {
+		t.Fatalf("backfill during breaker = %#v tasks=%d", result, len(queue.tasks))
+	}
+}
+
 // TestMemoryEmbedWorkerStartStops 验证向量化 Worker 循环随取消退出。
 func TestMemoryEmbedWorkerStartStops(t *testing.T) {
 	job := biz.Job{ID: uuid.New(), Type: biz.MemoryEmbedJobType, Payload: map[string]any{}}

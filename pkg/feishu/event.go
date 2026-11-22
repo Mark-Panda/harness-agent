@@ -181,17 +181,41 @@ func (e MessageEvent) Text() string {
 	return ""
 }
 
+// postNode 是富文本中的一个节点。
+type postNode struct {
+	Tag  string `json:"tag"`
+	Text string `json:"text"`
+}
+
+// postBody 是富文本正文，兼容扁平结构与 locale 包装后的内部结构。
+type postBody struct {
+	Title   string       `json:"title"`
+	Content [][]postNode `json:"content"`
+}
+
 // extractPostText 从富文本 post 中拼接文本节点，跳过图片与 @ 节点。
+// 飞书部分回调把正文包装为 {"zh_cn": {...}}，这里同时兼容两种结构。
 func extractPostText(content string) string {
-	var post struct {
-		Title   string `json:"title"`
-		Content [][]struct {
-			Tag  string `json:"tag"`
-			Text string `json:"text"`
-		} `json:"content"`
-	}
+	var post postBody
 	if err := json.Unmarshal([]byte(content), &post); err != nil {
 		return ""
+	}
+	if post.Title == "" && len(post.Content) == 0 {
+		var localized map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(content), &localized); err != nil {
+			return ""
+		}
+		for _, key := range []string{"zh_cn", "en_us", "ja_jp"} {
+			raw, ok := localized[key]
+			if !ok {
+				continue
+			}
+			var candidate postBody
+			if json.Unmarshal(raw, &candidate) == nil && (candidate.Title != "" || len(candidate.Content) > 0) {
+				post = candidate
+				break
+			}
+		}
 	}
 	var builder strings.Builder
 	if strings.TrimSpace(post.Title) != "" {

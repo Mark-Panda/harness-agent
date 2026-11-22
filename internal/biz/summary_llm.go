@@ -175,10 +175,16 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 	}
 
 	mergeItems := partials
-	for strings.TrimSpace(previousForMerge) != "" || len(mergeItems) > 1 {
+	// 归并必须有界：模型若始终输出接近上限的摘要，拆分与归并可能长期不收敛。
+	for round := 0; strings.TrimSpace(previousForMerge) != "" || len(mergeItems) > 1; round++ {
+		if round >= maxSummaryMergeRounds {
+			return SummaryGeneration{}, fmt.Errorf("%w: summary merge did not converge after %d rounds", ErrSummaryPermanent, maxSummaryMergeRounds)
+		}
 		before := len(mergeItems)
+		beforeTokens := mergeTokenEstimate(mergeItems)
 		if strings.TrimSpace(previousForMerge) != "" {
 			before++
+			beforeTokens += memory.EstimateTokens(previousForMerge)
 		}
 		batches, buildErr := memory.BuildSummaryMergeBatches(previousForMerge, mergeItems, inputBudget)
 		if buildErr != nil {
@@ -219,7 +225,9 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 			next = append(next, response.Content)
 			index++
 		}
-		if !retriedContext && before > 1 && len(next) >= before {
+		// 预拆分会让片段数暂时等于原始条目数，但真实压缩已发生；
+		// 只有“条目数未减少且总 Token 也未下降”才说明本轮没有取得任何进展。
+		if !retriedContext && before > 1 && len(next) >= before && mergeTokenEstimate(next) >= beforeTokens {
 			return SummaryGeneration{}, fmt.Errorf("%w: summary merge made no reduction", ErrSummaryPermanent)
 		}
 		mergeItems = next
@@ -233,6 +241,18 @@ func (g *SummaryLLMGenerator) Summarize(ctx context.Context, userID, sessionID u
 		Text: strings.TrimSpace(mergeItems[0]), ProviderID: &providerID, ModelID: resolved.modelID,
 		InputTokens: inputTokens, OutputTokens: outputTokens,
 	}, nil
+}
+
+// maxSummaryMergeRounds 限制分层归并轮数，避免模型持续输出超长摘要时无限循环。
+const maxSummaryMergeRounds = 8
+
+// mergeTokenEstimate 汇总待归并摘要的估算 Token，用于判断本轮是否发生真实压缩。
+func mergeTokenEstimate(items []string) int {
+	total := 0
+	for _, item := range items {
+		total += memory.EstimateTokens(item)
+	}
+	return total
 }
 
 // summaryMergeBatch 标记归并批次；上下文超限拆出的单片段也必须经模型压缩，不能直接当作最终摘要。

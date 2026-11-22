@@ -927,3 +927,51 @@ func TestSupervisorRouterRetriesShareProviderBudget(t *testing.T) {
 		t.Fatalf("Supervisor error=%v model calls=%d; want budget error before router retry", err, calls.Load())
 	}
 }
+
+// TestPersistSupervisorTasksReappendsPromptAfterReplan 验证重新规划出不同任务时，
+// 子会话会追加新的任务指令，而不是复用旧指令造成 transcript 与实际执行不一致。
+func TestPersistSupervisorTasksReappendsPromptAfterReplan(t *testing.T) {
+	worker, repo, sessions, _, _ := supervisorFixture(t, func(string, http.ResponseWriter) {})
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: AgentModeSupervisor}
+	fence := RunFence{Owner: "supervisor-worker", Token: 1}
+	first := SupervisorDraft{Workers: []SupervisorWorker{{Name: "A", Task: "任务A"}}}
+	if _, err := worker.persistSupervisorTasks(context.Background(), run, fence, emptyToolRegistry{}, first); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 CreateTasks 失败：任务表为空，但子会话已写入任务 A 的用户指令。
+	repo.mu.Lock()
+	repo.tasks = map[uuid.UUID]SupervisorTask{}
+	repo.mu.Unlock()
+
+	second := SupervisorDraft{Workers: []SupervisorWorker{{Name: "A", Task: "任务B"}}}
+	tasks, err := worker.persistSupervisorTasks(context.Background(), run, fence, emptyToolRegistry{}, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Task != "任务B" {
+		t.Fatalf("tasks = %#v", tasks)
+	}
+	prompts := make([]string, 0, 2)
+	for _, message := range sessions.messages {
+		if message.Role == MessageUser {
+			prompts = append(prompts, message.Content)
+		}
+	}
+	if len(prompts) != 2 || prompts[0] != "任务A" || prompts[1] != "任务B" {
+		t.Fatalf("child user prompts = %#v", prompts)
+	}
+
+	// 相同任务再次重试不得重复写入指令。
+	if _, err := worker.persistSupervisorTasks(context.Background(), run, fence, emptyToolRegistry{}, second); err != nil {
+		t.Fatal(err)
+	}
+	repeated := 0
+	for _, message := range sessions.messages {
+		if message.Role == MessageUser && message.Content == "任务B" {
+			repeated++
+		}
+	}
+	if repeated != 1 {
+		t.Fatalf("任务B prompt count = %d", repeated)
+	}
+}

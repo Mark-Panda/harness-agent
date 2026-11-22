@@ -74,6 +74,22 @@ func TestJobRepositoryEnqueueDedupeAndRequeue(t *testing.T) {
 	if err := adminDB.Raw("SELECT COUNT(*) FROM jobs WHERE dedupe_key = ?", dedupeKeys[0]).Scan(&summaryJobs).Error; err != nil || summaryJobs != 1 {
 		t.Fatalf("summary dedupe rows = %d, %v", summaryJobs, err)
 	}
+	// 已终止但未产出摘要的旧任务必须重新激活，否则同一来源指纹会被永久吸收，摘要无法推进。
+	if err := adminDB.Exec("UPDATE jobs SET status = 'completed', attempts = 1 WHERE dedupe_key = ?", dedupeKeys[0]).Error; err != nil {
+		t.Fatalf("mark summary job completed: %v", err)
+	}
+	if err := jobs.EnqueueSummary(ctx, summaryTask, time.Time{}); err != nil {
+		t.Fatalf("rearm completed EnqueueSummary() = %v", err)
+	}
+	var status string
+	var delayed bool
+	if err := adminDB.Raw("SELECT status, available_at > now() + interval '30 seconds' FROM jobs WHERE dedupe_key = ?", dedupeKeys[0]).
+		Row().Scan(&status, &delayed); err != nil {
+		t.Fatalf("read rearmed summary job: %v", err)
+	}
+	if status != "pending" || !delayed {
+		t.Fatalf("rearmed summary job status=%q delayed=%t", status, delayed)
+	}
 
 	// 事实任务：去重键含事实归属用户，同会话不同发言人不互相吞并。
 	speakerOwnerID := uuid.New()

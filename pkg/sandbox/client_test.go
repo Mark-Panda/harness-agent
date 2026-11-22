@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,33 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// TestBlockedSandboxAddress 验证拨号期地址校验拒绝元数据与链路本地地址，同时保留内网与回环。
+func TestBlockedSandboxAddress(t *testing.T) {
+	cases := []struct {
+		address string
+		blocked bool
+	}{
+		{"169.254.169.254", true},
+		{"169.254.1.1", true},
+		{"100.100.100.200", true},
+		{"fe80::1", true},
+		{"ff02::1", true},
+		{"224.0.0.1", true},
+		{"255.255.255.255", true},
+		{"0.0.0.0", true},
+		{"127.0.0.1", false},
+		{"10.0.0.8", false},
+		{"192.168.1.20", false},
+		{"172.16.0.5", false},
+		{"8.8.8.8", false},
+	}
+	for _, testCase := range cases {
+		if got := blockedSandboxAddress(net.ParseIP(testCase.address)); got != testCase.blocked {
+			t.Errorf("blockedSandboxAddress(%s) = %v, want %v", testCase.address, got, testCase.blocked)
+		}
+	}
+}
 
 // TestClientExecuteAuthenticatesAndParses 验证 Sandbox 调用携带认证头并正确解析输出。
 func TestClientExecuteAuthenticatesAndParses(t *testing.T) {

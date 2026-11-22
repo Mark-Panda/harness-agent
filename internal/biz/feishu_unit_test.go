@@ -481,6 +481,12 @@ func (s *feishuSenderStub) ReplyTextInThread(_ context.Context, _, _ string) (bi
 // feishuMessageBody 构造消息事件信封 JSON，供 Worker 测试复用。
 func feishuMessageBody(t *testing.T, chatType, chatID, messageID, threadID string, mentions []map[string]string) string {
 	t.Helper()
+	return feishuTypedMessageBody(t, chatType, chatID, messageID, threadID, mentions, "text", `{"text":"你好"}`)
+}
+
+// feishuTypedMessageBody 构造指定消息类型的飞书事件体。
+func feishuTypedMessageBody(t *testing.T, chatType, chatID, messageID, threadID string, mentions []map[string]string, messageType, content string) string {
+	t.Helper()
 	payload := map[string]any{
 		"schema": "2.0",
 		"header": map[string]any{
@@ -490,7 +496,7 @@ func feishuMessageBody(t *testing.T, chatType, chatID, messageID, threadID strin
 			"sender": map[string]any{"sender_id": map[string]any{"open_id": "ou_user"}, "sender_type": "user"},
 			"message": map[string]any{
 				"message_id": messageID, "chat_id": chatID, "chat_type": chatType,
-				"message_type": "text", "content": `{"text":"你好"}`, "thread_id": threadID, "mentions": mentions,
+				"message_type": messageType, "content": content, "thread_id": threadID, "mentions": mentions,
 			},
 		},
 	}
@@ -590,6 +596,63 @@ func TestFeishuEventWorkerP2PCreatesRun(t *testing.T) {
 	}
 	if hot.invalidated != 1 {
 		t.Fatalf("hot invalidated=%d, want 1", hot.invalidated)
+	}
+}
+
+// TestFeishuEventWorkerNotifiesUnsupportedMessage 验证图片等非文本消息会得到明确提示而不是静默忽略。
+func TestFeishuEventWorkerNotifiesUnsupportedMessage(t *testing.T) {
+	body := feishuTypedMessageBody(t, feishu.ChatTypeP2P, "oc_img", "om_img", "", nil, "image", `{"image_key":"img_1"}`)
+	record := biz.FeishuEventRecord{
+		EventID: "evt-om_img", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
+		Payload: map[string]any{"default_route": true, "body": body}, Status: biz.FeishuEventReceived,
+	}
+	fixture := newFeishuWorkerFixture(t, record, feishuJob("evt-om_img", 1, 3), biz.FeishuEventWorkerConfig{})
+	claimed, err := fixture.worker.ProcessOne(context.Background())
+	if err != nil || !claimed {
+		t.Fatalf("process one claimed=%v err=%v", claimed, err)
+	}
+	if fixture.runs.calls != 0 {
+		t.Fatalf("unsupported message must not create run, calls=%d", fixture.runs.calls)
+	}
+	if len(fixture.notices.texts) != 1 || !strings.Contains(fixture.notices.texts[0], "图片") {
+		t.Fatalf("notice texts = %v", fixture.notices.texts)
+	}
+	route := fixture.notices.routes[0]
+	if route.ReplyToMessageID != "om_img" || route.ChatID != "oc_img" || route.ThreadID != "p2p" || !route.DefaultRoute {
+		t.Fatalf("notice route = %+v", route)
+	}
+	if fixture.events.statuses["evt-om_img"] != biz.FeishuEventIgnored {
+		t.Fatalf("event status = %q", fixture.events.statuses["evt-om_img"])
+	}
+	if fixture.jobs.completed != 1 || fixture.jobs.failed != 0 {
+		t.Fatalf("job completed=%d failed=%d", fixture.jobs.completed, fixture.jobs.failed)
+	}
+}
+
+// TestFeishuEventWorkerNotifiesTerminalBusinessError 验证预算超限等确定性错误不再重试或进入死信。
+func TestFeishuEventWorkerNotifiesTerminalBusinessError(t *testing.T) {
+	body := feishuMessageBody(t, feishu.ChatTypeP2P, "oc_budget", "om_budget", "", nil)
+	record := biz.FeishuEventRecord{
+		EventID: "evt-om_budget", EventType: feishu.EventTypeMessageReceive, TenantKey: "tenant",
+		Payload: map[string]any{"default_route": true, "body": body}, Status: biz.FeishuEventReceived,
+	}
+	fixture := newFeishuWorkerFixture(t, record, feishuJob("evt-om_budget", 1, 3), biz.FeishuEventWorkerConfig{})
+	fixture.runs.err = fmt.Errorf("%w: daily budget exhausted", biz.ErrBudgetExceeded)
+	claimed, err := fixture.worker.ProcessOne(context.Background())
+	if err != nil || !claimed {
+		t.Fatalf("process one claimed=%v err=%v", claimed, err)
+	}
+	if fixture.runs.calls != 1 {
+		t.Fatalf("run calls = %d, want 1", fixture.runs.calls)
+	}
+	if len(fixture.notices.texts) != 1 || !strings.Contains(fixture.notices.texts[0], "额度") {
+		t.Fatalf("notice texts = %v", fixture.notices.texts)
+	}
+	if fixture.events.statuses["evt-om_budget"] != biz.FeishuEventIgnored {
+		t.Fatalf("event status = %q", fixture.events.statuses["evt-om_budget"])
+	}
+	if fixture.jobs.failed != 0 || fixture.jobs.completed != 1 {
+		t.Fatalf("job failed=%d completed=%d, terminal business errors must not retry", fixture.jobs.failed, fixture.jobs.completed)
 	}
 }
 
@@ -946,7 +1009,21 @@ type feishuWorkerFixture struct {
 	outbound      *feishuOutboundStub
 	bots          *feishuBotRouterStub
 	facts         *feishuFactTriggerStub
+	notices       *feishuNoticeStub
 	userID        uuid.UUID
+}
+
+// feishuNoticeStub 记录系统提示的投递路由与正文。
+type feishuNoticeStub struct {
+	routes []biz.FeishuNoticeRoute
+	texts  []string
+	err    error
+}
+
+func (s *feishuNoticeStub) SendNotice(_ context.Context, route biz.FeishuNoticeRoute, text string) error {
+	s.routes = append(s.routes, route)
+	s.texts = append(s.texts, text)
+	return s.err
 }
 
 // newFeishuWorkerFixture 构造默认成功链路的桩并装配 Worker。
@@ -967,6 +1044,7 @@ func newFeishuWorkerFixture(t *testing.T, record biz.FeishuEventRecord, job biz.
 		outbound:      &feishuOutboundStub{},
 		bots:          &feishuBotRouterStub{},
 		facts:         &feishuFactTriggerStub{},
+		notices:       &feishuNoticeStub{},
 	}
 	fixture.sessions.conversation = fixture.conversations
 	if config.WorkerID == "" {
@@ -992,7 +1070,7 @@ func (f *feishuWorkerFixture) buildWithConfig(t *testing.T, config biz.FeishuEve
 	worker, err := biz.NewFeishuEventWorker(biz.FeishuEventWorkerDependencies{
 		Jobs: f.jobs, Events: f.events, Identities: f.identities, Conversations: f.conversations,
 		Sessions: f.sessions, Messages: f.messages, Runs: f.runs, Outbound: f.outbound,
-		Bots: f.bots, SpeakerFacts: f.facts,
+		Bots: f.bots, SpeakerFacts: f.facts, Notices: f.notices,
 		Clock: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	}, config)
 	if err != nil {

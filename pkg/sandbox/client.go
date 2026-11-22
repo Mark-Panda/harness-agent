@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -116,6 +117,8 @@ func NewClient(config Config) (*Client, error) {
 	// 环境代理会把携带 Bearer 的内部请求转发到不可信出口，重定向则可能把令牌带到其他主机。
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	// 拨号期解析并校验目标地址，防止域名被解析到云元数据或链路本地地址后泄露令牌。
+	transport.DialContext = safeDialContext
 	return &Client{
 		endpoint: endpoint, token: config.Token, timeout: config.Timeout,
 		maxResponseBytes: config.MaxResponseBytes,
@@ -126,6 +129,51 @@ func NewClient(config Config) (*Client, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
+}
+
+// safeDialContext 解析目标主机并拒绝元数据、链路本地等不应访问的地址。
+// 内网 Runner 与回环地址仍允许，保持现有私有网络部署可用。
+func safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, resolved := range addresses {
+		if blockedSandboxAddress(resolved.IP) {
+			return nil, fmt.Errorf("%w: sandbox endpoint resolves to disallowed address %s", ErrInvalidConfig, resolved.IP)
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%w: sandbox endpoint resolved no addresses", ErrInvalidConfig)
+	}
+	return nil, lastErr
+}
+
+// blockedSandboxAddress 判断地址是否属于云元数据、链路本地、组播或未指定地址。
+// 私网与回环地址允许，以支持内网/本地部署的 Sandbox Runner。
+func blockedSandboxAddress(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	// 常见云厂商元数据地址（阿里云 100.100.100.200 不在链路本地网段内）。
+	if ip.Equal(net.ParseIP("100.100.100.200")) {
+		return true
+	}
+	return ip.Equal(net.IPv4bcast)
 }
 
 // Execute 调用 Sandbox Runner 并解析结果；响应体超过上限时拒绝解析。

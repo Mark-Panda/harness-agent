@@ -10,6 +10,39 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+func TestRedisLimiterRoundsSubMillisecondWindow(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	limiter, err := NewRedisLimiter(client, "tiny", 1, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := limiter.Allow(context.Background(), "key")
+	if err != nil || !result.Allowed {
+		t.Fatalf("sub-millisecond window = %#v, %v", result, err)
+	}
+}
+
+func TestRedisLimiterRefillsOverTime(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	limiter, err := NewRedisLimiter(client, "refill", 1, 40*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if result, err := limiter.Allow(ctx, "key"); err != nil || !result.Allowed {
+		t.Fatalf("first = %#v, %v", result, err)
+	}
+	if result, err := limiter.Allow(ctx, "key"); err != nil || result.Allowed {
+		t.Fatalf("second = %#v, %v", result, err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if result, err := limiter.Allow(ctx, "key"); err != nil || !result.Allowed {
+		t.Fatalf("after refill = %#v, %v", result, err)
+	}
+}
+
 func TestRedisLimiterLimitAndReset(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})

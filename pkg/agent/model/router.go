@@ -316,7 +316,7 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			r.current, r.attempts = index, 0
 		}
 		candidate := r.candidates[r.current]
-		outputBudget := r.outputBudget(candidate)
+		outputBudget := r.budgetWithinWindow(candidate, inputTokens, requiresTools, r.outputBudget(candidate))
 
 		client, err := r.client(candidate)
 		if err != nil {
@@ -389,10 +389,21 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			record.Status = "succeeded"
 			record.FinishReason = response.FinishReason
 			record.ProviderRequestID = response.ProviderRequestID
-			record.InputTokens = response.InputTokens
-			record.OutputTokens = response.OutputTokens
+			// 部分 OpenAI 兼容网关不返回 usage；缺失时保留请求侧估算并按响应文本估算输出，
+			// 避免预算与计费全部归零，使单 Run Token/费用上限失效。
+			if response.InputTokens > 0 {
+				record.InputTokens = response.InputTokens
+			}
+			if response.OutputTokens > 0 {
+				record.OutputTokens = response.OutputTokens
+			} else {
+				record.OutputTokens = int(EstimateTextTokens(response.Content))
+				if response.ReasoningContent != "" {
+					record.OutputTokens += int(EstimateTextTokens(response.ReasoningContent))
+				}
+			}
 			record.ResponseText = response.Content
-			record.EstimatedCost = estimateCost(candidate, response.InputTokens, response.OutputTokens)
+			record.EstimatedCost = estimateCost(candidate, record.InputTokens, record.OutputTokens)
 			totalUsage.InputTokens += record.InputTokens
 			totalUsage.OutputTokens += record.OutputTokens
 			totalCost += record.EstimatedCost
@@ -411,7 +422,7 @@ func (r *Router) complete(ctx context.Context, messages []react.Message, tools [
 			return react.Completion{
 				Content: response.Content, ReasoningContent: response.ReasoningContent,
 				FinishReason:  response.FinishReason,
-				Usage:         react.Usage{InputTokens: response.InputTokens, OutputTokens: response.OutputTokens},
+				Usage:         react.Usage{InputTokens: record.InputTokens, OutputTokens: record.OutputTokens},
 				EstimatedCost: record.EstimatedCost,
 				ToolCalls:     toReactToolCalls(response.ToolCalls),
 			}, nil
@@ -612,6 +623,19 @@ func (r *Router) outputBudget(candidate Candidate) int {
 	}
 	if r.config.MaxOutputTokens > 0 && r.config.MaxOutputTokens < budget {
 		budget = r.config.MaxOutputTokens
+	}
+	return budget
+}
+
+// budgetWithinWindow 在没有更大窗口候选可切换时，把输出预算收紧到剩余上下文。
+// 续写会追加完整半截回答，输入随之增长；沿用完整预算会让续写请求必然超过窗口。
+func (r *Router) budgetWithinWindow(candidate Candidate, inputTokens int64, requiresTools bool, budget int) int {
+	window := candidate.Ref.ContextWindowTokens
+	if window <= 0 || inputTokens+int64(budget) <= window || r.hasLargerCandidate(inputTokens, requiresTools) {
+		return budget
+	}
+	if remaining := int(window - inputTokens); remaining > 0 {
+		return remaining
 	}
 	return budget
 }

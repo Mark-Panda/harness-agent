@@ -25,6 +25,28 @@ type feishuGroupRunCreator interface {
 	CreateFeishuGroup(ctx context.Context, principal Principal, policyID uuid.UUID, input CreateRunInput) (Run, error)
 }
 
+// FeishuNoticeRoute 是与 Run 无关的系统提示的投递路由，复用入站事件验签时的机器人身份。
+type FeishuNoticeRoute struct {
+	// AppID 接收消息的飞书应用。
+	AppID string
+	// BotID 已登记机器人 ID；零值表示默认应用。
+	BotID uuid.UUID
+	// DefaultRoute 是否使用默认应用机器人。
+	DefaultRoute bool
+	// ChatID 目标会话。
+	ChatID string
+	// ThreadID 目标话题；p2p 或空值表示普通回复。
+	ThreadID string
+	// ReplyToMessageID 触发提示的原始消息 ID。
+	ReplyToMessageID string
+}
+
+// FeishuNoticeSender 发送与 Run 无关的系统提示（如额度不足、消息类型不支持）。
+// 实现必须自行完成机器人路由与凭据校验；失败由调用方记录日志，不影响事件终态。
+type FeishuNoticeSender interface {
+	SendNotice(ctx context.Context, route FeishuNoticeRoute, text string) error
+}
+
 // FeishuSharedChat 显式授权某个飞书应用在指定租户和群中为群成员执行模型对话。
 type FeishuSharedChat struct {
 	AppID, TenantKey, ChatID string
@@ -106,6 +128,8 @@ type FeishuEventWorkerDependencies struct {
 	Runs FeishuRunCreator
 	// Outbound 外发回复仓储。
 	Outbound FeishuOutboundStore
+	// Notices 与 Run 无关的系统提示发送器；为空时只记录日志。
+	Notices FeishuNoticeSender
 	// HotMessages 会话热消息缓存；入站消息落库后清理，确保下一次 Run 能读到新消息。
 	HotMessages HotMessageStore
 	// Bots 机器人注册与绑定解析端口；为空时退化为配置中的默认机器人。
@@ -131,6 +155,7 @@ type FeishuEventWorker struct {
 	sharedChats   map[feishuChatScope]uuid.UUID
 	runs          FeishuRunCreator
 	outbound      FeishuOutboundStore
+	notices       FeishuNoticeSender
 	hotMessages   HotMessageStore
 	bots          FeishuBotRouter
 	config        FeishuEventWorkerConfig
@@ -179,6 +204,7 @@ func NewFeishuEventWorker(dependencies FeishuEventWorkerDependencies, config Fei
 		jobs: dependencies.Jobs, events: dependencies.Events, identities: dependencies.Identities,
 		conversations: dependencies.Conversations, sessions: dependencies.Sessions,
 		messages: dependencies.Messages, runs: dependencies.Runs, outbound: dependencies.Outbound,
+		notices:       dependencies.Notices,
 		groupMessages: dependencies.GroupMessages, groupRuns: groupRuns, sharedChats: sharedChats,
 		hotMessages: dependencies.HotMessages,
 		bots:        dependencies.Bots,
@@ -374,14 +400,16 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		}
 	}
 	text := messageEvent.Text()
-	if text == "" {
-		return FeishuEventIgnored, nil
-	}
 	if len(text) > w.config.MaxMessageBytes {
 		text = truncateUTF8Bytes(text, w.config.MaxMessageBytes)
 	}
 	threadID, rootMessageID, ignored := w.threadKey(messageEvent)
 	if ignored {
+		return FeishuEventIgnored, nil
+	}
+	// 无法进入模型对话的消息（图片、文件、纯 @ 等）给出明确反馈，避免用户 @ 机器人后毫无响应。
+	if text == "" {
+		w.sendNotice(ctx, record, messageEvent, threadID, botID, feishuUnsupportedNotice(messageEvent))
 		return FeishuEventIgnored, nil
 	}
 	identity, err := w.identities.Resolve(ctx, record.TenantKey, messageEvent.SenderOpenID)
@@ -525,6 +553,12 @@ func (w *FeishuEventWorker) process(ctx context.Context, record FeishuEventRecor
 		TriggerMessageID: &stored.ID,
 	})
 	if err != nil {
+		// 预算超限、会话失效等确定性业务错误不会因重试自行恢复：
+		// 直接给出提示并结束事件，避免无效退避重试最终进入死信。
+		if notice, terminal := feishuBusinessNotice(err); terminal {
+			w.sendNotice(ctx, record, messageEvent, threadID, botID, notice)
+			return FeishuEventIgnored, nil
+		}
 		return "", err
 	}
 	if run.UserID != binding.UserID || run.SessionID != session.ID ||
@@ -546,6 +580,59 @@ func (w *FeishuEventWorker) createReply(ctx context.Context, appID string, botID
 		return "", err
 	}
 	return FeishuEventProcessed, nil
+}
+
+// feishuUnsupportedNotice 为无法进入模型对话的消息生成用户提示。
+func feishuUnsupportedNotice(event feishu.MessageEvent) string {
+	switch event.MessageType {
+	case "image":
+		return "当前机器人暂不支持图片消息，请用文字描述图片内容或直接提问。"
+	case "file":
+		return "当前机器人暂不支持文件消息，请粘贴文件中的关键文字后再提问。"
+	case "audio":
+		return "当前机器人暂不支持语音消息，请改用文字发送。"
+	case "media":
+		return "当前机器人暂不支持视频消息，请用文字描述视频内容。"
+	case "sticker":
+		return "当前机器人暂不支持表情消息，请直接输入问题。"
+	case "post":
+		return "没有读取到富文本正文，请改用纯文字发送。"
+	default:
+		return "没有读取到文字内容，请补充要咨询的问题。"
+	}
+}
+
+// feishuBusinessNotice 把确定性业务错误映射为用户提示；第二个返回值表示是否应立即终止重试。
+func feishuBusinessNotice(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrBudgetExceeded):
+		return "今天的可用额度已用完，请明天再试或联系管理员。", true
+	case errors.Is(err, ErrForbidden):
+		return "当前身份无权继续该会话，请联系管理员。", true
+	case errors.Is(err, ErrResourceConflict):
+		return "会话状态已变化，请重新发送消息开始新对话。", true
+	case errors.Is(err, ErrInvalidConfig):
+		return "机器人配置不完整，请联系管理员。", true
+	default:
+		return "", false
+	}
+}
+
+// sendNotice 尽力发送与 Run 无关的系统提示；失败只记录日志，不影响事件终态。
+func (w *FeishuEventWorker) sendNotice(ctx context.Context, record FeishuEventRecord, event feishu.MessageEvent, threadID string, botID uuid.UUID, text string) {
+	if w.notices == nil {
+		w.logger.Info("feishu notice skipped: sender is not configured",
+			"event_id", record.EventID, "message_type", event.MessageType)
+		return
+	}
+	route := FeishuNoticeRoute{
+		AppID: record.AppID, BotID: botID, DefaultRoute: botID == uuid.Nil,
+		ChatID: event.ChatID, ThreadID: threadID, ReplyToMessageID: event.MessageID,
+	}
+	if err := w.notices.SendNotice(ctx, route, text); err != nil {
+		w.logger.Warn("send feishu notice failed",
+			"event_id", record.EventID, "chat_id", event.ChatID, "error", err)
+	}
 }
 
 // threadKey 计算话题键与根消息别名；单聊固定 p2p，群聊无话题时按策略忽略或使用根消息过渡别名。

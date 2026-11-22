@@ -121,6 +121,31 @@ func writeCompletion(w http.ResponseWriter, content string) {
 	_, _ = w.Write([]byte(`{"id":"req-1","choices":[{"message":{"content":"` + content + `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50}}`))
 }
 
+// writeCompletionWithoutUsage 写出省略 usage 的合法响应，模拟不返回计费信息的兼容网关。
+func writeCompletionWithoutUsage(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"id":"req-1","choices":[{"message":{"content":"` + content + `"},"finish_reason":"stop"}]}`))
+}
+
+// TestRouterEstimatesUsageWhenProviderOmitsIt 验证 usage 缺失时仍按估算累计 Token 与费用，
+// 避免单 Run 预算与计费全部归零。
+func TestRouterEstimatesUsageWhenProviderOmitsIt(t *testing.T) {
+	server := newChatServer(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		writeCompletionWithoutUsage(w, "estimated output tokens")
+	})
+	router, err := NewRouter([]Candidate{candidateFor(server, "p1", "m1", 1_000_000)}, newFakeHealth(), testConfig(), &attemptRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := router.Complete(context.Background(), []react.Message{{Role: react.RoleUser, Content: "hello"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage.InputTokens <= 0 || result.Usage.OutputTokens <= 0 || result.EstimatedCost <= 0 {
+		t.Fatalf("usage fallback = %#v cost=%v", result.Usage, result.EstimatedCost)
+	}
+}
+
 // candidateFor 构造指向测试服务的候选。
 func candidateFor(server *httptest.Server, providerID, modelID string, window int64) Candidate {
 	return Candidate{

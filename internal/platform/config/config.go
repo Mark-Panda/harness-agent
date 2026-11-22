@@ -325,6 +325,8 @@ type SummaryConfig struct {
 	Lease Duration `yaml:"lease"`
 	// Heartbeat 摘要任务租约续约间隔。
 	Heartbeat Duration `yaml:"heartbeat"`
+	// MaintenanceInterval 摘要补建扫描间隔；为零时使用 1 分钟。
+	MaintenanceInterval Duration `yaml:"maintenance_interval"`
 }
 
 // BudgetsConfig 是用户、Agent 与供应商的每日预算上限；零值表示该维度不限制。

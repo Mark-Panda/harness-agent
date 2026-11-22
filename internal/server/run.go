@@ -219,36 +219,70 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 		notify = channel
 	}
 
+	// writeBatch 写出一批事件并推进游标；返回 false 表示客户端已断开。
+	writeBatch := func(events []biz.RunEvent) bool {
+		for _, event := range events {
+			after = event.Seq
+			if !writeSSE(w, event.Seq, event.EventType, event.Payload) {
+				return false
+			}
+		}
+		if len(events) > 0 {
+			flusher.Flush()
+		}
+		return true
+	}
+	// writeStreamError 发送可重试的流错误。使用独立事件名，避免客户端把事件读取故障误判为 Run 失败。
+	// seq 传 0 不写 id，防止污染客户端 Last-Event-ID 游标。
+	writeStreamError := func(reason string) {
+		writeSSE(w, 0, "stream.error", map[string]any{
+			"reason": reason, "retryable": true, "last_seq": after,
+		})
+		flusher.Flush()
+	}
 	for {
 		// 每轮数据库查询使用独立短超时，避免全局请求超时或慢查询无限占用连接。
 		queryCtx, cancelQuery := context.WithTimeout(streamCtx, 10*time.Second)
 		events, listErr := h.service.Runs.ListEvents(queryCtx, requestPrincipal(r), runID, after, 200)
 		cancelQuery()
 		if listErr != nil {
-			// 流已开始，只能以 run.failed 风格结束，避免写入非法 JSON 错误体。
-			// 合成事件不是真实事件流成员，seq 传 0 不写 id，防止污染客户端 Last-Event-ID 游标。
-			writeSSE(w, 0, "run.failed", map[string]any{"reason": "event_read_failed"})
-			flusher.Flush()
+			// 流已开始，只能以事件流错误结束，避免写入非法 JSON 错误体。
+			writeStreamError("event_read_failed")
 			return
 		}
-		for _, event := range events {
-			after = event.Seq
-			if !writeSSE(w, event.Seq, event.EventType, event.Payload) {
-				return
-			}
-		}
-		if len(events) > 0 {
-			flusher.Flush()
+		if !writeBatch(events) {
+			return
 		}
 		// 兜底轮询只读状态列，避免每轮反序列化完整 Run 快照。
 		statusCtx, cancelStatus := context.WithTimeout(streamCtx, 10*time.Second)
 		current, statusErr := h.service.Runs.Status(statusCtx, requestPrincipal(r), runID)
 		cancelStatus()
 		if statusErr != nil {
+			writeStreamError("status_read_failed")
 			return
 		}
 		// 终态或人工对账状态且事件已全部输出后关闭连接，客户端无需猜测结束时间。
-		if biz.RunSettled(current) && len(events) == 0 {
+		// 状态与终态事件在同一事务提交，但上面的 ListEvents 发生在提交之前：
+		// 必须再补读一次，否则会在两次查询之间漏掉 run.completed 等终态事件。
+		if biz.RunSettled(current) {
+			for drained := 0; drained < 20; drained++ {
+				drainCtx, cancelDrain := context.WithTimeout(streamCtx, 10*time.Second)
+				remaining, drainErr := h.service.Runs.ListEvents(drainCtx, requestPrincipal(r), runID, after, 200)
+				cancelDrain()
+				if drainErr != nil {
+					writeStreamError("event_read_failed")
+					return
+				}
+				if len(remaining) == 0 {
+					return
+				}
+				if !writeBatch(remaining) {
+					return
+				}
+			}
+			// 终态后仍有大量事件（异常写入循环）：主动截断，客户端可凭最后游标续订。
+			writeSSE(w, 0, "stream.truncated", map[string]any{"last_seq": after, "reason": "terminal_drain_limit"})
+			flusher.Flush()
 			return
 		}
 		if time.Now().After(deadline) {

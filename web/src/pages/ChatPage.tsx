@@ -490,6 +490,17 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
                 });
                 return;
               }
+              // 事件读取/状态读取的瞬时故障不是 Run 失败，保留游标并自动重连。
+              if (event.event === "stream.error") {
+                setStreamError(null);
+                pushTimeline({
+                  key: `${event.seq}:${event.event}:${Date.now()}`,
+                  label: "事件流暂时中断，正在自动重连",
+                  detail: `${String(event.data?.reason ?? "unknown")} · 已接收至序号 ${String(event.data?.last_seq ?? "?")}`,
+                  tone: "warning",
+                });
+                return;
+              }
               if (event.seq > 0) {
                 if (event.seq <= streamCursor.current.seq) return;
                 streamCursor.current.seq = event.seq;

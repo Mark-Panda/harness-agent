@@ -500,6 +500,36 @@ func (r *SessionRepository) CountMessagesThrough(ctx context.Context, userID, se
 	return count, nil
 }
 
+// ListSummaryCandidateSessions 按最近活跃时间返回需要检查摘要进度的会话。
+// 只返回活跃且未禁用记忆的会话；是否真正达到阈值由规划器再次判断。
+func (r *SessionRepository) ListSummaryCandidateSessions(ctx context.Context, limit int) ([]biz.SummarySessionRef, error) {
+	limit = NormalizeLimit(limit)
+	var rows []struct {
+		UserID    uuid.UUID
+		SessionID uuid.UUID
+	}
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return tx.Raw(`
+SELECT s.user_id, s.id AS session_id
+FROM sessions s
+WHERE s.status = ? AND s.memory_policy <> ?
+  AND EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.session_id = s.id AND m.user_id = s.user_id AND m.deleted_at IS NULL
+  )
+ORDER BY COALESCE(s.last_message_at, s.updated_at) DESC, s.id
+LIMIT ?`, string(biz.SessionActive), string(biz.SessionMemoryDisabled), limit).Scan(&rows).Error
+	})
+	if err != nil {
+		return nil, catalogError("list summary candidate sessions", err)
+	}
+	sessions := make([]biz.SummarySessionRef, 0, len(rows))
+	for _, row := range rows {
+		sessions = append(sessions, biz.SummarySessionRef{UserID: row.UserID, SessionID: row.SessionID})
+	}
+	return sessions, nil
+}
+
 // toBizMessages 把消息行批量转换为领域消息。
 func toBizMessages(records []messageModel) ([]biz.Message, error) {
 	messages := make([]biz.Message, 0, len(records))

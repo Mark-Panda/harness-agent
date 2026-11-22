@@ -20,7 +20,10 @@ var (
 	ErrInvalidCredentials  = errors.New("invalid username or password")
 	ErrInvalidRefreshToken = errors.New("invalid refresh token")
 	ErrRefreshTokenReused  = errors.New("refresh token reuse detected")
-	ErrInvalidUsername     = errors.New("username must contain between 3 and 64 characters")
+	// ErrRefreshTokenInProgress 表示同一刷新令牌刚被并发请求轮换，调用方稍后重试即可。
+	// 该错误不应导致令牌族撤销，避免 Redis 写入延迟把正常并发刷新误判为重用。
+	ErrRefreshTokenInProgress = errors.New("refresh token rotation in progress")
+	ErrInvalidUsername        = errors.New("username must contain between 3 and 64 characters")
 	// ErrRegistrationDisabled 开放注册已关闭，需要管理员邀请。
 	ErrRegistrationDisabled = errors.New("open registration is disabled")
 	// ErrFeishuLoginUnavailable 未配置飞书网页登录。
@@ -340,6 +343,11 @@ func (s *AuthService) Refresh(ctx context.Context, rawToken string) (AuthResult,
 		if result, ok := s.waitReplay(ctx, oldToken, hash); ok {
 			return result, nil
 		}
+		// 重放窗口内仍未读到结果，通常是对端刚完成轮换但重放记录尚未写入；
+		// 此时返回可重试错误，不撤销整族，避免 Redis 抖动导致所有会话失效。
+		if s.rotationInProgress(oldToken, now) {
+			return AuthResult{}, ErrRefreshTokenInProgress
+		}
 		if err := s.tokens.RevokeFamily(ctx, oldToken.UserID, oldToken.FamilyID, now, true, authEvent(oldToken.UserID, "auth.refresh.reuse_detected", "refresh_token_family", oldToken.FamilyID.String(), "auth.refresh.reuse:"+oldToken.ID.String(), "denied")); err != nil {
 			return AuthResult{}, fmt.Errorf("revoke reused token family: %w", err)
 		}
@@ -360,9 +368,14 @@ func (s *AuthService) Refresh(ctx context.Context, rawToken string) (AuthResult,
 	}
 	if err := s.tokens.RotateRefreshToken(ctx, user.ID, oldToken.ID, hash, newToken, authEvent(user.ID, "auth.refresh.rotated", "refresh_token_family", oldToken.FamilyID.String(), "auth.refresh.rotated:"+newToken.ID.String(), "success")); err != nil {
 		if errors.Is(err, biz.ErrRefreshTokenConflict) {
-			// 另一个并发请求先完成了轮换，优先重放它的结果；确认不存在后才按重用撤销整族。
+			// 另一个并发请求先完成了轮换，优先重放它的结果。
 			if replay, ok := s.waitReplay(ctx, oldToken, hash); ok {
 				return replay, nil
+			}
+			// 读到旧状态后才发生的轮换冲突几乎必然来自并发刷新；
+			// 返回可重试错误，避免把正常并发误判为重放并撤销整族。
+			if s.replay != nil {
+				return AuthResult{}, ErrRefreshTokenInProgress
 			}
 			_ = s.tokens.RevokeFamily(ctx, user.ID, oldToken.FamilyID, now, true, authEvent(user.ID, "auth.refresh.reuse_detected", "refresh_token_family", oldToken.FamilyID.String(), "auth.refresh.reuse:"+oldToken.ID.String(), "denied"))
 			return AuthResult{}, ErrRefreshTokenReused
@@ -372,11 +385,38 @@ func (s *AuthService) Refresh(ctx context.Context, rawToken string) (AuthResult,
 	// 轮换成功后写入短时重放记录，使同一令牌的并发刷新返回同一次结果。
 	if s.replay != nil {
 		replay := RefreshReplay{Result: result, SuccessorHash: newToken.TokenHash}
-		if err := s.replay.SaveRefreshReplay(ctx, hash, replay, s.replayTTL); err != nil {
-			slog.Warn("store refresh replay failed", "error", err)
-		}
+		s.saveReplay(ctx, hash, replay)
 	}
 	return result, nil
+}
+
+// saveReplay 写入重放记录并对瞬时故障做短暂重试。
+// 写入失败只降级为“并发刷新返回可重试错误”，不会影响已完成的轮换。
+func (s *AuthService) saveReplay(ctx context.Context, hash []byte, replay RefreshReplay) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		if err = s.replay.SaveRefreshReplay(ctx, hash, replay, s.replayTTL); err == nil {
+			return
+		}
+	}
+	slog.Warn("store refresh replay failed", "error", err)
+}
+
+// rotationInProgress 判断令牌是否刚刚被并发请求轮换。
+// 只有启用了重放存储且轮换时间落在重放窗口内时才可判定为进行中；
+// 超出窗口的重复使用仍按真实重用撤销整族。
+func (s *AuthService) rotationInProgress(token biz.RefreshToken, now time.Time) bool {
+	if s.replay == nil || token.RotatedAt == nil {
+		return false
+	}
+	return now.Sub(*token.RotatedAt) <= s.replayTTL
 }
 
 // waitReplay 在重放窗口内读取并发轮换结果，短暂重试以覆盖“先提交轮换、后写重放”的间隙。
@@ -384,12 +424,13 @@ func (s *AuthService) waitReplay(ctx context.Context, oldToken biz.RefreshToken,
 	if s.replay == nil {
 		return AuthResult{}, false
 	}
-	for attempt := 0; attempt < 4; attempt++ {
+	// 重试总时长覆盖 Redis 常规写入延迟；轮换后的写入通常在一个 RTT 内完成。
+	for attempt := 0; attempt < 6; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return AuthResult{}, false
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 		}
 		replay, found, err := s.replay.LoadRefreshReplay(ctx, hash)

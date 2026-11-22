@@ -369,17 +369,26 @@ func (w *ExecutionWorker) persistSupervisorTasks(ctx context.Context, run Run, f
 			return nil, err
 		}
 		persistPrompt := true
+		promptIndex := 0
 		if reused {
-			// 已存在会话只在缺少任务消息时补写；上次重试可能已完成消息写入。
-			page, listErr := w.sessions.ListMessages(ctx, run.UserID, sessionID, 1, "")
+			// 已存在会话时只在尚未记录相同任务时补写；上次重试可能已完成消息写入。
+			// 必须检查全部历史而不是仅首条：重新规划可能产生不同任务，此时应追加新指令，
+			// 否则子会话会出现“旧任务指令 + 新任务结果”的不一致 transcript。
+			existing, listErr := w.listChildMessages(ctx, run.UserID, sessionID)
 			if listErr != nil {
 				return nil, listErr
 			}
-			persistPrompt = len(page.Items) == 0
+			promptIndex = len(existing)
+			for _, message := range existing {
+				if message.Role == MessageUser && message.Content == worker.Task {
+					persistPrompt = false
+					break
+				}
+			}
 		}
 		if persistPrompt {
 			taskMessage := Message{
-				ID: deterministicMessageID(childSession.ID, 0), SessionID: childSession.ID, UserID: run.UserID,
+				ID: deterministicSupervisorTaskMessageID(childSession.ID, promptIndex), SessionID: childSession.ID, UserID: run.UserID,
 				Role: MessageUser, Content: worker.Task,
 			}
 			if _, err := w.sessions.AppendMessage(ctx, taskMessage, OutboxEvent{
@@ -899,6 +908,33 @@ func hasSupervisorToolResult(messages []react.Message) bool {
 
 func supervisorToolResultUncertain(err error) bool {
 	return errors.Is(err, ErrToolResultPersistence) || errors.Is(err, ErrApprovalExecutionUnknown)
+}
+
+// listChildMessages 读取子会话全部消息，用于重试时判断任务指令是否已持久化。
+// 该路径只在任务表为空、需要重新持久化委派时执行，分页上限由子会话规模决定。
+func (w *ExecutionWorker) listChildMessages(ctx context.Context, userID, sessionID uuid.UUID) ([]Message, error) {
+	if w.sessions == nil || sessionID == uuid.Nil {
+		return nil, nil
+	}
+	messages := make([]Message, 0, 32)
+	cursor := ""
+	for {
+		page, err := w.sessions.ListMessages(ctx, userID, sessionID, 200, cursor)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, page.Items...)
+		if page.NextCursor == "" || page.NextCursor == cursor {
+			return messages, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// deterministicSupervisorTaskMessageID 为子会话任务指令生成稳定 ID。
+// 使用独立命名空间，避免与 Worker 助手消息按索引生成的 ID 冲突。
+func deterministicSupervisorTaskMessageID(sessionID uuid.UUID, index int) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("supervisor-task:%s:prompt:%d", sessionID, index)))
 }
 
 // supervisorChildHistoryLimit 是回放到 Worker 上下文中的最大历史消息数。
