@@ -1,6 +1,8 @@
 x-app-environment: &app-environment
   # 本地默认 dev；部署到共享环境时必须显式覆盖 APP_ENV 与全部密钥。
   APP_ENV: ${APP_ENV:-dev}
+  # 进程角色：app 只提供 API/SSE，worker 服务只消费持久化任务。
+  WORKER_ROLE: api
   DATABASE_URL: postgres://harness_app:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
   AUTH_DATABASE_URL: postgres://harness_auth:${POSTGRES_PASSWORD:-harness}@postgres:5432/harness?sslmode=disable
   REDIS_ADDR: redis:6379
@@ -113,6 +115,36 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  worker:
+    build:
+      context: .
+    # 独立 Worker 入口：不监听 HTTP，只消费 jobs 队列。
+    entrypoint: ["/app/harness-worker"]
+    environment:
+      <<: *app-environment
+      WORKER_ROLE: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # 与 app 相同的只读与降权基线；长任务需要更长的停机宽限。
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    cpus: 2
+    stop_grace_period: 60s
+    # Worker 不监听 HTTP，镜像内置的 /health/ready 健康检查不适用。
+    healthcheck:
+      disable: true
 
 volumes:
   postgres-data:

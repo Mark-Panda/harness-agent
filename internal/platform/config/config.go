@@ -351,6 +351,14 @@ type BudgetsConfig struct {
 type WorkerConfig struct {
 	// Enabled 是否在当前进程启动执行 Worker。
 	Enabled bool `yaml:"enabled"`
+	// Role 进程角色：api 仅接入、worker 仅执行、all 兼容单进程；为空按 all 处理。
+	Role string `yaml:"role"`
+	// Components 逗号分隔的 Worker 组件：execution/background/feishu/deletion；为空启动全部。
+	Components string `yaml:"components"`
+	// PoolFilter 逗号分隔的执行池名称；为空启动全部 pools。
+	PoolFilter string `yaml:"pool_filter"`
+	// Pools 是执行资源池配置；为空时使用单池兼容模式。
+	Pools []WorkerPoolConfig `yaml:"pools"`
 	// WorkerID 实例标识；为空时启动时自动生成，多副本部署必须唯一。
 	WorkerID string `yaml:"worker_id"`
 	// Concurrency 单实例并发执行 Run 数。
@@ -401,6 +409,22 @@ type WorkerConfig struct {
 	PerProviderConcurrency int `yaml:"per_provider_concurrency"`
 	// ConcurrencyLease 并发槽位租约，超时后自动回收崩溃实例占用的槽位。
 	ConcurrencyLease Duration `yaml:"concurrency_lease"`
+}
+
+// WorkerPoolConfig 是单个执行资源池的配置。
+type WorkerPoolConfig struct {
+	// Name 资源池名称，必须在配置内唯一，用于日志、租约与指标。
+	Name string `yaml:"name"`
+	// Lanes 认领的 lane 列表；为空表示不按 lane 过滤。
+	Lanes []string `yaml:"lanes"`
+	// Concurrency 单实例并发执行 Run 数；零值回退到 worker.concurrency。
+	Concurrency int `yaml:"concurrency"`
+	// GlobalConcurrency 跨副本池级并发上限；零值回退到 worker.global_concurrency。
+	GlobalConcurrency int `yaml:"global_concurrency"`
+	// Lease 池级任务与 Run 租约；零值回退到 worker.lease。
+	Lease Duration `yaml:"lease"`
+	// Heartbeat 池级租约续约间隔；零值回退到 worker.heartbeat。
+	Heartbeat Duration `yaml:"heartbeat"`
 }
 
 type ModelRoutingConfig struct {
@@ -687,9 +711,51 @@ func (c Config) Validate() error {
 		return fmt.Errorf("agent.skills.max_output_bytes must not be negative")
 	}
 	worker := c.Agent.Worker
+	switch strings.ToLower(strings.TrimSpace(worker.Role)) {
+	case "", "all", "api", "worker":
+	default:
+		return fmt.Errorf("agent.worker.role must be all, api or worker")
+	}
+	for _, component := range csvValues(worker.Components) {
+		switch component {
+		case "execution", "background", "feishu", "deletion":
+		default:
+			return fmt.Errorf("agent.worker.components contains unsupported component %q", component)
+		}
+	}
 	if worker.Enabled {
 		if worker.Concurrency <= 0 {
 			return fmt.Errorf("agent.worker.concurrency must be positive")
+		}
+		seenPools := make(map[string]struct{}, len(worker.Pools))
+		for index, pool := range worker.Pools {
+			name := strings.TrimSpace(pool.Name)
+			if name == "" {
+				return fmt.Errorf("agent.worker.pools[%d].name is required", index)
+			}
+			if _, exists := seenPools[name]; exists {
+				return fmt.Errorf("agent.worker.pools contains duplicate name %q", name)
+			}
+			seenPools[name] = struct{}{}
+			if pool.Concurrency < 0 || pool.GlobalConcurrency < 0 {
+				return fmt.Errorf("agent.worker.pools[%d] concurrency must not be negative", index)
+			}
+			if pool.Lease.Duration < 0 {
+				return fmt.Errorf("agent.worker.pools[%d].lease must not be negative", index)
+			}
+			if pool.Heartbeat.Duration < 0 {
+				return fmt.Errorf("agent.worker.pools[%d].heartbeat must not be negative", index)
+			}
+			if pool.Heartbeat.Duration > 0 && pool.Lease.Duration > 0 && pool.Heartbeat.Duration >= pool.Lease.Duration {
+				return fmt.Errorf("agent.worker.pools[%d].heartbeat must be shorter than lease", index)
+			}
+		}
+		for _, name := range csvValues(worker.PoolFilter) {
+			if len(seenPools) > 0 {
+				if _, exists := seenPools[name]; !exists {
+					return fmt.Errorf("agent.worker.pool_filter references unknown pool %q", name)
+				}
+			}
 		}
 		if worker.PollInterval.Duration <= 0 || worker.Lease.Duration <= 0 || worker.CancelPoll.Duration <= 0 || worker.RequestTimeout.Duration <= 0 {
 			return fmt.Errorf("agent.worker intervals and request timeout must be positive")
@@ -1049,4 +1115,22 @@ func (c Config) validateCredentials() error {
 		keyIDs[key.ID] = struct{}{}
 	}
 	return nil
+}
+
+// csvValues 把逗号分隔的环境变量配置转换为去空、去重的稳定列表。
+func csvValues(raw string) []string {
+	seen := make(map[string]struct{})
+	values := make([]string, 0, 4)
+	for _, part := range strings.Split(raw, ",") {
+		value := strings.ToLower(strings.TrimSpace(part))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
 }

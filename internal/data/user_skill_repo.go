@@ -377,8 +377,8 @@ func (r *JobRepository) EnqueueSkillSynthesis(ctx context.Context, task biz.Skil
 		dedupe += ":" + requestID
 	}
 	record := jobModel{
-		ID: uuid.New(), UserID: &task.UserID, JobType: biz.SkillSynthesisJobType, DedupeKey: &dedupe,
-		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 4,
+		ID: uuid.New(), UserID: &task.UserID, JobType: biz.SkillSynthesisJobType, Lane: biz.JobLaneBackground,
+		DedupeKey: &dedupe, Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 4,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	return WithScope(ctx, r.db, Scope{UserID: task.UserID}, func(tx *gorm.DB) error {

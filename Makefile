@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: generate generate-check lint test-unit test-race test-integration test-contract test-breaking test-license test-migration test-coverage test-quality test-web web-install web-build build docker-up docker-stop smoke test-chaos backup-check test-security
+.PHONY: generate generate-check lint test-unit test-race test-integration test-contract test-breaking test-license test-migration test-coverage test-quality test-memory-eval test-feishu-group-e2e test-web web-install web-build build docker-up docker-stop smoke test-chaos backup-check test-security
 
 generate:
 	buf generate
@@ -72,6 +72,14 @@ test-quality:
 	go test -count=1 ./tests/quality
 	go test -count=1 -run 'TestPlan|TestSupervisor' ./internal/biz
 
+# 记忆质量评测：需要独立空库与 TEST_*_DATABASE_URL，避免本地真实数据污染。
+test-memory-eval:
+	REQUIRE_DATABASE=true go test -tags=integration -count=1 ./tests/quality/memory
+
+# 飞书群聊多发言人链路：需要独立空库与 TEST_*_DATABASE_URL。
+test-feishu-group-e2e:
+	./scripts/feishu_group_multispeaker_e2e.sh
+
 test-web: web-install
 	npm --prefix web test
 
@@ -87,6 +95,7 @@ web-build: web-install
 build: web-build
 	mkdir -p bin
 	CGO_ENABLED=0 go build -trimpath -o bin/harness-agent ./cmd/server
+	CGO_ENABLED=0 go build -trimpath -o bin/harness-worker ./cmd/worker
 	CGO_ENABLED=0 go build -trimpath -o bin/harness-migrate ./cmd/migrate
 	CGO_ENABLED=0 go build -trimpath -o bin/harness-retention ./cmd/retention
 	CGO_ENABLED=0 go build -trimpath -o bin/harness-admin ./cmd/admin

@@ -78,3 +78,79 @@ func TestSpeakerAttributionRate(t *testing.T) {
 		t.Fatalf("empty speakers rate = %f", rate)
 	}
 }
+
+// TestRankingMetrics 验证 MRR 与 nDCG 对排序位置的敏感度。
+func TestRankingMetrics(t *testing.T) {
+	relevant := map[string]struct{}{"a": {}, "b": {}}
+	if mrr := MRR([]string{"x", "a", "b"}, relevant); math.Abs(mrr-0.5) > 1e-9 {
+		t.Fatalf("mrr = %f", mrr)
+	}
+	if mrr := MRR([]string{"x", "y"}, relevant); mrr != 0 {
+		t.Fatalf("miss mrr = %f", mrr)
+	}
+	if ndcg := NDCGAtK([]string{"a", "b"}, relevant, 2); math.Abs(ndcg-1) > 1e-9 {
+		t.Fatalf("perfect ndcg = %f", ndcg)
+	}
+	if ndcg := NDCGAtK([]string{"x", "a", "b"}, relevant, 3); ndcg >= 1 || ndcg <= 0 {
+		t.Fatalf("downgraded ndcg = %f", ndcg)
+	}
+	if ndcg := NDCGAtK(nil, relevant, 2); ndcg != 0 {
+		t.Fatalf("empty ndcg = %f", ndcg)
+	}
+}
+
+// TestClaimMetrics 验证 claim 级摘要召回与禁止 claim 检测。
+func TestClaimMetrics(t *testing.T) {
+	summary := "用户偏好中文回答；部署窗口是周末。"
+	if recall := SummaryClaimRecall(summary, []string{"偏好中文回答", "部署窗口是周末"}); recall != 1 {
+		t.Fatalf("claim recall = %f", recall)
+	}
+	if recall := SummaryClaimRecall(summary, []string{"预算 9999 元"}); recall != 0 {
+		t.Fatalf("missing claim recall = %f", recall)
+	}
+	if rate := UnsupportedClaimRate(summary, []string{"预算 9999 元", "部署窗口是周三"}); rate != 0 {
+		t.Fatalf("unsupported rate = %f", rate)
+	}
+	if rate := UnsupportedClaimRate(summary, []string{"部署窗口是周末"}); rate != 1 {
+		t.Fatalf("matched forbidden rate = %f", rate)
+	}
+}
+
+// TestSpeakerAttributionAccuracy 验证 claim 是否归到正确发言人。
+func TestSpeakerAttributionAccuracy(t *testing.T) {
+	transcript := "ou_a：部署窗口是周六\nou_b：部署窗口是周日"
+	expected := map[string]string{"ou_a": "部署窗口是周六", "ou_b": "部署窗口是周日"}
+	if accuracy := SpeakerAttributionAccuracy(expected, transcript); accuracy != 1 {
+		t.Fatalf("attribution accuracy = %f", accuracy)
+	}
+	wrong := map[string]string{"ou_a": "部署窗口是周日", "ou_b": "部署窗口是周六"}
+	if accuracy := SpeakerAttributionAccuracy(wrong, transcript); accuracy != 0 {
+		t.Fatalf("wrong attribution accuracy = %f", accuracy)
+	}
+}
+
+// TestConflictResolutionAccuracy 验证生效事实与期望值的一致性。
+func TestConflictResolutionAccuracy(t *testing.T) {
+	active := map[string]string{"preference.language": "zh"}
+	if accuracy := ConflictResolutionAccuracy(active, map[string]string{"preference.language": "zh"}); accuracy != 1 {
+		t.Fatalf("conflict accuracy = %f", accuracy)
+	}
+	if accuracy := ConflictResolutionAccuracy(active, map[string]string{"preference.language": "en"}); accuracy != 0 {
+		t.Fatalf("stale conflict accuracy = %f", accuracy)
+	}
+}
+
+// TestMultilingualFaithfulness 验证日语假名与韩文不会被 tokenizer 丢弃。
+func TestMultilingualFaithfulness(t *testing.T) {
+	sources := []string{"こんにちは、今日はいい天気です。", "안녕하세요 오늘 날씨가 좋습니다."}
+	if score := SummaryFaithfulness("こんにちは、今日はいい天気です。", sources[:1]); score < 0.8 {
+		t.Fatalf("japanese faithfulness = %f", score)
+	}
+	if score := SummaryFaithfulness("안녕하세요 오늘 날씨가 좋습니다.", sources[1:]); score < 0.8 {
+		t.Fatalf("korean faithfulness = %f", score)
+	}
+	hallucinated := SummaryFaithfulness("さようなら、明日は雨です。", sources[:1])
+	if hallucinated >= 0.5 {
+		t.Fatalf("japanese hallucination faithfulness = %f", hallucinated)
+	}
+}

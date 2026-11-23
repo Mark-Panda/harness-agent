@@ -27,6 +27,26 @@
 | 记忆相关性/冲突/摘要忠实度 | `REQUIRE_DATABASE=true go test -tags=integration ./internal/data -run TestMemoryQualityEvaluation` | Precision/Recall、MMR、事实冲突、跨用户零泄漏 |
 | 删除后不可召回 | `REQUIRE_DATABASE=true go test -tags=integration ./internal/data -run 'TestDeletion|TestPurgeExpired'` | 向量与摘要清理 |
 
+## 记忆质量评测 v1
+
+数据集：`tests/quality/memory/testdata/dataset.v1.json`；门禁：`baseline.v1.json`；执行：`make test-memory-eval`（必须使用独立空库）。
+
+| 指标 | 基线 | 说明 |
+| --- | --- | --- |
+| `recall@8` | ≥ 0.90 | 相关记忆召回覆盖率 |
+| `precision@8` | ≥ 0.50 | 小规模确定性数据集的下限 |
+| `MRR` | ≥ 0.80 | 首个相关记忆排名 |
+| `SummaryFaithfulness` | ≥ 0.80 | 摘要 token 被来源覆盖比例 |
+| `SummaryClaimRecall` | ≥ 0.90 | 期望 claim 出现在摘要中的比例 |
+| `UnsupportedClaimRate` | 0 | 摘要不得出现禁止 claim |
+| `SpeakerAttributionAccuracy` | 1.0 | 群聊 claim 必须归到正确发言人 |
+| `ConflictResolutionAccuracy` | 1.0 | 用户纠正后生效事实必须为新值 |
+| `CrossUserLeak` | 0 | 跨用户记忆召回为阻断缺陷 |
+| `StalePreferenceLeak` | 0 | 已纠正旧偏好不得继续生效 |
+| `DeletedMemoryLeak` | 0 | 删除后向量、摘要、事实、消息均不可召回 |
+
+场景覆盖：中文/英文/日语/韩语检索、群聊发言人归属、长周期偏好冲突、摘要 claim 忠实度、会话删除后不可召回。
+
 ## 变更规则
 
 - 修改模型、Prompt、Skill、MCP、Embedding 或预算阈值时，必须更新本基线并重新执行 `make test-quality`。

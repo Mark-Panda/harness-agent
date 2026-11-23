@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "baseline": "2026-11-23",
+  "cases": [
+    {
+      "id": "zh_retrieval",
+      "category": "retrieval",
+      "locale": "zh-CN",
+      "query": "回答语言偏好",
+      "query_group": "language_zh",
+      "messages": [
+        {"id": "zh_pref", "role": "user", "content": "我习惯用中文回答", "age_days": 0},
+        {"id": "en_distractor", "role": "user", "content": "I prefer English answers", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "zh_pref", "group": "language_zh"},
+        {"message_id": "en_distractor", "group": "language_en"},
+        {"message_id": "other_user_memory", "group": "language_zh", "other_user": true}
+      ],
+      "relevant": ["zh_pref"],
+      "forbidden": ["other_user_memory"]
+    },
+    {
+      "id": "ja_retrieval",
+      "category": "multilingual",
+      "locale": "ja-JP",
+      "query": "天気の好み",
+      "query_group": "weather_ja",
+      "messages": [
+        {"id": "ja_weather", "role": "user", "content": "今日はいい天気です", "age_days": 0},
+        {"id": "en_weather", "role": "user", "content": "The weather is nice today", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "ja_weather", "group": "weather_ja"},
+        {"message_id": "en_weather", "group": "weather_en"}
+      ],
+      "relevant": ["ja_weather"],
+      "summary": {
+        "generated": "今日はいい天気です。",
+        "sources": ["今日はいい天気です。"],
+        "expected_claims": ["いい天気"],
+        "forbidden_claims": ["雨です"]
+      }
+    },
+    {
+      "id": "ko_retrieval",
+      "category": "multilingual",
+      "locale": "ko-KR",
+      "query": "날씨 선호",
+      "query_group": "weather_ko",
+      "messages": [
+        {"id": "ko_weather", "role": "user", "content": "오늘 날씨가 좋습니다", "age_days": 0},
+        {"id": "zh_weather", "role": "user", "content": "今天天气不错", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "ko_weather", "group": "weather_ko"},
+        {"message_id": "zh_weather", "group": "weather_zh"}
+      ],
+      "relevant": ["ko_weather"],
+      "summary": {
+        "generated": "오늘 날씨가 좋습니다.",
+        "sources": ["오늘 날씨가 좋습니다."],
+        "expected_claims": ["날씨가 좋습니다"],
+        "forbidden_claims": ["비가 옵니다"]
+      }
+    },
+    {
+      "id": "group_speaker_attribution",
+      "category": "group",
+      "locale": "zh-CN",
+      "policy": "group",
+      "query": "部署窗口",
+      "query_group": "deploy_window",
+      "messages": [
+        {"id": "group_a", "role": "user", "speaker": "ou_a", "content": "部署窗口是周六", "age_days": 0},
+        {"id": "group_b", "role": "user", "speaker": "ou_b", "content": "部署窗口是周日", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "group_a", "group": "deploy_window", "speaker": "ou_a"},
+        {"message_id": "group_b", "group": "deploy_window", "speaker": "ou_b"}
+      ],
+      "relevant": [],
+      "summary": {
+        "generated": "ou_a：部署窗口是周六\nou_b：部署窗口是周日",
+        "sources": ["ou_a：部署窗口是周六", "ou_b：部署窗口是周日"],
+        "expected_claims": ["部署窗口是周六", "部署窗口是周日"],
+        "forbidden_claims": ["ou_a：部署窗口是周日"],
+        "speakers": {"ou_a": "部署窗口是周六", "ou_b": "部署窗口是周日"}
+      }
+    },
+    {
+      "id": "long_horizon_preference_conflict",
+      "category": "conflict",
+      "locale": "zh-CN",
+      "query": "回答语言偏好",
+      "query_group": "language_conflict",
+      "messages": [
+        {"id": "old_pref", "role": "user", "content": "以后用英文回答", "age_days": 60},
+        {"id": "new_pref", "role": "user", "content": "更正：以后都用中文回答，不要英文", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "old_pref", "group": "language_conflict", "age_days": 60},
+        {"message_id": "new_pref", "group": "language_conflict", "age_days": 0}
+      ],
+      "relevant": ["new_pref"],
+      "expected_top": "new_pref",
+      "facts": [
+        {"key": "preference.language", "value": "\"en\"", "confidence": 0.9, "correction": false},
+        {"key": "preference.language", "value": "\"zh\"", "confidence": 0.95, "correction": true}
+      ],
+      "expected_facts": {"preference.language": "zh"}
+    },
+    {
+      "id": "summary_faithfulness",
+      "category": "summary",
+      "locale": "zh-CN",
+      "query": "总结部署约束",
+      "query_group": "summary_sources",
+      "messages": [
+        {"id": "summary_src", "role": "user", "content": "部署窗口是周末，预算上限 1000 元。", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "summary_src", "group": "summary_sources"}
+      ],
+      "relevant": ["summary_src"],
+      "summary": {
+        "generated": "部署窗口是周末，预算上限 1000 元。",
+        "sources": ["部署窗口是周末，预算上限 1000 元。"],
+        "expected_claims": ["部署窗口是周末", "预算上限 1000 元"],
+        "forbidden_claims": ["部署窗口是周三", "预算上限 9999 元"]
+      }
+    },
+    {
+      "id": "delete_session_no_recall",
+      "category": "deletion",
+      "locale": "zh-CN",
+      "query": "删除后是否还能召回",
+      "query_group": "delete_memory",
+      "messages": [
+        {"id": "delete_a", "role": "user", "content": "这段记忆应该被删除", "age_days": 0},
+        {"id": "delete_b", "role": "user", "content": "这段记忆也必须删除", "age_days": 0}
+      ],
+      "vectors": [
+        {"message_id": "delete_a", "group": "delete_memory"},
+        {"message_id": "delete_b", "group": "delete_memory"}
+      ],
+      "relevant": ["delete_a", "delete_b"],
+      "delete_session": true,
+      "seed_summary": true,
+      "facts": [
+        {"key": "memory.delete_test", "value": "\"should_disappear\"", "confidence": 0.95, "correction": false}
+      ]
+    }
+  ]
+}

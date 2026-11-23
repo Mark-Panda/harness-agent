@@ -407,14 +407,25 @@ func (s *RunService) createAndEnqueue(ctx context.Context, principal Principal, 
 		adopted = s.adoptPausedPlan(ctx, principal, created)
 	}
 	if s.enqueuer != nil {
-		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
+		if enqueueErr := s.enqueueRun(ctx, created.UserID, created.ID, created.Mode); enqueueErr != nil {
 			if s.creationTransaction == nil {
-				s.abortUnqueuedRun(ctx, principal, created, adopted, err)
+				s.abortUnqueuedRun(ctx, principal, created, adopted, enqueueErr)
 			}
-			return Run{}, err
+			return Run{}, enqueueErr
 		}
 	}
 	return created, nil
+}
+
+// enqueueRun 优先按 Run 模式写入资源池 lane；队列不支持时回退到原有入队接口。
+func (s *RunService) enqueueRun(ctx context.Context, userID, runID uuid.UUID, mode AgentMode) error {
+	if s.enqueuer == nil {
+		return fmt.Errorf("%w: run queue is not configured", ErrInvalidConfig)
+	}
+	if laneEnqueuer, ok := s.enqueuer.(RunLaneEnqueuer); ok {
+		return laneEnqueuer.EnqueueRunLane(ctx, userID, runID, mode, s.clock())
+	}
+	return s.enqueuer.EnqueueRun(ctx, userID, runID, s.clock())
 }
 
 // abortUnqueuedRun 在 Run 入队失败时做补偿：把 Run 推进到失败终态并恢复被接管的暂停计划。
@@ -783,7 +794,7 @@ func (s *RunService) Enqueue(ctx context.Context, principal Principal, runID uui
 	if s.enqueuer == nil {
 		return fmt.Errorf("%w: run queue is not configured", ErrInvalidConfig)
 	}
-	return s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock())
+	return s.enqueueRun(ctx, principal.UserID, runID, run.Mode)
 }
 
 // Replay 重新投递卡在 queued/running 的 Run 任务，支持 failed/dead Job 的人工重放。
@@ -874,7 +885,7 @@ func (s *RunService) ResumeAfterPause(ctx context.Context, principal Principal, 
 	if s.enqueuer == nil {
 		return Run{}, fmt.Errorf("%w: run queue is not configured", ErrInvalidConfig)
 	}
-	if err := s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock()); err != nil {
+	if err := s.enqueueRun(ctx, principal.UserID, runID, run.Mode); err != nil {
 		return Run{}, err
 	}
 	return run, nil
@@ -1173,7 +1184,7 @@ func (s *RunService) DecideApproval(ctx context.Context, principal Principal, ru
 		}
 	}
 	if s.enqueuer != nil {
-		if err := s.enqueuer.EnqueueRun(ctx, principal.UserID, runID, s.clock()); err != nil {
+		if err := s.enqueueRun(ctx, principal.UserID, runID, run.Mode); err != nil {
 			return ToolApproval{}, err
 		}
 	}

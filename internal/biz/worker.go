@@ -99,6 +99,10 @@ type WorkerConfig struct {
 	WorkerID string
 	// JobType 认领的任务类型，默认 agent.run；集成测试可使用独立类型隔离真实 Worker。
 	JobType string
+	// PoolName 资源池名称，仅用于日志与指标定位。
+	PoolName string
+	// Lanes 资源池认领的 lane 列表；为空表示不按 lane 过滤，兼容单池部署。
+	Lanes []string
 	// Concurrency 单实例并发执行 Run 数。
 	Concurrency int
 	// PollInterval 无任务时的轮询间隔。
@@ -166,6 +170,9 @@ type WorkerConfig struct {
 func (c WorkerConfig) normalize() WorkerConfig {
 	if c.JobType == "" {
 		c.JobType = "agent.run"
+	}
+	if c.PoolName == "" {
+		c.PoolName = "default"
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 1
@@ -423,7 +430,10 @@ func (w *ExecutionWorker) loop(ctx context.Context) {
 
 // ProcessOne 认领并处理至多一个任务；返回是否实际领取到任务，供运维与单测直接驱动。
 func (w *ExecutionWorker) ProcessOne(ctx context.Context) (bool, error) {
-	job, claimed, err := w.jobs.Claim(ctx, w.config.WorkerID, w.config.JobType, w.config.Lease, w.clock())
+	job, claimed, err := ClaimNextJob(ctx, w.jobs, JobClaim{
+		WorkerID: w.config.WorkerID, JobType: w.config.JobType,
+		Lanes: w.config.Lanes, Lease: w.config.Lease, Now: w.clock(),
+	})
 	if err != nil {
 		return false, err
 	}
@@ -436,8 +446,9 @@ func (w *ExecutionWorker) ProcessOne(ctx context.Context) (bool, error) {
 		w.handle(ctx, job)
 		return true, nil
 	}
+	globalKey, userKey := w.limiterKeys(userID)
 	// 先占用全局槽位，再占用用户槽位；任一不可用都退回任务且不消耗重试次数。
-	releaseGlobal, acquired := w.tryAcquire(ctx, w.globalLimiter, "global")
+	releaseGlobal, acquired := w.tryAcquire(ctx, w.globalLimiter, globalKey)
 	if !acquired {
 		w.deferJob(ctx, job, "global concurrency limit")
 		return false, nil
@@ -445,7 +456,7 @@ func (w *ExecutionWorker) ProcessOne(ctx context.Context) (bool, error) {
 	if releaseGlobal != nil {
 		defer releaseGlobal()
 	}
-	releaseUser, acquired := w.tryAcquire(ctx, w.userLimiter, "user:"+userID.String())
+	releaseUser, acquired := w.tryAcquire(ctx, w.userLimiter, userKey)
 	if !acquired {
 		w.deferJob(ctx, job, "user concurrency limit")
 		return false, nil
@@ -455,6 +466,15 @@ func (w *ExecutionWorker) ProcessOne(ctx context.Context) (bool, error) {
 	}
 	w.handle(ctx, job)
 	return true, nil
+}
+
+// limiterKeys 返回池级并发槽位键；不同资源池使用独立键，避免跨池共享同一配额。
+func (w *ExecutionWorker) limiterKeys(userID uuid.UUID) (string, string) {
+	if w.config.PoolName == "" || w.config.PoolName == "default" {
+		return "global", "user:" + userID.String()
+	}
+	prefix := "pool:" + w.config.PoolName + ":"
+	return prefix + "global", prefix + "user:" + userID.String()
 }
 
 // tryAcquire 尝试获取舱壁槽位；Redis 故障时降级放行，避免缓存故障阻断全部执行。

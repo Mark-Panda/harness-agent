@@ -24,6 +24,12 @@ type jobModel struct {
 	UserID *uuid.UUID `gorm:"type:uuid"`
 	// JobType 任务类型。
 	JobType string
+	// Lane 资源池标识，决定由哪类 Worker 池认领。
+	Lane string
+	// TenantKey 租户标识，预留给租户级资源池。
+	TenantKey string
+	// Priority 任务优先级，数值越大越优先。
+	Priority int
 	// DedupeKey 幂等去重键，同一键只允许一个任务。
 	DedupeKey *string
 	// Payload 任务载荷 JSON。
@@ -86,19 +92,26 @@ FOR UPDATE`, fence.JobID, fence.Owner, fence.Token).Scan(&locked)
 
 // EnqueueRun 幂等写入 Run 执行任务；去重键为 run:<run_id>，重复入队直接视为成功。
 func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error {
+	return r.EnqueueRunLane(ctx, userID, runID, "", availableAt)
+}
+
+// EnqueueRunLane 按 Agent 模式把 Run 写入对应资源池；mode 为空时保留兼容 lane。
+func (r *JobRepository) EnqueueRunLane(ctx context.Context, userID, runID uuid.UUID, mode biz.AgentMode, availableAt time.Time) error {
 	if userID == uuid.Nil || runID == uuid.Nil {
 		return fmt.Errorf("%w: run job requires user and run ids", biz.ErrInvalidConfig)
 	}
 	if availableAt.IsZero() {
 		availableAt = time.Now().UTC()
 	}
-	payload, err := json.Marshal(map[string]any{"run_id": runID.String(), "user_id": userID.String()})
+	payload, err := json.Marshal(map[string]any{
+		"run_id": runID.String(), "user_id": userID.String(), "mode": string(mode),
+	})
 	if err != nil {
 		return err
 	}
 	dedupe := "run:" + runID.String()
 	record := jobModel{
-		ID: uuid.New(), UserID: &userID, JobType: "agent.run", DedupeKey: &dedupe,
+		ID: uuid.New(), UserID: &userID, JobType: "agent.run", Lane: biz.RunLane(mode), DedupeKey: &dedupe,
 		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
@@ -112,10 +125,13 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 			return nil
 		}
 		// 已有同 Run 的 pending 任务：重复入队通常发生在“审批决策/恢复需要立即唤醒”场景。
-		// 若旧任务被退避到了更晚的 available_at，直接返回会推迟唤醒；这里只在提前时前移。
+		// available_at 只向前推进，避免把更早的唤醒时间推迟；lane 每次同步，修复迁移前的空 lane。
 		return tx.Model(&jobModel{}).
-			Where("user_id = ? AND dedupe_key = ? AND status = ? AND available_at > ?", userID, dedupe, "pending", availableAt).
-			Updates(map[string]any{"available_at": availableAt, "updated_at": time.Now().UTC()}).Error
+			Where("user_id = ? AND dedupe_key = ? AND status = ?", userID, dedupe, "pending").
+			Updates(map[string]any{
+				"available_at": gorm.Expr("LEAST(available_at, ?)", availableAt),
+				"lane":         biz.RunLane(mode), "updated_at": time.Now().UTC(),
+			}).Error
 	})
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
 		// Worker 重启或客户端重试可能重复入队，幂等键保证只有一个任务。
@@ -188,8 +204,8 @@ func (r *JobRepository) EnqueueSummary(ctx context.Context, task biz.SummaryTask
 	}
 	dedupe := "summary:" + task.SessionID.String() + ":" + task.Fingerprint
 	record := jobModel{
-		ID: uuid.New(), UserID: &task.UserID, JobType: biz.SummaryJobType, DedupeKey: &dedupe,
-		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
+		ID: uuid.New(), UserID: &task.UserID, JobType: biz.SummaryJobType, Lane: biz.JobLaneBackground,
+		DedupeKey: &dedupe, Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
@@ -242,8 +258,8 @@ func (r *JobRepository) EnqueueMemory(ctx context.Context, task biz.MemoryTask, 
 	}
 	dedupe := fmt.Sprintf("memory:%s:%s:%x", task.SessionID, task.MessageIDs[len(task.MessageIDs)-1], versionHash(task.Versions))
 	record := jobModel{
-		ID: uuid.New(), UserID: &task.UserID, JobType: biz.MemoryEmbedJobType, DedupeKey: &dedupe,
-		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
+		ID: uuid.New(), UserID: &task.UserID, JobType: biz.MemoryEmbedJobType, Lane: biz.JobLaneBackground,
+		DedupeKey: &dedupe, Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
@@ -292,8 +308,8 @@ func (r *JobRepository) EnqueueFacts(ctx context.Context, task biz.FactTask, ava
 	// 去重键包含事实归属用户，避免同一会话不同发言人的任务互相吞并。
 	dedupe := fmt.Sprintf("fact:%s:%s:%s:%s", task.SessionID, task.MessageIDs[len(task.MessageIDs)-1], task.FactOwnerID, task.Fingerprint[:16])
 	record := jobModel{
-		ID: uuid.New(), UserID: &task.UserID, JobType: biz.FactExtractJobType, DedupeKey: &dedupe,
-		Payload: datatypes.JSON(encoded), Status: "pending", MaxAttempts: 8,
+		ID: uuid.New(), UserID: &task.UserID, JobType: biz.FactExtractJobType, Lane: biz.JobLaneBackground,
+		DedupeKey: &dedupe, Payload: datatypes.JSON(encoded), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
@@ -319,7 +335,7 @@ func (r *JobRepository) EnqueueFeishuEvent(ctx context.Context, eventID string, 
 	}
 	dedupe := "feishu.event:" + eventID
 	record := jobModel{
-		ID: uuid.New(), JobType: biz.FeishuEventJobType, DedupeKey: &dedupe,
+		ID: uuid.New(), JobType: biz.FeishuEventJobType, Lane: biz.JobLaneFeishu, DedupeKey: &dedupe,
 		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
@@ -335,13 +351,31 @@ func (r *JobRepository) EnqueueFeishuEvent(ctx context.Context, eventID string, 
 
 // Claim 使用 SKIP LOCKED 领取一个到期任务；running 且租约过期的任务允许恢复。
 func (r *JobRepository) Claim(ctx context.Context, workerID string, jobType string, lease time.Duration, now time.Time) (biz.Job, bool, error) {
+	return r.claim(ctx, workerID, jobType, nil, lease, now)
+}
+
+// ClaimLane 按资源池 lane 认领任务；lane 为空时保持原有按 job_type 认领语义。
+func (r *JobRepository) ClaimLane(ctx context.Context, claim biz.JobClaim) (biz.Job, bool, error) {
+	now := claim.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return r.claim(ctx, claim.WorkerID, claim.JobType, claim.Lanes, claim.Lease, now)
+}
+
+// claim 是 Claim 与 ClaimLane 的共享实现；laneCSV 为空表示不按 lane 过滤。
+func (r *JobRepository) claim(ctx context.Context, workerID, jobType string, lanes []string, lease time.Duration, now time.Time) (biz.Job, bool, error) {
 	if workerID == "" || lease <= 0 || jobType == "" {
 		return biz.Job{}, false, fmt.Errorf("%w: worker, lease and job types are required", biz.ErrInvalidConfig)
 	}
+	laneCSV := strings.Join(lanes, ",")
 	type claimed struct {
 		ID             uuid.UUID
 		UserID         *uuid.UUID
 		JobType        string
+		Lane           string
+		TenantKey      string
+		Priority       int
 		Payload        datatypes.JSON
 		Attempts       int
 		MaxAttempts    int
@@ -352,12 +386,15 @@ func (r *JobRepository) Claim(ctx context.Context, workerID string, jobType stri
 	var record claimed
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
 		// 先锁定可领取行，再更新租约与 fencing token；SKIP LOCKED 避免多 Worker 阻塞。
+		// lane='' 是迁移前的兼容任务，允许任意池认领，避免升级后存量任务永久停滞。
 		query := `
 WITH candidate AS (
   SELECT j.id, (j.dedupe_key IS NOT NULL AND j.dedupe_key LIKE 'run:%' AND
     (j.attempts >= j.max_attempts OR j.payload->'run_settlement' IS NOT NULL OR j.status = 'dead')) AS settlement_only
   FROM jobs AS j
-  WHERE j.job_type = ? AND (
+  WHERE j.job_type = ?
+    AND (? = '' OR j.lane = ANY(string_to_array(?, ',')) OR j.lane = '')
+    AND (
     (j.status = 'pending' AND j.available_at <= ?)
     OR (j.status = 'running' AND (j.lease_expires_at IS NULL OR j.lease_expires_at < ?))
     OR (j.status = 'dead' AND j.dedupe_key LIKE 'run:%' AND EXISTS (
@@ -366,7 +403,7 @@ WITH candidate AS (
         AND ar.status IN ('queued', 'running', 'waiting_approval')
     ))
   )
-  ORDER BY j.available_at, j.created_at, j.id
+  ORDER BY j.priority DESC, j.available_at, j.created_at, j.id
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
@@ -374,9 +411,9 @@ UPDATE jobs SET status = 'running',
   attempts = attempts + CASE WHEN candidate.settlement_only THEN 0 ELSE 1 END, lease_owner = ?,
   lease_expires_at = ?, fencing_token = fencing_token + 1, updated_at = ?
 FROM candidate WHERE jobs.id = candidate.id
-RETURNING jobs.id, jobs.user_id, jobs.job_type, jobs.payload, jobs.attempts, jobs.max_attempts,
-  jobs.fencing_token, jobs.lease_owner, candidate.settlement_only`
-		return tx.Raw(query, jobType, now, now, workerID, now.Add(lease), now).Scan(&record).Error
+RETURNING jobs.id, jobs.user_id, jobs.job_type, jobs.lane, jobs.tenant_key, jobs.priority,
+  jobs.payload, jobs.attempts, jobs.max_attempts, jobs.fencing_token, jobs.lease_owner, candidate.settlement_only`
+		return tx.Raw(query, jobType, laneCSV, laneCSV, now, now, workerID, now.Add(lease), now).Scan(&record).Error
 	})
 	if err != nil {
 		return biz.Job{}, false, catalogError("claim job", err)
@@ -389,7 +426,8 @@ RETURNING jobs.id, jobs.user_id, jobs.job_type, jobs.payload, jobs.attempts, job
 		return biz.Job{}, false, fmt.Errorf("decode job payload: %w", err)
 	}
 	job := biz.Job{
-		ID: record.ID, UserID: record.UserID, Type: record.JobType, Payload: payload,
+		ID: record.ID, UserID: record.UserID, Type: record.JobType, Lane: record.Lane,
+		TenantKey: record.TenantKey, Priority: record.Priority, Payload: payload,
 		Attempts: record.Attempts, MaxAttempts: record.MaxAttempts, FencingToken: record.FencingToken,
 		LeaseOwner: record.LeaseOwner, AvailableAt: now,
 		RunSettlementOnly: record.SettlementOnly,
@@ -536,11 +574,49 @@ func (r *JobRepository) Fail(ctx context.Context, jobID uuid.UUID, workerID stri
 	return catalogError("fail job", err)
 }
 
+// JobQueueStat 是单个资源池的队列深度快照，供指标与 HPA 使用。
+type JobQueueStat struct {
+	// Lane 资源池标识。
+	Lane string
+	// Pending 待执行任务数。
+	Pending int64
+	// Running 正在执行的任务数。
+	Running int64
+	// OldestAvailableAt 最老待执行任务的可用时间；为空表示没有待执行任务。
+	OldestAvailableAt *time.Time
+}
+
+// StatsByLane 按 lane 聚合任务队列深度；查询只读 jobs 表，不持有锁。
+func (r *JobRepository) StatsByLane(ctx context.Context) ([]JobQueueStat, error) {
+	var stats []JobQueueStat
+	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		return tx.Raw(`
+SELECT lane,
+  count(*) FILTER (WHERE status = 'pending') AS pending,
+  count(*) FILTER (WHERE status = 'running') AS running,
+  min(available_at) FILTER (WHERE status = 'pending') AS oldest_available_at
+FROM jobs
+WHERE status IN ('pending', 'running')
+GROUP BY lane
+ORDER BY lane`).Scan(&stats).Error
+	})
+	if err != nil {
+		return nil, catalogError("job queue stats", err)
+	}
+	return stats, nil
+}
+
 // 编译期断言执行队列接口实现。
 var _ biz.RunExecutionQueue = (*JobRepository)(nil)
 
+// 编译期断言池化认领接口实现。
+var _ biz.LaneJobQueue = (*JobRepository)(nil)
+
 // 编译期断言 Run 入队端口实现。
 var _ biz.RunEnqueuer = (*JobRepository)(nil)
+
+// 编译期断言按模式入队端口实现。
+var _ biz.RunLaneEnqueuer = (*JobRepository)(nil)
 
 var _ biz.RunJobLookup = (*JobRepository)(nil)
 

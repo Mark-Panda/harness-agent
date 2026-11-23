@@ -26,6 +26,9 @@ var metricHelp = map[string]string{
 	"agent_llm_request_duration_seconds": "LLM request duration in seconds by agent mode and status.",
 	"agent_tool_call_duration_seconds":   "Tool call duration in seconds by agent mode, tool and status.",
 	"agent_event_append_failures_total":  "Total Run event append failures by event type.",
+	"harness_jobs_pending":               "Pending persistent jobs by resource pool lane.",
+	"harness_jobs_running":               "Running persistent jobs by resource pool lane.",
+	"harness_jobs_oldest_age_seconds":    "Age in seconds of the oldest pending job by resource pool lane.",
 }
 
 // durationBuckets 是耗时秒指标的默认直方图分桶。
@@ -42,6 +45,7 @@ type histogram struct {
 type Metrics struct {
 	mu         sync.Mutex
 	counters   map[string]map[string]float64
+	gauges     map[string]map[string]float64
 	histograms map[string]map[string]*histogram
 }
 
@@ -49,6 +53,7 @@ type Metrics struct {
 func NewMetrics() *Metrics {
 	return &Metrics{
 		counters:   make(map[string]map[string]float64),
+		gauges:     make(map[string]map[string]float64),
 		histograms: make(map[string]map[string]*histogram),
 	}
 }
@@ -72,6 +77,22 @@ func (m *Metrics) IncCounter(name string, labels map[string]string, delta float6
 		m.counters[name] = series
 	}
 	series[key] += delta
+}
+
+// SetGauge 设置瞬时值；负值按 0 处理，避免队列深度出现负指标。
+func (m *Metrics) SetGauge(name string, labels map[string]string, value float64) {
+	if value < 0 {
+		value = 0
+	}
+	key := labelsKey(labels)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	series, ok := m.gauges[name]
+	if !ok {
+		series = make(map[string]float64)
+		m.gauges[name] = series
+	}
+	series[key] = value
 }
 
 // ObserveDuration 记录耗时（秒）到默认分桶的直方图。
@@ -119,6 +140,14 @@ func (m *Metrics) Render() string {
 		}
 		counters[name] = copied
 	}
+	gauges := make(map[string]map[string]float64, len(m.gauges))
+	for name, series := range m.gauges {
+		copied := make(map[string]float64, len(series))
+		for key, value := range series {
+			copied[key] = value
+		}
+		gauges[name] = copied
+	}
 	histograms := make(map[string]map[string]histogram, len(m.histograms))
 	for name, series := range m.histograms {
 		copied := make(map[string]histogram, len(series))
@@ -133,6 +162,13 @@ func (m *Metrics) Render() string {
 	for _, name := range sortedKeys(counters) {
 		writeMeta(&builder, name, "counter")
 		series := counters[name]
+		for _, key := range sortedKeys(series) {
+			fmt.Fprintf(&builder, "%s%s %s\n", name, key, formatFloat(series[key]))
+		}
+	}
+	for _, name := range sortedKeys(gauges) {
+		writeMeta(&builder, name, "gauge")
+		series := gauges[name]
 		for _, key := range sortedKeys(series) {
 			fmt.Fprintf(&builder, "%s%s %s\n", name, key, formatFloat(series[key]))
 		}

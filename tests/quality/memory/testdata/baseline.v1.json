@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "dataset_version": 1,
+  "thresholds": {
+    "recall_at_8": 0.9,
+    "precision_at_8": 0.5,
+    "mrr": 0.8,
+    "summary_faithfulness": 0.8,
+    "summary_claim_recall": 0.9,
+    "unsupported_claim_rate": 0.0,
+    "speaker_attribution_accuracy": 1.0,
+    "conflict_resolution_accuracy": 1.0,
+    "cross_user_leak": 0,
+    "stale_preference_leak": 0,
+    "deleted_memory_leak": 0
+  }
+}

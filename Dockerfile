@@ -17,6 +17,7 @@ RUN go mod download
 COPY . .
 COPY --from=web-builder /app/web/dist ./internal/server/static/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/harness-agent ./cmd/server \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/harness-worker ./cmd/worker \
     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/harness-migrate ./cmd/migrate \
     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/harness-backup ./cmd/backup \
     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/harness-retention ./cmd/retention \
@@ -29,6 +30,7 @@ RUN apk --no-cache add ca-certificates tzdata \
     && adduser -S -D -H -u 10001 -G harness harness
 WORKDIR /app
 COPY --from=server-builder /out/harness-agent /app/harness-agent
+COPY --from=server-builder /out/harness-worker /app/harness-worker
 COPY --from=server-builder /out/harness-migrate /app/harness-migrate
 COPY --from=server-builder /out/harness-backup /app/harness-backup
 COPY --from=server-builder /out/harness-retention /app/harness-retention

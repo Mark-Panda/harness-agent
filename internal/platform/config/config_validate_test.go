@@ -480,3 +480,28 @@ func TestLoadEnvironmentMissingBase(t *testing.T) {
 		t.Fatalf("expected read config error, got %v", err)
 	}
 }
+
+// TestValidateWorkerRoleAndPools 校验进程角色与资源池配置边界。
+func TestValidateWorkerRoleAndPools(t *testing.T) {
+	cfg := newValidConfig()
+	enableWorker(cfg)
+	cfg.Agent.Worker.Role = "worker"
+	cfg.Agent.Worker.Pools = []WorkerPoolConfig{{
+		Name: "react", Lanes: []string{"react"}, Concurrency: 4, GlobalConcurrency: 8,
+		Lease: dur(60 * time.Second), Heartbeat: dur(20 * time.Second),
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid worker pools rejected: %v", err)
+	}
+
+	cfg.Agent.Worker.Role = "invalid"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "worker.role") {
+		t.Fatalf("expected invalid role error, got %v", err)
+	}
+
+	cfg.Agent.Worker.Role = "all"
+	cfg.Agent.Worker.Pools = append(cfg.Agent.Worker.Pools, cfg.Agent.Worker.Pools[0])
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("expected duplicate pool error, got %v", err)
+	}
+}

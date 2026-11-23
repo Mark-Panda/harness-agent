@@ -25,6 +25,12 @@ type Job struct {
 	UserID *uuid.UUID
 	// Type 任务类型，如 agent.run。
 	Type string
+	// Lane 资源池标识：react/plan/super/background/feishu；空值表示兼容旧任务。
+	Lane string
+	// TenantKey 租户标识，预留给租户级资源池；当前多数任务为空。
+	TenantKey string
+	// Priority 任务优先级，数值越大越优先；当前默认 0。
+	Priority int
 	// Payload 任务载荷，必须可 JSON 序列化且不含凭证。
 	Payload map[string]any
 	// Attempts 已领取次数，领取时递增。
@@ -43,6 +49,61 @@ type Job struct {
 	RunSettlementOnly bool
 	// RunSettlement 是先前写入失败的 Run 状态与事件。
 	RunSettlement *RunJobSettlement
+}
+
+// 资源池 lane 取值。agent.run 按 Agent 模式分池，后台与飞书任务使用独立池。
+const (
+	// JobLaneReact ReAct 执行池。
+	JobLaneReact = "react"
+	// JobLanePlan Plan-and-Execute 执行池。
+	JobLanePlan = "plan"
+	// JobLaneSupervisor Supervisor 执行池。
+	JobLaneSupervisor = "super"
+	// JobLaneBackground 摘要、向量化、事实提取、技能提炼等后台任务池。
+	JobLaneBackground = "background"
+	// JobLaneFeishu 飞书事件消费池。
+	JobLaneFeishu = "feishu"
+)
+
+// RunLane 返回 Agent Run 对应的资源池；未知模式返回空串，由兼容任务兜底。
+func RunLane(mode AgentMode) string {
+	switch mode {
+	case AgentModeReact:
+		return JobLaneReact
+	case AgentModePlan:
+		return JobLanePlan
+	case AgentModeSupervisor:
+		return JobLaneSupervisor
+	default:
+		return ""
+	}
+}
+
+// JobClaim 是一次池化认领请求。Lanes 为空表示不按 lane 过滤。
+type JobClaim struct {
+	WorkerID string
+	JobType  string
+	Lanes    []string
+	Lease    time.Duration
+	Now      time.Time
+}
+
+// LaneJobQueue 是支持按资源池认领的队列能力；未实现时调用方回退到 JobQueue.Claim。
+type LaneJobQueue interface {
+	ClaimLane(ctx context.Context, claim JobClaim) (Job, bool, error)
+}
+
+// ClaimNextJob 优先使用 lane-aware 认领；队列未实现该能力时保持原有语义。
+func ClaimNextJob(ctx context.Context, queue JobQueue, claim JobClaim) (Job, bool, error) {
+	if queue == nil {
+		return Job{}, false, invalid("job queue is required")
+	}
+	if len(claim.Lanes) > 0 {
+		if laneQueue, ok := queue.(LaneJobQueue); ok {
+			return laneQueue.ClaimLane(ctx, claim)
+		}
+	}
+	return queue.Claim(ctx, claim.WorkerID, claim.JobType, claim.Lease, claim.Now)
 }
 
 func newJobWriteFence(job Job, workerID string) JobWriteFence {
@@ -142,6 +203,13 @@ type RunJobReplayer interface {
 type RunEnqueuer interface {
 	// EnqueueRun 幂等入队 Run 执行任务。
 	EnqueueRun(ctx context.Context, userID, runID uuid.UUID, availableAt time.Time) error
+}
+
+// RunLaneEnqueuer 是支持按 Agent 模式写入资源池的入队端口。
+// 队列未实现时 RunService 回退到 RunEnqueuer，保持兼容。
+type RunLaneEnqueuer interface {
+	// EnqueueRunLane 幂等入队 Run 执行任务，并按模式写入 lane。
+	EnqueueRunLane(ctx context.Context, userID, runID uuid.UUID, mode AgentMode, availableAt time.Time) error
 }
 
 // RunJobLookup lets an idempotent Create distinguish an existing job from a Run that still needs enqueue.

@@ -47,7 +47,7 @@ Harness Agent 是一个**工程级、全栈、多用户的 Agent 运行平台**�
 - 生成模型必须满足 `context_window_tokens >= 1,000,000`；Embedding / Rerank 模型不受此限制。
 - 单个 Run 是有限的：默认最多 30 个模型步、45 次模型尝试、15 分钟、2000 万 Token、20 单位费用。
 - 工具协议以 **MCP Streamable HTTP** 为主；技能包脚本默认关闭，生产环境禁止本地执行。
-- 当前 Worker 与 API 同进程部署，通过配置可关闭 Worker；生产通过多副本 + 数据库队列实现水平扩展。
+- Worker 支持 `api / worker / all` 三种进程角色：API 可关闭 Worker，独立 `harness-worker` 只消费持久化任务；默认 Compose 已拆分 app 与 worker，`agent.run` 按 lane 进入 `react / plan / super` 资源池。
 - 不提供端到端 Exactly-Once 承诺，提供的是**至少一次投递 + 幂等消费 + 租约 fencing**。
 
 ---
@@ -74,7 +74,8 @@ Harness Agent 是一个**工程级、全栈、多用户的 Agent 运行平台**�
 
 | 程序 | 作用 | 启动方式 |
 | --- | --- | --- |
-| `harness-agent` | API、gRPC、SSE、静态资源、执行 Worker、飞书 Worker | `cmd/server` |
+| `harness-agent` | API、gRPC、SSE、静态资源；`WORKER_ROLE=all` 时兼容启动 Worker | `cmd/server` |
+| `harness-worker` | 只启动执行 / 后台 / 飞书 Worker，不监听 HTTP/gRPC | `cmd/worker` |
 | `harness-migrate` | 数据库迁移（一次性任务） | `cmd/migrate up` |
 | `harness-retention` | 执行载荷 / 审计 / 飞书回执保留期清理 | `cmd/retention` |
 | `harness-backup` | 备份与 PITR 辅助 | `cmd/backup` |
@@ -838,13 +839,17 @@ staging（回填中） → active（参与检索） → retired（退役）
 
 ### 9.6 记忆质量评测
 
-`tests/quality/golden_test.go` 与 `docs/quality/agent-eval-baseline.md` 固定以下门槛：
+数据驱动套件位于 `tests/quality/memory`，数据集与门禁分别为 `testdata/dataset.v1.json`、`testdata/baseline.v1.json`，执行 `make test-memory-eval`（必须使用独立空库）。
 
-- 跨用户记忆召回必须为 0；
-- 注入内容进入 `system` 角色的次数必须为 0；
-- 黄金集通过率 100%；
-- 记忆 Precision / Recall、MMR、事实冲突、摘要忠实度按基线比较；
-- 删除后向量与摘要不可召回。
+覆盖场景：
+
+- 中文 / 英文 / 日语 / 韩语检索与摘要忠实度；
+- 群聊发言人归属，且群聊会话不得召回个人长期向量；
+- 长周期偏好冲突：用户纠正后旧事实失效、新事实生效；
+- 摘要 claim 召回、禁止 claim 与发言人归属正确率；
+- 会话删除后消息、向量、摘要、事实均不可召回。
+
+指标门禁：`recall@8`、`precision@8`、`MRR`、`SummaryFaithfulness`、`SummaryClaimRecall`、`UnsupportedClaimRate`、`SpeakerAttributionAccuracy`、`ConflictResolutionAccuracy`，以及跨用户/旧偏好/删除后召回的零泄漏硬门禁。实现代码见 `pkg/memory/eval.go`。
 
 ---
 
@@ -1229,7 +1234,7 @@ sequenceDiagram
 `Dockerfile`：
 
 1. **web-builder**：Node 24，`npm ci` + `npm run build`；
-2. **server-builder**：Go 1.26，编译 `server / migrate / backup / retention / admin / reencrypt`；
+2. **server-builder**：Go 1.26，编译 `server / worker / migrate / backup / retention / admin / reencrypt`；
 3. **runtime**：Alpine 3.22，创建非 root 用户 `harness`，复制二进制、配置与迁移，`ENTRYPOINT /app/harness-agent`。
 
 特性：
@@ -1248,6 +1253,8 @@ sequenceDiagram
 | 环境覆盖 | `configs/config.{dev,staging,production}.yaml` | TLS、沙箱强制、日志级别等差异 |
 | 密钥 | Secret Manager / KMS | 不进入 YAML 或镜像 |
 | 动态目录 | PostgreSQL | Provider、模型、策略、Skill、MCP、Agent 由管理接口维护 |
+| 进程角色 | `agent.worker.role` / `WORKER_ROLE` | `api` 只接入、`worker` 只执行、`all` 单进程兼容 |
+| 资源池 | `agent.worker.pools` / `WORKER_POOLS` | 按 lane 划分 react/plan/super，独立并发、租约与 HPA |
 
 加载顺序：基线 YAML → 环境 YAML → 环境变量 / Secret Manager。  
 `KnownFields(true)` + `Validate()`：未知字段、缺失密钥、低上下文模型、生产默认口令、非法并发配置都会导致启动失败。
@@ -1396,23 +1403,103 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 
 ## 18. 已知边界与演进方向
 
+> 本章区分两类内容：**当前版本刻意不做的能力**（边界）与**后续扩展路线**（演进方向）。边界不是缺陷，而是为了控制交付复杂度、安全责任与运维成本做出的明确取舍。
+
 ### 18.1 当前边界
 
-- Worker 与 API 同进程；队列基于 PostgreSQL，不是独立消息中间件。
-- MCP 仅实现 Streamable HTTP，不包含 stdio 传输。
-- Embedding 维度固定 1536；更换维度需要迁移索引与表约束。
-- 不保存隐藏思维链，只保留最终回答与公开事件。
-- 飞书群聊共享会话不支持个人记忆与高风险工具。
-- Compose 仅用于开发/验收，不提供生产高可用。
+#### 18.1.1 Worker 已支持拆分，单进程 all 仅作兼容
+
+**现状**：系统已提供 `cmd/worker` 独立入口，并与 `cmd/server` 共用 `internal/bootstrap` 装配。进程角色由 `agent.worker.role` / `WORKER_ROLE` 控制：
+
+- `api`：只启动 HTTP、gRPC、SSE 与静态资源，不认领任何任务。
+- `worker`：只启动执行、后台、飞书与删除 Worker，不监听 HTTP。
+- `all`：兼容原有的单进程部署；未配置角色时的默认行为。
+
+队列在 PostgreSQL `jobs` 上新增 `lane / tenant_key / priority` 字段。`agent.run` 入队时按 Run 模式写入 `react / plan / super` lane；后台任务写 `background`，飞书事件写 `feishu`。执行 Worker 按 `lanes` 使用 `ClaimLane` 认领，`FOR UPDATE SKIP LOCKED`、租约、fencing token、会话串行与幂等键语义保持不变。默认 Compose 已拆分为 `app`（role=api）与 `worker`（role=worker）两个服务；`deploy/k8s/worker-pools.yaml` 提供按池独立 Deployment/HPA 示例。
+
+**剩余边界**：
+
+- 租户级资源池尚未默认启用；`tenant_key` 字段已预留，当前主要按用户并发舱壁保证公平性。
+- 飞书回复 Worker 的单群聊并发限制仍是进程内 `keyedLimiter`，默认保持单副本；多副本需要改为 Redis 分布式限流或按 `chat_id` 路由。
+- 队列仍基于 PostgreSQL；高认领 QPS 场景需要评估分区、部分索引或外部消息队列。
+- 生产高可用仍需独立补齐：HA PostgreSQL/Redis、负载均衡、TLS、Secret Manager、备份与 PITR。
+
+**生产建议**：API 副本使用 `WORKER_ROLE=api`，Worker 按池拆分为独立 Deployment；plan/super 池配置更长租约与更大资源限额，react 池按队列深度扩容；不要在同一池内混用不同执行预算。
+
+#### 18.1.2 MCP 仅实现 Streamable HTTP
+
+**现状**：`pkg/mcp` 是一个最小可用的 MCP Streamable HTTP 客户端，支持 `initialize`、`tools/list`、`tools/call`、JSON 与单事件 SSE 响应，不包含 stdio、旧版 HTTP+SSE 或 WebSocket 传输。
+
+**影响**：
+
+- 常见的本地 stdio MCP Server（文件系统、Git、本地数据库、IDE 工具）不能直接接入，必须先包装成 HTTP 服务。
+- 依赖长连接推送或双向流的 MCP 能力无法使用；当前只支持请求-响应式工具调用。
+- 传输层与 `Client` 结构耦合较紧，新增传输需要改客户端而不是只加一个适配器。
+
+**为什么这样设计**：HTTP 传输有明确的网络边界，便于统一实现 HTTPS 强制、SSRF 防护、超时、响应大小限制与凭证注入；stdio 涉及本地进程生命周期与逃逸风险，不适合直接放进多租户 API 进程。
+
+#### 18.1.3 Embedding 维度固定 1536
+
+**现状**：`memory_vectors.embedding` 为 `vector(1536)`，`embedding_dimension` 有 `CHECK (embedding_dimension = 1536)`；`embedding_indexes.dimension` 同样固定 1536；业务常量 `biz.EmbeddingDimension = 1536`。
+
+**影响**：
+
+- 切换到 1024 / 3072 维的 Embedding 模型不能只改配置；必须新建向量表或索引版本、重新回填、切换 active、退役旧索引。
+- 同一张表内不能混用不同维度模型；索引版本与双写机制已为“平滑切换”预留路径，但维度变更仍属于 schema 级变更。
+- 依赖固定维度的 HNSW / cosine 查询与 SQL 约束保持稳定，不会因模型切换产生隐式维度错配。
+
+**为什么这样设计**：pgvector 索引要求固定维度；固定维度可以让数据库约束、索引与检索 SQL 都保持确定性，避免运行期才发现维度不一致。
+
+#### 18.1.4 不保存隐藏思维链
+
+**现状**：`react.Completion.ReasoningContent` 只在内存中用于判断“模型只返回推理、没有最终回答”的异常情况，不进入上下文、不写入消息表、不写入执行载荷；执行记录只保存最终回答、工具调用、事件与可公开摘要。
+
+**影响**：
+
+- 排障主要依赖 Run 事件、工具调用、Attempt、最终回答与会话摘要，不能回放模型的原始内部推理。
+- 对合规与防泄漏更友好：即使模型供应商返回加密思维或隐藏推理字段，也不会落库。
+- 如果未来需要“可解释性”，应保存结构化的 `reasoning_summary`，而不是原始 CoT。
+
+#### 18.1.5 飞书共享群聊不支持个人记忆与高风险工具
+
+**现状**：`isFeishuSharedGroup` 判定共享群聊后，`restrictSharedGroupTools` 通过 `lowRiskOnlyRegistry` 只暴露低风险工具；会话记忆策略强制为非 private，不注入个人长期记忆、画像与事实；共享群聊使用平台模型策略，但每个发言人使用自己的 Run 预算。
+
+**影响**：
+
+- 群聊中不能执行需要人工审批的高风险工具，也不能使用个人画像与个人长期记忆。
+- 群聊场景更适合“公共知识问答 + 低风险查询”，不适合代表某个成员执行写操作。
+- 这是责任边界：群聊中无法确定审批责任人，且群成员不应看到他人的私有记忆。
+
+**为什么这样设计**：把“共享上下文”与“个人记忆/高风险副作用”物理隔离，避免群成员通过 @ 机器人间接读取他人画像或触发越权操作。
+
+#### 18.1.6 Compose 仅用于开发/验收，不提供生产高可用
+
+**现状**：`docker-compose.yml` 只定义一个 `app` 服务，没有副本、负载均衡、跨可用区或外部 TLS 终止；PostgreSQL 与 Redis 都是单实例；端口只绑定 `127.0.0.1`；镜像以只读根文件系统、非 root、cap_drop 运行。
+
+**影响**：
+
+- 不能承诺 99.9% 可用性、跨节点故障转移或零停机发布；容器或数据库实例故障会直接中断服务。
+- Compose 的职责是验证“单镜像 + 迁移 + API + Worker + 前端 + 飞书”功能闭环，以及本地 Smoke / 集成测试，不是生产拓扑。
+- 生产必须补齐：至少 2 个 API/Worker 副本、负载均衡、TLS、托管或 HA PostgreSQL/Redis、Secret Manager/KMS、备份与 PITR、监控告警与值班。
 
 ### 18.2 演进方向
 
-- 将执行 Worker 拆分为独立部署单元，支持按模式/租户隔离资源池。
-- 增加更多 MCP 传输与工具协议适配。
-- 引入更细粒度的模型成本与配额策略（按用户、Agent、Provider、数据区域）。
-- 增强 Plan 的人工可视化编辑与步骤级重跑。
-- 扩展记忆评测集，覆盖更多语言、群聊与长周期偏好冲突场景。
-- 完善多地域与灾备拓扑，验证跨区域 RPO/RTO。
+| 方向 | 当前基础 | 关键改造 | 主要风险 / 约束 |
+| --- | --- | --- | --- |
+| 资源池运维与租户隔离 | 已实现 `react / plan / super` 执行池、`background / feishu` 组件池、lane-aware 认领、池级并发键与队列深度指标 | 按租户/大客户独立池、跨池公平调度、飞书回复分布式限流、队列分区或外部消息队列 | 租户公平性、跨池迁移、停机排空、长任务缩容；必须保持 lease/fencing 与幂等语义不变 |
+| MCP 传输扩展 | 已有 HTTP 客户端、工具注册表、Schema 校验、审批与沙箱包装 | 抽象 `Transport` 接口（初始化 / 列工具 / 调用 / 关闭）；新增 stdio、旧版 SSE、WebSocket；stdio 必须在 Sandbox 或独立子进程运行 | 本地进程逃逸、凭证传递、生命周期管理、跨平台差异；安全边界不能因传输变化而降低 |
+| 更细粒度成本与配额 | 已有用户 / Agent / Provider 日预算、Run 预算、Plan/Supervisor 共享预算、Attempt 预留 | 增加数据区域、策略、会话、时间窗口维度；支持硬/软限额、预扣与结算、成本归集到 Run/Step/Attempt、告警与账单 | 多维度计数一致性、Redis/PG 计数漂移、超限退款与并发预留 |
+| Plan 可视化编辑与步骤级重跑 | 已有 pause / resume / revise、计划版本、步骤复用、审批与幂等键 | 前端图编辑器、依赖校验、单步重跑、版本差异对比、指定审批人；后端 revision CAS 与步骤级幂等 | 重跑可能重复副作用；必须复用已完成步骤并保留幂等键；旧版本未决审批需显式处理 |
+| 记忆评测扩展 | 已有黄金集、对抗集、记忆质量集成测试、跨用户零泄漏断言 | 覆盖多语言、群聊发言人归属、长周期偏好冲突、摘要忠实度、删除后不可召回；版本化基线与回归门禁 | 评测成本、真实模型漂移、评测数据隐私与脱敏 |
+| 多地域与灾备 | 已有备份 / PITR Runbook、RPO/RTO 目标与恢复演练流程 | 跨区域复制、只读副本、对象存储备份、密钥跨区、DNS/流量切换、定期跨区演练 | RPO/RTO 达标、数据驻留与合规、双写冲突、成本与运维复杂度 |
+
+**落地优先级建议**：
+
+1. **P0**：生产拓扑（HA PostgreSQL/Redis、LB/TLS、Secret Manager、备份与恢复演练）。
+2. **P1**：租户级资源池与公平调度、飞书回复分布式限流、成本与配额细化。
+3. **P2**：MCP 传输扩展、Plan 可视化编辑、记忆评测集扩展。
+
+这些演进都不会推翻现有核心：Repository 接口、`jobs` 队列、租约/fencing、索引版本、策略表、审批状态机与幂等键已经为扩展留出了接缝。
 
 ---
 

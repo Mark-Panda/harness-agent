@@ -90,6 +90,36 @@ agent:
   worker:
     # 是否在当前进程启动执行 Worker。
     enabled: true
+    # 进程角色：api 仅接入、worker 仅执行、all 单进程兼容；由 WORKER_ROLE 环境变量覆盖。
+    role: ${WORKER_ROLE}
+    # Worker 组件过滤（逗号分隔）：execution/background/feishu/deletion；为空启动全部。
+    components: ${WORKER_COMPONENTS}
+    # 执行池过滤（逗号分隔）：仅启动指定 pools，供每个池独立 Deployment/HPA；为空启动全部。
+    pool_filter: ${WORKER_POOLS}
+    # 执行资源池：每个池只认领对应 lane 的 agent.run 任务，独立并发与租约。
+    # 不配置时使用单池兼容模式，认领全部 agent.run 任务。
+    pools:
+      # ReAct 池：低延迟、短任务，可配置较高并发。
+      - name: react
+        lanes: [react]
+        concurrency: 4
+        global_concurrency: 8
+        lease: 60s
+        heartbeat: 20s
+      # Plan 池：步骤多、执行时间长，降低并发并延长租约。
+      - name: plan
+        lanes: [plan]
+        concurrency: 2
+        global_concurrency: 4
+        lease: 120s
+        heartbeat: 40s
+      # Supervisor 池：子任务扇出、内存占用高，限制并发。
+      - name: super
+        lanes: [super]
+        concurrency: 2
+        global_concurrency: 4
+        lease: 120s
+        heartbeat: 40s
     # Worker 实例标识；多副本部署必须唯一，为空时启动自动生成。
     worker_id: ${WORKER_ID}
     # 单实例并发执行的 Run 数。
