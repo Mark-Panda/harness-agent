@@ -171,6 +171,25 @@ export interface UserSkillSynthesisPolicy {
   version: number;
 }
 
+// UserSkillSynthesisRun 是每日自动提炼的执行记录；同一用户同一天一条。
+export interface UserSkillSynthesisRun {
+  id: string;
+  date: string;
+  status: string;
+  outcome: string;
+  detail: string;
+  sessions_scanned: number;
+  sessions_used: number;
+  messages_used: number;
+  candidate_name: string;
+  confidence: number;
+  skill_id: string | null;
+  attempts: number;
+  started_at: string;
+  finished_at: string | null;
+  updated_at: string;
+}
+
 // UserSkill 是用户私有技能，可由每日对话提炼或手动创建。
 export interface UserSkill {
   id: string;

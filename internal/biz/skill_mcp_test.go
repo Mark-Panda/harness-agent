@@ -159,6 +159,7 @@ func TestSkillServiceBundleLifecycle(t *testing.T) {
 			return current, nil
 		},
 	).Times(5)
+	repo.EXPECT().ListSkills(gomock.Any()).Return(nil, nil)
 
 	imported, err := service.ImportBundle(context.Background(), admin, newPlatformSkillTestArchive(t))
 	if err != nil || imported.Bundle.FileCount != 3 || !imported.Bundle.HasScripts {
@@ -175,6 +176,55 @@ func TestSkillServiceBundleLifecycle(t *testing.T) {
 	enabled, err := service.SetBundleExecution(context.Background(), admin, imported.ID, true)
 	if err != nil || !enabled.Bundle.ExecutionEnabled {
 		t.Fatalf("SetBundleExecution() = %#v, %v", enabled, err)
+	}
+}
+
+// TestSkillServiceImportOverwritesExistingName 验证同名技能按覆盖语义更新，保留标识、版本与发布状态。
+func TestSkillServiceImportOverwritesExistingName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockSkillRepository(ctrl)
+	bundles := &fakePlatformSkillBundles{}
+	admin := biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}
+	service, err := biz.NewSkillService(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.WithBundles(bundles)
+	existing := biz.SkillTemplate{
+		ID: uuid.New(), Name: "平台技能", Version: 1, Status: biz.SkillPublished,
+		Description: "旧描述", PromptTemplate: "旧提示词", Parameters: map[string]any{"channel": "ops"},
+		Bundle: biz.SkillBundleInfo{ExecutionEnabled: true},
+	}
+	repo.EXPECT().ListSkills(gomock.Any()).Return([]biz.SkillTemplate{existing}, nil)
+	var updated biz.SkillTemplate
+	repo.EXPECT().UpdateSkill(gomock.Any(), admin.UserID, gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, skill biz.SkillTemplate, _ biz.OutboxEvent) (biz.SkillTemplate, error) {
+			updated = skill
+			return skill, nil
+		},
+	)
+	repo.EXPECT().GetSkill(gomock.Any(), existing.ID).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID) (biz.SkillTemplate, error) {
+			current := updated
+			current.Bundle = bundles.info
+			return current, nil
+		},
+	)
+	imported, err := service.ImportBundle(context.Background(), admin, newPlatformSkillTestArchive(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.ID != existing.ID || imported.Version != existing.Version || imported.Status != biz.SkillPublished {
+		t.Fatalf("skill identity changed on overwrite: %#v", imported)
+	}
+	if !strings.Contains(imported.PromptTemplate, "按步骤执行") || imported.Description != "验证平台技能包" {
+		t.Fatalf("skill content was not overwritten: %#v", imported)
+	}
+	if imported.Parameters["channel"] != "ops" {
+		t.Fatalf("skill parameters were dropped: %#v", imported.Parameters)
+	}
+	if len(bundles.files) != 3 || bundles.info.FileCount != 3 {
+		t.Fatalf("bundle files were not replaced: %#v", bundles.info)
 	}
 }
 

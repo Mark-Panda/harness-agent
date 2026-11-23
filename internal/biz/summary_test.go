@@ -766,3 +766,159 @@ func TestSummaryWorkerRetriesOnSessionLookupFailure(t *testing.T) {
 		t.Fatalf("missing session: completed=%d failed=%d", jobs.completed, jobs.failed)
 	}
 }
+
+// fakeSummaryRunLocator 是摘要触发 Run 定位的内存实现。
+type fakeSummaryRunLocator struct {
+	triggerRun   biz.Run
+	triggerFound bool
+	latestRun    biz.Run
+	latestFound  bool
+	triggerCalls int
+	latestCalls  int
+}
+
+// FindRunByTriggerMessage 返回预置的触发 Run。
+func (f *fakeSummaryRunLocator) FindRunByTriggerMessage(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (biz.Run, bool, error) {
+	f.triggerCalls++
+	return f.triggerRun, f.triggerFound, nil
+}
+
+// LatestRunBefore 返回预置的最近 Run。
+func (f *fakeSummaryRunLocator) LatestRunBefore(context.Context, uuid.UUID, uuid.UUID, time.Time) (biz.Run, bool, error) {
+	f.latestCalls++
+	return f.latestRun, f.latestFound, nil
+}
+
+// fakeSummarySteps 记录摘要步骤与载荷写入。
+type fakeSummarySteps struct {
+	started  []biz.ExecutionStep
+	payloads []biz.ExecutionPayload
+	finished []biz.StepUpdate
+}
+
+// StartStep 分配序号并记录步骤。
+func (f *fakeSummarySteps) StartStep(_ context.Context, step biz.ExecutionStep) (biz.ExecutionStep, error) {
+	step.StepSeq = int64(len(f.started) + 1)
+	f.started = append(f.started, step)
+	return step, nil
+}
+
+// FinishStep 记录终态。
+func (f *fakeSummarySteps) FinishStep(_ context.Context, _ uuid.UUID, stepID uuid.UUID, update biz.StepUpdate) (biz.ExecutionStep, error) {
+	f.finished = append(f.finished, update)
+	return biz.ExecutionStep{ID: stepID, Status: update.Status}, nil
+}
+
+// MarkStepWaitingApproval 摘要步骤不涉及审批。
+func (f *fakeSummarySteps) MarkStepWaitingApproval(context.Context, uuid.UUID, uuid.UUID) (biz.ExecutionStep, error) {
+	return biz.ExecutionStep{}, nil
+}
+
+// ListSteps 测试不读取步骤列表。
+func (f *fakeSummarySteps) ListSteps(context.Context, uuid.UUID, uuid.UUID, int) ([]biz.ExecutionStep, error) {
+	return nil, nil
+}
+
+// SavePayload 记录载荷。
+func (f *fakeSummarySteps) SavePayload(_ context.Context, payload biz.ExecutionPayload) (biz.ExecutionPayload, error) {
+	f.payloads = append(f.payloads, payload)
+	return payload, nil
+}
+
+// ListPayloads 测试不读取载荷列表。
+func (f *fakeSummarySteps) ListPayloads(context.Context, uuid.UUID, uuid.UUID, *uuid.UUID, int) ([]biz.ExecutionPayload, error) {
+	return nil, nil
+}
+
+// newSummaryWorkerWithTrace 构造带 Run 定位与步骤记录的摘要 Worker。
+func newSummaryWorkerWithTrace(t *testing.T, ctrl *gomock.Controller, job biz.Job, locator biz.SummaryRunLocator, steps biz.ExecutionStepRepository) (*biz.SummaryWorker, *fakeSummaryJobs, *fakeSummaryReader) {
+	t.Helper()
+	jobs := &fakeSummaryJobs{job: job}
+	baseVersion := int64(0)
+	switch typed := job.Payload["base_version"].(type) {
+	case int64:
+		baseVersion = typed
+	case int:
+		baseVersion = int64(typed)
+	}
+	reader := &fakeSummaryReader{}
+	sessions := mocks.NewMockSessionRepository(ctrl)
+	sessions.EXPECT().GetSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(biz.Session{Status: biz.SessionActive}, nil).AnyTimes()
+	worker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
+		Jobs: jobs, Sessions: sessions, Messages: reader,
+		Summaries: &fakeSummaryRepository{latest: baseVersion, applied: true},
+		Generator: &fakeSummaryGenerator{generation: biz.SummaryGeneration{Text: "摘要正文"}},
+		Runs:      locator, Steps: steps,
+	}, biz.SummaryWorkerConfig{WorkerID: "summary-trace-test", Heartbeat: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker, jobs, reader
+}
+
+// TestSummaryWorkerRecordsSummaryStepOnTriggerRun 验证用户消息触发的摘要写入触发 Run 的系统步骤。
+func TestSummaryWorkerRecordsSummaryStepOnTriggerRun(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	message := biz.Message{ID: uuid.New(), Role: biz.MessageUser, Content: "问题", CreatedAt: time.Date(2026, 11, 2, 1, 0, 0, 0, time.UTC)}
+	task := biz.SummaryTask{
+		UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: 0,
+		SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+		EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
+	}
+	run := biz.Run{ID: uuid.New(), UserID: task.UserID, SessionID: task.SessionID, AttemptNo: 1}
+	locator := &fakeSummaryRunLocator{triggerRun: run, triggerFound: true}
+	steps := &fakeSummarySteps{}
+	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+	worker, jobs, reader := newSummaryWorkerWithTrace(t, ctrl, job, locator, steps)
+	reader.byIDs = []biz.Message{message}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.completed != 1 || locator.triggerCalls != 1 || locator.latestCalls != 0 {
+		t.Fatalf("completed=%d trigger=%d latest=%d", jobs.completed, locator.triggerCalls, locator.latestCalls)
+	}
+	if len(steps.started) != 1 {
+		t.Fatalf("summary steps = %#v", steps.started)
+	}
+	step := steps.started[0]
+	if step.Kind != biz.StepKindSystem || step.Name != "会话摘要生成" || step.RunID != run.ID {
+		t.Fatalf("summary step = %#v", step)
+	}
+	if len(steps.payloads) != 1 || steps.payloads[0].Type != biz.PayloadContextCompression {
+		t.Fatalf("summary payloads = %#v", steps.payloads)
+	}
+	payload := steps.payloads[0].ContentJSON
+	if payload["stage"] != "summary_generation" || payload["summary_version"] != int64(1) ||
+		payload["covered_messages"] != 1 || payload["source_messages"] != 1 {
+		t.Fatalf("summary payload = %#v", payload)
+	}
+	if len(steps.finished) != 1 || steps.finished[0].Status != biz.StepCompleted {
+		t.Fatalf("summary settlement = %#v", steps.finished)
+	}
+}
+
+// TestSummaryWorkerRecordsSummaryStepForAssistantTail 验证助手结尾的摘要按结束时间定位最近 Run。
+func TestSummaryWorkerRecordsSummaryStepForAssistantTail(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	message := biz.Message{ID: uuid.New(), Role: biz.MessageAssistant, Content: "回答", CreatedAt: time.Date(2026, 11, 2, 1, 0, 0, 0, time.UTC)}
+	task := biz.SummaryTask{
+		UserID: uuid.New(), SessionID: uuid.New(), BaseVersion: 0,
+		SourceMessageIDs: []uuid.UUID{message.ID}, Fingerprint: biz.SummarySourceFingerprint([]biz.Message{message}),
+		EndMessageID: message.ID, EndAt: message.CreatedAt, CoveredMessageCount: 1,
+	}
+	run := biz.Run{ID: uuid.New(), UserID: task.UserID, SessionID: task.SessionID, AttemptNo: 1}
+	locator := &fakeSummaryRunLocator{latestRun: run, latestFound: true}
+	steps := &fakeSummarySteps{}
+	job := biz.Job{ID: uuid.New(), Type: biz.SummaryJobType, Payload: summaryJobPayload(task), Attempts: 1, FencingToken: 1}
+	worker, jobs, reader := newSummaryWorkerWithTrace(t, ctrl, job, locator, steps)
+	reader.byIDs = []biz.Message{message}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if jobs.completed != 1 || locator.latestCalls != 1 || locator.triggerCalls != 0 {
+		t.Fatalf("completed=%d trigger=%d latest=%d", jobs.completed, locator.triggerCalls, locator.latestCalls)
+	}
+	if len(steps.started) != 1 || steps.started[0].RunID != run.ID || steps.started[0].Name != "会话摘要生成" {
+		t.Fatalf("summary steps = %#v", steps.started)
+	}
+}

@@ -102,6 +102,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("PUT /api/v1/user-skill-synthesis/settings", "user_skill_synthesis_settings", handler.updateUserSkillSynthesisSettings)
 	// 可选提炼策略：仅返回已发布策略，供普通用户配置提炼模型。
 	handle("GET /api/v1/user-skill-synthesis/policies", handler.listUserSkillSynthesisPolicies)
+	handle("GET /api/v1/user-skill-synthesis/runs", handler.listUserSkillSynthesisRuns)
+	handleWrite("POST /api/v1/user-skill-synthesis/trigger", "user_skill_synthesis", handler.triggerUserSkillSynthesis)
 	// 用户级技能：每日对话自动提炼生成，用户可审核、发布后被 Agent 引用。
 	handleWrite("POST /api/v1/user-skills", "user_skill", handler.createUserSkill)
 	// 用户技能包：导入后保存完整目录树，脚本默认不可执行且需人工审批。
@@ -1373,6 +1375,10 @@ func writePlatformError(w http.ResponseWriter, err error) {
 		writeErrorCode(w, http.StatusNotFound, "resource_not_found")
 	case errors.Is(err, biz.ErrResourceConflict):
 		writeErrorCode(w, http.StatusConflict, "resource_conflict")
+	case errors.Is(err, biz.ErrSkillSynthesisDisabled):
+		writeErrorCode(w, http.StatusConflict, "synthesis_disabled")
+	case errors.Is(err, biz.ErrSkillSynthesisInProgress):
+		writeErrorCode(w, http.StatusConflict, "synthesis_in_progress")
 	case errors.Is(err, biz.ErrInvalidConfig):
 		writeErrorCode(w, http.StatusBadRequest, "invalid_configuration")
 	case errors.Is(err, skillpkg.ErrInvalidPackage):
@@ -1822,6 +1828,12 @@ func (h *platformHTTPHandler) listUserSkillSynthesisPolicies(w http.ResponseWrit
 	writePlatformResult(w, http.StatusOK, map[string]any{"items": items}, err)
 }
 
+// triggerUserSkillSynthesis 处理 POST /api/v1/user-skill-synthesis/trigger：立即入队一次提炼。
+func (h *platformHTTPHandler) triggerUserSkillSynthesis(w http.ResponseWriter, r *http.Request) {
+	date, err := h.service.UserSkills.TriggerSynthesis(r.Context(), requestPrincipal(r))
+	writePlatformResult(w, http.StatusAccepted, map[string]any{"status": "queued", "date": date}, err)
+}
+
 // userSkillSynthesisSettingsResponse 构造用户提炼设置出参。
 func userSkillSynthesisSettingsResponse(settings biz.UserSkillSynthesisSettings) map[string]any {
 	return map[string]any{
@@ -1829,4 +1841,21 @@ func userSkillSynthesisSettingsResponse(settings biz.UserSkillSynthesisSettings)
 		"model_policy_version": settings.ModelPolicyVersion,
 		"created_at":           settings.CreatedAt, "updated_at": settings.UpdatedAt,
 	}
+}
+
+// listUserSkillSynthesisRuns 处理 GET /api/v1/user-skill-synthesis/runs：列出每日提炼执行记录。
+func (h *platformHTTPHandler) listUserSkillSynthesisRuns(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	runs, err := h.service.UserSkills.ListSynthesisRuns(r.Context(), requestPrincipal(r), limit)
+	items := make([]map[string]any, 0, len(runs))
+	for _, run := range runs {
+		items = append(items, map[string]any{
+			"id": run.ID, "date": run.Date, "status": run.Status, "outcome": run.Outcome,
+			"detail": run.Detail, "sessions_scanned": run.SessionsScanned, "sessions_used": run.SessionsUsed,
+			"messages_used": run.MessagesUsed, "candidate_name": run.CandidateName,
+			"confidence": run.Confidence, "skill_id": run.SkillID, "attempts": run.Attempts,
+			"started_at": run.StartedAt, "finished_at": run.FinishedAt, "updated_at": run.UpdatedAt,
+		})
+	}
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": items}, err)
 }

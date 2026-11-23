@@ -24,13 +24,39 @@ var (
 	ErrInvalidEndpoint = errors.New("invalid MCP endpoint")
 	// ErrRPC MCP 服务返回 JSON-RPC 错误。
 	ErrRPC = errors.New("MCP JSON-RPC error")
-	// ErrTransport 网络或响应解析失败。
+	// ErrTransport 网络失败、响应解析失败或服务端 5xx；请求可能已经执行。
 	ErrTransport = errors.New("MCP transport error")
 	// ErrToolOutcomeUnknown indicates a tools/call request may have been executed.
 	ErrToolOutcomeUnknown = errors.New("MCP tool outcome unknown")
 	// ErrSessionExpired 服务端已回收会话（HTTP 404），需要重新初始化。
 	ErrSessionExpired = errors.New("MCP session expired")
+	// ErrToolRejected 服务端在 4xx 层拒绝请求；工具未被派发，可安全重试或回填模型。
+	ErrToolRejected = errors.New("MCP request rejected")
+	// ErrToolUnauthorized 服务端以 401/403 拒绝鉴权；属于配置故障，需要人工修复凭证。
+	ErrToolUnauthorized = errors.New("MCP authentication failed")
+	// ErrRateLimited 服务端限流拒绝请求；工具未被派发，应按退避策略稍后重试。
+	ErrRateLimited = errors.New("MCP rate limited")
 )
+
+// statusError 保留被拒绝请求的 HTTP 状态与诊断摘要，供判定是否已派发和记录排查线索。
+type statusError struct {
+	// status HTTP 状态码。
+	status int
+	// kind 错误分类哨兵，用于 errors.Is 判定。
+	kind error
+	// detail 响应头与响应体摘要，已截断并去除非法 UTF-8。
+	detail string
+}
+
+// Error 输出分类、状态码与诊断摘要；凭证不会进入错误文本。
+func (e *statusError) Error() string {
+	return fmt.Sprintf("%v: status %d%s", e.kind, e.status, e.detail)
+}
+
+// Unwrap 返回错误分类哨兵，保持 errors.Is 语义。
+func (e *statusError) Unwrap() error {
+	return e.kind
+}
 
 // maxResponseBytes 限制单次 MCP 响应大小，避免恶意服务耗尽内存。
 const maxResponseBytes = 8 << 20
@@ -399,15 +425,32 @@ func (c *Client) CallToolWithMeta(ctx context.Context, name string, arguments js
 		return CallResult{}, err
 	}
 	result, err := c.callTool(ctx, name, arguments, meta)
-	if !errors.Is(err, ErrSessionExpired) {
+	if !retryableCallError(err) {
 		return result, err
 	}
-	// 缓存复用的客户端可能持有已被服务端回收的会话；重置后重新握手并重试一次。
+	// 缓存复用的客户端可能持有已被服务端回收的会话，部分网关也会用 400/405 表示会话失效；
+	// 这些状态证明请求未被派发，重置会话后重新握手并重试一次是安全的。
 	c.resetSession()
 	if initErr := c.Initialize(ctx); initErr != nil {
 		return CallResult{}, initErr
 	}
 	return c.callTool(ctx, name, arguments, meta)
+}
+
+// retryableCallError 判断 tools/call 失败能否在重置会话后安全重试一次。
+// 只有服务端明确拒绝派发（会话或方法层）的状态才可重试；限流与鉴权重试无意义。
+func retryableCallError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrSessionExpired) {
+		return true
+	}
+	var rejected *statusError
+	if errors.As(err, &rejected) {
+		return rejected.status == http.StatusBadRequest || rejected.status == http.StatusMethodNotAllowed
+	}
+	return false
 }
 
 // callTool 执行一次 tools/call，供会话重置后的重试复用。
@@ -541,7 +584,7 @@ func (c *Client) roundTrip(ctx context.Context, id int64, sessionID, method stri
 		if response.StatusCode == http.StatusNotFound && sessionID != "" {
 			return rpcResponse{}, "", fmt.Errorf("%w: status %d", ErrSessionExpired, response.StatusCode)
 		}
-		return rpcResponse{}, "", fmt.Errorf("%w: status %d", ErrTransport, response.StatusCode)
+		return rpcResponse{}, "", classifyHTTPStatus(response)
 	}
 	session := ""
 	if requireSession {
@@ -579,6 +622,67 @@ func (c *Client) applyAuth(request *http.Request) {
 			request.Header.Set(name, value)
 		}
 	}
+}
+
+// classifyHTTPStatus 把非 200 响应映射为可判断"是否已派发"的错误。
+// 4xx 表示服务端在派发前拒绝请求，可安全重试或回填模型；5xx 与超时才可能是结果未知。
+// 客户端禁止跟随重定向，因此 3xx 同样属于未派发。
+func classifyHTTPStatus(response *http.Response) error {
+	status := response.StatusCode
+	detail := rejectionDetail(response)
+	switch {
+	case status == http.StatusTooManyRequests:
+		return &statusError{status: status, kind: ErrRateLimited, detail: detail}
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &statusError{status: status, kind: ErrToolUnauthorized, detail: detail}
+	case status >= 300 && status < 400:
+		return &statusError{status: status, kind: ErrToolRejected, detail: detail}
+	case status >= 400 && status < 500 && status != http.StatusRequestTimeout && status != http.StatusTooEarly:
+		return &statusError{status: status, kind: ErrToolRejected, detail: detail}
+	default:
+		return fmt.Errorf("%w: status %d%s", ErrTransport, status, detail)
+	}
+}
+
+// rejectionDetail 汇总响应头与响应体摘要，为 405 等拒绝提供可定位的排查线索。
+// 响应体只保留前缀且去除非法 UTF-8，避免超长或二进制内容污染错误文本与数据库。
+func rejectionDetail(response *http.Response) string {
+	parts := make([]string, 0, 4)
+	if allow := strings.TrimSpace(response.Header.Get("Allow")); allow != "" {
+		parts = append(parts, "allow="+truncate(allow, 64))
+	}
+	if retryAfter := strings.TrimSpace(response.Header.Get("Retry-After")); retryAfter != "" {
+		parts = append(parts, "retry_after="+truncate(retryAfter, 16))
+	}
+	if correlation := strings.TrimSpace(response.Header.Get("x-correlation-id")); correlation != "" {
+		parts = append(parts, "correlation_id="+truncate(correlation, 64))
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, 256))
+	if err == nil || len(payload) > 0 {
+		if body := sanitizeErrorBody(string(payload)); body != "" {
+			parts = append(parts, "body="+body)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
+// sanitizeErrorBody 去除首尾空白、非法 UTF-8 与控制字符，并截断到固定长度。
+func sanitizeErrorBody(body string) string {
+	body = strings.ToValidUTF8(body, "")
+	body = strings.Map(func(char rune) rune {
+		if char == '\n' || char == '\t' {
+			return ' '
+		}
+		if char < ' ' || char == 0x7f {
+			return -1
+		}
+		return char
+	}, body)
+	// 先按字节截断再去一次非法 UTF-8，保证错误文本可直接写入日志与数据库。
+	return strings.ToValidUTF8(truncate(strings.TrimSpace(body), 256), "")
 }
 
 // readPayload 读取 JSON 或 SSE 响应体并返回与请求编号匹配的 JSON-RPC 响应。

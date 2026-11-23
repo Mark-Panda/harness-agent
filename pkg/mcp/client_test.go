@@ -245,6 +245,100 @@ func TestToolResponseDistinguishesRejectionFromUnknownOutcome(t *testing.T) {
 	}
 }
 
+// TestToolCallClassifiesHTTPRejections 验证 4xx 拒绝不会被升级成"结果未知"，并保留排查线索。
+func TestToolCallClassifiesHTTPRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		want      error
+		unknown   bool
+		wantCalls int64
+	}{
+		{name: "method not allowed", status: http.StatusMethodNotAllowed, want: ErrToolRejected, wantCalls: 2},
+		{name: "bad request", status: http.StatusBadRequest, want: ErrToolRejected, wantCalls: 2},
+		{name: "redirect", status: http.StatusTemporaryRedirect, want: ErrToolRejected, wantCalls: 1},
+		{name: "unprocessable", status: http.StatusUnprocessableEntity, want: ErrToolRejected, wantCalls: 1},
+		{name: "unauthorized", status: http.StatusUnauthorized, want: ErrToolUnauthorized, wantCalls: 1},
+		{name: "forbidden", status: http.StatusForbidden, want: ErrToolUnauthorized, wantCalls: 1},
+		{name: "rate limited", status: http.StatusTooManyRequests, want: ErrRateLimited, wantCalls: 1},
+		{name: "server error", status: http.StatusInternalServerError, want: ErrTransport, unknown: true, wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int64
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				switch body.Method {
+				case "initialize":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18"}}`, body.ID)
+				case "notifications/initialized":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/call":
+					calls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("x-correlation-id", "corr-405")
+					w.Header().Set("Allow", "POST, DELETE")
+					w.Header().Set("Retry-After", "900")
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(`{"detail":"gateway rejected request"}`))
+				}
+			}))
+			t.Cleanup(server.Close)
+			_, err := newTestClient(t, server, "none", "").CallTool(context.Background(), "tool", nil)
+			if !errors.Is(err, tc.want) || errors.Is(err, ErrToolOutcomeUnknown) != tc.unknown {
+				t.Fatalf("CallTool() error = %v, want %v, unknown=%t", err, tc.want, tc.unknown)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Fatalf("tools/call attempts = %d, want %d", got, tc.wantCalls)
+			}
+			for _, fragment := range []string{"correlation_id=corr-405", "retry_after=900", "gateway rejected request"} {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("error %q does not contain %q", err, fragment)
+				}
+			}
+		})
+	}
+}
+
+// TestToolCallRetriesMethodRejectionOnce 验证 405 在重置会话后重试一次即可恢复，且不会误判为结果未知。
+func TestToolCallRetriesMethodRejectionOnce(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch body.Method {
+		case "initialize":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18"}}`, body.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			if calls.Add(1) == 1 {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				_, _ = w.Write([]byte(`{"detail":"Method Not Allowed"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}`, body.ID)
+		}
+	}))
+	t.Cleanup(server.Close)
+	result, err := newTestClient(t, server, "none", "").CallTool(context.Background(), "tool", nil)
+	if err != nil || len(result.Content) != 1 || result.Content[0].Text != "ok" {
+		t.Fatalf("CallTool() = %#v, %v", result, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("tools/call attempts = %d, want 2", got)
+	}
+}
+
 // TestClientSendsMultipleAuthHeaders 验证握手请求携带完整的多请求头凭证。
 func TestClientSendsMultipleAuthHeaders(t *testing.T) {
 	server := mockRPCServer(t, func(method string, _ json.RawMessage, request *http.Request, response http.ResponseWriter) (any, bool) {

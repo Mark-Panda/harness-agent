@@ -15,8 +15,9 @@ agent:
     skill_synthesis:
       # 联调验收开启每日技能提炼；生产默认关闭，需显式开启并指定模型策略。
       enabled: true
-      # 平台默认提炼策略：验收环境使用已发布的“自动切换”策略（deepseek-v4.1-flash / kimi-k3）。
-      default_model_policy_id: "cc7565ca-bfe2-4d3c-9568-b2f6d9a11f76"
-      default_model_policy_version: 1
+      # 平台默认提炼策略：必须引用本环境已发布的策略版本。
+      # 旧值 cc7565ca-.../v1 在当前库中不存在，导致提炼任务静默跳过；改用已发布的“个人”策略 v2。
+      default_model_policy_id: "bba3e21f-437d-4ed4-9dd9-c92d5231471b"
+      default_model_policy_version: 2
       # 缩短维护扫描周期，便于在验收窗口内触发提炼任务。
       interval: 1m

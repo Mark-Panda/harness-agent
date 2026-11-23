@@ -109,6 +109,98 @@ type UserSkillSynthesisSettingsRepository interface {
 	ListEnabledUserIDs(ctx context.Context, userIDs []uuid.UUID) ([]uuid.UUID, error)
 }
 
+// SkillSynthesisRunStatus 是每日技能提炼记录的状态。
+type SkillSynthesisRunStatus string
+
+const (
+	// SkillSynthesisRunRunning 正在执行。
+	SkillSynthesisRunRunning SkillSynthesisRunStatus = "running"
+	// SkillSynthesisRunCompleted 执行完成且生成了技能。
+	SkillSynthesisRunCompleted SkillSynthesisRunStatus = "completed"
+	// SkillSynthesisRunSkipped 执行完成但按规则跳过，例如无有效对话或置信度不足。
+	SkillSynthesisRunSkipped SkillSynthesisRunStatus = "skipped"
+	// SkillSynthesisRunFailed 执行失败或中断。
+	SkillSynthesisRunFailed SkillSynthesisRunStatus = "failed"
+)
+
+// SkillSynthesisRun 是每日技能提炼的执行记录；同一用户同一天只保留一条。
+type SkillSynthesisRun struct {
+	// ID 记录唯一标识。
+	ID uuid.UUID
+	// UserID 所属用户，RLS 隔离键。
+	UserID uuid.UUID
+	// Date 任务对应的 UTC 日期，格式 2006-01-02。
+	Date string
+	// JobID 对应的提炼任务。
+	JobID *uuid.UUID
+	// Status 执行状态。
+	Status SkillSynthesisRunStatus
+	// Outcome 结果原因，例如 created、not_worthwhile、low_confidence。
+	Outcome string
+	// Detail 脱敏后的执行说明。
+	Detail string
+	// SessionsScanned 扫描到的活跃会话数。
+	SessionsScanned int
+	// SessionsUsed 实际参与提炼的会话数。
+	SessionsUsed int
+	// MessagesUsed 实际参与提炼的消息数。
+	MessagesUsed int
+	// CandidateName 模型给出的候选技能名。
+	CandidateName string
+	// Confidence 模型判定置信度。
+	Confidence float64
+	// SkillID 生成的用户技能 ID。
+	SkillID *uuid.UUID
+	// Attempts 当天累计执行次数。
+	Attempts int
+	// StartedAt 本次开始时间（UTC）。
+	StartedAt time.Time
+	// FinishedAt 结束时间（UTC），运行中为空。
+	FinishedAt *time.Time
+	// UpdatedAt 最后更新时间（UTC）。
+	UpdatedAt time.Time
+}
+
+// SkillSynthesisRunUpdate 是记录结束时的可变字段。
+type SkillSynthesisRunUpdate struct {
+	// Status 目标状态。
+	Status SkillSynthesisRunStatus
+	// Outcome 结果原因。
+	Outcome string
+	// Detail 脱敏说明。
+	Detail string
+	// SessionsScanned 扫描会话数。
+	SessionsScanned int
+	// SessionsUsed 参与提炼的会话数。
+	SessionsUsed int
+	// MessagesUsed 参与提炼的消息数。
+	MessagesUsed int
+	// CandidateName 候选技能名。
+	CandidateName string
+	// Confidence 置信度。
+	Confidence float64
+	// SkillID 生成的技能 ID。
+	SkillID *uuid.UUID
+	// FinishedAt 结束时间。
+	FinishedAt time.Time
+}
+
+// SkillSynthesisRunRepository 定义每日提炼执行记录、覆盖水位与日额度的持久化契约。
+type SkillSynthesisRunRepository interface {
+	// StartSkillSynthesisRun 开启或重启当天记录；重试只更新同一条记录并累加次数。
+	StartSkillSynthesisRun(ctx context.Context, run SkillSynthesisRun) (SkillSynthesisRun, error)
+	// FinishSkillSynthesisRun 写入当天记录的最终结果。
+	FinishSkillSynthesisRun(ctx context.Context, userID, runID uuid.UUID, update SkillSynthesisRunUpdate) (SkillSynthesisRun, error)
+	// ListSkillSynthesisRuns 按日期倒序列出用户最近的提炼记录。
+	ListSkillSynthesisRuns(ctx context.Context, userID uuid.UUID, limit int) ([]SkillSynthesisRun, error)
+	// GetSkillSynthesisWatermark 返回最近一次成功分析到的消息时间；未初始化时 found=false。
+	GetSkillSynthesisWatermark(ctx context.Context, userID uuid.UUID) (coveredAt time.Time, found bool, err error)
+	// AdvanceSkillSynthesisWatermark 只向前推进覆盖水位，避免并发乱序回退。
+	AdvanceSkillSynthesisWatermark(ctx context.Context, userID uuid.UUID, coveredAt time.Time) error
+	// CountAutoUserSkillsSince 统计指定时间后自动生成的用户技能数，用于每日额度控制。
+	CountAutoUserSkillsSince(ctx context.Context, userID uuid.UUID, since time.Time) (int, error)
+}
+
 // UserSkillRepository 定义用户级技能持久化契约，所有方法强制携带 userID。
 type UserSkillRepository interface {
 	// CreateUserSkill 创建用户技能并写入审计事件。
@@ -135,6 +227,8 @@ type UserSkillService struct {
 	bundles  UserSkillBundleRepository
 	settings UserSkillSynthesisSettingsRepository
 	policies PolicyRepository
+	runs     SkillSynthesisRunRepository
+	trigger  SkillSynthesisJobQueue
 }
 
 // NewUserSkillService 构造用户技能服务。
@@ -253,6 +347,71 @@ func (s *UserSkillService) WithSynthesisSettings(settings UserSkillSynthesisSett
 	return s
 }
 
+// WithSynthesisRuns 附加每日提炼执行记录读取能力；未注入时记录接口返回未配置错误。
+func (s *UserSkillService) WithSynthesisRuns(runs SkillSynthesisRunRepository) *UserSkillService {
+	if runs != nil {
+		s.runs = runs
+	}
+	return s
+}
+
+// WithSynthesisTrigger 附加手动触发能力；未注入时手动触发接口返回未配置错误。
+func (s *UserSkillService) WithSynthesisTrigger(queue SkillSynthesisJobQueue) *UserSkillService {
+	if queue != nil {
+		s.trigger = queue
+	}
+	return s
+}
+
+// TriggerSynthesis 立即入队一次技能提炼；同一分钟重复触发由去重键合并。
+func (s *UserSkillService) TriggerSynthesis(ctx context.Context, principal Principal) (string, error) {
+	if principal.UserID == uuid.Nil {
+		return "", ErrForbidden
+	}
+	if s.settings == nil || s.runs == nil || s.trigger == nil {
+		return "", invalid("user skill synthesis is not configured")
+	}
+	settings, err := s.settings.GetUserSkillSynthesisSettings(ctx, principal.UserID)
+	if err != nil {
+		return "", err
+	}
+	if !settings.Enabled {
+		return "", ErrSkillSynthesisDisabled
+	}
+	now := time.Now().UTC()
+	date := now.Format("2006-01-02")
+	runs, err := s.runs.ListSkillSynthesisRuns(ctx, principal.UserID, 1)
+	if err != nil {
+		return "", err
+	}
+	if len(runs) > 0 && runs[0].Date == date && runs[0].Status == SkillSynthesisRunRunning {
+		return "", ErrSkillSynthesisInProgress
+	}
+	task := SkillSynthesisTask{
+		UserID: principal.UserID, Date: date,
+		// 按分钟去重：连点不会排出一串任务，但当天不同时间可以重复手动提炼。
+		RequestID: "manual:" + now.Format("2006-01-02T15:04"),
+	}
+	if err := s.trigger.EnqueueSkillSynthesis(ctx, task, now); err != nil {
+		return "", err
+	}
+	return date, nil
+}
+
+// ListSynthesisRuns 列出当前用户最近的每日提炼执行记录。
+func (s *UserSkillService) ListSynthesisRuns(ctx context.Context, principal Principal, limit int) ([]SkillSynthesisRun, error) {
+	if principal.UserID == uuid.Nil {
+		return nil, ErrForbidden
+	}
+	if s.runs == nil {
+		return nil, invalid("user skill synthesis runs are not configured")
+	}
+	if limit <= 0 || limit > 90 {
+		limit = 30
+	}
+	return s.runs.ListSkillSynthesisRuns(ctx, principal.UserID, limit)
+}
+
 // GetSynthesisSettings 读取当前用户设置；从未保存时返回默认关闭状态。
 func (s *UserSkillService) GetSynthesisSettings(ctx context.Context, principal Principal) (UserSkillSynthesisSettings, error) {
 	if principal.UserID == uuid.Nil {
@@ -341,10 +500,41 @@ func (s *UserSkillService) CreateAuto(ctx context.Context, userID uuid.UUID, ski
 	skill.Version = 1
 	skill.Status = UserSkillAutoGenerated
 	skill.Origin = UserSkillOriginAuto
-	if err := validateUserSkill(&skill); err != nil {
+	if skill.Confidence < 0 || skill.Confidence > 1 {
+		return UserSkill{}, invalid("user skill confidence must be within [0,1]")
+	}
+	if err := validateJSONSize(skill.Parameters, 64*1024); err != nil {
 		return UserSkill{}, err
 	}
-	return s.repo.CreateUserSkill(ctx, skill, mutationEvent(userID, "user_skill.auto_created", "user_skill", skill.ID))
+	// 自动技能在白名单入口再校验一次结构，避免绕过 Worker 写入不合规草稿。
+	if err := validateSynthesizedSkillStructure(SkillCandidate{
+		ShouldCreate: true, Name: skill.Name, Description: skill.Description,
+		PromptTemplate: skill.PromptTemplate, Parameters: skill.Parameters,
+	}); err != nil {
+		return UserSkill{}, err
+	}
+	created, err := s.repo.CreateUserSkill(ctx, skill, mutationEvent(userID, "user_skill.auto_created", "user_skill", skill.ID))
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if s.bundles == nil {
+		return created, nil
+	}
+	info, files, err := buildAutoSkillBundle(created)
+	if err != nil {
+		_ = s.repo.DeleteUserSkill(context.WithoutCancel(ctx), userID, created.ID,
+			mutationEvent(userID, "user_skill.deleted", "user_skill", created.ID))
+		return UserSkill{}, err
+	}
+	if err := s.bundles.ReplaceUserSkillBundle(ctx, userID, created.ID, info, files,
+		mutationEvent(userID, "user_skill.bundle_created", "user_skill", created.ID)); err != nil {
+		// 包写入失败时删除刚创建的技能，避免留下没有标准包的半成品草稿。
+		_ = s.repo.DeleteUserSkill(context.WithoutCancel(ctx), userID, created.ID,
+			mutationEvent(userID, "user_skill.deleted", "user_skill", created.ID))
+		return UserSkill{}, err
+	}
+	created.Bundle = info
+	return created, nil
 }
 
 // Update 更新技能正文；仅 auto_generated 状态可修改，已发布技能不可原地编辑。
@@ -463,15 +653,39 @@ type SkillCandidate struct {
 	Name string
 	// Description 技能描述。
 	Description string
+	// WhenToUse 触发场景说明。
+	WhenToUse string
 	// PromptTemplate 提示词模板。
 	PromptTemplate string
 	// Parameters 参数定义 JSON Schema。
 	Parameters map[string]any
+	// RequiredTools 执行技能需要的工具或数据源。
+	RequiredTools []string
+	// Evidence 支撑技能提炼的对话证据。
+	Evidence []SkillEvidence
+	// DuplicateOf 模型判定与已有技能重复时给出该技能名称。
+	DuplicateOf string
+}
+
+// SkillEvidence 是技能提炼引用的对话证据。
+type SkillEvidence struct {
+	// Session 会话标题。
+	Session string `json:"session"`
+	// Quote 对话原文片段。
+	Quote string `json:"quote"`
+}
+
+// SkillDigest 是已有技能的摘要视图，供提炼时避免重复创建同类技能。
+type SkillDigest struct {
+	// Name 技能名称。
+	Name string
+	// Description 技能用途描述。
+	Description string
 }
 
 // SkillExtractor 从当日有效对话中提炼可复用技能。
 type SkillExtractor interface {
-	Extract(ctx context.Context, userID uuid.UUID, sessions []Session, messagesBySession map[uuid.UUID][]Message) (SkillCandidate, error)
+	Extract(ctx context.Context, userID uuid.UUID, sessions []Session, messagesBySession map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error)
 }
 
 // SkillSynthesisTask 是异步技能提炼任务载荷。
@@ -480,7 +694,17 @@ type SkillSynthesisTask struct {
 	UserID uuid.UUID
 	// Date 任务对应日期（UTC 日期字符串），用于去重。
 	Date string
+	// RequestID 手动触发标识；非空时参与去重键，同一天可多次手动执行。
+	RequestID string
 }
+
+// 技能提炼手动触发错误。
+var (
+	// ErrSkillSynthesisDisabled 用户未开启每日技能自动提炼。
+	ErrSkillSynthesisDisabled = errors.New("skill synthesis is disabled")
+	// ErrSkillSynthesisInProgress 当天提炼正在执行，避免重复触发。
+	ErrSkillSynthesisInProgress = errors.New("skill synthesis is already running")
+)
 
 // SkillSynthesisJobQueue 是技能提炼任务入队端口。
 type SkillSynthesisJobQueue interface {
@@ -554,7 +778,7 @@ func (c SkillSynthesisConfig) normalize() SkillSynthesisConfig {
 		c.MaxMessageBytes = 8 * 1024
 	}
 	if c.MaxOutputTokens <= 0 {
-		c.MaxOutputTokens = 2048
+		c.MaxOutputTokens = 4096
 	}
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = 60 * time.Second
@@ -678,6 +902,8 @@ type SkillSynthesisWorkerDependencies struct {
 	UserSkills *UserSkillService
 	// Extractor 技能提炼器。
 	Extractor SkillExtractor
+	// Runs 每日提炼执行记录仓储；为空时不记录执行事实。
+	Runs SkillSynthesisRunRepository
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -691,6 +917,7 @@ type SkillSynthesisWorker struct {
 	sessions   SkillSynthesisSessionReader
 	userSkills *UserSkillService
 	extractor  SkillExtractor
+	runs       SkillSynthesisRunRepository
 	config     SkillSynthesisConfig
 	clock      func() time.Time
 	logger     *slog.Logger
@@ -711,7 +938,7 @@ func NewSkillSynthesisWorker(dependencies SkillSynthesisWorkerDependencies, conf
 	}
 	return &SkillSynthesisWorker{
 		jobs: dependencies.Jobs, settings: dependencies.Settings, sessions: dependencies.Sessions,
-		userSkills: dependencies.UserSkills, extractor: dependencies.Extractor,
+		userSkills: dependencies.UserSkills, extractor: dependencies.Extractor, runs: dependencies.Runs,
 		config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -787,95 +1014,250 @@ func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
 			w.logger.Warn("fail skill synthesis job failed", "job_id", job.ID, "error", err)
 		}
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			w.logger.Error("skill synthesis job panicked", "job_id", job.ID,
-				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
-			fail(fmt.Errorf("skill synthesis panicked: %v", recovered))
-		}
-	}()
-
 	task, err := decodeSkillSynthesisTask(job)
 	if err != nil {
 		w.logger.Error("invalid skill synthesis job payload", "job_id", job.ID, "error", err)
 		complete()
 		return
 	}
+
+	// 每日提炼执行记录：同一用户同一天一条，所有退出路径都写入最终结果，
+	// 让界面可以回答"今天有没有跑、为什么没有生成技能"。
+	var record *SkillSynthesisRun
+	var sessionsScanned, sessionsUsed, messagesUsed int
+	var candidateName string
+	var confidence float64
+	var skillID *uuid.UUID
+	var scanNotes []string
+	scanFailed := false
+	finished := false
+	finishRun := func(status SkillSynthesisRunStatus, outcome, detail string) {
+		finished = true
+		if record == nil || w.runs == nil {
+			return
+		}
+		if len(scanNotes) > 0 {
+			detail = strings.TrimSpace(detail + "；" + strings.Join(scanNotes, "；"))
+		}
+		update := SkillSynthesisRunUpdate{
+			Status: status, Outcome: outcome, Detail: detail,
+			SessionsScanned: sessionsScanned, SessionsUsed: sessionsUsed, MessagesUsed: messagesUsed,
+			CandidateName: candidateName, Confidence: confidence, SkillID: skillID, FinishedAt: w.clock(),
+		}
+		if _, err := w.runs.FinishSkillSynthesisRun(context.WithoutCancel(ctx), record.UserID, record.ID, update); err != nil {
+			w.logger.Warn("finish skill synthesis run failed", "user_id", record.UserID, "run_id", record.ID, "error", err)
+		}
+	}
+	if w.runs != nil && task.UserID != uuid.Nil {
+		started, err := w.runs.StartSkillSynthesisRun(context.WithoutCancel(ctx), SkillSynthesisRun{
+			UserID: task.UserID, Date: task.Date, JobID: &job.ID, StartedAt: w.clock(),
+		})
+		if err != nil {
+			w.logger.Warn("start skill synthesis run failed", "user_id", task.UserID, "error", err)
+		} else {
+			record = &started
+		}
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			w.logger.Error("skill synthesis job panicked", "job_id", job.ID,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			finishRun(SkillSynthesisRunFailed, "panic", fmt.Sprintf("执行异常：%v", recovered))
+			fail(fmt.Errorf("skill synthesis panicked: %v", recovered))
+		}
+	}()
+	defer func() {
+		if !finished {
+			finishRun(SkillSynthesisRunFailed, "interrupted", "任务中断或执行租约丢失")
+		}
+	}()
+
 	settings, err := w.settings.GetUserSkillSynthesisSettings(runCtx, task.UserID)
 	if err != nil {
+		finishRun(SkillSynthesisRunFailed, "settings_unavailable", sanitizeExecutionError(err))
 		fail(err)
 		return
 	}
 	if !settings.Enabled {
 		w.logger.Info("skill synthesis skipped because user disabled it", "job_id", job.ID, "user_id", task.UserID)
+		finishRun(SkillSynthesisRunSkipped, "disabled", "用户已关闭每日技能自动提炼")
 		complete()
 		return
 	}
 
-	since := w.clock().Add(-time.Duration(w.config.LookbackHours) * time.Hour)
-	sessions, err := w.sessions.ListSessionsActiveSince(runCtx, task.UserID, since, w.config.MaxSessionsPerUser)
+	// 只分析覆盖水位之后的新消息：每日任务与手动触发共享同一水位，避免重复提炼同一批对话。
+	now := w.clock()
+	since := now.Add(-time.Duration(w.config.LookbackHours) * time.Hour)
+	hasWatermark := false
+	if w.runs != nil {
+		if coveredAt, found, err := w.runs.GetSkillSynthesisWatermark(runCtx, task.UserID); err != nil {
+			w.logger.Warn("load skill synthesis watermark failed; falling back to lookback window",
+				"user_id", task.UserID, "error", err)
+		} else if found {
+			hasWatermark = true
+			if coveredAt.After(since) {
+				since = coveredAt
+			}
+		}
+	}
+	sessions, err := w.sessions.ListSessionsActiveSince(runCtx, task.UserID, since, w.config.MaxSessionsPerUser+1)
 	if err != nil {
+		finishRun(SkillSynthesisRunFailed, "sessions_unavailable", sanitizeExecutionError(err))
 		fail(err)
 		return
 	}
+	if len(sessions) > w.config.MaxSessionsPerUser {
+		sessions = sessions[:w.config.MaxSessionsPerUser]
+		scanNotes = append(scanNotes, fmt.Sprintf("活跃会话超过上限 %d，仅分析最近活跃的 %d 个；采样扫描，未覆盖的旧消息不会再次提炼",
+			w.config.MaxSessionsPerUser, w.config.MaxSessionsPerUser))
+	}
+	sessionsScanned = len(sessions)
 	if len(sessions) == 0 {
+		outcome, detail := "no_activity", fmt.Sprintf("最近 %d 小时没有活跃会话", w.config.LookbackHours)
+		if hasWatermark {
+			outcome, detail = "no_new_messages", "上次提炼后没有新的活跃会话"
+		}
+		finishRun(SkillSynthesisRunSkipped, outcome, detail)
 		complete()
 		return
 	}
 
 	messagesBySession := make(map[uuid.UUID][]Message, len(sessions))
 	effectiveSessionCount := 0
+	messageTruncatedSessions := 0
+	var latestMessageAt time.Time
 	for _, session := range sessions {
 		// 跳过禁用记忆的会话，避免提炼无效内容。
 		if session.MemoryPolicy == SessionMemoryDisabled {
 			continue
 		}
-		messages, err := w.sessions.ListRecentMessages(runCtx, task.UserID, session.ID, w.config.MaxMessagesPerSession)
+		messages, err := w.sessions.ListRecentMessages(runCtx, task.UserID, session.ID, w.config.MaxMessagesPerSession+1)
 		if err != nil {
 			w.logger.Warn("load session messages failed", "session_id", session.ID, "error", err)
+			if !scanFailed {
+				scanNotes = append(scanNotes, "部分会话消息读取失败，本轮未推进水位")
+			}
+			scanFailed = true
 			continue
 		}
-		filtered := filterEffectiveMessages(messages)
-		if len(filtered) == 0 {
+		if len(messages) > w.config.MaxMessagesPerSession {
+			messages = messages[:w.config.MaxMessagesPerSession]
+			messageTruncatedSessions++
+		}
+		fresh := make([]Message, 0, len(messages))
+		for _, message := range filterEffectiveMessages(messages) {
+			// 缺少时间戳的历史/测试消息不参与水位过滤，避免被误判为旧消息。
+			if !message.CreatedAt.IsZero() && message.CreatedAt.Before(since) {
+				continue
+			}
+			fresh = append(fresh, message)
+			if message.CreatedAt.After(latestMessageAt) {
+				latestMessageAt = message.CreatedAt
+			}
+		}
+		if len(fresh) == 0 {
 			continue
 		}
-		messagesBySession[session.ID] = filtered
+		messagesBySession[session.ID] = fresh
+		messagesUsed += len(fresh)
 		effectiveSessionCount++
 	}
+	sessionsUsed = effectiveSessionCount
+	if messageTruncatedSessions > 0 {
+		scanNotes = append(scanNotes, fmt.Sprintf("%d 个会话消息超过上限 %d，仅分析最近 %d 条；采样扫描，未覆盖的旧消息不会再次提炼",
+			messageTruncatedSessions, w.config.MaxMessagesPerSession, w.config.MaxMessagesPerSession))
+	}
 	if effectiveSessionCount == 0 {
+		outcome, detail := "no_activity", "会话中没有可用于提炼的用户或助手消息"
+		if hasWatermark {
+			outcome, detail = "no_new_messages", "上次提炼后没有新的可提炼消息"
+		}
+		finishRun(SkillSynthesisRunSkipped, outcome, detail)
 		complete()
 		return
+	}
+	// advanceWatermark 只在水位推进成功时继续；读取失败时不能推进，否则未分析消息会被永久跳过。
+	advanceWatermark := func() {
+		if scanFailed || w.runs == nil || latestMessageAt.IsZero() {
+			return
+		}
+		if err := w.runs.AdvanceSkillSynthesisWatermark(context.WithoutCancel(ctx), task.UserID, latestMessageAt); err != nil {
+			w.logger.Warn("advance skill synthesis watermark failed", "user_id", task.UserID, "error", err)
+		}
 	}
 	if err := lease.check(); err != nil {
 		w.logger.Warn("skill synthesis job lease lost before extraction", "job_id", job.ID, "error", err)
 		return
 	}
 
-	candidate, err := w.extractor.Extract(runCtx, task.UserID, sessions, messagesBySession)
+	existingSkills := w.existingUserSkills(runCtx, task.UserID)
+	candidate, err := w.extractor.Extract(runCtx, task.UserID, sessions, messagesBySession, existingSkillDigests(existingSkills))
 	if err != nil {
 		if errors.Is(err, ErrUserSkillSynthesisUnavailable) {
 			w.logger.Warn("skill synthesis unavailable; completing job", "job_id", job.ID, "error", err)
+			finishRun(SkillSynthesisRunSkipped, "model_unavailable", sanitizeExecutionError(err))
 			complete()
 			return
 		}
+		finishRun(SkillSynthesisRunFailed, "extraction_failed", sanitizeExecutionError(err))
 		fail(err)
 		return
 	}
+	candidateName = candidate.Name
+	confidence = candidate.Confidence
 	if !candidate.ShouldCreate || candidate.Confidence < w.config.MinConfidence {
 		w.logger.Info("skill synthesis skipped", "user_id", task.UserID,
-			"should_create", candidate.ShouldCreate, "confidence", candidate.Confidence)
+			"should_create", candidate.ShouldCreate, "confidence", candidate.Confidence,
+			"duplicate_of", candidate.DuplicateOf)
+		outcome, detail := "not_worthwhile", "模型判断当前对话没有值得沉淀的复用技能"
+		switch {
+		case candidate.DuplicateOf != "":
+			outcome, detail = "duplicate_skill", fmt.Sprintf("已有相似技能「%s」，未重复创建", candidate.DuplicateOf)
+		case candidate.ShouldCreate:
+			outcome = "low_confidence"
+			detail = fmt.Sprintf("候选技能置信度 %.2f 低于阈值 %.2f", candidate.Confidence, w.config.MinConfidence)
+		}
+		advanceWatermark()
+		finishRun(SkillSynthesisRunSkipped, outcome, detail)
 		complete()
 		return
+	}
+	if err := validateSynthesizedSkill(&candidate, sessions, messagesBySession); err != nil {
+		advanceWatermark()
+		finishRun(SkillSynthesisRunSkipped, "invalid_candidate", fmt.Sprintf("格式校验未通过：%v", err))
+		complete()
+		return
+	}
+	scanNotes = append(scanNotes, synthesizedSkillWarnings(candidate)...)
+	sourceIDs := make([]uuid.UUID, 0, len(messagesBySession))
+	for id := range messagesBySession {
+		sourceIDs = append(sourceIDs, id)
+	}
+	if matched, ok := findDuplicateSkill(candidate, sourceIDs, existingSkills); ok {
+		advanceWatermark()
+		finishRun(SkillSynthesisRunSkipped, "duplicate_skill", fmt.Sprintf("已有相似技能「%s」，未重复创建", matched.Name))
+		complete()
+		return
+	}
+	// 每日自动技能额度：到上限后只推进水位，不继续生成。
+	if w.config.MaxSkillsPerUserPerDay > 0 && w.runs != nil {
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		count, countErr := w.runs.CountAutoUserSkillsSince(runCtx, task.UserID, dayStart)
+		if countErr != nil {
+			w.logger.Warn("count daily auto skills failed; continuing", "user_id", task.UserID, "error", countErr)
+		} else if count >= w.config.MaxSkillsPerUserPerDay {
+			advanceWatermark()
+			finishRun(SkillSynthesisRunSkipped, "daily_limit_reached",
+				fmt.Sprintf("今天已自动生成 %d 个技能，达到上限 %d", count, w.config.MaxSkillsPerUserPerDay))
+			complete()
+			return
+		}
 	}
 	if err := lease.check(); err != nil {
 		w.logger.Warn("skill synthesis job lease lost before save", "job_id", job.ID, "error", err)
 		return
 	}
 
-	sourceIDs := make([]uuid.UUID, 0, len(messagesBySession))
-	for id := range messagesBySession {
-		sourceIDs = append(sourceIDs, id)
-	}
 	skill := UserSkill{
 		Name: candidate.Name, Description: candidate.Description,
 		PromptTemplate: candidate.PromptTemplate, Parameters: candidate.Parameters,
@@ -883,12 +1265,58 @@ func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
 	}
 	created, err := w.userSkills.CreateAuto(runCtx, task.UserID, skill)
 	if err != nil {
+		finishRun(SkillSynthesisRunFailed, "create_failed", sanitizeExecutionError(err))
 		fail(err)
 		return
 	}
+	skillID = &created.ID
+	candidateName = created.Name
+	confidence = created.Confidence
 	w.logger.Info("user skill auto created", "user_id", task.UserID, "skill_id", created.ID,
 		"name", created.Name, "confidence", created.Confidence)
+	advanceWatermark()
+	finishRun(SkillSynthesisRunCompleted, "created", fmt.Sprintf("已生成技能「%s」", created.Name))
 	complete()
+}
+
+// existingUserSkills 读取已有技能全量视图，供提示去重与确定性判重共用。
+func (w *SkillSynthesisWorker) existingUserSkills(ctx context.Context, userID uuid.UUID) []UserSkill {
+	if w.userSkills == nil {
+		return nil
+	}
+	skills, err := w.userSkills.List(ctx, Principal{UserID: userID}, 200)
+	if err != nil {
+		w.logger.Warn("load existing user skills failed; continue without dedupe", "user_id", userID, "error", err)
+		return nil
+	}
+	return skills
+}
+
+// existingSkillDigests 从已有技能派生提示词摘要，最多 30 条，避免提示过长。
+func existingSkillDigests(skills []UserSkill) []SkillDigest {
+	const maxDigests = 30
+	digests := make([]SkillDigest, 0, min(len(skills), maxDigests))
+	for _, skill := range skills {
+		if len(digests) >= maxDigests {
+			break
+		}
+		digests = append(digests, SkillDigest{Name: skill.Name, Description: truncateRunes(skill.Description, 200)})
+	}
+	return digests
+}
+
+// matchExistingSkillName 返回与候选规范化后同名的已有技能名。
+func matchExistingSkillName(candidate string, existing []SkillDigest) string {
+	normalized := normalizeSkillName(candidate)
+	if normalized == "" {
+		return ""
+	}
+	for _, skill := range existing {
+		if normalizeSkillName(skill.Name) == normalized {
+			return skill.Name
+		}
+	}
+	return ""
 }
 
 // filterEffectiveMessages 仅保留非空的用户与助手消息，并按时间正序返回。
@@ -914,13 +1342,18 @@ func decodeSkillSynthesisTask(job Job) (SkillSynthesisTask, error) {
 	if date == "" {
 		return SkillSynthesisTask{}, fmt.Errorf("date is required")
 	}
-	return SkillSynthesisTask{UserID: userID, Date: date}, nil
+	requestID, _ := job.Payload["request_id"].(string)
+	return SkillSynthesisTask{UserID: userID, Date: date, RequestID: requestID}, nil
 }
 
 // EncodeSkillSynthesisTask 序列化任务载荷，供数据层入队使用。
 func EncodeSkillSynthesisTask(task SkillSynthesisTask) map[string]any {
-	return map[string]any{
+	payload := map[string]any{
 		"user_id": task.UserID.String(),
 		"date":    task.Date,
 	}
+	if strings.TrimSpace(task.RequestID) != "" {
+		payload["request_id"] = task.RequestID
+	}
+	return payload
 }

@@ -36,6 +36,43 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+// StopNotice 是非正常结束的 Run 在对话内的提示配置。
+type StopNotice = {
+  // tone 决定配色：danger 用于失败，warning 用于中断或取消。
+  tone: "danger" | "warning";
+  // title 提示标题。
+  title: string;
+  // detail 具体原因，优先展示错误码与错误信息。
+  detail: string;
+  // actionLabel 运行详情入口文案。
+  actionLabel: string;
+  // allowRetry 是否允许基于上条消息重新编辑发送。
+  allowRetry: boolean;
+};
+
+// stopNoticeFor 把任意非正常终止的 Run 映射为对话内提示。
+// 只要不是 completed，就必须让用户看到"为什么停了"，不能依赖用户主动打开运行详情。
+function stopNoticeFor(run: Run | null): StopNotice | null {
+  if (!run || !isTerminal(run.status) || run.status === "completed") {
+    return null;
+  }
+  const reason = [run.error_code, run.error_message].filter(Boolean).join(" · ");
+  switch (run.status) {
+    case "failed":
+      return { tone: "danger", title: "本轮处理失败", detail: reason || "可以打开运行详情查看执行步骤。", actionLabel: "查看完整过程", allowRetry: true };
+    case "reconciliation_required":
+      return {
+        tone: "warning", title: "本轮执行中断，需要人工对账",
+        detail: reason || "工具执行结果未知，请前往运行详情确认后结案。",
+        actionLabel: "查看并处理", allowRetry: false,
+      };
+    case "cancelled":
+      return { tone: "warning", title: "本轮执行已停止", detail: reason || "本次执行已取消，可以编辑上条消息重新发送。", actionLabel: "查看完整过程", allowRetry: true };
+    default:
+      return { tone: "danger", title: "本轮执行异常终止", detail: reason || "请打开运行详情查看执行步骤。", actionLabel: "查看完整过程", allowRetry: true };
+  }
+}
+
 // approvalFields 把审批参数转成可读的键值对，避免整段 JSON 难以扫读。
 function approvalFields(value: Record<string, unknown> | null): Array<[string, string]> {
   if (!value) {
@@ -810,7 +847,8 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
   const hasMessages = persistedMessages.length + liveVisible.length > 0;
   const lastUserContent = persistedMessages.slice().reverse().find((message) => message.role === "user")?.content;
   const latestRun = runs.data?.items[0] ?? null;
-  const failedRun = !runActive && (activeRun ?? latestRun)?.status === "failed" ? (activeRun ?? latestRun) : null;
+  const settledRun = !runActive ? (activeRun ?? latestRun) : null;
+  const stopNotice = stopNoticeFor(settledRun);
 
   useLayoutEffect(() => {
     const composer = composerRef.current;
@@ -995,16 +1033,20 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
               />
             )))}
 
-            {failedRun ? (
-              <div role="alert" className="rounded-xl border border-rust/40 bg-rust-soft/65 p-4">
+            {stopNotice && settledRun ? (
+              <div
+                role="alert"
+                aria-live="assertive"
+                className={cn("rounded-xl border p-4", stopNotice.tone === "danger" ? "border-rust/40 bg-rust-soft/65" : "border-ochre/40 bg-ochre-soft/45")}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="font-medium text-rust">本轮处理失败</p>
-                  <Link to={`/runs/${failedRun.id}`} className="rounded text-sm text-accent underline underline-offset-2">查看完整过程</Link>
+                  <p className={cn("font-medium", stopNotice.tone === "danger" ? "text-rust" : "text-ochre")}>{stopNotice.title}</p>
+                  <Link to={`/runs/${settledRun.id}`} className="rounded text-sm text-accent underline underline-offset-2">{stopNotice.actionLabel}</Link>
                 </div>
-                <p className="mt-1.5 break-words text-sm leading-6 text-rust">
-                  {failedRun.error_code ? `${failedRun.error_code} · ` : ""}{failedRun.error_message || "可以打开运行详情查看执行步骤。"}
+                <p className={cn("mt-1.5 break-words text-sm leading-6", stopNotice.tone === "danger" ? "text-rust" : "text-ink-soft")}>
+                  {stopNotice.detail}
                 </p>
-                {lastUserContent ? (
+                {stopNotice.allowRetry && lastUserContent ? (
                   <Button size="sm" variant="secondary" className="mt-3" onClick={() => editMessage(lastUserContent)} disabled={!canCompose}>
                     编辑上条消息
                   </Button>

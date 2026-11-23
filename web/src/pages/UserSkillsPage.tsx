@@ -8,7 +8,7 @@ import { mutate, requestJSON, uploadSkillPackage } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
 import { useClientPage, useRemote } from "../lib/hooks";
-import type { UserSkill, UserSkillInput, UserSkillOrigin, UserSkillSynthesisPolicy, UserSkillSynthesisSettings, UserSkillSynthesisSettingsInput } from "../lib/types";
+import type { UserSkill, UserSkillInput, UserSkillOrigin, UserSkillSynthesisPolicy, UserSkillSynthesisRun, UserSkillSynthesisSettings, UserSkillSynthesisSettingsInput } from "../lib/types";
 
 interface UserSkillList {
   items: UserSkill[];
@@ -104,8 +104,8 @@ function UserSkillForm({ initial, onSaved, onCancel }: { initial: UserSkill | nu
         <Input value={initial ? originLabel(initial.origin) : "手动创建"} disabled />
       </Field>
       <div className="sm:col-span-2">
-        <Field label="一句话说明" hint="告诉使用者在什么场景下选这个技能。">
-          <Input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} maxLength={512} placeholder="例如：把零散需求整理成带优先级的清单" />
+        <Field label="一句话说明" hint="告诉使用者在什么场景下选这个技能；建议 150-300 字，超过 300 Token 的部分运行时不会进入系统提示。">
+          <Input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} maxLength={1024} placeholder="例如：把零散需求整理成带优先级的清单" />
         </Field>
       </div>
       <div className="sm:col-span-2">
@@ -227,6 +227,101 @@ function SynthesisSettingsCard() {
   );
 }
 
+// synthesisOutcomeLabels 把提炼结果原因翻译成用户语言。
+const synthesisOutcomeLabels: Record<string, string> = {
+  created: "已生成技能",
+  not_worthwhile: "没有值得沉淀的技能",
+  low_confidence: "置信度不足",
+  no_activity: "没有有效对话",
+  no_new_messages: "上次提炼后没有新对话",
+  duplicate_skill: "已有同类技能",
+  invalid_candidate: "格式校验未通过",
+  daily_limit_reached: "达到每日上限",
+  disabled: "你已关闭自动提炼",
+  model_unavailable: "提炼模型不可用",
+  extraction_failed: "模型提炼失败",
+  create_failed: "技能保存失败",
+  settings_unavailable: "设置读取失败",
+  sessions_unavailable: "会话读取失败",
+  interrupted: "执行中断",
+  panic: "执行异常",
+  history: "历史执行记录",
+};
+
+// SynthesisRunsCard 展示每日自动提炼的执行记录与结果原因。
+function SynthesisRunsCard() {
+  const runs = useRemote(() => requestJSON<{ items: UserSkillSynthesisRun[] }>("/api/v1/user-skill-synthesis/runs?limit=90"), []);
+  const settings = useRemote(() => requestJSON<UserSkillSynthesisSettings>("/api/v1/user-skill-synthesis/settings"), []);
+  const toast = useToast();
+  const [triggering, setTriggering] = useState(false);
+  const enabled = settings.data?.enabled ?? false;
+  const items = runs.data?.items ?? [];
+  const paging = useClientPage(items, 10);
+
+  // triggerSynthesis 立即入队一次提炼；同一分钟内的重复点击由后端去重。
+  const triggerSynthesis = async () => {
+    setTriggering(true);
+    try {
+      await mutate("/api/v1/user-skill-synthesis/trigger", "POST", {}, crypto.randomUUID());
+      toast.show("已触发提炼，后台执行中；稍后会刷新记录", "success");
+      window.setTimeout(() => {
+        paging.reset();
+        runs.reload();
+      }, 2500);
+    } catch (failure) {
+      toast.show(describeError(failure), "danger");
+    } finally {
+      setTriggering(false);
+    }
+  };
+
+  return (
+    <Card title="自动提炼记录" description="每天最多一条记录；只分析上次提炼后的新对话，重试会更新当天结果。可分页查看最近 90 天记录。">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-line pb-3">
+        <p className="text-xs text-muted">
+          {enabled ? "开启状态下可随时手动执行一次，只处理上次提炼后的新对话。" : "开启自动提炼后才可以手动触发。"}
+        </p>
+        <Button size="sm" variant="secondary" loading={triggering} disabled={!enabled || triggering} onClick={() => void triggerSynthesis()}>
+          立即提炼一次
+        </Button>
+      </div>
+      {runs.loading && !runs.data ? (
+        <LoadingState />
+      ) : runs.error ? (
+        <ErrorBanner message={runs.error} onRetry={runs.reload} />
+      ) : items.length === 0 ? (
+        <EmptyState title="还没有执行记录" description="开启自动提炼后系统每天执行一次；升级前的历史任务也会补录执行事实。" />
+      ) : (
+        <ul className="divide-y divide-line">
+          {paging.pageItems.map((run) => (
+            <li key={run.id} className="flex flex-col gap-1 py-3 first:pt-0 last:pb-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium text-ink">{run.date}</span>
+                <Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge>
+                <span className="text-xs text-ink-soft">{synthesisOutcomeLabels[run.outcome] ?? run.outcome}</span>
+                {run.attempts > 1 ? <span className="text-xs text-muted">当天第 {run.attempts} 次执行</span> : null}
+              </div>
+              <p className="text-xs text-muted">
+                扫描 {run.sessions_scanned} 个会话 · 使用 {run.sessions_used} 个会话 / {run.messages_used} 条消息
+                {run.candidate_name ? ` · 候选「${run.candidate_name}」` : ""}
+                {run.confidence > 0 ? ` · 置信度 ${run.confidence.toFixed(2)}` : ""}
+              </p>
+              {run.detail ? <p className="text-xs leading-5 text-muted">{run.detail}</p> : null}
+              <p className="text-[11px] text-muted">
+                {formatDateTime(run.started_at)}
+                {run.finished_at ? ` → ${formatDateTime(run.finished_at)}` : ""}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      {items.length > 0 ? (
+        <Pager page={paging.page} totalPages={paging.totalPages} total={items.length} busy={runs.loading} onChange={paging.setPage} />
+      ) : null}
+    </Card>
+  );
+}
+
 export default function UserSkillsPage() {
   const skills = useRemote(() => requestJSON<UserSkillList>("/api/v1/user-skills?limit=200"), []);
   const toast = useToast();
@@ -319,6 +414,7 @@ export default function UserSkillsPage() {
       {skills.error ? <ErrorBanner message={skills.error} onRetry={skills.reload} /> : null}
       {actionError ? <ErrorBanner message={actionError} /> : null}
       <SynthesisSettingsCard />
+      <SynthesisRunsCard />
       {editing ? (
         <UserSkillForm
           initial={editing === "new" ? null : editing}

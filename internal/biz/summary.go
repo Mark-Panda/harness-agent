@@ -488,6 +488,14 @@ func (c SummaryWorkerConfig) normalize() SummaryWorkerConfig {
 	return c
 }
 
+// SummaryRunLocator 定位摘要任务对应的触发 Run，供执行步骤回填。
+type SummaryRunLocator interface {
+	// FindRunByTriggerMessage 返回由指定用户消息触发的 Run；不存在时 found=false。
+	FindRunByTriggerMessage(ctx context.Context, userID, sessionID, messageID uuid.UUID) (Run, bool, error)
+	// LatestRunBefore 返回会话中创建时间不晚于给定时刻的最近 Run；不存在时 found=false。
+	LatestRunBefore(ctx context.Context, userID, sessionID uuid.UUID, at time.Time) (Run, bool, error)
+}
+
 // SummaryWorkerDependencies 聚合摘要 Worker 所需依赖。
 type SummaryWorkerDependencies struct {
 	// Jobs 持久化任务队列。
@@ -502,6 +510,10 @@ type SummaryWorkerDependencies struct {
 	Generator SummaryGenerator
 	// Queue 在旧版本任务被更新的摘要版本超越时补建未覆盖尾部任务；为空时只完成当前任务。
 	Queue SummaryJobQueue
+	// Runs 定位摘要的触发 Run，用于把摘要生成写入该 Run 的步骤明细；为空时跳过步骤写入。
+	Runs SummaryRunLocator
+	// Steps 执行步骤仓储；为空时跳过步骤写入。
+	Steps ExecutionStepRepository
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -516,6 +528,8 @@ type SummaryWorker struct {
 	summaries SummaryRepository
 	generator SummaryGenerator
 	queue     SummaryJobQueue
+	runs      SummaryRunLocator
+	steps     ExecutionStepRepository
 	config    SummaryWorkerConfig
 	clock     func() time.Time
 	logger    *slog.Logger
@@ -541,6 +555,7 @@ func NewSummaryWorker(dependencies SummaryWorkerDependencies, config SummaryWork
 	return &SummaryWorker{
 		jobs: dependencies.Jobs, sessions: dependencies.Sessions, messages: dependencies.Messages,
 		summaries: dependencies.Summaries, generator: dependencies.Generator, queue: dependencies.Queue,
+		runs: dependencies.Runs, steps: dependencies.Steps,
 		config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -624,6 +639,8 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 		_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
 		return
 	}
+	// 步骤开始时间覆盖摘要校验与生成全过程，便于在执行树中看到真实耗时。
+	stepStartedAt := w.clock()
 	// 会话归档或删除后不再生成新摘要，避免继续消耗模型额度。
 	session, err := w.sessions.GetSession(ctx, task.UserID, task.SessionID)
 	if err != nil {
@@ -803,7 +820,69 @@ func (w *SummaryWorker) handle(ctx context.Context, job Job) {
 	}
 	w.logger.Info("summary version created", "session_id", task.SessionID, "version", saved.Version,
 		"covered_messages", saved.CoveredMessageCount, "input_tokens", saved.InputTokens, "output_tokens", saved.OutputTokens)
+	// 摘要已落库；把生成过程写入触发 Run 的步骤明细，失败只告警，不影响任务完成。
+	w.recordSummaryStep(context.WithoutCancel(ctx), task, saved, source, stepStartedAt)
 	_ = w.jobs.Complete(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken)
+}
+
+// recordSummaryStep 把一次成功的摘要生成写入触发 Run 的 system 步骤。
+// 消息写入触发的任务用触发消息精确定位 Run；Run 完成触发的任务用结束时间定位最近 Run。
+func (w *SummaryWorker) recordSummaryStep(ctx context.Context, task SummaryTask, summary SessionSummary, source []Message, startedAt time.Time) {
+	if w.steps == nil || w.runs == nil {
+		return
+	}
+	run, found := w.summaryTriggerRun(ctx, task, source)
+	if !found {
+		w.logger.Info("summary triggering run not found; skip compression step",
+			"session_id", task.SessionID, "end_message_id", task.EndMessageID)
+		return
+	}
+	payload := map[string]any{
+		"stage": "summary_generation", "summary_version": summary.Version,
+		"covered_messages": summary.CoveredMessageCount, "source_messages": len(task.SourceMessageIDs),
+		"input_tokens": summary.InputTokens, "output_tokens": summary.OutputTokens,
+	}
+	if len(source) > 0 {
+		payload["last_role"] = string(source[len(source)-1].Role)
+	}
+	step, err := w.steps.StartStep(ctx, ExecutionStep{
+		RunID: run.ID, UserID: run.UserID, Kind: StepKindSystem,
+		Name: "会话摘要生成", Status: StepRunning, AttemptNo: run.AttemptNo,
+		RiskLevel: "low", StartedAt: &startedAt,
+	})
+	if err != nil {
+		w.logger.Warn("start summary generation step failed", "run_id", run.ID, "error", err)
+		return
+	}
+	if _, err := w.steps.SavePayload(ctx, ExecutionPayload{
+		RunID: run.ID, UserID: run.UserID, StepID: &step.ID, Type: PayloadContextCompression,
+		ContentJSON: payload, CaptureMode: CaptureMetadataOnly,
+	}); err != nil {
+		w.logger.Warn("save summary generation payload failed", "run_id", run.ID, "error", err)
+	}
+	if _, err := w.steps.FinishStep(ctx, run.UserID, step.ID, StepUpdate{Status: StepCompleted, FinishedAt: w.clock()}); err != nil {
+		w.logger.Warn("finish summary generation step failed", "run_id", run.ID, "error", err)
+	}
+}
+
+// summaryTriggerRun 定位摘要任务对应的触发 Run。
+func (w *SummaryWorker) summaryTriggerRun(ctx context.Context, task SummaryTask, source []Message) (Run, bool) {
+	// 用户消息触发的摘要：用触发消息匹配 Run，避免错挂到上一轮执行。
+	if len(source) > 0 && source[len(source)-1].Role == MessageUser {
+		run, found, err := w.runs.FindRunByTriggerMessage(ctx, task.UserID, task.SessionID, task.EndMessageID)
+		if err != nil {
+			w.logger.Warn("find summary trigger run failed", "session_id", task.SessionID, "error", err)
+			return Run{}, false
+		}
+		return run, found
+	}
+	// 助手/工具结尾的摘要由 Run 完成路径触发：取结束时间之前最近的一次 Run。
+	run, found, err := w.runs.LatestRunBefore(ctx, task.UserID, task.SessionID, task.EndAt)
+	if err != nil {
+		w.logger.Warn("find latest summary run failed", "session_id", task.SessionID, "error", err)
+		return Run{}, false
+	}
+	return run, found
 }
 
 // enqueueUncoveredTail 把当前生效摘要边界之后、本任务结束边界之前的消息补建为新任务。

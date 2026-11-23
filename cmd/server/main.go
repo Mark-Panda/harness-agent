@@ -548,6 +548,8 @@ func run() error {
 		return err
 	}
 	userSkillService.WithSynthesisSettings(userSkillRepository, catalogRepository)
+	userSkillService.WithSynthesisRuns(userSkillRepository)
+	userSkillService.WithSynthesisTrigger(jobRepository)
 	userSkillService.WithBundles(skillBundleRepository)
 	platformService.UserSkills = userSkillService
 	platformService.WithFeishuBots(feishuBotService, feishuBotBindingService)
@@ -931,7 +933,8 @@ func run() error {
 		generator.WithUsageRecorder(budgetRepository)
 		summaryWorker, err := biz.NewSummaryWorker(biz.SummaryWorkerDependencies{
 			Jobs: jobRepository, Sessions: sessionRepository, Messages: sessionRepository,
-			Summaries: summaryRepository, Generator: generator, Queue: jobRepository, Logger: slog.Default(),
+			Summaries: summaryRepository, Generator: generator, Queue: jobRepository,
+			Runs: runRepository, Steps: stepRepository, Logger: slog.Default(),
 		}, biz.SummaryWorkerConfig{
 			WorkerID: workerID, Concurrency: cfg.Agent.Memory.Summary.Concurrency,
 			PollInterval: cfg.Agent.Memory.Summary.PollInterval.Duration, Lease: cfg.Agent.Memory.Summary.Lease.Duration,
@@ -1044,6 +1047,7 @@ func run() error {
 		skillExtractor.WithUsageRecorder(budgetRepository).WithBudgetChecker(budgetService)
 		skillSynthesisWorker, err := biz.NewSkillSynthesisWorker(biz.SkillSynthesisWorkerDependencies{
 			Jobs: jobRepository, Settings: userSkillRepository, Sessions: sessionRepository, UserSkills: userSkillService,
+			Runs:      userSkillRepository,
 			Extractor: skillExtractor, Logger: slog.Default(),
 		}, biz.SkillSynthesisConfig{
 			Enabled:                cfg.Agent.Memory.SkillSynthesis.Enabled,

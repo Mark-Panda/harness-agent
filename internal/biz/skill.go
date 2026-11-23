@@ -83,6 +83,7 @@ func (s *SkillService) WithBundles(repo SkillBundleRepository) *SkillService {
 }
 
 // ImportBundle 解析标准技能包 zip 并创建平台技能草稿，仅管理员可用。
+// 同名技能按覆盖语义更新：保留 ID、版本、状态与参数，只替换描述、提示词与技能包文件。
 func (s *SkillService) ImportBundle(ctx context.Context, principal Principal, archive []byte) (SkillTemplate, error) {
 	if err := RequireAdmin(principal); err != nil {
 		return SkillTemplate{}, err
@@ -93,6 +94,14 @@ func (s *SkillService) ImportBundle(ctx context.Context, principal Principal, ar
 	pkg, err := skillpkg.ParseZip(archive, "技能包")
 	if err != nil {
 		return SkillTemplate{}, err
+	}
+	// 同名技能直接覆盖，避免命中 (name, version) 唯一约束返回无法解释的 409。
+	existing, found, err := s.findByName(ctx, pkg.Name)
+	if err != nil {
+		return SkillTemplate{}, err
+	}
+	if found {
+		return s.overwriteImportedSkill(ctx, principal, existing, pkg)
 	}
 	skill, err := s.Create(ctx, principal, SkillTemplate{
 		Name: pkg.Name, Description: pkg.Description,
@@ -109,6 +118,43 @@ func (s *SkillService) ImportBundle(ctx context.Context, principal Principal, ar
 		return SkillTemplate{}, err
 	}
 	return s.Get(ctx, principal, skill.ID)
+}
+
+// findByName 按名称查找平台技能；导入覆盖依赖名称作为稳定标识。
+func (s *SkillService) findByName(ctx context.Context, name string) (SkillTemplate, bool, error) {
+	skills, err := s.repo.ListSkills(ctx)
+	if err != nil {
+		return SkillTemplate{}, false, err
+	}
+	for _, skill := range skills {
+		if skill.Name == name {
+			return skill, true, nil
+		}
+	}
+	return SkillTemplate{}, false, nil
+}
+
+// overwriteImportedSkill 用导入包覆盖同名技能。
+// 保留 ID、名称、版本、状态与参数，确保已发布助手的绑定与执行契约不变；
+// 技能包脚本执行开关随整包替换重置为关闭，需要管理员重新显式开启。
+func (s *SkillService) overwriteImportedSkill(ctx context.Context, principal Principal, existing SkillTemplate, pkg *skillpkg.Package) (SkillTemplate, error) {
+	updated := existing
+	updated.Description = pkg.Description
+	updated.PromptTemplate = pkg.PromptTemplate
+	if err := validateSkill(&updated); err != nil {
+		return SkillTemplate{}, err
+	}
+	updated, err := s.repo.UpdateSkill(ctx, principal.UserID, updated,
+		mutationEvent(principal.UserID, "skill.updated", "skill", updated.ID))
+	if err != nil {
+		return SkillTemplate{}, err
+	}
+	info, files := bundleFromPackage(pkg, SkillFileOwnerPlatform, updated.ID)
+	if err := s.bundles.ReplaceSkillBundle(ctx, principal.UserID, updated.ID, info, files,
+		mutationEvent(principal.UserID, "skill.bundle_imported", "skill", updated.ID)); err != nil {
+		return SkillTemplate{}, err
+	}
+	return s.Get(ctx, principal, updated.ID)
 }
 
 // GetBundleFiles 列出平台技能包文件元数据，仅管理员可用。

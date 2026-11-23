@@ -126,7 +126,8 @@ export default function SkillsPage() {
       if (file.name.toLowerCase().endsWith(".zip")) {
         const created = await uploadSkillPackage<Skill>("/api/v1/skills/import", file);
         skills.reload();
-        setImportNote(`已导入「${created.name}」，文件与脚本已保存；请检查后发布。`);
+        // 同名技能按覆盖导入：已发布技能保持发布状态，新导入的草稿才提示发布。
+        setImportNote(`已导入「${created.name}」，文件与脚本已保存${created.status === "published" ? "" : "；请检查后发布"}。`);
         return;
       }
       const parsed = await parseSkillPackage(file);

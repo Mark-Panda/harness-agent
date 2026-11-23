@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
@@ -206,5 +207,41 @@ func TestPrepareMCPToolsSkipsCredentialReadFailure(t *testing.T) {
 	}
 	if tools := registry.List(); len(tools) != 0 {
 		t.Fatalf("credential failure must not expose tools: %d", len(tools))
+	}
+}
+
+// missingToolsTestRegistry 是只暴露静态工具定义的测试注册表。
+type missingToolsTestRegistry struct {
+	specs []react.ToolSpec
+}
+
+// Lookup 测试替身不做名称解析。
+func (r missingToolsTestRegistry) Lookup(string) (react.Tool, bool) { return nil, false }
+
+// List 返回预设工具定义。
+func (r missingToolsTestRegistry) List() []react.ToolSpec { return r.specs }
+
+// TestMCPToolsMissingRequiresEnabledBinding 验证空工具集只在绑定启用 MCP 时判定为故障。
+func TestMCPToolsMissingRequiresEnabledBinding(t *testing.T) {
+	snapshot := func(status string) map[string]any {
+		return map[string]any{"published_snapshot": map[string]any{"mcps": []any{
+			map[string]any{"id": uuid.NewString(), "name": "contextforge", "status": status},
+		}}}
+	}
+	enabled := Run{UserID: uuid.New(), ConfigSnapshot: snapshot("enabled")}
+	if !mcpToolsMissing(enabled, emptyToolRegistry{}) {
+		t.Fatal("enabled MCP binding with empty registry must be treated as missing tools")
+	}
+	disabled := Run{UserID: uuid.New(), ConfigSnapshot: snapshot("disabled")}
+	if mcpToolsMissing(disabled, emptyToolRegistry{}) {
+		t.Fatal("disabled MCP binding must allow running without tools")
+	}
+	withSkills := missingToolsTestRegistry{specs: []react.ToolSpec{{Name: "skill_script"}}}
+	if mcpToolsMissing(enabled, withSkills) {
+		t.Fatal("skill tools must satisfy the tool requirement")
+	}
+	noBinding := Run{UserID: uuid.New()}
+	if mcpToolsMissing(noBinding, emptyToolRegistry{}) {
+		t.Fatal("run without MCP bindings must keep running without tools")
 	}
 }

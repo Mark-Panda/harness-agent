@@ -22,6 +22,10 @@ func TestValidateCompletionResponseGuards(t *testing.T) {
 		{name: "truncated tool call", completion: Completion{FinishReason: "length", ToolCalls: []ToolCall{toolCall}}, allowTools: true, want: ErrIncompleteToolCall},
 		{name: "text response rejects tool call", completion: Completion{Content: "{}", ToolCalls: []ToolCall{toolCall}}, want: ErrIncompleteToolCall},
 		{name: "plain text may be continued", completion: Completion{Content: "partial", FinishReason: "length"}},
+		{name: "dsml markup in content", completion: Completion{Content: "先查一下。\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"query\">"}, want: ErrUnparsedToolCall},
+		{name: "ascii dsml markup in content", completion: Completion{Content: `<|DSML| tool_calls>`}, want: ErrUnparsedToolCall},
+		{name: "structured tool call is accepted", completion: Completion{ToolCalls: []ToolCall{toolCall}}, allowTools: true},
+		{name: "markup with structured tool call is ignored", completion: Completion{Content: "<tool_call>", ToolCalls: []ToolCall{toolCall}}, allowTools: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateCompletion(tc.completion, tc.allowTools)

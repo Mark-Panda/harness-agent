@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -140,17 +141,22 @@ type fakeSkillSessionReader struct {
 	messages          map[uuid.UUID][]Message
 	listSessionsCalls int
 	listMessagesCalls int
+	sessionsErr       error
+	messagesErr       error
 }
 
 func (f *fakeSkillSessionReader) ListSessionsActiveSince(_ context.Context, _ uuid.UUID, _ time.Time, _ int) ([]Session, error) {
 	f.listSessionsCalls++
+	if f.sessionsErr != nil {
+		return nil, f.sessionsErr
+	}
 	return f.sessions, nil
 }
 
 func (f *fakeSkillSessionReader) ListRecentMessages(_ context.Context, _ uuid.UUID, sessionID uuid.UUID, _ int) ([]Message, error) {
 	f.listMessagesCalls++
-	if f.messages == nil {
-		return nil, nil
+	if f.messagesErr != nil {
+		return nil, f.messagesErr
 	}
 	// 返回倒序，Worker 会反转。
 	msgs := f.messages[sessionID]
@@ -166,10 +172,12 @@ type fakeSkillExtractor struct {
 	candidate SkillCandidate
 	err       error
 	calls     int
+	existing  []SkillDigest
 }
 
-func (f *fakeSkillExtractor) Extract(context.Context, uuid.UUID, []Session, map[uuid.UUID][]Message) (SkillCandidate, error) {
+func (f *fakeSkillExtractor) Extract(_ context.Context, _ uuid.UUID, _ []Session, _ map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error) {
 	f.calls++
+	f.existing = existing
 	return f.candidate, f.err
 }
 
@@ -178,6 +186,26 @@ func makeSkillSynthesisJob(userID uuid.UUID) Job {
 		ID: uuid.New(), UserID: &userID, Type: SkillSynthesisJobType,
 		Attempts: 1, FencingToken: 0,
 		Payload: map[string]any{"user_id": userID.String(), "date": "2026-11-14"},
+	}
+}
+
+// validWorkerCandidate 构造能通过自动技能确定性校验的候选，证据取自测试会话消息。
+func validWorkerCandidate(session Session, messages []Message, name string) SkillCandidate {
+	title := session.Title
+	if title == "" {
+		title = "(无标题)"
+	}
+	return SkillCandidate{
+		ShouldCreate: true, Confidence: 0.9, Name: name,
+		Description: "把重复出现的排查过程整理成可复用步骤，适用于同类问题再次出现时。",
+		WhenToUse:   "当同类问题再次出现并需要按固定步骤排查时使用。",
+		PromptTemplate: "# " + name + "\n\n## 何时使用\n同类问题再次出现时使用。\n\n" +
+			"## 步骤\n1. 收集证据。\n2. 输出结论。\n\n## 输出格式\nMarkdown。\n\n## 约束\n不得编造。",
+		Parameters: map[string]any{},
+		Evidence: []SkillEvidence{
+			{Session: title, Quote: messages[0].Content},
+			{Session: title, Quote: messages[1].Content},
+		},
 	}
 }
 
@@ -204,21 +232,18 @@ func TestSkillSynthesisWorkerCreatesSkillWhenWorthwhile(t *testing.T) {
 	jobs.statuses[job.ID] = "pending"
 
 	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报"},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果"},
+	}
 	reader := &fakeSkillSessionReader{
-		sessions: []Session{{ID: sessionID, UserID: userID}},
-		messages: map[uuid.UUID][]Message{
-			sessionID: {
-				{Role: MessageUser, Content: "帮我做周报"},
-				{Role: MessageAssistant, Content: "好的"},
-			},
-		},
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
 	}
 	repo := newFakeUserSkillRepository()
 	skills, _ := NewUserSkillService(repo)
-	extractor := &fakeSkillExtractor{candidate: SkillCandidate{
-		ShouldCreate: true, Confidence: 0.9, Name: "weekly-report",
-		PromptTemplate: "总结 {{content}}",
-	}}
+	extractor := &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")}
 
 	worker := newSkillWorker(t, jobs, reader, skills, extractor)
 	if _, err := worker.ProcessOne(context.Background()); err != nil {
@@ -229,6 +254,46 @@ func TestSkillSynthesisWorkerCreatesSkillWhenWorthwhile(t *testing.T) {
 	}
 	if len(jobs.completed) != 1 {
 		t.Fatalf("expected job completed, got completed=%d failed=%d", len(jobs.completed), len(jobs.failed))
+	}
+}
+
+func TestSkillSynthesisWorkerRecordsLongDescriptionWarning(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	now := time.Now().UTC()
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: now.Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: now},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	skills, _ := NewUserSkillService(repo)
+	candidate := validWorkerCandidate(session, messages, "long-description")
+	candidate.Description = strings.Repeat("描", 600)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("expected skill created, got %d", len(repo.skills))
+	}
+	if len(runs.finished) != 1 || !strings.Contains(runs.finished[0].Detail, "500") {
+		t.Fatalf("run detail missing description warning: %#v", runs.finished)
 	}
 }
 
@@ -476,6 +541,217 @@ func TestSkillSynthesisMaintenanceReturnsSettingsQueryError(t *testing.T) {
 	}
 }
 
+// TestSkillSynthesisWorkerSkipsInvalidCandidate 验证不合规候选不会落库，但会记录原因并推进水位。
+func TestSkillSynthesisWorkerSkipsInvalidCandidate(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	now := time.Now().UTC()
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: now.Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: now},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	skills, _ := NewUserSkillService(repo)
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	candidate.Name = "Weekly_Report"
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 0 {
+		t.Fatalf("invalid candidate created a skill: %d", len(repo.skills))
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "invalid_candidate" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+	if len(runs.advanced) != 1 {
+		t.Fatalf("invalid candidate must advance watermark, got %#v", runs.advanced)
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsSimilarDuplicate 验证不同名称但同来源、正文相似的候选会被判重。
+func TestSkillSynthesisWorkerSkipsSimilarDuplicate(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	messages := []Message{
+		{Role: MessageUser, Content: "锁屏指令下发后设备没有生效，请帮我排查"},
+		{Role: MessageAssistant, Content: "我先核对设备状态与指令记录"},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: "tablet-lock-issue-investigation",
+		Description:    "面向教育平板管控系统的锁屏/解锁异常排查工作流。",
+		PromptTemplate: duplicateExistingPrompt, SourceSessionIDs: []uuid.UUID{sessionID},
+		Status: UserSkillAutoGenerated,
+	}
+	repo.skills[existing.ID] = existing
+	skills, _ := NewUserSkillService(repo)
+	candidate := validWorkerCandidate(session, messages, "device-control-issue-forensics")
+	dedupedPrompt := strings.NewReplacer(
+		"{{problem_description}}", "设备管控异常",
+		"{{device_ids}}", "设备列表",
+		"{{time_range}}", "时间范围",
+		"{{data_sources}}", "日志系统",
+		"{{system_context}}", "业务上下文",
+	).Replace(duplicateCandidatePrompt)
+	candidate.PromptTemplate = "# device-control-issue-forensics\n\n## 何时使用\n同类设备管控异常再次出现时使用。\n\n## 步骤\n" +
+		dedupedPrompt + "\n\n## 输出格式\n表格与结论。\n\n## 约束\n不得编造。"
+	candidate.Description = "用于排查设备批量管控指令未生效或异常触发的问题。"
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("similar duplicate created a skill: %d", len(repo.skills))
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerDoesNotAdvanceWatermarkOnReadFailure 验证消息读取失败时水位不推进。
+func TestSkillSynthesisWorkerDoesNotAdvanceWatermarkOnReadFailure(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	reader := &fakeSkillSessionReader{
+		sessions:    []Session{{ID: sessionID, UserID: userID}},
+		messagesErr: errors.New("database unavailable"),
+	}
+	skills, _ := NewUserSkillService(newFakeUserSkillRepository())
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.advanced) != 0 {
+		t.Fatalf("watermark advanced after read failure: %#v", runs.advanced)
+	}
+	if len(runs.finished) != 1 || !strings.Contains(runs.finished[0].Detail, "读取失败") {
+		t.Fatalf("run detail missing scan failure: %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerReportsMessageSampling 验证消息数量截断会写入采样说明，并继续推进水位。
+func TestSkillSynthesisWorkerReportsMessageSampling(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	now := time.Now().UTC()
+	messages := []Message{
+		{Role: MessageUser, Content: "这是较早的一条工作记录，用来触发消息数量截断", CreatedAt: now.Add(-2 * time.Minute)},
+		{Role: MessageUser, Content: "请继续整理本周工作周报的中间结果", CreatedAt: now.Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是最终的本周工作周报整理结果", CreatedAt: now},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	skills, _ := NewUserSkillService(repo)
+	candidate := validWorkerCandidate(session, messages[1:], "sampled-report")
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5, MaxMessagesPerSession: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.finished) != 1 || !strings.Contains(runs.finished[0].Detail, "采样扫描") {
+		t.Fatalf("run detail missing sampling note: %#v", runs.finished)
+	}
+	if len(runs.advanced) != 1 {
+		t.Fatalf("partial scan should still advance watermark, got %#v", runs.advanced)
+	}
+}
+
+// TestSkillSynthesisWorkerReportsSessionSampling 验证会话数量截断会写入采样说明。
+func TestSkillSynthesisWorkerReportsSessionSampling(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	firstID, secondID := uuid.New(), uuid.New()
+	first := Session{ID: firstID, UserID: userID}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报"},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果"},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{first, {ID: secondID, UserID: userID}},
+		messages: map[uuid.UUID][]Message{firstID: messages},
+	}
+	skills, _ := NewUserSkillService(newFakeUserSkillRepository())
+	candidate := validWorkerCandidate(first, messages, "sampled-session")
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate}, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5, MaxSessionsPerUser: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.finished) != 1 || !strings.Contains(runs.finished[0].Detail, "采样扫描") {
+		t.Fatalf("run detail missing session sampling note: %#v", runs.finished)
+	}
+	if runs.finished[0].SessionsScanned != 1 {
+		t.Fatalf("sessions scanned = %d", runs.finished[0].SessionsScanned)
+	}
+}
+
 func TestFilterEffectiveMessages(t *testing.T) {
 	// ListRecentMessages 返回倒序（最新在前），filterEffectiveMessages 会反转为正序。
 	messages := []Message{
@@ -512,5 +788,231 @@ func TestSkillSynthesisConfigNormalize(t *testing.T) {
 	}
 	if cfg.MinConfidence != 0.6 {
 		t.Fatalf("expected default min confidence 0.6, got %f", cfg.MinConfidence)
+	}
+}
+
+// fakeSkillSynthesisRuns 记录每日提炼执行记录写入。
+type fakeSkillSynthesisRuns struct {
+	started      []SkillSynthesisRun
+	finished     []SkillSynthesisRunUpdate
+	listed       []SkillSynthesisRun
+	watermark    time.Time
+	hasWatermark bool
+	autoSkills   int
+	advanced     []time.Time
+}
+
+// StartSkillSynthesisRun 记录当天记录开启。
+func (f *fakeSkillSynthesisRuns) StartSkillSynthesisRun(_ context.Context, run SkillSynthesisRun) (SkillSynthesisRun, error) {
+	run.ID = uuid.New()
+	f.started = append(f.started, run)
+	return run, nil
+}
+
+// FinishSkillSynthesisRun 记录最终结果。
+func (f *fakeSkillSynthesisRuns) FinishSkillSynthesisRun(_ context.Context, _ uuid.UUID, _ uuid.UUID, update SkillSynthesisRunUpdate) (SkillSynthesisRun, error) {
+	f.finished = append(f.finished, update)
+	return SkillSynthesisRun{Status: update.Status}, nil
+}
+
+// ListSkillSynthesisRuns 返回预设记录。
+func (f *fakeSkillSynthesisRuns) ListSkillSynthesisRuns(context.Context, uuid.UUID, int) ([]SkillSynthesisRun, error) {
+	return f.listed, nil
+}
+
+// GetSkillSynthesisWatermark 返回预设水位。
+func (f *fakeSkillSynthesisRuns) GetSkillSynthesisWatermark(context.Context, uuid.UUID) (time.Time, bool, error) {
+	return f.watermark, f.hasWatermark, nil
+}
+
+// AdvanceSkillSynthesisWatermark 记录水位推进。
+func (f *fakeSkillSynthesisRuns) AdvanceSkillSynthesisWatermark(_ context.Context, _ uuid.UUID, coveredAt time.Time) error {
+	f.advanced = append(f.advanced, coveredAt)
+	return nil
+}
+
+// CountAutoUserSkillsSince 返回预设的当天自动技能数。
+func (f *fakeSkillSynthesisRuns) CountAutoUserSkillsSince(context.Context, uuid.UUID, time.Time) (int, error) {
+	return f.autoSkills, nil
+}
+
+// TestSkillSynthesisWorkerRecordsDailyRun 验证每次提炼执行都会写入当天记录并带上结果原因。
+func TestSkillSynthesisWorkerRecordsDailyRun(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		candidate SkillCandidate
+		status    SkillSynthesisRunStatus
+		outcome   string
+	}{
+		{"created", SkillCandidate{ShouldCreate: true, Confidence: 0.9, Name: "weekly", PromptTemplate: "总结"}, SkillSynthesisRunCompleted, "created"},
+		{"not worthwhile", SkillCandidate{ShouldCreate: false}, SkillSynthesisRunSkipped, "not_worthwhile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			userID := uuid.New()
+			jobs := newFakeJobQueue()
+			job := makeSkillSynthesisJob(userID)
+			jobs.jobs[job.ID] = job
+			jobs.statuses[job.ID] = "pending"
+			sessionID := uuid.New()
+			session := Session{ID: sessionID, UserID: userID}
+			messages := []Message{
+				{Role: MessageUser, Content: "请帮我整理一份本周工作周报"},
+				{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果"},
+			}
+			reader := &fakeSkillSessionReader{
+				sessions: []Session{session},
+				messages: map[uuid.UUID][]Message{sessionID: messages},
+			}
+			skills, _ := NewUserSkillService(newFakeUserSkillRepository())
+			runs := &fakeSkillSynthesisRuns{}
+			candidate := tc.candidate
+			if tc.outcome == "created" {
+				candidate = validWorkerCandidate(session, messages, "weekly-report")
+			}
+			worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+				Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+				Sessions: reader, UserSkills: skills, Extractor: &fakeSkillExtractor{candidate: candidate},
+				Runs: runs,
+			}, SkillSynthesisConfig{MinConfidence: 0.5})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(runs.started) != 1 || runs.started[0].Date != "2026-11-14" {
+				t.Fatalf("started runs = %#v", runs.started)
+			}
+			if len(runs.finished) != 1 {
+				t.Fatalf("finished runs = %#v", runs.finished)
+			}
+			update := runs.finished[0]
+			if update.Status != tc.status || update.Outcome != tc.outcome {
+				t.Fatalf("run outcome = %#v, want %s/%s", update, tc.status, tc.outcome)
+			}
+			if update.SessionsUsed != 1 || update.SessionsScanned != 1 || update.MessagesUsed != 2 {
+				t.Fatalf("run counters = %#v", update)
+			}
+		})
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsDuplicateSkill 验证同名已有技能不会被重复创建。
+func TestSkillSynthesisWorkerSkipsDuplicateSkill(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	messages := []Message{
+		{Role: MessageUser, Content: "锁屏指令下发后设备没有生效，请帮我排查"},
+		{Role: MessageAssistant, Content: "我先核对设备状态与指令记录"},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	existing := UserSkill{ID: uuid.New(), UserID: userID, Name: "tablet_lock_issue_investigation", Description: "已存在的锁屏排查技能", Status: UserSkillAutoGenerated}
+	repo.skills[existing.ID] = existing
+	skills, _ := NewUserSkillService(repo)
+	extractor := &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "tablet-lock-issue-investigation")}
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: extractor, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("duplicate skill was created: %d", len(repo.skills))
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+	if len(extractor.existing) != 1 || extractor.existing[0].Name != existing.Name {
+		t.Fatalf("existing skills were not passed to extractor: %#v", extractor.existing)
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsWhenNoNewMessages 验证水位之后的旧消息不会再次进入提炼。
+func TestSkillSynthesisWorkerSkipsWhenNoNewMessages(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	messageAt := time.Now().UTC().Add(-2 * time.Hour)
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{{ID: sessionID, UserID: userID}},
+		messages: map[uuid.UUID][]Message{sessionID: {
+			{Role: MessageUser, Content: "旧问题", CreatedAt: messageAt},
+			{Role: MessageAssistant, Content: "旧回答", CreatedAt: messageAt.Add(time.Minute)},
+		}},
+	}
+	skills, _ := NewUserSkillService(newFakeUserSkillRepository())
+	extractor := &fakeSkillExtractor{candidate: SkillCandidate{ShouldCreate: true, Confidence: 0.9, Name: "x", PromptTemplate: "y"}}
+	runs := &fakeSkillSynthesisRuns{watermark: time.Now().UTC().Add(-time.Hour), hasWatermark: true}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: extractor, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if extractor.calls != 0 {
+		t.Fatalf("extractor should not run for covered messages: %d", extractor.calls)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "no_new_messages" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerRespectsDailyLimit 验证每日自动技能数量达到上限后停止创建。
+func TestSkillSynthesisWorkerRespectsDailyLimit(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID}
+	messages := []Message{
+		{Role: MessageUser, Content: "本周有多个设备出现同样的离线问题，请整理排查步骤"},
+		{Role: MessageAssistant, Content: "我先按心跳、绑定关系和操作记录逐项核对"},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	skills, _ := NewUserSkillService(repo)
+	extractor := &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "new-skill")}
+	runs := &fakeSkillSynthesisRuns{autoSkills: 3}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: extractor, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5, MaxSkillsPerUserPerDay: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 0 {
+		t.Fatalf("skill was created beyond daily limit: %d", len(repo.skills))
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "daily_limit_reached" {
+		t.Fatalf("run outcome = %#v", runs.finished)
 	}
 }

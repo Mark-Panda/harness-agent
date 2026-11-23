@@ -24,6 +24,9 @@ var (
 	ErrEmptyResponse = errors.New("react model returned an empty response")
 	// ErrIncompleteToolCall 模型输出被截断，工具调用的完整性无法保证。
 	ErrIncompleteToolCall = errors.New("react model returned incomplete tool calls")
+	// ErrUnparsedToolCall 模型把工具调用写进正文（如 DeepSeek DSML），但供应商没有返回结构化 tool_calls。
+	// 继续把标记当正文展示会误导用户，必须终止并向运行记录暴露原因。
+	ErrUnparsedToolCall = errors.New("react model emitted unparsed tool call markup")
 	// ErrBudgetExceeded Token 或费用预算耗尽。
 	ErrBudgetExceeded = errors.New("react budget exceeded")
 	// ErrUnknownTool 模型调用了未注册工具。

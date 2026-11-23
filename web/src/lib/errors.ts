@@ -25,6 +25,10 @@ export function describeError(error: unknown): string {
         return "资源不存在或已被删除。";
       case "resource_conflict":
         return "资源状态冲突，请刷新后重试。";
+      case "synthesis_disabled":
+        return "请先开启每日技能自动提炼，再手动触发。";
+      case "synthesis_in_progress":
+        return "今天的提炼正在执行，请稍后刷新记录。";
       case "invalid_configuration":
         return "配置不合规，请检查必填项与取值。";
       case "csrf_token_missing":

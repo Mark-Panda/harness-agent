@@ -24,6 +24,11 @@ func ValidateCompletion(completion Completion, allowTools bool) error {
 	if !allowTools && len(completion.ToolCalls) > 0 {
 		return fmt.Errorf("%w: text completion returned tool calls", ErrIncompleteToolCall)
 	}
+	// 部分供应商（如 DeepSeek V4 系列）在未下发工具时会用原生标记把工具调用写进正文；
+	// 这类标记必须终止执行，而不是当作模型答案持久化并展示给用户。
+	if len(completion.ToolCalls) == 0 && containsToolCallMarkup(completion.Content) {
+		return fmt.Errorf("%w: provider returned tool-call text instead of structured tool_calls", ErrUnparsedToolCall)
+	}
 	if strings.TrimSpace(completion.Content) != "" || (allowTools && len(completion.ToolCalls) > 0) {
 		return nil
 	}
@@ -36,6 +41,32 @@ func ValidateCompletion(completion Completion, allowTools bool) error {
 // IsLengthFinish 判断供应商是否因输出长度限制截断响应。
 func IsLengthFinish(completion Completion) bool {
 	return strings.EqualFold(strings.TrimSpace(completion.FinishReason), "length")
+}
+
+// toolCallMarkupMarkers 是已知会被错误写进正文的供应商原生工具调用标记。
+// 只用完整标记匹配，避免模型正常讨论相关格式时误判。
+var toolCallMarkupMarkers = []string{
+	"<｜｜dsml｜｜",
+	"<||dsml||",
+	"<|dsml|",
+	"<｜tool▁calls▁begin｜>",
+	"<|tool▁calls▁begin|",
+	"<tool_call>",
+	"<function_call>",
+}
+
+// containsToolCallMarkup 判断正文是否包含未解析的原生工具调用标记。
+func containsToolCallMarkup(content string) bool {
+	if content == "" {
+		return false
+	}
+	lower := strings.ToLower(content)
+	for _, marker := range toolCallMarkupMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // ContinuationMessages 在原上下文后追加不落库的半截回答与续写指令。

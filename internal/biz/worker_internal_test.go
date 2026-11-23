@@ -1322,16 +1322,20 @@ func TestRecoverReactResultUsesConsolidatedContinuation(t *testing.T) {
 }
 
 func TestAbnormalModelOutputIsBusinessFailure(t *testing.T) {
-	for _, err := range []error{react.ErrIncompleteToolCall, react.ErrContentFiltered} {
+	for _, err := range []error{react.ErrIncompleteToolCall, react.ErrContentFiltered, react.ErrUnparsedToolCall, ErrMCPToolsUnavailable} {
 		if !isBusinessFailure(err) {
 			t.Fatalf("%v must not be retried as infrastructure failure", err)
 		}
 	}
-	if code, _ := failureDetails(react.ErrIncompleteToolCall); code != "incomplete_tool_call" {
-		t.Fatalf("unexpected failure code %q", code)
-	}
-	if code, _ := failureDetails(react.ErrContentFiltered); code != "content_filtered" {
-		t.Fatalf("unexpected failure code %q", code)
+	for err, want := range map[error]string{
+		react.ErrIncompleteToolCall: "incomplete_tool_call",
+		react.ErrContentFiltered:    "content_filtered",
+		react.ErrUnparsedToolCall:   "unparsed_tool_call",
+		ErrMCPToolsUnavailable:      "mcp_tools_unavailable",
+	} {
+		if code, _ := failureDetails(err); code != want {
+			t.Fatalf("failureDetails(%v) = %q, want %q", err, code, want)
+		}
 	}
 }
 

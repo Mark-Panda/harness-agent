@@ -260,6 +260,51 @@ func ParseZip(data []byte, fallbackName string) (*Package, error) {
 	}, nil
 }
 
+// ParseMarkdown 解析单个 SKILL.md 内容，复用 zip 包相同的 frontmatter 与正文规则。
+// fallbackName 仅在 frontmatter 缺少 name 时使用。
+func ParseMarkdown(content []byte, fallbackName string) (*Package, error) {
+	if len(content) == 0 {
+		return nil, fmt.Errorf("%w: SKILL.md is empty", ErrInvalidPackage)
+	}
+	meta, body, err := parseFrontmatter(content)
+	if err != nil {
+		return nil, err
+	}
+	name := strings.TrimSpace(meta.Name)
+	if name == "" {
+		name = strings.TrimSpace(fallbackName)
+	}
+	if name == "" {
+		name = "未命名技能"
+	}
+	if len(name) > MaxNameLength {
+		return nil, fmt.Errorf("%w: skill name exceeds %d bytes", ErrInvalidPackage, MaxNameLength)
+	}
+	description := strings.TrimSpace(meta.Description)
+	if description == "" {
+		description = firstParagraph(body)
+	}
+	if len(description) > MaxDescriptionLength {
+		description = description[:MaxDescriptionLength]
+	}
+	if len(body) > MaxPromptBytes {
+		body = body[:MaxPromptBytes]
+	}
+	if strings.TrimSpace(body) == "" {
+		return nil, fmt.Errorf("%w: SKILL.md body is required", ErrInvalidPackage)
+	}
+	digest := sha256.Sum256(content)
+	files := []File{{
+		Path: "SKILL.md", Content: content, MIME: "text/markdown; charset=utf-8",
+		SHA256: hex.EncodeToString(digest[:]), IsScript: false,
+	}}
+	return &Package{
+		Name: name, Description: description, PromptTemplate: strings.TrimSpace(body),
+		Entrypoint: "SKILL.md", Files: files, Digest: digestFiles(files),
+		TotalBytes: int64(len(content)), HasScripts: false,
+	}, nil
+}
+
 // normalizePath 校验并规范化 zip 内路径，拒绝目录穿越与非常规路径。
 func normalizePath(name string) (string, error) {
 	trimmed := strings.TrimSpace(name)

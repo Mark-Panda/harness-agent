@@ -303,8 +303,8 @@ agent:
       max_messages_per_session: 50
       # 单条消息进入提示词的最大字节数。
       max_message_bytes: 8192
-      # 技能 JSON 输出的 Token 上限。
-      max_output_tokens: 2048
+      # 技能 JSON 输出的 Token 上限；正文、参数与证据合计可能接近 2K，留足余量。
+      max_output_tokens: 4096
       # 技能提炼采样温度（低温度以保证稳定输出）。
       temperature: 0.1
       # 单次模型调用超时。

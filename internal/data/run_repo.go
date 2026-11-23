@@ -186,6 +186,52 @@ func (r *RunRepository) GetRunStatus(ctx context.Context, userID, runID uuid.UUI
 	return biz.RunStatus(record.Status), nil
 }
 
+// FindRunByTriggerMessage 返回由指定用户消息触发的 Run，用于把摘要生成回填到触发它的执行步骤。
+func (r *RunRepository) FindRunByTriggerMessage(ctx context.Context, userID, sessionID, messageID uuid.UUID) (biz.Run, bool, error) {
+	if userID == uuid.Nil || sessionID == uuid.Nil || messageID == uuid.Nil {
+		return biz.Run{}, false, nil
+	}
+	var record runModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND session_id = ? AND trigger_message_id = ?", userID, sessionID, messageID).
+			Order("created_at DESC, id DESC").First(&record).Error
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return biz.Run{}, false, nil
+	}
+	if err != nil {
+		return biz.Run{}, false, catalogError("find run by trigger message", err)
+	}
+	run, err := toBizRun(record)
+	if err != nil {
+		return biz.Run{}, false, err
+	}
+	return run, true, nil
+}
+
+// LatestRunBefore 返回会话中创建时间不晚于给定时刻的最近 Run。
+func (r *RunRepository) LatestRunBefore(ctx context.Context, userID, sessionID uuid.UUID, at time.Time) (biz.Run, bool, error) {
+	if userID == uuid.Nil || sessionID == uuid.Nil || at.IsZero() {
+		return biz.Run{}, false, nil
+	}
+	var record runModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND session_id = ? AND created_at <= ?", userID, sessionID, at).
+			Order("created_at DESC, id DESC").First(&record).Error
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return biz.Run{}, false, nil
+	}
+	if err != nil {
+		return biz.Run{}, false, catalogError("find latest run before", err)
+	}
+	run, err := toBizRun(record)
+	if err != nil {
+		return biz.Run{}, false, err
+	}
+	return run, true, nil
+}
+
 // ListRuns 按创建时间与 ID 降序游标分页。
 func (r *RunRepository) ListRuns(ctx context.Context, userID, sessionID uuid.UUID, limit int, cursor string) (biz.Page[biz.Run], error) {
 	decoded, err := DecodeCursor(cursor)

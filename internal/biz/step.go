@@ -106,6 +106,8 @@ const (
 	PayloadExternalRequest PayloadType = "external_request"
 	// PayloadExternalResponse 外部系统响应。
 	PayloadExternalResponse PayloadType = "external_response"
+	// PayloadContextCompression 会话压缩元数据，如摘要版本、覆盖消息数与 Token 裁剪统计。
+	PayloadContextCompression PayloadType = "context_compression"
 )
 
 // CaptureMode 表示载荷采集模式，默认只保存脱敏内容。

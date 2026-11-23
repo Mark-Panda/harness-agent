@@ -118,6 +118,61 @@ func TestParseZipRejectsOversizedScript(t *testing.T) {
 	}
 }
 
+func TestParseMarkdownValid(t *testing.T) {
+	pkg, err := ParseMarkdown([]byte(sampleSkill), "fallback")
+	if err != nil {
+		t.Fatalf("parse markdown: %v", err)
+	}
+	if pkg.Name != "测试技能" || pkg.Description != "用于验证解析" {
+		t.Fatalf("unexpected metadata: %+v", pkg)
+	}
+	if pkg.Entrypoint != "SKILL.md" || len(pkg.Files) != 1 || pkg.Files[0].Path != "SKILL.md" {
+		t.Fatalf("unexpected files: %+v", pkg.Files)
+	}
+	if pkg.HasScripts || pkg.TotalBytes == 0 || pkg.Digest == "" {
+		t.Fatalf("unexpected bundle stats: %+v", pkg)
+	}
+	if strings.Contains(pkg.PromptTemplate, "name:") {
+		t.Fatalf("frontmatter leaked into prompt: %s", pkg.PromptTemplate)
+	}
+}
+
+func TestParseMarkdownFallbackAndDigest(t *testing.T) {
+	first, err := ParseMarkdown([]byte("# 标题\n\n第一段说明。\n"), "fallback-name")
+	if err != nil {
+		t.Fatalf("parse markdown: %v", err)
+	}
+	if first.Name != "fallback-name" || first.Description != "第一段说明。" {
+		t.Fatalf("fallback metadata incorrect: %+v", first)
+	}
+	second, err := ParseMarkdown([]byte("# 标题\n\n第一段说明。\n\n更多内容。\n"), "fallback-name")
+	if err != nil {
+		t.Fatalf("parse markdown: %v", err)
+	}
+	if first.Digest == second.Digest {
+		t.Fatal("digest must change with content")
+	}
+}
+
+func TestParseMarkdownRejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name     string
+		content  string
+		fallback string
+	}{
+		{name: "empty", content: "", fallback: "x"},
+		{name: "empty body", content: "---\nname: x\n---\n", fallback: ""},
+		{name: "long name", content: "---\nname: " + strings.Repeat("a", MaxNameLength+1) + "\n---\n\nbody\n", fallback: ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := ParseMarkdown([]byte(testCase.content), testCase.fallback); !errors.Is(err, ErrInvalidPackage) {
+				t.Fatalf("expected invalid package, got %v", err)
+			}
+		})
+	}
+}
+
 func TestInterpreterAndTextMIME(t *testing.T) {
 	if Interpreter("scripts/a.py") != "python3" || Interpreter("a.txt") != "" {
 		t.Fatal("interpreter mapping is incorrect")

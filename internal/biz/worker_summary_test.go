@@ -303,3 +303,85 @@ func TestBuildMessagesPolicyReadFailureFallsBackToGroup(t *testing.T) {
 		t.Fatalf("fallback context = %#v", messages)
 	}
 }
+
+// TestBuildMessagesRecordsSummaryCompressionStep 验证使用滚动摘要时写入"会话压缩"系统步骤与元数据载荷。
+func TestBuildMessagesRecordsSummaryCompressionStep(t *testing.T) {
+	steps := &fakeStepRepository{}
+	worker := &ExecutionWorker{
+		sessions: fakeSessionRepository{messages: []Message{{Role: MessageUser, Content: "当前问题"}}},
+		summaries: fakeSummaryRepository{found: true, summary: SessionSummary{
+			Version: 3, SummaryText: "压缩后的历史", CoveredMessageCount: 42,
+			SourceMessageIDs: make([]uuid.UUID, 10),
+		}},
+		steps:  steps,
+		clock:  func() time.Time { return time.Unix(1700000000, 0).UTC() },
+		logger: slog.Default(),
+	}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), AttemptNo: 2}
+	if _, err := worker.buildMessages(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps.started) != 1 {
+		t.Fatalf("compression steps = %d, want 1", len(steps.started))
+	}
+	step := steps.started[0]
+	if step.Kind != StepKindSystem || step.Name != "会话压缩" || step.RunID != run.ID || step.AttemptNo != 2 {
+		t.Fatalf("compression step = %#v", step)
+	}
+	if len(steps.payloads) != 1 || steps.payloads[0].Type != PayloadContextCompression ||
+		steps.payloads[0].CaptureMode != CaptureMetadataOnly {
+		t.Fatalf("compression payloads = %#v", steps.payloads)
+	}
+	payload := steps.payloads[0].ContentJSON
+	if payload["summary_version"] != int64(3) || payload["summary_covered_messages"] != 42 ||
+		payload["summary_source_messages"] != 10 || payload["summary_tokens"] == 0 {
+		t.Fatalf("compression payload = %#v", payload)
+	}
+	if len(steps.finished) != 1 || steps.finished[0].Status != StepCompleted {
+		t.Fatalf("compression step settlement = %#v", steps.finished)
+	}
+}
+
+// TestBuildMessagesRecordsTrimCompressionStep 验证 Token 预算裁剪同样写入会话压缩步骤。
+func TestBuildMessagesRecordsTrimCompressionStep(t *testing.T) {
+	steps := &fakeStepRepository{}
+	worker := &ExecutionWorker{
+		sessions: fakeSessionRepository{messages: []Message{
+			{Role: MessageAssistant, Content: "当前回答"},
+			{Role: MessageUser, Content: "当前问题"},
+			{Role: MessageAssistant, Content: strings.Repeat("旧回答", 20)},
+			{Role: MessageUser, Content: strings.Repeat("旧问题", 20)},
+		}},
+		config: WorkerConfig{PromptTokenBudget: 20}, steps: steps, logger: slog.Default(),
+	}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
+	if _, err := worker.buildMessages(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps.started) != 1 || steps.started[0].Name != "会话压缩" {
+		t.Fatalf("compression steps = %#v", steps.started)
+	}
+	payload := steps.payloads[0].ContentJSON
+	if payload["dropped_messages"] == 0 || payload["dropped_turns"] == 0 || payload["budget"] != 20 {
+		t.Fatalf("trim payload = %#v", payload)
+	}
+	if len(steps.finished) != 1 || steps.finished[0].Status != StepCompleted {
+		t.Fatalf("compression step settlement = %#v", steps.finished)
+	}
+}
+
+// TestBuildMessagesSkipsCompressionStepWithoutCompression 验证没有摘要与裁剪时不产生压缩步骤。
+func TestBuildMessagesSkipsCompressionStepWithoutCompression(t *testing.T) {
+	steps := &fakeStepRepository{}
+	worker := &ExecutionWorker{
+		sessions: fakeSessionRepository{messages: []Message{{Role: MessageUser, Content: "当前问题"}}},
+		steps:    steps, logger: slog.Default(),
+	}
+	run := Run{ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New()}
+	if _, err := worker.buildMessages(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps.started) != 0 || len(steps.payloads) != 0 {
+		t.Fatalf("unexpected compression steps: %#v", steps.started)
+	}
+}

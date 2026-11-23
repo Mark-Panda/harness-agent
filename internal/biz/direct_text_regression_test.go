@@ -126,7 +126,7 @@ func TestSkillLLMExtractorRejectsAbnormalResponses(t *testing.T) {
 				t.Fatal(err)
 			}
 			sessions, messages := skillLLMConversations()
-			candidate, err := extractor.Extract(context.Background(), userID, sessions, messages)
+			candidate, err := extractor.Extract(context.Background(), userID, sessions, messages, nil)
 			if !errors.Is(err, ErrUserSkillSynthesisUnavailable) || candidate.ShouldCreate {
 				t.Fatalf("Extract() = %#v, %v", candidate, err)
 			}
@@ -170,7 +170,7 @@ func TestSkillLLMExtractorContinuesTruncatedJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessions, messages := skillLLMConversations()
-	candidate, err := extractor.Extract(context.Background(), userID, sessions, messages)
+	candidate, err := extractor.Extract(context.Background(), userID, sessions, messages, nil)
 	if err != nil || candidate.ShouldCreate || calls != 2 {
 		t.Fatalf("Extract() = %#v, %v, calls=%d", candidate, err, calls)
 	}

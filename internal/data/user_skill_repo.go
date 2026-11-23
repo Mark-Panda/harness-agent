@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
@@ -371,6 +372,10 @@ func (r *JobRepository) EnqueueSkillSynthesis(ctx context.Context, task biz.Skil
 		return err
 	}
 	dedupe := "skill-synth:" + task.UserID.String() + ":" + task.Date
+	if requestID := strings.TrimSpace(task.RequestID); requestID != "" {
+		// 手动触发使用独立去重后缀，避免被当天已完成的每日任务吸收。
+		dedupe += ":" + requestID
+	}
 	record := jobModel{
 		ID: uuid.New(), UserID: &task.UserID, JobType: biz.SkillSynthesisJobType, DedupeKey: &dedupe,
 		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 4,
