@@ -532,8 +532,6 @@ func run() error {
 		biz.WithToolApprovals(approvalRepository),
 		biz.WithBudgets(budgetService),
 		biz.WithModelCalls(data.NewModelCallRepository(appDB)),
-		biz.WithSupervisorTasks(data.NewSupervisorTaskRepository(appDB)),
-		biz.WithPlanResume(data.NewPlanRepository(appDB)),
 		biz.WithRunDeadline(cfg.Agent.Worker.RunDeadline.Duration),
 	)
 	if err != nil {
@@ -566,12 +564,6 @@ func run() error {
 	}
 	platformService.WithVectorStatus(vectorStatusService)
 	platformService.WithAttachments(attachmentService)
-	// Plan 服务复用 Run 服务完成取消与恢复入队。
-	planService, err := biz.NewPlanService(data.NewPlanRepository(appDB), runService)
-	if err != nil {
-		return err
-	}
-	platformService.WithPlans(planService)
 	deletionRepository := data.NewDeletionRepository(appDB)
 	deletionService, err := biz.NewDeletionService(deletionRepository, sessionRepository, slog.Default(), nil)
 	if err != nil {
@@ -859,7 +851,7 @@ func run() error {
 			SessionPolicies: sessionRepository,
 			Providers:       catalogRepository, Opener: credentialKeys,
 			Attempts: data.NewModelCallRepository(appDB), Steps: stepRepository,
-			Approvals: approvalRepository, Plans: data.NewPlanRepository(appDB), SupervisorTasks: data.NewSupervisorTaskRepository(appDB), Budgets: budgetService, HotMessages: hotMessages, MCPs: catalogRepository,
+			Approvals: approvalRepository, Budgets: budgetService, HotMessages: hotMessages, MCPs: catalogRepository,
 			MCPCache:  mcpClientCache,
 			Summaries: summaryRepository, SummaryTrigger: summaryPlanner,
 			Memory: memoryRetriever, MemoryTrigger: memoryIndexer,
@@ -884,8 +876,6 @@ func run() error {
 			RunDeadline:            cfg.Agent.Worker.RunDeadline.Duration,
 			ReactMaxTotalTokens:    cfg.Agent.Worker.ReactMaxTotalTokens,
 			ReactMaxCost:           cfg.Agent.Worker.ReactMaxCost,
-			SupervisorMaxTokens:    cfg.Agent.Worker.SupervisorMaxTokens,
-			SupervisorMaxCost:      cfg.Agent.Worker.SupervisorMaxCost,
 			MCPTimeout:             cfg.Agent.Worker.MCPTimeout.Duration,
 			MCPAllowPrivateNetwork: cfg.Agent.Worker.AllowPrivateMCPEndpoints,
 			ApprovalPoll:           cfg.Agent.Worker.ApprovalPoll.Duration,

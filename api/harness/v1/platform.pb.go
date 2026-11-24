@@ -1814,7 +1814,7 @@ type Agent struct {
 	Name string `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
 	// description Agent 描述。
 	Description string `protobuf:"bytes,4,opt,name=description,proto3" json:"description,omitempty"`
-	// mode 编排模式：react/plan/super。
+	// mode 编排模式：目前仅支持 react。
 	Mode string `protobuf:"bytes,5,opt,name=mode,proto3" json:"mode,omitempty"`
 	// model_policy_id 引用的策略 ID，草稿可为空。
 	ModelPolicyId *string `protobuf:"bytes,6,opt,name=model_policy_id,json=modelPolicyId,proto3,oneof" json:"model_policy_id,omitempty"`

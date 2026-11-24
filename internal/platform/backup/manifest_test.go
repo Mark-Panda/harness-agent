@@ -41,7 +41,6 @@ func sampleManifest() Manifest {
 			VectorEmbeddingType: "vector",
 			BusinessChecks: map[string]int64{
 				"messages_without_session": 0,
-				"plans_without_session":    0,
 			},
 		},
 	}
@@ -264,7 +263,7 @@ func TestCompareStats(t *testing.T) {
 		c.TableCounts = map[string]int64{"users": 10, "sessions": 20, "messages": 300}
 		c.RLSEnabledTables = []string{"messages", "sessions"}
 		c.Extensions = map[string]string{"vector": "0.8.0", "pgcrypto": "1.3"}
-		c.BusinessChecks = map[string]int64{"messages_without_session": 0, "plans_without_session": 0}
+		c.BusinessChecks = map[string]int64{"messages_without_session": 0}
 		return c
 	}
 	tests := []struct {
@@ -335,9 +334,9 @@ func TestCompareStats(t *testing.T) {
 		},
 		{
 			name:         "business check orphan rows",
-			mutate:       func(s *Stats) { s.BusinessChecks["plans_without_session"] = 3 },
+			mutate:       func(s *Stats) { s.BusinessChecks["messages_without_session"] = 3 },
 			wantProblems: 1,
-			wantContains: "business check plans_without_session",
+			wantContains: "business check messages_without_session",
 		},
 		{
 			name:         "business check missing",

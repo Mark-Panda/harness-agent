@@ -15,18 +15,8 @@ const modes: Array<{ value: AgentMode; title: string; description: string; badge
   {
     value: "react",
     title: "边做边想",
-    description: "适合大多数日常任务。助手会根据每一步的结果调整下一步，回答更快、成本更低。",
+    description: "助手会根据每一步的结果调整下一步，回答更快、成本更低。",
     badge: "推荐",
-  },
-  {
-    value: "plan",
-    title: "先列计划，再执行",
-    description: "适合步骤较多的任务。助手先生成计划，你可以中途暂停、恢复或修改计划。",
-  },
-  {
-    value: "super",
-    title: "多助手协作",
-    description: "把大任务拆给多个子助手并行处理。适合复杂调研或长任务，耗时与费用更高。",
   },
 ];
 

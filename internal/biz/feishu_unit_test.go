@@ -1562,7 +1562,7 @@ func TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent(t *testing.T) {
 		fixture.bots.botFound = true
 		fixture.bots.binding = biz.FeishuBotBinding{
 			BotID: botID, BotName: "绑定机器人", UserID: fixture.userID, AgentID: boundAgentID,
-			AgentVersion: boundVersion, AgentStatus: biz.AgentPublished, AgentMode: biz.AgentModePlan,
+			AgentVersion: boundVersion, AgentStatus: biz.AgentPublished, AgentMode: biz.AgentModeReact,
 		}
 		fixture.bots.bindingFound = true
 		return fixture
@@ -1573,7 +1573,7 @@ func TestFeishuEventWorkerRoutesRegisteredBotToBoundAgent(t *testing.T) {
 		t.Fatalf("bound bot process: %v", err)
 	}
 	if bound.runs.calls != 1 || bound.runs.input.AgentID == nil || *bound.runs.input.AgentID != boundAgentID ||
-		bound.runs.input.AgentVersion == nil || *bound.runs.input.AgentVersion != boundVersion || bound.runs.input.Mode != biz.AgentModePlan {
+		bound.runs.input.AgentVersion == nil || *bound.runs.input.AgentVersion != boundVersion || bound.runs.input.Mode != biz.AgentModeReact {
 		t.Fatalf("bound route input = %#v", bound.runs.input)
 	}
 	if bound.outbound.created == nil || bound.outbound.created.AppID != "app_bot" ||

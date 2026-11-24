@@ -161,18 +161,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handle("GET /api/v1/admin/agents", handler.listAdminAgents)
 	// 管理员跨用户删除助手版本：历史记录保留，仅解除助手归属。
 	handle("DELETE /api/v1/admin/agents/{id}", handler.adminDeleteAgent)
-	// Supervisor 执行树：展示 Worker 子任务、尝试次数、结果与失败原因。
-	handle("GET /api/v1/runs/{id}/supervisor-tasks", handler.runSupervisorTasks)
 	if platform.Routing != nil {
 		handle("GET /api/v1/model-routing/health", handler.listRoutingHealth)
-	}
-	if platform.Plans != nil {
-		handle("GET /api/v1/runs/{id}/plan", handler.getPlan)
-		handle("GET /api/v1/runs/{id}/plan/versions", handler.listPlanVersions)
-		handleWrite("POST /api/v1/runs/{id}/plan/pause", "plan", handler.pausePlan)
-		handleWrite("POST /api/v1/runs/{id}/plan/resume", "plan", handler.resumePlan)
-		handleWrite("POST /api/v1/runs/{id}/plan/cancel", "plan", handler.cancelPlan)
-		handleWrite("POST /api/v1/runs/{id}/plan/revise", "plan", handler.revisePlan)
 	}
 	// 审批接口：中高风险工具未获批准不得执行，决策后自动恢复 Run。
 	handle("GET /api/v1/runs/{id}/approvals", handler.runApprovals)

@@ -52,7 +52,7 @@ func runCreationTransactionFromContext(ctx context.Context, db *gorm.DB) *runCre
 }
 
 // NewRunCreationTransaction lets repositories sharing db join Run creation.
-// A nested call uses a savepoint so a failed plan adoption can be rolled back independently.
+// A nested call uses a savepoint so a failed write can be rolled back independently.
 func NewRunCreationTransaction(db *gorm.DB) func(context.Context, func(context.Context) error) error {
 	return func(ctx context.Context, fn func(context.Context) error) error {
 		parent := runCreationTransactionFromContext(ctx, db)

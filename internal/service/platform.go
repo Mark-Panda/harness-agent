@@ -38,8 +38,6 @@ type PlatformService struct {
 	Attachments *biz.AttachmentService
 	// MemoryGraph 个人记忆知识图谱聚合服务，可为空表示未启用。
 	MemoryGraph *biz.MemoryGraphService
-	// Plans 计划查询、暂停、恢复与人工终止服务，可为空表示未启用。
-	Plans *biz.PlanService
 	// FeishuIngest 飞书事件接入服务；为空表示飞书未启用，回调路由不会注册。
 	FeishuIngest *biz.FeishuIngestService
 	// FeishuBindings 飞书话题解绑服务；为空表示飞书未启用，解绑路由不会注册。
@@ -68,12 +66,6 @@ func (s *PlatformService) WithFeishuIngest(ingest *biz.FeishuIngestService) *Pla
 // WithFeishuBindings 附加飞书话题解绑能力。
 func (s *PlatformService) WithFeishuBindings(bindings *biz.FeishuBindingService) *PlatformService {
 	s.FeishuBindings = bindings
-	return s
-}
-
-// WithPlans 附加 Plan-and-Execute 管理能力。
-func (s *PlatformService) WithPlans(plans *biz.PlanService) *PlatformService {
-	s.Plans = plans
 	return s
 }
 

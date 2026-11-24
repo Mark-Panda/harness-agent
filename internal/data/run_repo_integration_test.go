@@ -52,7 +52,7 @@ func TestRunCreationRollsBackWhenEnqueueFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	queue, plans := NewJobRepository(appDB), NewPlanRepository(appDB)
+	queue := NewJobRepository(appDB)
 	var notified []uuid.UUID
 	runs := NewRunRepository(appDB, WithRunEventNotifier(runCreationNotifierFunc(func(ctx context.Context, runID uuid.UUID) {
 		notified = append(notified, runID)
@@ -62,15 +62,8 @@ func TestRunCreationRollsBackWhenEnqueueFails(t *testing.T) {
 		}
 	})))
 	previous, err := runs.CreateRun(ctx, biz.Run{
-		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan, Status: biz.RunRunning,
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModeReact, Status: biz.RunRunning,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := plans.CreatePlan(ctx, user.ID, biz.Plan{
-		ID: uuid.New(), SessionID: session.ID, RunID: previous.ID, UserID: user.ID, Version: 1,
-		Status: biz.PlanPaused, Goal: "resume this plan", MaxSteps: 5,
-	}, testOutboxEvent(user.ID, "test.plan"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,13 +73,12 @@ func TestRunCreationRollsBackWhenEnqueueFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	service, err := biz.NewRunService(runs, sessions, biz.WithRunEnqueuer(queue),
-		biz.WithPlanResume(plans),
 		biz.WithRunCreationTransaction(NewRunCreationTransaction(appDB)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal := biz.Principal{UserID: user.ID}
-	input := biz.CreateRunInput{SessionID: session.ID, Mode: biz.AgentModePlan, IdempotencyKey: "enqueue-retry"}
+	input := biz.CreateRunInput{SessionID: session.ID, Mode: biz.AgentModeReact, IdempotencyKey: "enqueue-retry"}
 	enqueueErr := errors.New("injected enqueue failure")
 	if err := appDB.Callback().Create().After("gorm:create").Register("test:fail-job-insert", func(tx *gorm.DB) {
 		if tx.Statement.Table == "jobs" {
@@ -99,23 +91,15 @@ func TestRunCreationRollsBackWhenEnqueueFails(t *testing.T) {
 		t.Fatalf("Create error = %v, want %v", err, enqueueErr)
 	}
 	page, err := runs.ListRuns(ctx, user.ID, session.ID, 20, "")
-	if err != nil || len(page.Items) != 1 || page.Items[0].ID != previous.ID || page.Items[0].Status != biz.RunRunning {
-		t.Fatalf("runs after enqueue rollback = %v, err=%v", page.Items, err)
-	}
-	paused, err := plans.GetPlan(ctx, user.ID, plan.ID)
-	if err != nil || paused.RunID != previous.ID || paused.Status != biz.PlanPaused || len(notified) != 0 {
-		t.Fatalf("plan after enqueue rollback = %#v, err=%v, notifications=%v", paused, err, notified)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != previous.ID || page.Items[0].Status != biz.RunRunning || len(notified) != 0 {
+		t.Fatalf("runs after enqueue rollback = %v, err=%v, notifications=%v", page.Items, err, notified)
 	}
 	if err := appDB.Callback().Create().Remove("test:fail-job-insert"); err != nil {
 		t.Fatal(err)
 	}
 	created, err := service.Create(ctx, principal, input)
-	if err != nil || created.Status != biz.RunQueued {
-		t.Fatalf("retry after rollback = %#v, err=%v", created, err)
-	}
-	rebound, err := plans.GetPlanByRun(ctx, user.ID, created.ID)
-	if err != nil || rebound.ID != plan.ID || rebound.Status != biz.PlanExecuting || len(notified) != 1 || notified[0] != created.ID {
-		t.Fatalf("plan after enqueue commit = %#v, err=%v, notifications=%v", rebound, err, notified)
+	if err != nil || created.Status != biz.RunQueued || len(notified) != 1 || notified[0] != created.ID {
+		t.Fatalf("retry after rollback = %#v, err=%v, notifications=%v", created, err, notified)
 	}
 	replayed, err := service.Create(ctx, principal, input)
 	if err != nil || replayed.ID != created.ID {
@@ -344,7 +328,7 @@ func TestRunRepositoryCompensatesQueuedDeadlineOnce(t *testing.T) {
 	base := time.Now().UTC().Truncate(time.Millisecond)
 	initialDeadline := base.Add(30 * time.Minute)
 	run, err := runs.CreateRun(ctx, biz.Run{
-		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModePlan,
+		ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModeReact,
 		Status: biz.RunQueued, DeadlineAt: &initialDeadline,
 	})
 	if err != nil {
@@ -364,8 +348,12 @@ func TestRunRepositoryCompensatesQueuedDeadlineOnce(t *testing.T) {
 		t.Fatalf("first queued deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
 	}
 
+	// 模拟 Run 退回队列后再次被认领：排队时长仍应只补偿一次。
+	if _, err := runs.TransitionRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunQueued, nil); err != nil {
+		t.Fatal(err)
+	}
 	requeueAt := firstClaimAt.Add(30 * time.Second)
-	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, requeueAt); err != nil {
+	if err := adminDB.Exec("UPDATE agent_runs SET updated_at = ? WHERE id = ?", requeueAt, run.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	requeued, err := runs.GetRun(ctx, user.ID, run.ID)
@@ -388,21 +376,7 @@ func TestRunRepositoryCompensatesQueuedDeadlineOnce(t *testing.T) {
 	if claimed.DeadlineAt == nil || !claimed.DeadlineAt.Equal(wantDeadline) {
 		t.Fatalf("second queued deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
 	}
-
-	secondRequeueAt := secondClaimAt.Add(30 * time.Second)
-	if err := runs.RequeuePausedRun(ctx, user.ID, run.ID, fence, secondRequeueAt); err != nil {
-		t.Fatal(err)
-	}
-	thirdClaimAt := secondRequeueAt.Add(4 * time.Minute)
-	claimed, fence, err = runs.ClaimRun(ctx, user.ID, run.ID, "worker-c", time.Minute, thirdClaimAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantDeadline = wantDeadline.Add(4 * time.Minute)
-	if claimed.DeadlineAt == nil || !claimed.DeadlineAt.Equal(wantDeadline) {
-		t.Fatalf("repeated pause deadline = %v, want %v", claimed.DeadlineAt, wantDeadline)
-	}
-	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunCompleted, nil, fence, thirdClaimAt.Add(30*time.Second)); err != nil {
+	if _, err := runs.FinishRun(ctx, user.ID, run.ID, biz.RunRunning, biz.RunCompleted, nil, fence, secondClaimAt.Add(30*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 

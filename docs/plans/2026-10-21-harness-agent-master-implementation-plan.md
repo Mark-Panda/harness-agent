@@ -1,5 +1,7 @@
 # Harness Agent 全栈多用户系统分步实施计划
 
+> **状态说明（2026-11-25）：** 本文件为历史实施计划。当前代码已移除 Plan-and-Execute 与 Supervisor，仅保留 ReAct；下文阶段 6、7 中的对应实现不再适用，`plans`、`plan_steps`、`supervisor_tasks` 仅保留存量数据，服务不再读写。
+
 > **执行约束：** 按阶段逐项实施；产品代码遵循测试先行，阶段门禁通过后再进入下一阶段。
 
 **需求来源：** `AGENTS.md`
@@ -37,7 +39,7 @@
 - **灾备目标：** 初始 RPO 不超过 5 分钟、RTO 不超过 60 分钟；GA 前必须从独立备份实际恢复到干净环境并校验数据、RLS、向量和任务一致性。
 - **安全门禁：** 无未处置的 Critical/High 漏洞，无硬编码密钥，无跨用户数据泄露；鉴权、RLS、SSRF、Prompt Injection、工具越权、Webhook 重放和供应链检查全部通过。
 - **可靠性门禁：** PostgreSQL、Redis、LLM、MCP、飞书故障及 API/Worker 滚动重启均完成故障注入；系统可降级或明确失败，不出现静默丢消息、重复副作用或永久卡住的活动 Run。
-- **Agent 质量门禁：** 建立版本化黄金集与对抗集，覆盖三种模式、工具参数、循环终止、记忆相关性/冲突、摘要忠实度、跨用户隔离和注入防护；阈值在阶段 0 固化，GA 前不得相对已批准基线回退。
+- **Agent 质量门禁：** 建立版本化黄金集与对抗集，覆盖 ReAct 执行、工具参数、循环终止、记忆相关性/冲突、摘要忠实度、跨用户隔离和注入防护；阈值在阶段 0 固化，GA 前不得相对已批准基线回退。
 - **数据治理：** 用户可导出并删除其数据；删除覆盖 PG、向量、缓存、外部绑定及异步任务，备份按保留周期最终清除；所有管理操作与删除任务可审计。
 - **运维门禁：** SLO 看板、告警、值班责任人、Runbook、事件分级与复盘流程齐全；每个 Critical/High 告警都有可执行处置步骤和升级路径。
 
@@ -63,7 +65,7 @@ deploy/                  开发 Compose、生产拓扑、监控、告警与备�
 tests/                   集成、契约、E2E、负载、故障注入、迁移与 Agent 质量评测
 ```
 
-核心 API 使用 `/api/v1` 前缀，覆盖认证、平台配置、Agent、Session、Message、Run、Execution、Audit、Plan、Memory 与飞书事件。聊天接口使用 SSE，事件类型固定为 `meta`、`message.delta`、`model.attempt.started`、`model.attempt.failed`、`model.switched`、`tool.started`、`tool.completed`、`plan.updated`、`worker.started`、`worker.completed`、`run.completed`、`run.failed`、`heartbeat`。
+核心 API 使用 `/api/v1` 前缀，覆盖认证、平台配置、Agent、Session、Message、Run、Execution、Audit、Memory 与飞书事件。聊天接口使用 SSE，事件类型固定为 `meta`、`message.delta`、`model.attempt.started`、`model.attempt.failed`、`model.switched`、`tool.started`、`tool.completed`、`run.completed`、`run.failed`、`heartbeat`。
 
 API 统一使用稳定业务错误码、`request_id`、`retryable` 语义和游标分页；列表页大小、请求体、批量操作和并发均有上限。写接口定义 `Idempotency-Key` 的作用域、指纹和保留期，冲突请求返回原结果或明确冲突。Protobuf 通过 Buf Breaking 检查兼容性是 CI 阻断项，契约废弃必须有迁移期。SSE 事件包含 `event_id`、`run_id`、单调 `seq`、`schema_version`、`occurred_at`，客户端以游标重放；浏览器使用 Fetch 流或安全 Cookie 鉴权，禁止在 URL 中携带 Token。
 
@@ -91,7 +93,7 @@ API 统一使用稳定业务错误码、`request_id`、`retryable` 语义和游�
 
 ### 1M+ 上下文硬准入
 
-- Chat、ReAct、Planner、Supervisor 等生成模型的 `context_window_tokens` 必须大于等于 `1_000_000`；该约束不适用于独立 Embedding/Rerank 模型。数据库按 `model_kind` 执行条件 CHECK，并与 Biz 校验、启动策略校验共同阻断不合规模型，不能仅依赖前端提示。
+- Chat、ReAct 等生成模型的 `context_window_tokens` 必须大于等于 `1_000_000`；该约束不适用于独立 Embedding/Rerank 模型。数据库按 `model_kind` 执行条件 CHECK，并与 Biz 校验、启动策略校验共同阻断不合规模型，不能仅依赖前端提示。
 - 低于 1M 的模型不得启用或加入新策略；已有低上下文模型只能保留历史 Run 快照，不得创建新 Run。候选切换也只能选择同属 1M+ 且满足当前 Agent 工具、流式、JSON 和合规能力的模型。
 - 上下文窗口来自经管理员核验的模型元数据，并记录来源与核验时间；OpenAI-compatible 自动发现只能作为辅助，不能根据模型名称猜测，也不能把未核验的自报值直接作为准入依据。
 - 1M 是能力下限，不是每次请求的填充目标。实际输入预算为 `min(context_window - reserve_output - safety_margin, policy.max_prompt_tokens, Run 剩余 Token/费用预算)`；滑动窗口、摘要和长期记忆仍然保留，避免超长上下文带来的成本、延迟和注意力稀释。
@@ -112,7 +114,7 @@ API 统一使用稳定业务错误码、`request_id`、`retryable` 语义和游�
 | 实际上下文超出模型窗口 | 否 | 仅当更大候选能容纳完整请求时切换 | 否则先按确定性规则压缩或明确失败 |
 | 已向客户端发送流式 Delta 后中断 | 不直接续写拼接 | 默认不自动切换 | 保留部分输出并明确失败；新 Attempt 必须从规范上下文重新生成并标记，已完成工具不得重放 |
 
-- 只有尚未产生外部副作用的模型 Attempt 才能自动重试/切换。已完成的工具调用、PlanStep 和外部回复从持久化结果恢复，禁止因更换模型再次执行。
+- 只有尚未产生外部副作用的模型 Attempt 才能自动重试/切换。已完成的工具调用与外部回复从持久化结果恢复，禁止因更换模型再次执行。
 - 预发布必须覆盖连续失败、429/Retry-After、跨 Provider 熔断与半开、流式中途失败、上下文超限、策略无候选、费用上限和切换后工具幂等测试。
 
 ## Agent 执行记录、监控日志与审计设计
@@ -121,7 +123,7 @@ API 统一使用稳定业务错误码、`request_id`、`retryable` 语义和游�
 
 | 数据链路 | 主要内容 | 存储与用途 | 内容约束 |
 |---|---|---|---|
-| Agent 执行事实 | 模型请求/响应、工具输入/输出、Plan/Worker、Attempt、错误与状态迁移 | PostgreSQL 的 `agent_runs`、`execution_steps`、`execution_payloads`、`model_calls`、`run_events`，用于执行树、排障、恢复和导出 | 按用户隔离，按策略保存脱敏内容，支持截断、保留和删除 |
+| Agent 执行事实 | 模型请求/响应、工具输入/输出、ReAct 步骤、Attempt、错误与状态迁移 | PostgreSQL 的 `agent_runs`、`execution_steps`、`execution_payloads`、`model_calls`、`run_events`，用于执行树、排障、恢复和导出 | 按用户隔离，按策略保存脱敏内容，支持截断、保留和删除 |
 | 应用观测 | Trace、Metric、结构化日志、健康与告警 | OTel、Prometheus、日志平台，用于 SLO 和系统运维 | 默认只放关联 ID、状态、耗时和脱敏错误，不放 Prompt、Completion 或工具原文 |
 | 安全审计 | 谁代表谁，在何时对何资源执行何操作，结果与原因 | 追加型 `audit_logs`，用于安全、合规与追责 | 只记录必要元数据和白名单差异，不复制执行载荷，独立保留与防篡改 |
 
@@ -196,11 +198,11 @@ API 统一使用稳定业务错误码、`request_id`、`retryable` 语义和游�
 ### 触发、上下文与生命周期
 
 - 主时间线仅在 @机器人或显式命令时创建话题；已绑定话题默认自动回复，可按群配置为“仅 @或回复机器人卡片时触发”，避免把成员闲聊误当成 Agent 请求。
-- 每个话题拥有独立消息窗口、摘要、Run、Plan、取消和配额状态；同一群内多个话题可并行，但按 `chat + thread + user` 限流。切换 Agent 或“重新提问”显式创建新 Session，并记录来源 Session，不能污染原话题历史。
+- 每个话题拥有独立消息窗口、摘要、Run、取消和配额状态；同一群内多个话题可并行，但按 `chat + thread + user` 限流。切换 Agent 或“重新提问”显式创建新 Session，并记录来源 Session，不能污染原话题历史。
 - 群话题不读取成员个人长期记忆；每条消息保留发言人内部 user_id/open_id，个人事实只写发言者私有记忆。只有显式启用且归属同一 chat 的群级共享记忆才能跨话题检索。
 - 支持关闭、归档、恢复、解绑和删除话题；关闭后迟到事件不得重启 Run，删除继续遵循 PG、向量、缓存、绑定和任务的一致清理。
 - 优先使用飞书话题群/线程能力。普通群若平台或机器人权限不支持话题回复，只能按配置使用 `root_id` 回复链降级或拒绝该模式，并在管理端显示能力状态；不得把普通群消息伪装成具有完整话题隔离。
-- 测试必须覆盖同群多话题并行、root/thread 别名竞态、首消息重复、事件乱序、跨话题记忆隔离、话题内取消/Plan 恢复、回复串题和普通群能力降级。
+- 测试必须覆盖同群多话题并行、root/thread 别名竞态、首消息重复、事件乱序、跨话题记忆隔离、话题内取消/恢复、回复串题和普通群能力降级。
 
 ## YAML 配置与动态模型配置边界
 
@@ -340,7 +342,9 @@ feishu:
 - [x] 将 Web 静态资源 embed 到 Go 二进制并支持 SPA 回退；带 Hash 静态资源长期缓存，`index.html` 禁止长期缓存，版本升级不得混用不兼容资源。
 - [x] 完成非 root 单应用镜像、只读根文件系统兼容、资源限制和健康检查；Release A 仅在内部测试环境发布并通过核心链路回归，不作为生产 GA。
 
-### 阶段 6：Plan-and-Execute（第 18–20 周）
+### 阶段 6：Plan-and-Execute（第 18–20 周，已移除）
+
+> 当前服务仅保留 ReAct，本阶段能力已从代码与接口中移除，以下条目仅作为历史记录保留。
 
 - [x] 实现 Plan 与 PlanStep 状态机，覆盖等待审批、暂停、部分失败和人工终止，禁止终态被迟到事件回写。
 - [x] Planner 输出执行 JSON Schema 校验，最多 50 步，并限制依赖深度、总输入/输出、执行时长和费用。
@@ -349,7 +353,9 @@ feishu:
 - [x] 验证步骤乱序、重复、依赖失败、配置版本升级和进程崩溃后的恢复；继续执行沿用原 Plan 快照，人工修改生成新版本。
 - [x] 将 Plan 成功、步骤重试、恢复、取消、工具成功率和成本纳入黄金集回归，防止功能通过但执行质量回退。
 
-### 阶段 7：Supervisor 与 Release B（第 21–22 周）
+### 阶段 7：Supervisor 与 Release B（第 21–22 周，Supervisor 已移除）
+
+> Supervisor 模式已从代码与接口中移除；本阶段条目仅作为历史记录保留。
 
 - [x] 实现 Worker 能力注册、任务委派和汇总协议；Worker 权限取用户、主 Agent 与 Worker 配置交集，委派不得提升工具或数据权限。
 - [x] 子任务使用独立 Session 并关联主 Run 与当前用户，RLS、审计、记忆写入和删除均保留原始用户及父子关系。
@@ -443,7 +449,7 @@ make verify-rollback
 - **Agent 质量评测：** 黄金集与对抗集版本化，固定模型/参数/Prompt 快照并重复运行以观察波动；CI 使用确定性 Fake Model 验证连续失败、限流、熔断、候选切换与流式中断，预发布再对批准的实时模型验收，结果与基线比较并保留人工评审记录。
 - **安全测试：** 强制验证跨用户 ID 枚举、缓存/向量串扰、JWT 过期/重放、RLS 绕过、CSRF/XSS/CORS、SSRF/DNS Rebinding、Prompt Injection、工具越权、Sandbox 逃逸、飞书伪造与重复投递，以及所有密钥和敏感内容脱敏。
 - **执行与审计测试：** 验证模型请求先于调用落库、完成/失败/取消响应、工具 I/O 与顺序、1M Manifest 重建、脱敏/截断、隐藏思维链丢弃、跨用户读取阻断、Break-Glass 理由审计、审计同事务、Hash Chain 验链，以及结果落库失败后的 `reconciliation_required`。
-- **可靠性与性能测试：** 强制验证 SSE 断线/慢消费/取消、Agent 循环、Plan 恢复与幂等、Supervisor 部分失败、任务重复/乱序/死信、Worker/API 重启、PostgreSQL 故障转移、Redis 清空和外部依赖降级；负载之外必须做压力与稳定性测试。
+- **可靠性与性能测试：** 强制验证 SSE 断线/慢消费/取消、Agent 循环、审批恢复与幂等、工具结果未知对账、任务重复/乱序/死信、Worker/API 重启、PostgreSQL 故障转移、Redis 清空和外部依赖降级；负载之外必须做压力与稳定性测试。
 - **灾备与发布测试：** 每个候选版本验证空库和上一版本升级、新旧代码并行、应用回滚、备份恢复和密钥恢复；恢复后执行登录、RLS、历史 Run、向量检索、任务续跑和 Smoke。
 
 ## 发布、回滚与持续运营门禁

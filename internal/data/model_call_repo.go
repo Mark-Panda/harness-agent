@@ -3,7 +3,6 @@ package data
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -11,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // modelCallModel 对应 model_calls 表：单次模型 Attempt 的执行事实。
@@ -112,36 +110,6 @@ func (r *ModelCallRepository) CreateModelCall(ctx context.Context, call biz.Mode
 		record.Status = string(biz.ModelCallRunning)
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: call.UserID}, func(tx *gorm.DB) error {
-		if planUsage, _ := call.RequestManifest["plan_usage"].(bool); planUsage {
-			if err := lockPlanUsageRun(tx, call.UserID, call.RunID); err != nil {
-				return err
-			}
-			planID, err := latestPlanUsageID(tx, call.UserID, call.RunID)
-			if err != nil {
-				return err
-			}
-			if planID != uuid.Nil {
-				call.RequestManifest["plan_id"] = planID.String()
-				record.RequestManifest, err = json.Marshal(call.RequestManifest)
-				if err != nil {
-					return err
-				}
-				plan := tx.Model(&planModel{}).Where("user_id = ? AND id = ?", call.UserID, planID)
-				if call.PlanMaxTokens > 0 {
-					plan = plan.Where("total_input_tokens + total_output_tokens + ? <= ?", call.InputTokens+call.OutputTokens, call.PlanMaxTokens)
-				}
-				if call.PlanMaxCost > 0 {
-					plan = plan.Where("estimated_cost + ? <= ?", call.EstimatedCost, call.PlanMaxCost)
-				}
-				reservation := addModelUsageToPlan(plan, call.InputTokens, call.OutputTokens, call.EstimatedCost)
-				if reservation.Error != nil {
-					return reservation.Error
-				}
-				if reservation.RowsAffected != 1 {
-					return biz.ErrPlanBudget
-				}
-			}
-		}
 		return tx.Create(&record).Error
 	})
 	if err != nil {
@@ -160,16 +128,6 @@ func (r *ModelCallRepository) FinishModelCall(ctx context.Context, userID, callI
 	}
 	var record modelCallModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		var previous modelCallModel
-		if err := tx.Select("id", "run_id", "request_manifest", "input_tokens", "output_tokens", "estimated_cost").
-			Where("id = ? AND user_id = ? AND status = ? AND request_manifest ->> 'plan_usage' = 'true'", callID, userID, biz.ModelCallRunning).Find(&previous).Error; err != nil {
-			return err
-		}
-		if previous.ID != uuid.Nil {
-			if err := settlePlanModelUsage(tx, userID, previous, update); err != nil {
-				return err
-			}
-		}
 		result := tx.Model(&modelCallModel{}).
 			Where("id = ? AND user_id = ? AND status = ?", callID, userID, string(biz.ModelCallRunning)).
 			Updates(map[string]any{
@@ -196,71 +154,6 @@ func (r *ModelCallRepository) FinishModelCall(ctx context.Context, userID, callI
 		return biz.ModelCall{}, catalogError("finish model call", err)
 	}
 	return toBizModelCall(record)
-}
-
-// The run row serializes planner settlements with creation of the first plan.
-func lockPlanUsageRun(tx *gorm.DB, userID, runID uuid.UUID) error {
-	var run runModel
-	return tx.Select("id").Clauses(clause.Locking{Strength: "UPDATE"}).Take(&run, "id = ? AND user_id = ?", runID, userID).Error
-}
-
-func latestPlanUsageID(tx *gorm.DB, userID, runID uuid.UUID) (uuid.UUID, error) {
-	var plan planModel
-	err := tx.Select("id").Where("user_id = ? AND run_id = ?", userID, runID).Order("version DESC").Take(&plan).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		err = nil
-	}
-	return plan.ID, err
-}
-
-func settlePlanModelUsage(tx *gorm.DB, userID uuid.UUID, previous modelCallModel, update biz.ModelCallUpdate) error {
-	if err := lockPlanUsageRun(tx, userID, previous.RunID); err != nil {
-		return err
-	}
-	// First plan creation may have assigned the Plan ID while the settlement waited for the lock.
-	if err := tx.Select("request_manifest").Take(&previous, "id = ? AND user_id = ?", previous.ID, userID).Error; err != nil {
-		return err
-	}
-	var manifest struct {
-		PlanID uuid.UUID `json:"plan_id"`
-	}
-	if err := json.Unmarshal(previous.RequestManifest, &manifest); err != nil {
-		return err
-	}
-	planID := manifest.PlanID
-	if planID == uuid.Nil {
-		var err error
-		planID, err = latestPlanUsageID(tx, userID, previous.RunID)
-		if err != nil {
-			return err
-		}
-	}
-	// Late settlements adjust reservations inherited by subsequent plan versions.
-	for planID != uuid.Nil {
-		plan := tx.Model(&planModel{}).Where("user_id = ? AND id = ?", userID, planID)
-		if err := addModelUsageToPlan(plan, update.InputTokens-previous.InputTokens,
-			update.OutputTokens-previous.OutputTokens, update.EstimatedCost-previous.EstimatedCost).Error; err != nil {
-			return err
-		}
-		var child planModel
-		err := tx.Select("id").Where("user_id = ? AND parent_plan_id = ?", userID, planID).Order("version DESC").Take(&child).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		planID = child.ID
-	}
-	return nil
-}
-
-func addModelUsageToPlan(query *gorm.DB, input, output int64, cost float64) *gorm.DB {
-	return query.UpdateColumns(map[string]any{
-		"total_input_tokens":  gorm.Expr("total_input_tokens + ?", input),
-		"total_output_tokens": gorm.Expr("total_output_tokens + ?", output),
-		"estimated_cost":      gorm.Expr("estimated_cost + ?", cost),
-	})
 }
 
 // incrementRunUsage 在结算事务内按用户、Agent 与供应商累加每日预算计数。

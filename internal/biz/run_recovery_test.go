@@ -224,8 +224,7 @@ func TestRunServiceTraceViewsEnforceTenantAndAdminAccess(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	runs := mocks.NewMockRunRepository(ctrl)
 	sessions := mocks.NewMockSessionRepository(ctrl)
-	tasks := mocks.NewMockSupervisorTaskRepository(ctrl)
-	service, err := biz.NewRunService(runs, sessions, biz.WithSupervisorTasks(tasks))
+	service, err := biz.NewRunService(runs, sessions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,22 +243,6 @@ func TestRunServiceTraceViewsEnforceTenantAndAdminAccess(t *testing.T) {
 	page, err := service.ListAll(ctx, admin, filter, 10, "cursor")
 	if err != nil || len(page.Items) != 1 || page.Items[0].Run.ID != runID {
 		t.Fatalf("ListAll = %+v, %v", page, err)
-	}
-	if _, err := service.ListSupervisorTasks(ctx, biz.Principal{}, runID); !errors.Is(err, biz.ErrForbidden) {
-		t.Fatal(err)
-	}
-	runs.EXPECT().GetRun(ctx, admin.UserID, runID).Return(biz.Run{}, biz.ErrResourceNotFound)
-	if _, err := service.ListSupervisorTasks(ctx, admin, runID); !errors.Is(err, biz.ErrResourceNotFound) {
-		t.Fatal(err)
-	}
-	runs.EXPECT().GetRun(ctx, user.UserID, runID).Return(want, nil).Times(2)
-	tasks.EXPECT().ListTasks(ctx, user.UserID, runID).Return([]biz.SupervisorTask{{ParentRunID: runID}}, nil)
-	if list, err := service.ListSupervisorTasks(ctx, user, runID); err != nil || len(list) != 1 {
-		t.Fatalf("ListSupervisorTasks = %+v, %v", list, err)
-	}
-	plain, _ := biz.NewRunService(runs, sessions)
-	if list, err := plain.ListSupervisorTasks(ctx, user, runID); err != nil || len(list) != 0 {
-		t.Fatalf("unconfigured ListSupervisorTasks = %+v, %v", list, err)
 	}
 }
 

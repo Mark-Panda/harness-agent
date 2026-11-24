@@ -72,7 +72,6 @@ var businessCheckQueries = map[string]string{
 	"execution_steps_without_run":       `SELECT count(*) FROM execution_steps e LEFT JOIN agent_runs r ON r.id = e.run_id WHERE e.run_id IS NOT NULL AND r.id IS NULL`,
 	"memory_vectors_without_session":    `SELECT count(*) FROM memory_vectors v LEFT JOIN sessions s ON s.id = v.session_id WHERE v.session_id IS NOT NULL AND s.id IS NULL`,
 	"session_summaries_without_session": `SELECT count(*) FROM session_summaries x LEFT JOIN sessions s ON s.id = x.session_id WHERE x.session_id IS NOT NULL AND s.id IS NULL`,
-	"plans_without_session":             `SELECT count(*) FROM plans p LEFT JOIN sessions s ON s.id = p.session_id WHERE p.session_id IS NOT NULL AND s.id IS NULL`,
 }
 
 // CaptureStats 采集当前数据库的恢复验收基线。

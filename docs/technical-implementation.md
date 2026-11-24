@@ -1,7 +1,7 @@
 # Harness Agent 技术实现文档
 
-> 文档版本：v1.0  
-> 代码基线：`670da48`（2026-11-23）  
+> 文档版本：v1.1  
+> 代码基线：2026-11-25 工作区（已移除 Plan/Supervisor，仅保留 ReAct）  
 > 适用读者：后端 / 前端 / 架构 / 测试 / 安全 / 运维  
 > 文档范围：当前仓库内已落地的实现，不包含规划中能力
 
@@ -11,7 +11,7 @@
 
 ### 1.1 一句话定位
 
-Harness Agent 是一个**工程级、全栈、多用户的 Agent 运行平台**：用户通过 Web 或飞书发起对话，平台以 `react / plan / super` 三种模式驱动大模型调用外部工具，并把执行过程、记忆、审批、审计与恢复能力统一收敛到 PostgreSQL 事实源之上。
+Harness Agent 是一个**工程级、全栈、多用户的 Agent 运行平台**：用户通过 Web 或飞书发起对话，平台以 ReAct 模式驱动大模型调用外部工具，并把执行过程、记忆、审批、审计与恢复能力统一收敛到 PostgreSQL 事实源之上。
 
 ### 1.2 本项目中 Harness 的定义
 
@@ -19,7 +19,7 @@ Harness Agent 是一个**工程级、全栈、多用户的 Agent 运行平台**�
 
 | Harness 能力面 | 本项目的实现 | 主要代码位置 |
 | --- | --- | --- |
-| 执行循环 | ReAct / Plan-and-Execute / Supervisor 三种编排 | `pkg/einoext`、`internal/biz/plan_eino.go`、`internal/biz/supervisor_eino.go` |
+| 执行循环 | ReAct 单模式编排 | `pkg/einoext`、`internal/biz/worker.go` |
 | 上下文工程 | 系统提示、画像、长期记忆、摘要、历史、当前输入的确定性组装与预算裁剪 | `internal/biz/worker.go`、`pkg/memory` |
 | 工具协议 | MCP 工具发现、命名规范化、Schema 校验、审批、沙箱、技能工具 | `pkg/mcp`、`pkg/sandbox`、`internal/biz/skill_tool.go` |
 | 状态与恢复 | Run 状态机、Job 队列、租约、fencing、Outbox、幂等键 | `internal/biz`、`internal/data` |
@@ -97,7 +97,7 @@ graph TB
         Auth["Auth / Principal"]
         Svc["Service 层"]
         Biz["Biz 层<br/>Run / Session / Agent / Memory"]
-        Worker["Execution Worker<br/>ReAct / Plan / Super"]
+        Worker["Execution Worker<br/>ReAct"]
         FWorker["Feishu Event / Reply Worker"]
         BG["摘要 / 向量 / 事实<br/>后台 Worker"]
         Obs["Metrics / Trace / Audit"]
@@ -239,7 +239,7 @@ stateDiagram-v2
 
 - **终态不可再迁移**：`completed / failed / cancelled` 不再接受 Worker 修改。
 - **`reconciliation_required` 不是终态，但属于“已停止”**：`RunSettled` 将其视为停止自动执行，SSE 会关闭连接，前端允许用户发起新对话。
-- **`running → queued` 是合法迁移**：用于 Plan 暂停时主动让出会话，清退租约后退回队列，避免长期暂停阻塞同会话新消息。
+- **`running → queued` 是合法迁移**：用于需要主动让出会话的场景（如审批暂停），清退租约后退回队列，避免长期暂停阻塞同会话新消息。
 - 状态迁移统一由 `biz.TransitionRunStatus` 校验，非法迁移返回 `ErrResourceConflict`。
 
 ### 4.2 持久化任务队列与租约
@@ -276,7 +276,6 @@ stateDiagram-v2
 4. `runs.GetRun` 读取 Run；不存在则完成任务，避免死信堆积。
 5. 若 Run 已是终态或 `reconciliation_required`，直接完成任务。
 6. 若 Run 为 `waiting_approval`：
-   - 读取 Plan 状态，若计划被人工暂停则按 `PausedPoll` 退回队列；
    - 检查审批超时（默认 24h）；
    - 若所有审批已决策但进程曾崩溃，主动恢复 Run；
    - 否则按 `ApprovalPoll` 退回队列，不消耗失败次数。
@@ -314,8 +313,6 @@ stateDiagram-v2
 | 模型 Attempt | `(run_id, attempt_no)` 唯一；`InitialAttemptNo` 从已落库进度继续 |
 | 工具调用 | 审批记录携带 `idempotency_key`，通过 MCP `_meta` 透传远端 |
 | 审批结果投递 | 单事务提交审批状态、tool 消息、Outbox、RunEvent、会话版本、步骤终态与载荷 |
-| Plan 最终回答 | 计划级确定性消息 ID，已保存内容优先，禁止重复追加 |
-| Plan 步骤复用 | 按工具名、参数、依赖集合一对一匹配，避免重复副作用 |
 | Run 终态 | `FinishRunWithEvent` 同事务提交状态与事件 |
 | SSE 断线 | 客户端携带 `Last-Event-ID`，按 `(run_id, seq)` 继续读取 |
 
@@ -325,7 +322,7 @@ Worker 将执行错误分为四类：
 
 | 类型 | 典型错误 | 处理 |
 | --- | --- | --- |
-| 业务失败 | 无用户消息、快照非法、计划非法、配置错误 | 直接 `failed`，不重试 |
+| 业务失败 | 无用户消息、快照非法、编排模式非法、配置错误 | 直接 `failed`，不重试 |
 | 可重试基础设施失败 | 数据库瞬时故障、事件写入失败、Job 认领失败 | 指数退避重试，受 `max_attempts` 限制 |
 | 已推流后失败 | 流式增量已发送后模型/网络中断 | 不重试、不切换，直接失败并保留部分输出；避免重复文本 |
 | 副作用未知 | 工具已派发但结果未落库、审批执行态崩溃、Worker 结算失败 | `reconciliation_required`，只能人工对账或受控重放 |
@@ -338,7 +335,7 @@ Worker 将执行错误分为四类：
 
 ---
 
-## 5. 三种 Agent 模式与 Eino 适配
+## 5. Agent 执行模式与 Eino 适配
 
 ### 5.1 职责分工
 
@@ -347,7 +344,7 @@ Worker 将执行错误分为四类：
 | `internal/biz` | 上下文组装、工具准备、审批、预算、持久化、恢复 | 不实现 LLM 协议细节 |
 | `pkg/einoext` | Eino ChatModel / Tool / Message 适配、事件桥接、ReAct 执行 | 不持久化业务事实 |
 | `pkg/agent/model` | 候选过滤、重试、切换、熔断、Attempt 观测、费用估算 | 不决定 Prompt 内容 |
-| Eino `compose.Graph` | Plan / Supervisor 的节点流转 | 不作为计划事实源 |
+| Eino `flow/agent/react` | ReAct 图节点编排 | 不作为 Run 事实源 |
 
 ### 5.2 Eino 适配层
 
@@ -404,68 +401,13 @@ Worker 将执行错误分为四类：
 8. `finish_reason=length` 且无工具调用时，自动请求一次续写；续写增量通过 `ContinuationDeltaFilter` 去除与已有后缀的重叠，最终合并为同一条助手消息。
 9. `finish_reason=content_filter`、工具调用被截断、正文含未解析的原生工具标记（如 DSML）、空回答、仅推理无回答，均显式失败。
 
-### 5.4 Plan-and-Execute 模式
+### 5.4 模式约束
 
-实现位置：`internal/biz/plan_worker.go` + `internal/biz/plan_eino.go`。
-
-Eino Graph 节点：
-
-```text
-START → plan_load → plan_recover → plan_guard → plan_approvals
-      → plan_select → plan_model_step / plan_tool_step → plan_replan
-      → plan_finish → plan_final → END
-```
-
-核心机制：
-
-1. **计划生成**：Planner 使用独立系统提示，必须注入**完整可用工具目录与参数 Schema**（按 40k Token 预算，不设硬编码数量上限）。步骤数量 1–50，`step_no` 连续，`depends_on` 只能引用更小序号，依赖深度 ≤ 5。
-2. **工具校验与一次自修复**：Planner 只能引用真实存在且低风险的工具；校验失败时把具体原因与候选工具名回传模型修正一次，两次失败才终止。
-3. **计划事实源**：`plans / plan_steps` 存 PostgreSQL；图状态只保存本轮推进快照。步骤创建时显式写入合法 `risk_level`，避免枚举约束导致卡死。
-4. **步骤执行**：
-   - 纯模型步骤：独立消息命名空间，复用会话背景与已完成步骤结果；
-   - 工具步骤：持计划级幂等键 `plan:{plan_id}:step:{step_no}`，默认只领取一次，失败不自动盲重试。
-5. **审批**：高风险工具暂停计划，Run 进入 `waiting_approval`；审批结果原子投递后继续。
-6. **暂停 / 恢复**：用户暂停后 Run 退回 `queued` 并清退租约；恢复时顺延 Deadline，并只重置对应状态步骤，旧 Run 未决审批批量置为拒绝。
-7. **修订与重规划**：人工修订保留已完成步骤结果；模型重规划会复用“工具名 + 参数 + 依赖集合”完全匹配的历史步骤，避免重复副作用。
-8. **最终汇总**：所有步骤完成后，用汇总模型生成面向用户的结论，禁止直接拼接中间输出；最终消息使用计划级确定性 ID，恢复时以首次保存内容为准。
-9. **预算**：Plan 共享 Token 与费用上限（默认 200 万 Token / 100 费用），每次模型调用前校验；`MaxAttemptsPerRun` 按“步骤数 × 每步调用数”放大，避免长计划中途耗尽。
-
-### 5.5 Supervisor 模式
-
-实现位置：`internal/biz/supervisor_worker.go` + `internal/biz/supervisor_eino.go`。
-
-Eino Graph 节点：
-
-```text
-START → supervisor_load → (有 pending) supervisor_workers → supervisor_aggregate → END
-                        └─(无 pending)──────────────────────┘
-```
-
-核心机制：
-
-1. **委派规划**：模型输出 Worker 列表（最多 4 个），每个 Worker 声明目标、工具与输入；工具同样必须真实存在且为低风险，校验失败允许一次自修复。
-2. **子会话隔离**：每个 Worker 使用确定性子会话 ID `uuid.NewSHA1(run:{run_id}:worker:{index})`，同一 Run 重试复用同一子会话，避免孤儿会话与重复规划费用。
-3. **上下文注入**：子 Agent 继承父会话的记忆、画像、最近 6 轮对话摘要、用户偏好与当前任务，避免重复推理。
-4. **并发执行**：使用 Eino 分支同时调度多个 Worker；子任务共享父 Run 的 Token、费用、Deadline 与上下文裁剪逻辑。
-5. **共享预算**：规划、自修复、所有子任务、最终汇总全部计入同一预算；汇总前再次检查预算。
-6. **失败处理**：
-   - 预算耗尽且已有部分产出时，允许受控降级为“部分结果汇总”；
-   - 网络、鉴权、解析、空响应等错误必须上抛，不得发布伪成功答案；
-   - 子任务事件采用步骤级缓冲合并后落库，写失败时仅在 `degradations` 标记 `supervisor.events_degraded`，不静默丢弃执行过程。
-7. **审批穿透**：子任务遇到审批门禁时冒泡到父 Run，由主 Worker 暂停等待人工决策。
-8. **事件**：`supervisor.tasks.created / task.started / task.completed / task.failed / task.retrying / completed / failed / budget_exceeded / events_degraded` 全部进入 Run 事件流。
-
-### 5.6 三种模式对比
-
-| 维度 | ReAct | Plan | Supervisor |
-| --- | --- | --- | --- |
-| 适用场景 | 开放式问答、短链路工具调用 | 多步骤、依赖明确、需恢复的长任务 | 可并行拆分的复杂任务 |
-| 事实源 | Run + 消息 + 步骤 | `plans / plan_steps` + Run | `supervisor_tasks` + Run |
-| 暂停恢复 | 仅审批暂停 | 审批暂停 + 人工暂停 + 进程恢复 | 审批暂停 + 子任务恢复 |
-| 模型调用预算 | 45 次 | 按步骤放大 | 共享父 Run 预算 |
-| 工具范围 | 全部已绑定工具 | Planner 仅低风险工具 | Worker 仅低风险工具 |
-| 子上下文 | 无 | 步骤级消息命名空间 | 独立子会话 |
-| 最终输出 | ReAct 收尾调用 | 汇总模型 | 汇总模型 |
+- Agent 创建、发布、Run 创建与飞书路由只接受 `react`；其他模式统一返回 `ErrInvalidConfig`。
+- 存量 Agent 通过迁移 `000082_convert_agent_mode_to_react.up.sql` 统一转为 `react`。
+- 历史 Plan/Supervisor 数据表不再被服务读写，仅账号删除时清理旧用户数据；旧 Run 的 `mode` 字段保留用于审计追溯。
+- 部署时残留在队列中的非 `react` Run 会在工具准备与审批恢复之前直接失败，不执行任何工具副作用。
+- 前端不再提供模式选择、计划操作或协作助手明细，运行详情仅展示 ReAct 步骤树、模型 Attempt、载荷与审批。
 
 ---
 
@@ -632,7 +574,7 @@ Run 创建时校验：
 
 - **熔断**：Redis 按 `provider_id + model_id` 隔离；连续失败达到阈值（默认 3）打开，冷却 30s 后进入半开，仅放行有限探测；成功即关闭并清零。
 - **并发舱壁**：Provider 级 `provider:<id>`，全局与用户级舱壁在 Worker 入口；Redis 故障时 fail-open，避免缓存故障阻断全部请求。
-- **Attempt 预算**：`RouterConfig.AttemptBudget` 支持跨多个 Router 共享预算（Plan / Supervisor）；每次调用前 Reserve，结束后 Settle。
+- **Attempt 预算**：`RouterConfig.AttemptBudget` 支持跨多个 Router 共享预算；每次调用前 Reserve，结束后 Settle。
 - **费用估算**：按模型输入/输出价格计算；Provider 未返回 usage 时按请求与响应文本保守估算，避免预算失效。
 - **失败重试计数**：只统计当前模型的连续失败次数，模型调用成功后重置为 0，避免多轮成功调用累加导致误判切换。
 
@@ -708,7 +650,7 @@ pending → approved → executing → executed
 - Worker 将 Run 推进到 `waiting_approval`，释放租约并退回任务；
 - 决策接口使用 CAS，重复相同决策幂等返回；
 - 审批结果投递在**单个数据库事务**内完成：审批状态、Tool Message、Outbox、RunEvent、会话版本、步骤终态、执行载荷；
-- 执行前通过 `ClaimApprovalExecution` 校验 Run 租约与 Plan 状态，防止旧 Worker 领取；
+- 执行前通过 `ClaimApprovalExecution` 校验 Run 租约，防止旧 Worker 领取；
 - 审批等待有独立超时（默认 24h），不计入 Run 执行时长；恢复时按暂停时长顺延 Deadline；
 - 已批准工具执行时使用幂等键，通过 MCP `_meta` 透传远端。
 
@@ -718,8 +660,6 @@ pending → approved → executing → executed
 
 - 审批已进入 `executing`，但进程崩溃或结果落库失败；
 - 工具已返回，但 `tool.completed` 事件或 Tool Message 写入失败；
-- Plan 工具步骤已触达副作用但无法确认结果；
-- Supervisor 子任务结算失败。
 
 禁止行为：伪造成功结果、盲目重放工具、把未知结果当作业务失败让模型继续推理。人工确认后通过 reconciliation 接口结案。
 
@@ -900,8 +840,6 @@ staging（回填中） → active（参与检索） → retired（退役）
 | 消息 | `message.delta`、`message.created`、`message.truncated` |
 | 工具 | `tool.started`、`tool.completed`、`tool.approval.required`、`tool.approval.decided`、`tool.discovery.degraded` |
 | 上下文 | `context.assembled`、`context.degraded` |
-| Plan | `plan.created`、`plan.step.started`、`plan.step.completed`、`plan.step.failed`、`plan.step.waiting_approval`、`plan.replanned`、`plan.revised`、`plan.resumed`、`plan.completed`、`plan.failed` |
-| Supervisor | `supervisor.tasks.created`、`supervisor.task.started`、`supervisor.task.completed`、`supervisor.task.failed`、`supervisor.task.retrying`、`supervisor.completed`、`supervisor.failed`、`supervisor.budget_exceeded`、`supervisor.events_degraded` |
 | Worker | `worker.failed` |
 | Run | `run.completed`、`run.failed` |
 | 流 | `heartbeat`、`stream.error`、`stream.truncated` |
@@ -915,7 +853,7 @@ staging（回填中） → active（参与检索） → retired（退役）
 | `AppShell` | 导航、登录态、角色入口、窄屏折叠 |
 | `SessionsPage` | 会话列表、分页、批量删除 |
 | `ChatPage` | 消息流、流式打字、过程折叠、附件、审批、运行详情入口 |
-| `RunPage` | 执行树、Attempt、步骤载荷、Supervisor 子任务、审批 |
+| `RunPage` | 执行树、Attempt、步骤载荷、审批 |
 | `AgentsPage / AgentWizardPage` | 助手创建、版本、发布、技能/MCP 绑定 |
 | `ProvidersPage / ModelsPage / PoliciesPage` | 模型服务、模型目录、选模规则、熔断健康 |
 | `MCPsPage` | MCP 登记、工具发现、风险等级、单工具超时 |
@@ -940,7 +878,7 @@ staging（回填中） → active（参与检索） → retired（退役）
 
 | 链路 | 内容 | 存储 | 约束 |
 | --- | --- | --- | --- |
-| Agent 执行事实 | 模型请求/响应、工具 I/O、Plan/Worker、Attempt、错误与状态迁移 | PostgreSQL `agent_runs / execution_steps / execution_payloads / model_calls / run_events` | 受 RLS 保护，按策略脱敏与截断 |
+| Agent 执行事实 | 模型请求/响应、工具 I/O、ReAct 步骤、Attempt、错误与状态迁移 | PostgreSQL `agent_runs / execution_steps / execution_payloads / model_calls / run_events` | 受 RLS 保护，按策略脱敏与截断 |
 | 应用观测 | Trace、Metric、结构化日志 | OTel / Prometheus / stdout | 只放关联 ID、状态、耗时、脱敏错误 |
 | 安全审计 | 谁代表谁、何时、对何资源、执行何操作、结果与原因 | 追加型 `audit_logs` | 只记录元数据和白名单差异 |
 
@@ -948,7 +886,7 @@ staging（回填中） → active（参与检索） → retired（退役）
 
 ### 11.2 执行事实模型
 
-- `execution_steps`：`model / tool / plan / worker / system` 五类节点，`(run_id, step_seq)` 唯一，记录父步骤、风险等级、Attempt、幂等键与状态。
+- `execution_steps`：`model / tool / system` 三类节点，`(run_id, step_seq)` 唯一，记录父步骤、风险等级、Attempt、幂等键与状态。历史数据中可能仍存在 `plan / worker` 类型节点，仅用于回放。
 - `execution_payloads`：`model_request / model_response / tool_input / tool_output / tool_error / external_request / external_response / context_compression`，显式携带 `user_id`，记录捕获模式、原始大小、保存大小、截断/部分标记与脱敏 Hash。
 - `model_calls`：`(run_id, attempt_no)` 唯一，记录候选、Request Hash、消息数、工具名、Token、费用、耗时、Finish Reason、Provider Request ID、切换原因与脱敏错误。
 - `run_events`：只负责可重放时间线与 SSE，不重复存储完整载荷。
@@ -1064,7 +1002,7 @@ staging（回填中） → active（参与检索） → retired（退役）
 - 系统提示固定声明不可信内容约束；
 - 工具结果只能进入 `tool` 角色；
 - 模型输出原生工具标记但无结构化 `tool_calls` 时终止；
-- Plan / Supervisor 只允许低风险工具，委派不得提升权限；
+- 所有工具执行均受风险等级与审批约束，共享群聊进一步收窄工具面；
 - 共享群聊工具面进一步收窄，避免群成员触发高风险操作。
 
 ### 12.7 删除与导出
@@ -1178,9 +1116,7 @@ sequenceDiagram
 | Agent 配置 | `agents`、`skills`、`mcps`、`agent_skills`、`agent_mcps`、`user_skills`、`skill_files`、`user_skill_files`、`agent_user_skills` |
 | 会话 | `sessions`、`session_members`、`messages`、`attachments`、`attachment_contents` |
 | 执行 | `agent_runs`、`execution_steps`、`execution_payloads`、`model_calls`、`run_events` |
-| 计划 | `plans`、`plan_steps` |
 | 审批 | `tool_approvals` |
-| Supervisor | `supervisor_tasks` |
 | 记忆 | `session_summaries`、`memory_vectors`、`memory_facts`、`embedding_indexes`、`user_memory_state` |
 | 飞书 | `feishu_bots`、`external_conversation_bindings`、`feishu_event_receipts`、`feishu_outbound_messages`、`feishu_group_messages` |
 | 任务与一致性 | `jobs`、`outbox_events`、`idempotency_keys` |
@@ -1306,7 +1242,7 @@ sequenceDiagram
 | 故障注入 | `make test-chaos` | 依赖不可用、慢调用、连接池耗尽、恢复路径 |
 | 安全扫描 | `make test-security` | SAST、依赖/密钥/IaC/镜像、API Fuzz、许可证 |
 | 前端 | `make test-web` | Vitest + Testing Library |
-| 质量评测 | `make test-quality` | 黄金集、对抗集、Plan/Supervisor |
+| 质量评测 | `make test-quality` | 黄金集、对抗集、ReAct 恢复 |
 
 ### 16.2 覆盖率门槛
 
@@ -1332,8 +1268,6 @@ sequenceDiagram
 | 工具循环 | 返回 `ErrToolLoop` |
 | 未知工具 | 可恢复错误标记，不执行任意工具 |
 | 超大工具结果 | 原文不进入上下文 |
-| Plan 成功/重试/恢复/取消/成本 | 状态机与预算断言 |
-| Supervisor 部分失败/并发/取消 | 部分失败显式、子任务不孤儿 |
 | 记忆相关性/冲突/摘要忠实度 | Precision/Recall、MMR、事实冲突、跨用户零泄漏 |
 | 删除后不可召回 | 向量与摘要清理 |
 
@@ -1387,7 +1321,7 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
     Repository 方法显式 `userID`，缓存 Key 带用户维度，私有表 FORCE RLS，后台任务从 Run 恢复用户上下文。
 
 11. **长任务必须可恢复**  
-    Plan 持久化、步骤复用、审批原子投递、最终消息幂等、暂停顺延 Deadline；恢复逻辑要和首次执行一样经过测试。
+    审批原子投递、最终消息幂等、暂停顺延 Deadline、工具副作用未知转人工对账；恢复逻辑要和首次执行一样经过测试。
 
 12. **质量门禁要覆盖行为而不只是覆盖率**  
     黄金集、对抗集、故障注入、迁移守卫、安全扫描与前端测试共同构成发布门禁。
@@ -1407,10 +1341,9 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 
 ### 18.2 演进方向
 
-- 将执行 Worker 拆分为独立部署单元，支持按模式/租户隔离资源池。
+- 将执行 Worker 拆分为独立部署单元，支持按租户/任务类型隔离资源池。
 - 增加更多 MCP 传输与工具协议适配。
 - 引入更细粒度的模型成本与配额策略（按用户、Agent、Provider、数据区域）。
-- 增强 Plan 的人工可视化编辑与步骤级重跑。
 - 扩展记忆评测集，覆盖更多语言、群聊与长周期偏好冲突场景。
 - 完善多地域与灾备拓扑，验证跨区域 RPO/RTO。
 
@@ -1431,8 +1364,6 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 | `agent.worker.run_deadline` | 15m | Run 时长 |
 | `agent.worker.react_max_total_tokens` | 20,000,000 | ReAct Token |
 | `agent.worker.react_max_cost` | 20 | ReAct 费用 |
-| `agent.worker.supervisor_max_tokens` | 20,000,000 | Supervisor Token |
-| `agent.worker.supervisor_max_cost` | 100 | Supervisor 费用 |
 | `agent.worker.mcp_timeout` | 60s | MCP 默认超时 |
 | `agent.worker.approval_poll` | 5s | 审批轮询 |
 | `agent.worker.global_concurrency` | 100 | 全局并发 |
@@ -1463,8 +1394,6 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 | Run 状态机 | `internal/biz/run.go` |
 | Run 用例与快照 | `internal/biz/run_service.go` |
 | 执行 Worker | `internal/biz/worker.go` |
-| Plan 模式 | `internal/biz/plan_worker.go`、`internal/biz/plan_eino.go` |
-| Supervisor 模式 | `internal/biz/supervisor_worker.go`、`internal/biz/supervisor_eino.go` |
 | 审批 | `internal/biz/approval.go` |
 | 上下文窗口 | `pkg/memory/window.go` |
 | 摘要提示与分块 | `pkg/memory/summary.go` |
@@ -1500,7 +1429,7 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 | 术语 | 含义 |
 | --- | --- |
 | Run | 一次完整的 Agent 执行，包含一个或多个模型/工具步骤 |
-| Step | 执行树节点，类型为 model/tool/plan/worker/system |
+| Step | 执行树节点，类型为 model/tool/system |
 | Attempt | 一次真实的模型 Provider 调用 |
 | Payload | 某次步骤实际收发的脱敏请求/响应事实 |
 | Job | 持久化任务队列中的一条可认领任务 |
@@ -1508,8 +1437,6 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 | Fencing Token | 单调递增令牌，阻止过期 Worker 提交结果 |
 | Outbox | 与业务写入同事务提交、异步分发的领域事件 |
 | Approval | 中高风险工具调用的人工审批 |
-| Plan | Plan-and-Execute 模式的持久化计划 |
-| Worker Task | Supervisor 模式下委派给子 Agent 的任务 |
 | Reconciliation | 副作用结果未知时的人工对账状态 |
 | Hot Window | Redis 中的会话最近消息缓存 |
 | MMR | 最大边际相关性，用于记忆去冗余 |

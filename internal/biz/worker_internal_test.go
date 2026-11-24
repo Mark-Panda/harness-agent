@@ -44,11 +44,11 @@ func TestFailureDetailsMapping(t *testing.T) {
 		code string
 	}{
 		{name: "no user message", err: ErrNoUserMessage, code: "no_user_message"},
+		{name: "unsupported run mode", err: fmt.Errorf("%w: plan", ErrUnsupportedRunMode), code: "unsupported_run_mode"},
 		{name: "invalid snapshot", err: fmt.Errorf("%w: bad", ErrInvalidRunSnapshot), code: "invalid_run_snapshot"},
 		{name: "step limit", err: fmt.Errorf("%w: 12", react.ErrStepLimit), code: "step_limit_exceeded"},
 		{name: "tool loop", err: fmt.Errorf("%w: search", react.ErrToolLoop), code: "tool_loop_detected"},
 		{name: "budget", err: fmt.Errorf("%w: cost", react.ErrBudgetExceeded), code: "budget_exceeded"},
-		{name: "plan budget", err: ErrPlanBudget, code: "plan_budget_exceeded"},
 		{name: "no candidates", err: fmt.Errorf("%w: none", model.ErrNoCandidates), code: "no_model_candidates"},
 		{name: "attempt limit", err: fmt.Errorf("%w", model.ErrAttemptLimit), code: "model_attempts_exhausted"},
 		{name: "switch limit", err: fmt.Errorf("%w", model.ErrSwitchLimit), code: "model_switches_exhausted"},
@@ -69,6 +69,26 @@ func TestFailureDetailsMapping(t *testing.T) {
 			}
 			if message == "" || len(message) > 512 {
 				t.Fatalf("unexpected message: %q", message)
+			}
+		})
+	}
+}
+
+// TestExecuteRejectsLegacyModesBeforeToolPreparation 验证历史 Plan/Supervisor Run
+// 在准备工具、恢复审批或写入会话之前失败关闭，避免已批准工具被旧任务执行。
+func TestExecuteRejectsLegacyModesBeforeToolPreparation(t *testing.T) {
+	// 未注入任何依赖：若实现走到工具准备或审批恢复会直接 panic。
+	worker := &ExecutionWorker{}
+	for _, mode := range []AgentMode{"plan", "super"} {
+		t.Run(string(mode), func(t *testing.T) {
+			_, _, err := worker.execute(context.Background(), Run{
+				ID: uuid.New(), UserID: uuid.New(), SessionID: uuid.New(), Mode: mode,
+			}, RunFence{})
+			if !errors.Is(err, ErrUnsupportedRunMode) {
+				t.Fatalf("execute() error = %v, want ErrUnsupportedRunMode", err)
+			}
+			if !isBusinessFailure(err) {
+				t.Fatal("legacy mode must fail fast without retrying")
 			}
 		})
 	}
@@ -362,58 +382,6 @@ func (t *fakeRuntimeTool) Invoke(ctx context.Context, arguments json.RawMessage)
 // newObservedWorker 构造仅用于观测包装测试的 Worker。
 func newObservedWorker(steps ExecutionStepRepository) *ExecutionWorker {
 	return &ExecutionWorker{steps: steps, config: WorkerConfig{}.normalize(), clock: func() time.Time { return time.Now().UTC() }, logger: slog.Default()}
-}
-
-type pausedPlanToolSteps struct {
-	fakeStepRepository
-	fence PlanFence
-}
-
-func (r *pausedPlanToolSteps) StartPlanToolStep(_ context.Context, _ ExecutionStep, fence PlanFence) (ExecutionStep, error) {
-	r.fence = fence
-	return ExecutionStep{}, ErrPlanPaused
-}
-
-func TestObservedPlanToolHonorsDispatchFence(t *testing.T) {
-	repo := &pausedPlanToolSteps{}
-	inner := &fakeRuntimeTool{name: "mcp_docs_search"}
-	tool := observedTool{inner: inner, worker: newObservedWorker(repo), run: Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan}}
-	fence := PlanFence{Owner: "plan-worker", Token: 9}
-	ctx := context.WithValue(withParentStep(context.Background(), uuid.New()), planToolFenceContextKey{}, fence)
-	_, err := tool.Invoke(ctx, json.RawMessage(`{}`))
-	if !errors.Is(err, ErrPlanPaused) || inner.calls != 0 || len(repo.started) != 0 || len(repo.payloads) != 0 || repo.fence != fence {
-		t.Fatalf("paused tool reached dispatch: calls=%d, starts=%v, fence=%+v, error=%v", inner.calls, repo.started, repo.fence, err)
-	}
-}
-
-type planBudgetRejectingAttempts struct {
-	fakeAttemptRepository
-	call ModelCall
-}
-
-func (r *planBudgetRejectingAttempts) CreateModelCall(_ context.Context, call ModelCall) (ModelCall, error) {
-	r.call = call
-	return ModelCall{}, ErrPlanBudget
-}
-
-func TestPlanAttemptStopsOnDurableBudgetRejection(t *testing.T) {
-	steps := &fakeStepRepository{}
-	attempts := &planBudgetRejectingAttempts{}
-	worker := newObservedWorker(steps)
-	worker.runs, worker.attempts = stubRunRepository{}, attempts
-	worker.config.PlanMaxTokens, worker.config.PlanMaxCost = 50, 1.25
-	observer := &runAttemptObserver{
-		worker: worker, run: Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan},
-		stepIDs: map[int]uuid.UUID{}, stepSeqs: map[int]int64{},
-	}
-	err := observer.AttemptStarted(context.Background(), model.AttemptRecord{
-		AttemptNo: 1, ProviderID: uuid.NewString(), ModelID: uuid.NewString(), InputTokens: 10, OutputTokens: 20,
-	})
-	if !errors.Is(err, ErrPlanBudget) || attempts.call.PlanMaxTokens != 50 || attempts.call.PlanMaxCost != 1.25 ||
-		attempts.call.RequestManifest["plan_usage"] != true || len(steps.finished) != 1 ||
-		steps.finished[0].Status != StepCancelled || steps.finished[0].ErrorCode != "plan_budget_exceeded" {
-		t.Fatalf("durable budget rejection = %v, call=%+v, steps=%+v", err, attempts.call, steps.finished)
-	}
 }
 
 // TestObservedToolPersistsStepsAndPayloads 验证工具调用前后的步骤、入参与结果均落库。
@@ -1030,7 +998,7 @@ func (f fakeSessionRepository) CountSessions(context.Context, uuid.UUID) (int64,
 	return 0, nil
 }
 
-// latestRunRepository 返回固定的 Run 列表，用于暂停计划目标校验。
+// latestRunRepository 返回固定的 Run 列表，用于会话最近模型解析测试。
 type latestRunRepository struct {
 	stubRunRepository
 	items []Run
@@ -1335,37 +1303,6 @@ func TestAbnormalModelOutputIsBusinessFailure(t *testing.T) {
 	} {
 		if code, _ := failureDetails(err); code != want {
 			t.Fatalf("failureDetails(%v) = %q, want %q", err, code, want)
-		}
-	}
-}
-
-func TestPausedPlanIsLatestRejectsSupersededPlan(t *testing.T) {
-	created := Run{ID: uuid.New(), SessionID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan}
-	pausedRunID, newerRunID := uuid.New(), uuid.New()
-	service := &RunService{repo: latestRunRepository{items: []Run{
-		{ID: created.ID, Mode: AgentModePlan},
-		{ID: newerRunID, Mode: AgentModePlan},
-	}}}
-	latest, err := service.pausedPlanIsLatest(context.Background(), created.UserID, created, Plan{RunID: pausedRunID})
-	if err != nil || latest {
-		t.Fatalf("superseded plan accepted for resume: latest=%v, err=%v", latest, err)
-	}
-	service.repo = latestRunRepository{items: []Run{{ID: created.ID, Mode: AgentModePlan}, {ID: pausedRunID, Mode: AgentModePlan}}}
-	latest, err = service.pausedPlanIsLatest(context.Background(), created.UserID, created, Plan{RunID: pausedRunID})
-	if err != nil || !latest {
-		t.Fatalf("current paused plan rejected: latest=%v, err=%v", latest, err)
-	}
-}
-
-func TestPlanResumeIntentRequiresExplicitCommand(t *testing.T) {
-	for _, content := range []string{"继续", "继续执行。", "恢复执行", "接着", "resume", "Continue Plan"} {
-		if !isPlanResumeIntent(content) {
-			t.Fatalf("resume command %q was rejected", content)
-		}
-	}
-	for _, content := range []string{"帮我做一个新计划", "不要继续", "继续写一个完全不同的方案", ""} {
-		if isPlanResumeIntent(content) {
-			t.Fatalf("new task %q was treated as resume", content)
 		}
 	}
 }

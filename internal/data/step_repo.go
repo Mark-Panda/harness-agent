@@ -109,15 +109,6 @@ func NewExecutionStepRepository(db *gorm.DB) *ExecutionStepRepository {
 
 // StartStep 在 Run 级 advisory lock 内分配单调 step_seq，避免并发步骤产生重复序号。
 func (r *ExecutionStepRepository) StartStep(ctx context.Context, step biz.ExecutionStep) (biz.ExecutionStep, error) {
-	return r.startStep(ctx, step, nil)
-}
-
-// StartPlanToolStep records dispatch of a model step's tool while the Run and Plan are locked.
-func (r *ExecutionStepRepository) StartPlanToolStep(ctx context.Context, step biz.ExecutionStep, fence biz.PlanFence) (biz.ExecutionStep, error) {
-	return r.startStep(ctx, step, &fence)
-}
-
-func (r *ExecutionStepRepository) startStep(ctx context.Context, step biz.ExecutionStep, fence *biz.PlanFence) (biz.ExecutionStep, error) {
 	if step.ID == uuid.Nil {
 		step.ID = uuid.New()
 	}
@@ -131,7 +122,7 @@ func (r *ExecutionStepRepository) startStep(ctx context.Context, step biz.Execut
 	if step.AttemptNo <= 0 {
 		step.AttemptNo = 1
 	}
-	// risk_level 是带枚举检查的非空列；plan/worker 等非工具步骤没有风险等级，
+	// risk_level 是带枚举检查的非空列；非工具步骤没有风险等级，
 	// 必须显式回退为 low，否则 GORM 会写入空串并触发 check 约束失败。
 	if step.RiskLevel == "" {
 		step.RiskLevel = "low"
@@ -141,18 +132,6 @@ func (r *ExecutionStepRepository) startStep(ctx context.Context, step biz.Execut
 	}
 	var record executionStepModel
 	err := WithScope(ctx, r.db, Scope{UserID: step.UserID}, func(tx *gorm.DB) error {
-		if fence != nil {
-			planID, err := lockExecutingPlan(tx, step.UserID, step.RunID, *fence, step.CreatedAt)
-			if err != nil {
-				return err
-			}
-			var parent planStepModel
-			if err := tx.Select("id").Take(&parent, `user_id = ? AND plan_id = ? AND execution_step_id = ?
-AND status = 'running' AND lease_owner = ? AND fence_token = ?`,
-				step.UserID, planID, step.ParentStepID, fence.Owner, fence.Token).Error; err != nil {
-				return err
-			}
-		}
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "step:"+step.RunID.String()).Error; err != nil {
 			return err
 		}

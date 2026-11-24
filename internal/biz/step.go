@@ -18,10 +18,6 @@ const (
 	StepKindModel StepKind = "model"
 	// StepKindTool 工具调用步骤。
 	StepKindTool StepKind = "tool"
-	// StepKindPlan 计划步骤。
-	StepKindPlan StepKind = "plan"
-	// StepKindWorker Supervisor 子任务步骤。
-	StepKindWorker StepKind = "worker"
 	// StepKindSystem 系统编排步骤。
 	StepKindSystem StepKind = "system"
 	// StepPending 步骤已创建但尚未开始。

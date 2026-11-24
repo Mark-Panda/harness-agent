@@ -162,7 +162,7 @@ func TestRunServiceRejectsUnroutableSnapshots(t *testing.T) {
 			want: biz.ErrInvalidConfig,
 		},
 		{
-			name: "mode mismatch", mutate: func(repo *fakeSnapshotRepository) { repo.agent.Mode = biz.AgentModePlan },
+			name: "unsupported agent mode", mutate: func(repo *fakeSnapshotRepository) { repo.agent.Mode = biz.AgentMode("plan") },
 			input: func() biz.CreateRunInput {
 				return biz.CreateRunInput{AgentID: &agentID, AgentVersion: &version, Mode: biz.AgentModeReact}
 			},

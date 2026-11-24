@@ -21,14 +21,7 @@ function isTerminal(status: string): boolean {
 
 // modeLabel 把工作方式翻译成用户语言。
 function modeLabel(mode: string | undefined): string {
-  switch (mode) {
-    case "plan":
-      return "先计划再执行";
-    case "super":
-      return "多助手协作";
-    default:
-      return "边做边想";
-  }
+  return !mode || mode === "react" ? "边做边想" : mode;
 }
 
 // asString 安全提取事件载荷中的字符串字段。
@@ -418,83 +411,6 @@ function ChatWorkspace({ sessionId }: { sessionId: string }) {
             detail: asString(payload.message) ?? asString(payload.reason) ?? undefined,
             tone: "danger",
           });
-          break;
-        case "plan.created":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: "执行计划已生成", detail: `${String(payload.steps ?? "?")} 个步骤`, tone: "info" });
-          break;
-        case "plan.step.started":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: `计划步骤 ${String(payload.step_no ?? "?")} 开始：${asString(payload.title) ?? ""}`,
-            detail: asString(payload.tool) ?? undefined,
-            tone: "info",
-          });
-          break;
-        case "plan.step.completed":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: `计划步骤 ${String(payload.step_no ?? "?")} 完成`, tone: "success" });
-          break;
-        case "plan.step.failed":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: `计划步骤 ${String(payload.step_no ?? "?")} 失败`,
-            detail: asString(payload.message) ?? asString(payload.code) ?? undefined,
-            tone: "danger",
-          });
-          break;
-        case "plan.step.waiting_approval":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: `计划步骤 ${String(payload.step_no ?? "?")} 等待审批`,
-            detail: asString(payload.tool) ?? undefined,
-            tone: "warning",
-          });
-          void refreshApprovals(runID);
-          break;
-        case "plan.completed":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: "执行计划完成", detail: `总 Token ${String(payload.total_input_tokens ?? 0)} / ${String(payload.total_output_tokens ?? 0)}`, tone: "success" });
-          break;
-        case "plan.failed":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: "执行计划失败",
-            detail: asString(payload.message) ?? asString(payload.code) ?? undefined,
-            tone: "danger",
-          });
-          break;
-        case "supervisor.tasks.created":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: "Worker 委派已生成", detail: `${String(payload.workers ?? "?")} 个 Worker`, tone: "info" });
-          break;
-        case "supervisor.task.started":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: `Worker ${String(payload.index ?? "?")} 开始：${asString(payload.worker) ?? ""}`,
-            tone: "info",
-          });
-          break;
-        case "supervisor.task.completed":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: `Worker ${String(payload.index ?? "?")} 完成`, tone: "success" });
-          break;
-        case "supervisor.task.failed":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: `Worker ${asString(payload.worker) ?? String(payload.index ?? "?")} ${statusLabel(asString(payload.status) ?? "failed")}`,
-            detail: asString(payload.message) ?? asString(payload.code) ?? undefined,
-            tone: asString(payload.status) === "cancelled" ? "warning" : "danger",
-          });
-          break;
-        case "supervisor.completed":
-          pushTimeline({
-            key: `${event.seq}:${event.event}`,
-            label: payload.partial === true ? "Supervisor 部分完成" : "Supervisor 全部完成",
-            detail: `完成 ${String(payload.completed ?? 0)} / 失败 ${String(payload.failed ?? 0)} / 取消 ${String(payload.cancelled ?? 0)}`,
-            tone: payload.partial === true ? "warning" : "success",
-          });
-          break;
-        case "supervisor.failed":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: "Supervisor 全部失败", detail: `失败 ${String(payload.failed ?? 0)}`, tone: "danger" });
-          break;
-        case "supervisor.budget_exceeded":
-          pushTimeline({ key: `${event.seq}:${event.event}`, label: "Supervisor 共享预算耗尽", tone: "danger" });
           break;
         default:
           break;

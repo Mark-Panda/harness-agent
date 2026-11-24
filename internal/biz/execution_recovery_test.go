@@ -124,55 +124,7 @@ func TestToolTranscriptWriteFailureRequiresReconciliation(t *testing.T) {
 	}
 }
 
-func TestSupervisorRestartDoesNotRetryTaskWithToolAccess(t *testing.T) {
-	repo := newMemorySupervisorRepo()
-	worker := &ExecutionWorker{supervisor: repo, clock: time.Now}
-	run := Run{ID: uuid.New(), UserID: uuid.New()}
-	task := SupervisorTask{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, Status: SupervisorTaskRunning,
-		Attempts: 1, MaxAttempts: 2, ToolScope: []string{"mcp_update"}}
-	repo.tasks[task.ID] = task
-	if _, err := worker.recoverSupervisorTasks(context.Background(), run, RunFence{}, []SupervisorTask{task}); !errors.Is(err, ErrToolResultPersistence) {
-		t.Fatalf("recovery error = %v", err)
-	}
-	task = repo.tasks[task.ID]
-	if task.Status != SupervisorTaskUnknown || task.ErrorCode != supervisorUnknownToolCode || task.Attempts != 1 {
-		t.Fatalf("recovered task = %+v", task)
-	}
-	if _, err := worker.recoverSupervisorTasks(context.Background(), run, RunFence{}, []SupervisorTask{task}); !errors.Is(err, ErrToolResultPersistence) {
-		t.Fatalf("durable unknown task unexpectedly resumed: %v", err)
-	}
-}
-
-type plannerCatalog struct {
-	react.Registry
-	specs []react.ToolSpec
-}
-
-func (r plannerCatalog) List() []react.ToolSpec { return r.specs }
-
-func TestPlannerToolCatalogFormatsSchemasAndHonorsBudget(t *testing.T) {
-	tool := react.ToolSpec{Name: "search", Description: "Lookup documents", Parameters: json.RawMessage(` { "type": "object" } `)}
-	prompt := planPlannerSystem(plannerCatalog{specs: []react.ToolSpec{tool}})
-	if !strings.Contains(prompt, "Lookup documents") || !strings.Contains(prompt, `{"type":"object"}`) {
-		t.Fatalf("unexpected planner prompt: %s", prompt)
-	}
-	// 参数 Schema 必须完整注入，截断会让模型猜测字段名。
-	longSchema := json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"` + strings.Repeat("x", 300) + `"}}}`)
-	full := planPlannerSystem(plannerCatalog{specs: []react.ToolSpec{{Name: "search", Parameters: longSchema}}})
-	if !strings.Contains(full, string(longSchema)) {
-		t.Fatalf("planner schema was truncated")
-	}
-	// 预算不足时明确标注省略数量，而不是隐藏固定数量的工具。
-	specs := make([]react.ToolSpec, 50)
-	for index := range specs {
-		specs[index] = react.ToolSpec{Name: "tool_" + strings.Repeat("x", index+1)}
-	}
-	bounded := planPlannerSystemWithBudget(plannerCatalog{specs: specs}, 1)
-	if !strings.Contains(bounded, "因上下文预算已省略") || !strings.Contains(bounded, specs[0].Name) {
-		t.Fatalf("planner tool catalog budget was not applied: %s", bounded)
-	}
-}
-
+// TestPromptBudgetReservesModelOutputAndToolDefinitions 验证 Prompt 预算为输出与工具定义预留空间。
 func TestPromptBudgetReservesModelOutputAndToolDefinitions(t *testing.T) {
 	worker := &ExecutionWorker{config: WorkerConfig{PromptTokenBudget: 1000, ReserveOutputTokens: 100, SafetyMarginTokens: 50}, logger: slog.Default()}
 	for _, tc := range []struct {
@@ -217,96 +169,11 @@ func (r pendingApprovals) CountPendingApprovals(context.Context, uuid.UUID, uuid
 	return r.count, r.err
 }
 
-type pausedPlanHandleQueue struct {
-	RunExecutionQueue
-	releaseAt []time.Time
-	completed int
-}
-
-func (q *pausedPlanHandleQueue) Release(_ context.Context, _ uuid.UUID, _ string, _ int64, retryAt, _ time.Time) error {
-	q.releaseAt = append(q.releaseAt, retryAt)
-	return nil
-}
-
-func (q *pausedPlanHandleQueue) Complete(context.Context, uuid.UUID, string, int64) error {
-	q.completed++
-	return nil
-}
-
-type pausedPlanHandleRuns struct {
-	stubRunRepository
-	run              Run
-	claims, requeues int
-	finishes         int
-}
-
-func (r *pausedPlanHandleRuns) GetRun(context.Context, uuid.UUID, uuid.UUID) (Run, error) {
-	return r.run, nil
-}
-
-func (r *pausedPlanHandleRuns) ClaimRun(_ context.Context, _, _ uuid.UUID, owner string, _ time.Duration, now time.Time) (Run, RunFence, error) {
-	r.claims++
-	claimed := r.run
-	claimed.Status = RunRunning
-	claimed.UpdatedAt = now
-	return claimed, RunFence{Owner: owner, Token: 1}, nil
-}
-
-func (r *pausedPlanHandleRuns) RequeuePausedRun(_ context.Context, _, _ uuid.UUID, _ RunFence, _ time.Time) error {
-	r.requeues++
-	return nil
-}
-
-func (r *pausedPlanHandleRuns) FinishRunWithEvent(_ context.Context, _, _ uuid.UUID, _, _ RunStatus, _ map[string]any, _ RunEvent, _ RunFence, _ time.Time) (Run, error) {
-	r.finishes++
-	return Run{Status: RunFailed}, nil
-}
-
-func TestHandlePausedPlanNeverExpiresOrExecutes(t *testing.T) {
-	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
-	for _, tc := range []struct {
-		name                     string
-		status                   RunStatus
-		wantClaims, wantRequeues int
-	}{
-		{name: "waiting approval", status: RunWaitingApproval},
-		{name: "legacy running paused state", status: RunRunning, wantClaims: 1, wantRequeues: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			runID, userID := uuid.New(), uuid.New()
-			deadline := now.Add(time.Hour)
-			runs := &pausedPlanHandleRuns{run: Run{
-				ID: runID, UserID: userID, SessionID: uuid.New(), Mode: AgentModePlan, Status: tc.status,
-				UpdatedAt: now.Add(-2 * time.Hour), DeadlineAt: &deadline,
-			}}
-			jobs := &pausedPlanHandleQueue{}
-			worker := &ExecutionWorker{
-				jobs: jobs, runs: runs, plans: &pausedPlanRepository{plan: Plan{Status: PlanPaused}},
-				clock: func() time.Time { return now }, logger: slog.Default(),
-				config: WorkerConfig{WorkerID: "worker-test", PollInterval: 5 * time.Second, ApprovalPoll: 5 * time.Second,
-					PausedPoll: 30 * time.Second, ApprovalTimeout: 30 * time.Minute, Lease: time.Minute,
-					Heartbeat: 10 * time.Second, CancelPoll: 10 * time.Second},
-			}
-			job := Job{ID: uuid.New(), FencingToken: 1, MaxAttempts: 3, Payload: map[string]any{
-				"run_id": runID.String(), "user_id": userID.String(),
-			}}
-			worker.handle(context.Background(), job)
-			if runs.claims != tc.wantClaims || runs.requeues != tc.wantRequeues || runs.finishes != 0 || jobs.completed != 0 {
-				t.Fatalf("claims=%d requeues=%d finishes=%d completed=%d", runs.claims, runs.requeues, runs.finishes, jobs.completed)
-			}
-			if len(jobs.releaseAt) != 1 || !jobs.releaseAt[0].Equal(now.Add(30*time.Second)) {
-				t.Fatalf("releaseAt = %v, want paused poll", jobs.releaseAt)
-			}
-		})
-	}
-}
-
 func TestApprovalPauseAndDecisionRace(t *testing.T) {
 	fault := errors.New("database unavailable")
 	for _, tc := range []struct {
 		name                          string
 		current                       RunStatus
-		planStatus                    PlanStatus
 		pauseErr, resumeErr, countErr error
 		count, wantResumes            int
 	}{
@@ -316,17 +183,11 @@ func TestApprovalPauseAndDecisionRace(t *testing.T) {
 		{name: "approval count unavailable", countErr: fault},
 		{name: "pending approvals keep run paused", count: 1},
 		{name: "resume write failed", resumeErr: fault, wantResumes: 1},
-		{name: "manual plan pause wins the race", planStatus: PlanPaused},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runs := &approvalPauseRun{current: tc.current, pauseErr: tc.pauseErr, resumeErr: tc.resumeErr}
-			planStatus := tc.planStatus
-			if planStatus == "" {
-				planStatus = PlanExecuting
-			}
-			worker := &ExecutionWorker{runs: runs, approvals: pendingApprovals{count: tc.count, err: tc.countErr},
-				plans: &pausedPlanRepository{plan: Plan{Status: planStatus}}, clock: time.Now, logger: slog.Default()}
-			run := Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan}
+			worker := &ExecutionWorker{runs: runs, approvals: pendingApprovals{count: tc.count, err: tc.countErr}, clock: time.Now, logger: slog.Default()}
+			run := Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModeReact}
 			worker.pauseForApproval(context.Background(), run, RunFence{})
 			if runs.resumes != tc.wantResumes {
 				t.Fatalf("resume attempts = %d, want %d", runs.resumes, tc.wantResumes)
@@ -373,50 +234,6 @@ func TestFeishuWorkerReadsOnlyProjectedHistoryAndDisablesTools(t *testing.T) {
 	}
 }
 
-func TestSupervisorTranscriptKeepsOnlyCompleteToolBatchesForRetry(t *testing.T) {
-	messages := []react.Message{
-		{Role: react.RoleAssistant, ToolCalls: []react.ToolCall{{ID: "first"}}},
-		{Role: react.RoleTool, ToolCallID: "first", Content: "committed"},
-		{Role: react.RoleAssistant, ToolCalls: []react.ToolCall{{ID: "second"}, {ID: "third"}}},
-		{Role: react.RoleTool, ToolCallID: "second", Content: "also committed"},
-	}
-	if replay := truncateUnfinishedToolCalls(messages); len(replay) != 2 || replay[1].Content != "committed" ||
-		!hasSupervisorToolResult(messages[len(replay):]) {
-		t.Fatalf("incomplete batch concealed a tool result: %+v", replay)
-	}
-	messages = append(messages, react.Message{Role: react.RoleTool, ToolCallID: "third"})
-	if replay := truncateUnfinishedToolCalls(messages); len(replay) != len(messages) {
-		t.Fatalf("complete batch was removed: %+v", replay)
-	}
-}
-
-type usageAttemptRepository struct {
-	fakeAttemptRepository
-	usage ModelCallUsage
-	err   error
-}
-
-func (r usageAttemptRepository) SumModelCallUsage(context.Context, uuid.UUID, uuid.UUID) (ModelCallUsage, error) {
-	return r.usage, r.err
-}
-
-func TestSupervisorBudgetRecoversAllPersistedAttemptReservations(t *testing.T) {
-	ctx := context.Background()
-	run := Run{ID: uuid.New(), UserID: uuid.New()}
-	worker := &ExecutionWorker{attempts: &usageAttemptRepository{usage: ModelCallUsage{
-		Count: 201, InputTokens: 800, OutputTokens: 200, EstimatedCost: 1.5,
-	}}, config: WorkerConfig{SupervisorMaxTokens: 1000}}
-	budget, err := worker.recoverSupervisorBudget(ctx, run, nil)
-	if err != nil || budget.usage() != (supervisorUsage{input: 800, output: 200, cost: 1.5}) {
-		t.Fatalf("persisted usage = %v, %v", budget, err)
-	}
-	failure := errors.New("model call repository unavailable")
-	worker.attempts = &usageAttemptRepository{err: failure}
-	if _, err := worker.recoverSupervisorBudget(ctx, run, nil); !errors.Is(err, failure) {
-		t.Fatalf("usage recovery ignored error: %v", err)
-	}
-}
-
 type terminalRunWriter struct {
 	stubRunRepository
 	finishErr, getErr error
@@ -459,48 +276,6 @@ func TestFailRunOnlyIgnoresFenceConflictForSettledRun(t *testing.T) {
 				t.Fatalf("invalid failure event %+v", runs.failure)
 			}
 		})
-	}
-}
-
-func TestPlanModelStepOnlyExposesLowRiskTools(t *testing.T) {
-	for _, risk := range []string{"low", "medium", "high", "unknown"} {
-		tool := &fakeRuntimeTool{name: "search", risk: risk}
-		registry := lowRiskToolRegistry{parent: singleToolRegistry{tool: tool}}
-		_, found := registry.Lookup(tool.name)
-		if (risk == "low") != found || found != (len(registry.List()) == 1) {
-			t.Fatalf("risk=%q, found=%t, tools=%v", risk, found, registry.List())
-		}
-		if _, found := registry.Lookup("unavailable"); found {
-			t.Fatal("nonexistent tool exposed")
-		}
-	}
-}
-
-func TestSupervisorRestartRetriesOnlyModelTasksWithBudget(t *testing.T) {
-	repo := newMemorySupervisorRepo()
-	worker := &ExecutionWorker{supervisor: repo, clock: time.Now}
-	run := Run{ID: uuid.New(), UserID: uuid.New()}
-	tasks := []SupervisorTask{
-		{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, WorkerIndex: 1, Status: SupervisorTaskRunning, Attempts: 1, MaxAttempts: 2},
-		{ID: uuid.New(), UserID: run.UserID, ParentRunID: run.ID, WorkerIndex: 2, Status: SupervisorTaskRunning, Attempts: 2, MaxAttempts: 2},
-	}
-	for _, task := range tasks {
-		repo.tasks[task.ID] = task
-	}
-	recovered, err := worker.recoverSupervisorTasks(context.Background(), run, RunFence{}, tasks)
-	if err != nil || len(recovered) != 2 || recovered[0].Status != SupervisorTaskPending || recovered[1].Status != SupervisorTaskFailed {
-		t.Fatalf("model task recovery = %+v, %v", recovered, err)
-	}
-}
-
-func TestResumeDecidedApprovalKeepsPausedPlan(t *testing.T) {
-	runs := &approvalPauseRun{}
-	worker := &ExecutionWorker{
-		runs: runs, approvals: pendingApprovals{}, plans: &pausedPlanRepository{plan: Plan{Status: PlanPaused}}, clock: time.Now,
-	}
-	resumed, err := worker.resumeDecidedApprovalRun(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan})
-	if err != nil || resumed || runs.resumes != 0 {
-		t.Fatalf("resumeDecidedApprovalRun = %t, %v, resumes=%d", resumed, err, runs.resumes)
 	}
 }
 

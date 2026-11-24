@@ -60,8 +60,6 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 	}{
 		{"observed ReAct alias changed", "observed", "collision", true, false},
 		{"unobserved ReAct alias changed", "unobserved", "collision", true, false},
-		{"Plan tool alias changed", "plan", "collision", true, false},
-		{"Plan original server unavailable", "plan", "unavailable", false, false},
 		{"ReAct original tool name changed", "observed", "raw-name", false, false},
 		{"ReAct endpoint changed", "observed", "endpoint", false, false},
 		{"Sandbox routing alias changed", "observed", "collision", true, true},
@@ -90,16 +88,6 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 			}
 			approvals := &fakeApprovalRepository{}
 			worker := newObservedWorker(nil)
-			var plan Plan
-			var step PlanStep
-			if tc.source == "plan" {
-				var plans *memoryPlanRepo
-				worker, plans, plan, step = planToolFixture(t, nil, approvals)
-				run.ID, run.UserID, run.SessionID, run.Mode = plan.RunID, plan.UserID, plan.SessionID, AgentModePlan
-				step.ToolName = "mcp_ops_delete"
-				plan.Steps[0] = step
-				plans.seedPlan(plan)
-			}
 			worker.approvals = approvals
 			worker.sessions = fakeSessionRepository{}
 			worker.runs = stubRunRepository{}
@@ -111,7 +99,7 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 				worker.config.RequireSandboxForHighRisk = true
 				worker.sandbox = sandboxRunner
 			}
-			fence := RunFence{Owner: "plan-worker", Token: 1}
+			fence := RunFence{Owner: "worker", Token: 1}
 			initial, err := worker.prepareMCPTools(ctx, run, fence)
 			if err != nil {
 				t.Fatal(err)
@@ -123,11 +111,6 @@ func TestMCPApprovalResumesOnlyTheOriginallySelectedTool(t *testing.T) {
 					RunID: run.ID, UserID: run.UserID, ToolCallID: "call", ToolName: "mcp_ops_delete", Arguments: arguments,
 				}); err != nil {
 					t.Fatal(err)
-				}
-			case "plan":
-				err := worker.executePlanToolStep(ctx, run, fence, PlanFence{Owner: fence.Owner, Token: fence.Token}, initial, plan, step)
-				if !errors.Is(err, ErrApprovalPending) {
-					t.Fatalf("direct tool step error = %v, want pending approval", err)
 				}
 			default:
 				if tc.source == "observed" {

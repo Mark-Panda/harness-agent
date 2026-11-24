@@ -383,10 +383,6 @@ type WorkerConfig struct {
 	ReactMaxTotalTokens int `yaml:"react_max_total_tokens"`
 	// ReactMaxCost 单次 ReAct Run 的估算费用上限；零值使用默认 5。
 	ReactMaxCost float64 `yaml:"react_max_cost"`
-	// SupervisorMaxTokens Supervisor 全部子任务共享的输入加输出 Token 上限；零值使用默认 20,000,000。
-	SupervisorMaxTokens int64 `yaml:"supervisor_max_tokens"`
-	// SupervisorMaxCost Supervisor 全部子任务与汇总共享的估算费用上限；零值使用默认 100。
-	SupervisorMaxCost float64 `yaml:"supervisor_max_cost"`
 	// MCPTimeout 单次 MCP 工具发现或调用的超时。
 	MCPTimeout Duration `yaml:"mcp_timeout"`
 	// AllowPrivateMCPEndpoints 允许连接管理员登记的内网 MCP 端点；回环与元数据地址始终拒绝。
@@ -514,7 +510,7 @@ type FeishuConfig struct {
 	DefaultAgentID string `yaml:"default_agent_id"`
 	// DefaultAgentVersion 默认 Agent 版本号。
 	DefaultAgentVersion int `yaml:"default_agent_version"`
-	// Mode 默认编排模式：react/plan/super。
+	// Mode 默认编排模式：目前仅支持 react。
 	Mode string `yaml:"mode"`
 	// Worker 事件消费 Worker 配置。
 	Worker FeishuWorkerConfig `yaml:"worker"`
@@ -709,7 +705,7 @@ func (c Config) Validate() error {
 		if worker.RunDeadline.Duration < 0 || (worker.RunDeadline.Duration > 0 && worker.RunDeadline.Duration < time.Minute) {
 			return fmt.Errorf("agent.worker.run_deadline must be positive and at least 1m")
 		}
-		if worker.ReactMaxTotalTokens < 0 || worker.ReactMaxCost < 0 || worker.SupervisorMaxTokens < 0 || worker.SupervisorMaxCost < 0 {
+		if worker.ReactMaxTotalTokens < 0 || worker.ReactMaxCost < 0 {
 			return fmt.Errorf("agent.worker token and cost budgets must not be negative")
 		}
 		// 步数耗尽后的收尾总结也要消耗一次模型尝试，必须预留预算。
@@ -994,7 +990,7 @@ func (c Config) validateFeishu() error {
 		return fmt.Errorf("feishu.default_agent_version must not be negative")
 	}
 	switch feishu.Mode {
-	case "react", "plan", "super":
+	case "react":
 	default:
 		return fmt.Errorf("unsupported feishu mode %q", feishu.Mode)
 	}

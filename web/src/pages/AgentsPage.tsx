@@ -6,19 +6,7 @@ import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
 import { useCursorStack, useRemote } from "../lib/hooks";
-import type { Agent, AgentMode, FeishuBotOption, MCP, ModelPolicy, Page, Skill } from "../lib/types";
-
-// modeLabel 把技术模式翻译成用户能理解的工作方式。
-function modeLabel(mode: AgentMode): string {
-  switch (mode) {
-    case "plan":
-      return "先计划再执行";
-    case "super":
-      return "多助手协作";
-    default:
-      return "边做边想";
-  }
-}
+import type { Agent, FeishuBotOption, MCP, ModelPolicy, Page, Skill } from "../lib/types";
 
 export default function AgentsPage() {
   const paging = useCursorStack();
@@ -179,7 +167,7 @@ export default function AgentsPage() {
                   <p className="mt-1 text-xs leading-5 text-muted">{agent.description || "还没有写描述，编辑时可以补上它擅长什么。"}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <Badge tone="info">{modeLabel(agent.mode)}</Badge>
+                  <Badge tone="info">边做边想</Badge>
                   <RowMenu name={agent.name}>
                     {agent.status === "draft" ? (
                       <MenuItem danger disabled={busy} onClick={() => setDeleting(agent)}>删除草稿</MenuItem>

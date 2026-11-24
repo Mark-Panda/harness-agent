@@ -21,9 +21,9 @@ type sessionModel struct {
 	UserID uuid.UUID `gorm:"type:uuid"`
 	// AgentID 绑定的 Agent 版本，可为空。
 	AgentID *uuid.UUID `gorm:"type:uuid"`
-	// ParentSessionID Supervisor 父会话。
+	// ParentSessionID 历史子会话的父会话，仅用于读取既有数据。
 	ParentSessionID *uuid.UUID `gorm:"type:uuid"`
-	// ParentRunID Supervisor 主 Run。
+	// ParentRunID 历史子会话关联的主 Run，仅用于读取既有数据。
 	ParentRunID *uuid.UUID `gorm:"type:uuid"`
 	// Title 会话标题。
 	Title string
@@ -334,22 +334,19 @@ func (r *SessionRepository) AppendMessageIdempotent(ctx context.Context, message
 	var existing messageModel
 	err = WithScope(ctx, r.db, Scope{UserID: message.UserID}, func(tx *gorm.DB) error {
 		// Hold the Run row through commit so cancellation or takeover cannot interleave
-		// between validation and insertion. Supervisor may write to its own child sessions.
+		// between validation and insertion.
 		// The materialized query evaluates the expiry after acquiring the lock.
 		var valid bool
 		if err := tx.Raw(`
 WITH locked_run AS MATERIALIZED (
   SELECT lease_expires_at FROM agent_runs
   WHERE id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?
-    AND (session_id = ? OR EXISTS (
-      SELECT 1 FROM supervisor_tasks
-      WHERE parent_run_id = agent_runs.id AND user_id = agent_runs.user_id AND child_session_id = ?
-    ))
+    AND session_id = ?
   FOR UPDATE
 )
 SELECT EXISTS (SELECT 1 FROM locked_run WHERE lease_expires_at > clock_timestamp())`,
 			*message.RunID, message.UserID, biz.RunRunning, fence.Owner, fence.Token,
-			message.SessionID, message.SessionID).Scan(&valid).Error; err != nil {
+			message.SessionID).Scan(&valid).Error; err != nil {
 			return err
 		}
 		if !valid {

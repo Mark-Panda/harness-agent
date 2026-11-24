@@ -16,6 +16,4 @@ package service
 //go:generate mockgen -source=../biz/step.go -destination=mocks/step.go -package=mocks
 //go:generate mockgen -source=../biz/approval.go -destination=mocks/approval.go -package=mocks
 //go:generate mockgen -source=../biz/budget.go -destination=mocks/budget.go -package=mocks
-//go:generate mockgen -source=../biz/plan.go -destination=mocks/plan.go -package=mocks
-//go:generate mockgen -source=../biz/supervisor.go -destination=mocks/supervisor.go -package=mocks
 //go:generate mockgen -source=../biz/feishu.go -destination=mocks/feishu.go -package=mocks

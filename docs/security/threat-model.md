@@ -11,11 +11,11 @@
 | 类别 | 主要威胁 | 必需控制 |
 |---|---|---|
 | 伪造身份 | JWT 伪造、Refresh Token 重用、飞书签名伪造、open_id 绑定冲突 | 签名与过期校验、Token Family 重用检测、Webhook 验签和时间窗口、冲突人工处理 |
-| 篡改 | 消息/Plan/Run 被并发回写、审计被修改、任务结果被过期 Worker 提交 | 状态机、乐观锁、fencing token、单调序号、Append-only 与验链 |
+| 篡改 | 消息/Run 被并发回写、审计被修改、任务结果被过期 Worker 提交 | 状态机、乐观锁、fencing token、单调序号、Append-only 与验链 |
 | 抵赖 | 管理员改配置、Agent 自动执行工具后无法追责 | Actor 与 On-Behalf 用户、关键操作同事务审计、审批与外部 Request ID |
 | 信息泄露 | 跨用户 IDOR、RLS 绕过、日志泄露 Secret、Prompt/Tool 返回泄露隐私 | 用户 Scope、RLS、非特权 DB 角色、统一脱敏、受控 Payload 权限与导出审计 |
 | 拒绝服务 | SSE 长连接、工具风暴、429 重试风暴、长上下文费用、队列积压 | 分层限流、并发/Token/费用预算、超时与背压、熔断、有限重试和有界队列 |
-| 提权 | MCP 越权、Worker 委派提升权限、Sandbox 逃逸、管理员接口暴露 | 权限交集、工具风险分级、人工审批、受限 Sandbox、最小 RBAC 和网络策略 |
+| 提权 | MCP 越权、Sandbox 逃逸、管理员接口暴露 | 工具风险分级、人工审批、受限 Sandbox、最小 RBAC 和网络策略 |
 
 ## 重点滥用场景
 

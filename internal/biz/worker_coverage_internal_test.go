@@ -4,11 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/google/uuid"
@@ -216,75 +213,6 @@ func TestRecentAttachmentTexts(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// requeueRunRepository captures the worker fence and update time for a paused Run.
-type requeueRunRepository struct {
-	RunRepository
-	calls int
-	fence RunFence
-	now   time.Time
-	err   error
-}
-
-func (r *requeueRunRepository) RequeuePausedRun(_ context.Context, _, _ uuid.UUID, fence RunFence, now time.Time) error {
-	r.calls++
-	r.fence, r.now = fence, now
-	return r.err
-}
-
-// TestRequeuePausedRun 验证暂停 Run 只退回 queued 并清空租约，排队补偿由 ClaimRun 统一完成。
-func TestRequeuePausedRun(t *testing.T) {
-	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
-	deadline := now.Add(-time.Minute)
-	updatedAt := now.Add(-2 * time.Minute)
-	run := Run{
-		ID: uuid.New(), UserID: uuid.New(), Status: RunRunning,
-		DeadlineAt: &deadline, UpdatedAt: updatedAt,
-	}
-
-	repo := &requeueRunRepository{}
-	worker := &ExecutionWorker{
-		runs:   repo,
-		clock:  func() time.Time { return now },
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	fence := RunFence{Owner: "worker-a", Token: 1}
-	if err := worker.requeuePausedRun(context.Background(), run, fence); err != nil {
-		t.Fatal(err)
-	}
-
-	if repo.calls != 1 || repo.fence != fence {
-		t.Fatalf("transition = %d calls with fence %+v", repo.calls, repo.fence)
-	}
-	if !repo.now.Equal(now) {
-		t.Fatalf("updated_at = %v, want %v", repo.now, now)
-	}
-
-	// 无截止时间：不得写入 deadline_at 字段。
-	repoNoDeadline := &requeueRunRepository{}
-	workerNoDeadline := &ExecutionWorker{
-		runs: repoNoDeadline, clock: func() time.Time { return now },
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-	if err := workerNoDeadline.requeuePausedRun(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Status: RunRunning}, fence); err != nil {
-		t.Fatal(err)
-	}
-	if repoNoDeadline.calls != 1 {
-		t.Fatalf("transition calls without deadline = %d, want 1", repoNoDeadline.calls)
-	}
-
-	// 冲突与仓储错误都只记录日志，不得 panic。
-	for _, cause := range []error{ErrResourceConflict, errors.New("db down")} {
-		repoErr := &requeueRunRepository{err: cause}
-		workerErr := &ExecutionWorker{
-			runs: repoErr, clock: func() time.Time { return now },
-			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		}
-		if err := workerErr.requeuePausedRun(context.Background(), run, fence); !errors.Is(err, cause) || repoErr.calls != 1 {
-			t.Fatalf("transition calls = %d, error = %v, want %v", repoErr.calls, err, cause)
-		}
 	}
 }
 

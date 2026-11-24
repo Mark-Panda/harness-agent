@@ -59,7 +59,7 @@ type ToolApproval struct {
 	RunID uuid.UUID
 	// StepID 请求审批的工具步骤，可为空。
 	StepID *uuid.UUID
-	// SessionID 发起工具调用的会话；Supervisor 子任务审批需要回填到子会话，零值表示主会话。
+	// SessionID 发起工具调用的会话；零值表示主会话。
 	SessionID uuid.UUID
 	// UserID 所属用户，RLS 隔离键；决策人必须与之一致。
 	UserID uuid.UUID
@@ -107,7 +107,7 @@ type ToolApprovalRepository interface {
 	CountPendingApprovals(ctx context.Context, userID, runID uuid.UUID) (int, error)
 	// DecideApproval 锁定父 Run 后以 CAS 方式把 pending 推进到 approved/denied；重复相同决策幂等返回。
 	DecideApproval(ctx context.Context, userID, runID, approvalID uuid.UUID, decision ApprovalDecision, decidedBy uuid.UUID, now time.Time) (ToolApproval, error)
-	// ClaimApprovalExecution 仅在 Run 租约及当前 Plan 状态允许时领取审批。
+	// ClaimApprovalExecution 仅在 Run 租约有效时允许领取审批。
 	ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence RunFence, now time.Time) (ToolApproval, error)
 	// FinishApprovalExecution 以 CAS 方式把 executing 推进到 executed/failed，并保存结果或脱敏错误。
 	FinishApprovalExecution(ctx context.Context, userID, approvalID uuid.UUID, status ApprovalStatus, result json.RawMessage, errorCode, errorMessage string, now time.Time) (ToolApproval, error)

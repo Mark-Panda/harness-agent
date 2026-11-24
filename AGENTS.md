@@ -62,17 +62,12 @@
 
 ---
 
-## 四、 Agent 三种模式工程级实现细节
+## 四、 Agent 执行模式工程级实现细节
 
-### 1. ReAct 模式 (默认)
+### ReAct 模式（唯一支持）
 *   **多轮上下文**：按 `user_id` + `session_id` 拉取历史组装进 Eino。
 *   **防死循环与去重**：Redis Key 需区分会话，记录工具调用 Hash，防止跨会话误拦截。单轮 ReAct 结束后，明细全量落盘 PG。
-
-### 2. Plan-and-Execute 模式
-*   **跨多轮恢复**：Planner 生成的步骤列表 (`[]Step`) 全量存入 PG，关联 `user_id` 和 `session_id`。用户（如通过飞书）再次触发时，恢复未完成的 Plan 状态。
-
-### 3. Supervisor 模式
-*   **子 Agent 上下文隔离**：Supervisor 委派任务时，为子 Agent 生成独立的 Session ID，其上下文归属于主用户，但独立存储，避免主会话上下文爆炸。利用 Eino 并发分支同时调度多个 Worker。
+*   **模式约束**：服务端仅接受 `react`，Agent 创建、发布、Run 创建与飞书路由均拒绝其他模式。
 
 ---
 
@@ -81,7 +76,7 @@
 
 *   `users`: `id`, `username`, `password_hash`, `feishu_open_id` (用于飞书映射), `created_at`
 *   `llm_providers`: `id`, `name`, `api_key_encrypted`, `base_url`, `created_at`
-*   `agents`: `id`, `user_id`, `name`, `mode` (react/plan/super), `llm_provider_id`, `created_at`
+*   `agents`: `id`, `user_id`, `name`, `mode` (仅 react), `llm_provider_id`, `created_at`
 *   `skills`: `id`, `name`, `description`, `prompt_template`, `parameters_json`
 *   `mcps`: `id`, `name`, `endpoint`, `auth_type`, `auth_credentials`
 *   `sessions`: `id`, `user_id`, `agent_id`, `title`, `feishu_chat_id` (若来自飞书群聊), `created_at`
@@ -112,10 +107,10 @@
 *   **任务 3**：实现向量语义检索，确保检索范围限定在当前 `user_id`。
 *   **任务 4**：开发 `/pkg/einoext`，实现上下文组装器及 DB 配置到 Eino 对象转化。
 
-### 阶段四：多轮对话与 Agent 模式落地 (第 7-8 周)
-*   **任务 1**：实现 ReAct、Plan-and-Execute、Supervisor 三种模式。
+### 阶段四：多轮对话与 ReAct 落地 (第 7-8 周)
+*   **任务 1**：实现 ReAct 执行循环与工具调用。
 *   **任务 2**：处理 SSE 流式输出，打通多用户多会话并发链路。
-*   **任务 3**：完善各模式及 Memory 层对应单测。
+*   **任务 3**：完善 ReAct 与 Memory 层对应单测。
 
 ### 阶段五：前端 Web 界面开发 (第 9-11 周)
 *   **任务 1**：初始化 React + Vite 项目，配置路由与状态管理。
@@ -163,7 +158,7 @@ harness-agent/
 │ └── static/ # 预留目录，用于存放 Go embed 的前端静态文件
 ├── pkg/ # 公共包
 │ ├── memory/ # 记忆与上下文管理 (多用户维度, 滑动窗口, 摘要, 向量检索)
-│ ├── einoext/ # Eino 适配层 (ReAct, Plan, Super, Context Builder)
+│ ├── einoext/ # Eino 适配层 (ReAct, Context Builder)
 │ └── feishu/ # 飞书集成适配层 (身份映射, 群聊解析, 事件回调)
 ├── Dockerfile # 多阶段构建：Node前端编译 + Go后端embed编译
 ├── go.mod # Go 依赖管理
@@ -218,6 +213,6 @@ CMD [“./harness-agent”]
 ## 九、 可观测性与安全要求
 
 1. **全链路追踪**：集成 OpenTelemetry。在 Kratos HTTP Middleware 中提取或生成 TraceID，并通过 Eino 的 Context 传递至 LLM 调用和 Tool 执行环节，确保一个多轮对话请求的完整链路在 Jaeger 中可查。
-2. **指标监控**：暴露 Prometheus Metrics（如 `agent_llm_tokens_total`, `agent_tool_call_duration_seconds`），按 `agent_mode` 打标签，便于监控不同模式下的 Token 消耗和工具延迟。
+2. **指标监控**：暴露 Prometheus Metrics（如 `agent_llm_tokens_total`, `agent_tool_call_duration_seconds`），按 `agent_mode` 打标签（当前仅 `react`），便于监控 Token 消耗和工具延迟。
 3. **安全与沙箱**：针对通过 MCP 接入的外部工具，尤其是涉及代码执行或系统命令的工具，必须在受限的 Docker 容器或 gVisor 沙箱中执行，限制网络出站和文件系统写权限。
 4. **多租户限流**：基于 Kratos 的限流中间件 + Redis，针对不同 `user_id` 实现令牌桶限流，防止单一用户高频调用拖垮全局服务。

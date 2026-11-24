@@ -162,8 +162,6 @@ func TestValidate(t *testing.T) {
 		{name: "worker run deadline below one minute", mutate: func(c *Config) { enableWorker(c); c.Agent.Worker.RunDeadline = dur(30 * time.Second) }, wantErr: "run_deadline must be positive and at least 1m"},
 		{name: "worker negative react tokens", mutate: func(c *Config) { enableWorker(c); c.Agent.Worker.ReactMaxTotalTokens = -1 }, wantErr: "token and cost budgets must not be negative"},
 		{name: "worker negative react cost", mutate: func(c *Config) { enableWorker(c); c.Agent.Worker.ReactMaxCost = -1 }, wantErr: "token and cost budgets must not be negative"},
-		{name: "worker negative supervisor tokens", mutate: func(c *Config) { enableWorker(c); c.Agent.Worker.SupervisorMaxTokens = -1 }, wantErr: "token and cost budgets must not be negative"},
-		{name: "worker negative supervisor cost", mutate: func(c *Config) { enableWorker(c); c.Agent.Worker.SupervisorMaxCost = -1 }, wantErr: "token and cost budgets must not be negative"},
 		{name: "worker react steps exhaust attempts", mutate: func(c *Config) {
 			enableWorker(c)
 			c.Agent.Worker.ReactMaxSteps = 6

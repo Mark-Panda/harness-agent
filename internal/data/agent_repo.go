@@ -22,7 +22,7 @@ type agentModel struct {
 	Name string
 	// Description Agent 描述。
 	Description string
-	// Mode 编排模式：react/plan/super。
+	// Mode 编排模式：目前仅支持 react。
 	Mode string
 	// ModelPolicyID 引用的模型策略 ID。
 	ModelPolicyID *uuid.UUID `gorm:"type:uuid"`

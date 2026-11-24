@@ -22,8 +22,8 @@
 | 循环终止 | `adversarial_tool_loop` | 返回 `ErrToolLoop` |
 | 未知工具 | `adversarial_unknown_tool` | 可恢复错误标记，不执行任意工具 |
 | 超大工具结果 | `adversarial_oversize_result` | 原文不进入上下文 |
-| Plan 成功/重试/恢复/取消/成本 | `go test ./internal/biz -run 'TestPlan'` | 状态机与预算断言 |
-| Supervisor 部分失败/并发/取消 | `go test ./internal/biz -run 'TestSupervisor'` | 部分失败显式、子任务不孤儿 |
+| ReAct 工具恢复 | `go test ./internal/biz -run 'TestReact'` | 未派发/已完成工具不重复执行 |
+| 审批暂停与恢复竞态 | `go test ./internal/biz -run 'TestApproval|TestResumeDecidedApproval'` | 审批门禁与恢复状态一致 |
 | 记忆相关性/冲突/摘要忠实度 | `REQUIRE_DATABASE=true go test -tags=integration ./internal/data -run TestMemoryQualityEvaluation` | Precision/Recall、MMR、事实冲突、跨用户零泄漏 |
 | 删除后不可召回 | `REQUIRE_DATABASE=true go test -tags=integration ./internal/data -run 'TestDeletion|TestPurgeExpired'` | 向量与摘要清理 |
 

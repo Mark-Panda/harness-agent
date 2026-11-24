@@ -86,14 +86,11 @@ func (w *ExecutionWorker) expiredRunSettlement(ctx context.Context, run Run) (Ru
 }
 
 func (w *ExecutionWorker) expiredRunMissingToolResult(ctx context.Context, run Run, steps []ExecutionStep) (bool, error) {
-	completed := make(map[uuid.UUID]bool)
 	hasCompleted := false
 	for _, step := range steps {
 		if step.Status == StepCompleted {
 			hasCompleted = true
-			if step.ParentStepID != nil {
-				completed[*step.ParentStepID] = true
-			}
+			break
 		}
 	}
 	if !hasCompleted {
@@ -118,20 +115,6 @@ func (w *ExecutionWorker) expiredRunMissingToolResult(ctx context.Context, run R
 				if _, exists := results[index][call.ID]; !exists && missingReactToolResult(run, call.ID, call.Name, steps) != nil {
 					return true, nil
 				}
-			}
-		}
-	case AgentModePlan:
-		if len(completed) == 0 || w.plans == nil {
-			return false, nil
-		}
-		plan, err := w.plans.GetPlanByRun(ctx, run.UserID, run.ID)
-		if err != nil {
-			return false, err
-		}
-		for _, step := range plan.Steps {
-			if step.Status == PlanStepUnknown ||
-				(step.Status == PlanStepRunning && step.ExecutionStepID != nil && completed[*step.ExecutionStepID]) {
-				return true, nil
 			}
 		}
 	}

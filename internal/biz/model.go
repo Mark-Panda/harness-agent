@@ -20,7 +20,7 @@ type ModelKind string
 type ModelStatus string
 
 const (
-	// ModelKindChat 生成类模型，参与 Chat/ReAct/Plan/Supervisor 调用。
+	// ModelKindChat 生成类模型，参与 Chat/ReAct 调用。
 	ModelKindChat ModelKind = "chat"
 	// ModelKindEmbedding 向量化模型，不受 1M 上下文限制。
 	ModelKindEmbedding ModelKind = "embedding"

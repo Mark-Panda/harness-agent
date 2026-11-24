@@ -321,20 +321,6 @@ func (mr *MockRunRepositoryMockRecorder) RenewRunLease(ctx, userID, runID, fence
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RenewRunLease", reflect.TypeOf((*MockRunRepository)(nil).RenewRunLease), ctx, userID, runID, fence, lease, now)
 }
 
-// RequeuePausedRun mocks base method.
-func (m *MockRunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "RequeuePausedRun", ctx, userID, runID, fence, now)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// RequeuePausedRun indicates an expected call of RequeuePausedRun.
-func (mr *MockRunRepositoryMockRecorder) RequeuePausedRun(ctx, userID, runID, fence, now any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RequeuePausedRun", reflect.TypeOf((*MockRunRepository)(nil).RequeuePausedRun), ctx, userID, runID, fence, now)
-}
-
 // ResumeRun mocks base method.
 func (m *MockRunRepository) ResumeRun(ctx context.Context, userID, runID uuid.UUID, now time.Time) (biz.Run, error) {
 	m.ctrl.T.Helper()

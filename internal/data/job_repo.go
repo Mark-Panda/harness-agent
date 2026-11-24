@@ -124,7 +124,7 @@ func (r *JobRepository) EnqueueRun(ctx context.Context, userID, runID uuid.UUID,
 	return catalogError("enqueue run job", err)
 }
 
-// HasRunJob 检查幂等重试的 Run 是否已入队，避免重复接管暂停计划。
+// HasRunJob 检查幂等重试的 Run 是否已入队，避免重复创建任务。
 func (r *JobRepository) HasRunJob(ctx context.Context, userID, runID uuid.UUID) (bool, error) {
 	var count int64
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {

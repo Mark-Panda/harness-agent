@@ -9,14 +9,7 @@ import type { AdminAgent, AdminUser, ModelPolicy, Page } from "../../lib/types";
 
 // modeLabel 把技术模式翻译成用户能理解的工作方式。
 function modeLabel(mode: string): string {
-  switch (mode) {
-    case "plan":
-      return "先计划再执行";
-    case "super":
-      return "多助手协作";
-    default:
-      return "边做边想";
-  }
+  return mode === "react" ? "边做边想" : mode;
 }
 
 export default function AdminAgentsPage() {

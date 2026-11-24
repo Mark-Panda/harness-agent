@@ -379,13 +379,6 @@ func (r *RunRepository) TransitionRun(ctx context.Context, userID, runID uuid.UU
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: run status changed concurrently", biz.ErrResourceConflict)
 		}
-		// Run 进入终态时同事务终止仍存活的 Plan/Supervisor 子状态，
-		// 避免执行树残留 pending/running 的孤儿记录。
-		if biz.RunTerminal(to) {
-			if err := cancelRunChildren(tx, userID, runID, "run_terminal", now); err != nil {
-				return err
-			}
-		}
 		return tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error
 	})
 	if err != nil {
@@ -421,11 +414,6 @@ func (r *RunRepository) CancelRunAndDenyPendingApprovals(ctx context.Context, us
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: run status changed concurrently", biz.ErrResourceConflict)
 		}
-		// 取消是终态，必须在同一事务内终止 Plan/Supervisor 子状态；
-		// 仅拒绝待审批记录会留下 pending 子任务与 waiting_approval 步骤。
-		if err := cancelRunChildren(tx, userID, runID, "run_cancelled", now); err != nil {
-			return err
-		}
 		if err := tx.Model(&toolApprovalModel{}).
 			Where("user_id = ? AND run_id = ? AND status = ?", userID, runID, string(biz.ApprovalPending)).
 			Updates(map[string]any{
@@ -441,7 +429,7 @@ func (r *RunRepository) CancelRunAndDenyPendingApprovals(ctx context.Context, us
 	return toBizRun(record)
 }
 
-// ExtendRunDeadline 延长非终态 Run 的截止时间，用于计划暂停后恢复时补偿暂停时长。
+// ExtendRunDeadline 延长非终态 Run 的截止时间，用于审批等待恢复时补偿暂停时长。
 func (r *RunRepository) ExtendRunDeadline(ctx context.Context, userID, runID uuid.UUID, deadline time.Time) (biz.Run, error) {
 	if userID == uuid.Nil || runID == uuid.Nil || deadline.IsZero() {
 		return biz.Run{}, fmt.Errorf("%w: run identity and deadline are required", biz.ErrInvalidConfig)
@@ -560,7 +548,7 @@ func (r *RunRepository) RenewRunLease(ctx context.Context, userID, runID uuid.UU
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-session:"+run.SessionID.String()).Error; err != nil {
 			return err
 		}
-		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			return err
 		}
 		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).
@@ -570,36 +558,30 @@ func (r *RunRepository) RenewRunLease(ctx context.Context, userID, runID uuid.UU
 }
 
 // lockRunningRunLease holds the Run through the caller's transaction and checks expiry after the lock.
-func lockRunningRunLease(tx *gorm.DB, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) (biz.AgentMode, error) {
-	var run struct{ Mode biz.AgentMode }
+func lockRunningRunLease(tx *gorm.DB, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
+	var record struct{ ID uuid.UUID }
 	result := tx.Raw(`
 WITH locked_run AS MATERIALIZED (
-  SELECT mode, lease_expires_at FROM agent_runs
+  SELECT id, lease_expires_at FROM agent_runs
   WHERE id = ? AND user_id = ? AND status = ? AND lease_owner = ? AND fencing_token = ?
   FOR UPDATE
 )
-SELECT mode FROM locked_run WHERE lease_expires_at > GREATEST(?::timestamptz, clock_timestamp())`,
-		runID, userID, biz.RunRunning, fence.Owner, fence.Token, now).Scan(&run)
+SELECT id FROM locked_run WHERE lease_expires_at > GREATEST(?::timestamptz, clock_timestamp())`,
+		runID, userID, biz.RunRunning, fence.Owner, fence.Token, now).Scan(&record)
 	if result.Error != nil {
-		return "", result.Error
+		return result.Error
 	}
 	if result.RowsAffected != 1 {
-		return "", fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+		return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
 	}
-	return run.Mode, nil
+	return nil
 }
 
 // AuthorizeToolDispatch validates dispatch and records possible external effects atomically.
 func (r *RunRepository) AuthorizeToolDispatch(ctx context.Context, userID, runID uuid.UUID, stepID *uuid.UUID, fence biz.RunFence, now time.Time) error {
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		mode, err := lockRunningRunLease(tx, userID, runID, fence, now)
-		if err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			return err
-		}
-		if mode == biz.AgentModePlan {
-			if _, err := lockExecutingPlan(tx, userID, runID, biz.PlanFence(fence), now); err != nil {
-				return err
-			}
 		}
 		if stepID == nil {
 			return nil
@@ -618,18 +600,6 @@ func (r *RunRepository) AuthorizeToolDispatch(ctx context.Context, userID, runID
 	return catalogError("authorize tool dispatch", err)
 }
 
-// RequeuePausedRun clears only the live lease held by the worker that observed the pause.
-func (r *RunRepository) RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
-	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
-			return err
-		}
-		fields := map[string]any{"status": biz.RunQueued, "lease_owner": "", "lease_expires_at": nil, "updated_at": now}
-		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).Updates(fields).Error
-	})
-	return catalogError("requeue paused run", err)
-}
-
 // PauseRun 在栅栏有效时把 running 推进到 waiting_approval，清空租约并在同一事务写入 run.paused 事件。
 // 重复暂停幂等返回既有记录，避免 Worker 在审批竞态下重复写事件。
 func (r *RunRepository) PauseRun(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) (biz.Run, error) {
@@ -638,7 +608,7 @@ func (r *RunRepository) PauseRun(ctx context.Context, userID, runID uuid.UUID, f
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			if errors.Is(err, biz.ErrResourceConflict) {
 				if lookupErr := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; lookupErr != nil {
 					return lookupErr
@@ -723,7 +693,7 @@ func (r *RunRepository) MarkRunReconciliationRequired(ctx context.Context, userI
 	}
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			if errors.Is(err, biz.ErrResourceConflict) {
 				if lookupErr := tx.First(&record, "id = ? AND user_id = ?", runID, userID).Error; lookupErr != nil {
 					return lookupErr
@@ -778,7 +748,7 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 	var record runModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		if from == biz.RunRunning {
-			if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 				return err
 			}
 		}
@@ -796,12 +766,6 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 		if result.RowsAffected != 1 {
 			return fmt.Errorf("%w: run lease or status changed concurrently", biz.ErrResourceConflict)
 		}
-		// 终态与子状态清理必须原子提交，防止 Run 已结束但 Plan/Supervisor 仍显示执行中。
-		if biz.RunTerminal(to) {
-			if err := cancelRunChildren(tx, userID, runID, "run_terminal", now); err != nil {
-				return err
-			}
-		}
 		// 事件与状态同事务写入；任何事件写入失败都会回滚终态，避免幽灵事件。
 		if event != nil {
 			if _, err := appendRunEvent(tx, *event); err != nil {
@@ -818,38 +782,6 @@ func (r *RunRepository) finishRun(ctx context.Context, userID, runID uuid.UUID, 
 	return toBizRun(record)
 }
 
-// cancelRunChildren 在 Run 进入取消/失败等终态时，同事务终止仍存活的 Plan 与 Supervisor 子状态。
-// 已处于终态的子记录保持不变；reason 写入错误码，便于审计区分用户取消与普通终态。
-// 暂停中的计划是允许被新 Run 重新绑定的可恢复状态，不能随父 Run 终止，否则“继续”会丢失全部进度。
-func cancelRunChildren(tx *gorm.DB, userID, runID uuid.UUID, reason string, now time.Time) error {
-	if err := tx.Model(&supervisorTaskModel{}).
-		Where("user_id = ? AND parent_run_id = ? AND status IN ?", userID, runID,
-			[]string{string(biz.SupervisorTaskPending), string(biz.SupervisorTaskRunning)}).
-		Updates(map[string]any{
-			"status": string(biz.SupervisorTaskCancelled), "error_code": reason, "error_message": "父 Run 已终止，子任务取消",
-			"finished_at": now.UTC(), "updated_at": now.UTC(),
-		}).Error; err != nil {
-		return err
-	}
-	if err := tx.Model(&planStepModel{}).
-		Where("user_id = ? AND plan_id IN (SELECT id FROM plans WHERE run_id = ? AND user_id = ? AND status <> ?) AND status IN ?",
-			userID, runID, userID, string(biz.PlanPaused),
-			[]string{string(biz.PlanStepPending), string(biz.PlanStepRunning), string(biz.PlanStepWaitingApproval)}).
-		Updates(map[string]any{
-			"status": string(biz.PlanStepCancelled), "error_code": reason, "error_message": "父 Run 已终止，计划步骤取消",
-			"finished_at": now.UTC(), "updated_at": now.UTC(),
-		}).Error; err != nil {
-		return err
-	}
-	return tx.Model(&planModel{}).
-		Where("user_id = ? AND run_id = ? AND status IN ?", userID, runID,
-			[]string{string(biz.PlanPlanning), string(biz.PlanExecuting), string(biz.PlanWaitingApproval)}).
-		Updates(map[string]any{
-			"status": string(biz.PlanCancelled), "error_code": reason, "error_message": "父 Run 已终止，计划取消",
-			"finished_at": now.UTC(), "updated_at": now.UTC(),
-		}).Error
-}
-
 // SetRunAttempt 在栅栏有效时更新当前 Attempt 序号，保证崩溃恢复后序号连续。
 func (r *RunRepository) SetRunAttempt(ctx context.Context, userID, runID uuid.UUID, attemptNo int, fence biz.RunFence) error {
 	if attemptNo < 0 {
@@ -857,10 +789,10 @@ func (r *RunRepository) SetRunAttempt(ctx context.Context, userID, runID uuid.UU
 	}
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
-		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			return err
 		}
-		// Supervisor attempts can start out of order, so the sequence never decreases.
+		// Attempts can start out of order, so the sequence never decreases.
 		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).
 			Updates(map[string]any{"attempt_no": gorm.Expr("GREATEST(attempt_no, ?)", attemptNo), "updated_at": now}).Error
 	})
@@ -887,7 +819,7 @@ func (r *RunRepository) AppendEventFenced(ctx context.Context, event biz.RunEven
 	var record runEventModel
 	err := WithScope(ctx, r.db, Scope{UserID: event.UserID}, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
-		if _, err := lockRunningRunLease(tx, event.UserID, event.RunID, fence, now); err != nil {
+		if err := lockRunningRunLease(tx, event.UserID, event.RunID, fence, now); err != nil {
 			return err
 		}
 		if err := tx.Model(&runModel{}).Where("id = ? AND user_id = ?", event.RunID, event.UserID).

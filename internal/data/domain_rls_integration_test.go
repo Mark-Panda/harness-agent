@@ -62,7 +62,7 @@ func TestDomainSchemaRLSAndModelConstraints(t *testing.T) {
 	if err := admin.Exec("INSERT INTO model_policy_candidates(policy_id, model_id, priority) VALUES (?, ?, 1)", policyID, modelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	agentID, sessionID, runID, stepID, planID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	agentID, sessionID, runID, stepID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	if err := admin.Exec("INSERT INTO agents(id, user_id, name, mode, model_policy_id, model_policy_version, status) VALUES (?, ?, 'agent', 'react', ?, 1, 'published')", agentID, userA.ID, policyID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -90,12 +90,6 @@ func TestDomainSchemaRLSAndModelConstraints(t *testing.T) {
 	if err := admin.Exec("INSERT INTO model_calls(run_id, step_id, user_id, attempt_no, provider_id, model_id) VALUES (?, ?, ?, 1, ?, ?)", runID, stepID, userA.ID, providerID, modelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := admin.Exec("INSERT INTO plans(id, run_id, session_id, user_id, version) VALUES (?, ?, ?, ?, 1)", planID, runID, sessionID, userA.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := admin.Exec("INSERT INTO plan_steps(plan_id, user_id, step_no, title) VALUES (?, ?, 1, 'step')", planID, userA.ID).Error; err != nil {
-		t.Fatal(err)
-	}
 	if err := admin.Exec("INSERT INTO session_summaries(session_id, user_id, version, summary_text) VALUES (?, ?, 1, 'summary')", sessionID, userA.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +114,7 @@ func TestDomainSchemaRLSAndModelConstraints(t *testing.T) {
 
 	tables := []string{
 		"agents", "sessions", "session_members", "messages", "agent_runs", "execution_steps", "execution_payloads",
-		"run_events", "model_calls", "plans", "plan_steps", "session_summaries", "memory_facts",
+		"run_events", "model_calls", "session_summaries", "memory_facts",
 		"external_conversation_bindings", "jobs", "outbox_events", "idempotency_keys", "deletion_requests",
 	}
 	for _, table := range tables {

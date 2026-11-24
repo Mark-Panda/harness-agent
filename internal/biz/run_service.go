@@ -100,7 +100,7 @@ type AdminRunFilter struct {
 }
 
 // RunDeadlineExtender 是可选的 Run 截止时间延长能力。
-// 用于计划暂停/恢复：暂停期间不应消耗执行窗口，恢复时按暂停时长顺延截止时间。
+// 用于审批暂停/恢复：暂停期间不应消耗执行窗口，恢复时按暂停时长顺延截止时间。
 type RunDeadlineExtender interface {
 	// ExtendRunDeadline 延长非终态 Run 的截止时间并返回最新记录。
 	ExtendRunDeadline(ctx context.Context, userID, runID uuid.UUID, deadline time.Time) (Run, error)
@@ -146,8 +146,6 @@ type RunRepository interface {
 	RenewRunLease(ctx context.Context, userID, runID uuid.UUID, fence RunFence, lease time.Duration, now time.Time) error
 	// AuthorizeToolDispatch checks a live Run lease and marks the pending tool step as dispatched.
 	AuthorizeToolDispatch(ctx context.Context, userID, runID uuid.UUID, stepID *uuid.UUID, fence RunFence, now time.Time) error
-	// RequeuePausedRun releases the current worker's lease after a Plan pause.
-	RequeuePausedRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) error
 	// PauseRun 在栅栏有效时把运行中的 Run 推进到 waiting_approval，并清空租约。
 	PauseRun(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) (Run, error)
 	// ResumeRun 在无待决策审批时把 waiting_approval 推进到 running，并清空租约。
@@ -191,7 +189,7 @@ func WithRunEnqueuer(queue RunEnqueuer) RunServiceOption {
 	}
 }
 
-// WithRunCreationTransaction groups Run creation, plan adoption, and enqueue on the same database.
+// WithRunCreationTransaction 让 Run 创建与入队共享同一个数据库事务。
 func WithRunCreationTransaction(transaction func(context.Context, func(context.Context) error) error) RunServiceOption {
 	return func(s *RunService) {
 		s.creationTransaction = transaction
@@ -226,20 +224,6 @@ func WithModelCalls(calls ModelCallRepository) RunServiceOption {
 	}
 }
 
-// WithSupervisorTasks 注入 Supervisor 子任务读取端口，用于执行树展示。
-func WithSupervisorTasks(tasks SupervisorTaskRepository) RunServiceOption {
-	return func(s *RunService) {
-		s.supervisorTasks = tasks
-	}
-}
-
-// WithPlanResume 注入计划仓储，用于在同一会话新建 Plan Run 时续跑未完成计划。
-func WithPlanResume(plans PlanRepository) RunServiceOption {
-	return func(s *RunService) {
-		s.plans = plans
-	}
-}
-
 // WithRunDeadline 设置单次 Run 的总时长上限；零值使用默认 5 分钟。
 func WithRunDeadline(deadline time.Duration) RunServiceOption {
 	return func(s *RunService) {
@@ -251,18 +235,16 @@ func WithRunDeadline(deadline time.Duration) RunServiceOption {
 
 // RunService 实现 Run 创建、查询、取消与事件读取。
 type RunService struct {
-	repo            RunRepository
-	sessions        SessionRepository
-	snapshots       RunSnapshotRepository
-	enqueuer        RunEnqueuer
-	steps           ExecutionStepRepository
-	approvals       ToolApprovalRepository
-	budgets         BudgetChecker
-	calls           ModelCallRepository
-	supervisorTasks SupervisorTaskRepository
-	plans           PlanRepository
-	clock           func() time.Time
-	deadline        time.Duration
+	repo      RunRepository
+	sessions  SessionRepository
+	snapshots RunSnapshotRepository
+	enqueuer  RunEnqueuer
+	steps     ExecutionStepRepository
+	approvals ToolApprovalRepository
+	budgets   BudgetChecker
+	calls     ModelCallRepository
+	clock     func() time.Time
+	deadline  time.Duration
 
 	creationTransaction func(context.Context, func(context.Context) error) error
 }
@@ -329,7 +311,7 @@ func (s *RunService) create(ctx context.Context, principal Principal, input Crea
 		(session.FeishuGroupProjection && (session.Source != SessionSourceFeishu || session.MemoryPolicy == SessionMemoryPrivate || session.AgentID != nil)) {
 		return Run{}, ErrForbidden
 	}
-	if input.Mode != AgentModeReact && input.Mode != AgentModePlan && input.Mode != AgentModeSupervisor {
+	if input.Mode != AgentModeReact {
 		return Run{}, invalid("unsupported run mode")
 	}
 	if (input.AgentID == nil) != (input.AgentVersion == nil) {
@@ -355,12 +337,12 @@ func (s *RunService) create(ctx context.Context, principal Principal, input Crea
 		ConfigSnapshot: configSnapshot, ModelPolicySnapshot: policySnapshot,
 	}
 	if s.creationTransaction == nil {
-		return s.createAndEnqueue(ctx, principal, run)
+		return s.createAndEnqueue(ctx, run)
 	}
 	var created Run
 	if err := s.creationTransaction(ctx, func(txCtx context.Context) error {
 		var err error
-		created, err = s.createAndEnqueue(txCtx, principal, run)
+		created, err = s.createAndEnqueue(txCtx, run)
 		return err
 	}); err != nil {
 		return Run{}, err
@@ -386,7 +368,7 @@ func (s *RunService) buildRunSnapshots(ctx context.Context, principal Principal,
 	return map[string]any{"feishu_shared_group": true}, policySnapshot, err
 }
 
-func (s *RunService) createAndEnqueue(ctx context.Context, principal Principal, run Run) (Run, error) {
+func (s *RunService) createAndEnqueue(ctx context.Context, run Run) (Run, error) {
 	created, err := s.repo.CreateRun(ctx, run)
 	if err != nil {
 		return Run{}, err
@@ -394,22 +376,10 @@ func (s *RunService) createAndEnqueue(ctx context.Context, principal Principal, 
 	if created.Status != RunQueued {
 		return created, nil
 	}
-	var alreadyEnqueued bool
-	if lookup, ok := s.enqueuer.(RunJobLookup); ok && created.ID != run.ID {
-		alreadyEnqueued, err = lookup.HasRunJob(ctx, created.UserID, created.ID)
-		if err != nil {
-			return Run{}, err
-		}
-	}
-	// 旧版本遗留的排队 Run 可以通过幂等重试补齐任务；已入队的 Run 不再接管计划。
-	var adopted *Plan
-	if !alreadyEnqueued {
-		adopted = s.adoptPausedPlan(ctx, principal, created)
-	}
 	if s.enqueuer != nil {
 		if err := s.enqueuer.EnqueueRun(ctx, created.UserID, created.ID, s.clock()); err != nil {
 			if s.creationTransaction == nil {
-				s.abortUnqueuedRun(ctx, principal, created, adopted, err)
+				s.abortUnqueuedRun(ctx, created, err)
 			}
 			return Run{}, err
 		}
@@ -417,8 +387,8 @@ func (s *RunService) createAndEnqueue(ctx context.Context, principal Principal, 
 	return created, nil
 }
 
-// abortUnqueuedRun 在 Run 入队失败时做补偿：把 Run 推进到失败终态并恢复被接管的暂停计划。
-func (s *RunService) abortUnqueuedRun(ctx context.Context, principal Principal, created Run, adopted *Plan, cause error) {
+// abortUnqueuedRun 在 Run 入队失败时做补偿：把 Run 推进到失败终态。
+func (s *RunService) abortUnqueuedRun(ctx context.Context, created Run, cause error) {
 	// 入队失败后请求上下文可能很快取消，补偿动作必须脱离取消信号完成。
 	writeContext := context.WithoutCancel(ctx)
 	message := truncateUTF8Bytes(cause.Error(), 512)
@@ -430,151 +400,6 @@ func (s *RunService) abortUnqueuedRun(ctx context.Context, principal Principal, 
 	s.emitRunEvent(writeContext, created, "run.failed", map[string]any{
 		"code": "run_enqueue_failed", "message": message,
 	})
-	if adopted == nil || s.plans == nil {
-		return
-	}
-	// RebindPlanRun 已把计划推进到 executing；入队失败后没有执行者，重新置为 paused，
-	// 下一次带恢复意图的消息仍可接管该计划。
-	if _, err := s.plans.UpdatePlan(writeContext, principal.UserID, adopted.ID, PlanExecuting, PlanPaused,
-		adopted.Revision, PlanFence{}, PlanUpdate{ErrorCode: "run_enqueue_failed", ErrorMessage: message}); err != nil {
-		s.emitRunEvent(writeContext, created, "plan.resume_failed", map[string]any{
-			"plan_id": adopted.ID.String(), "reason": "restore_paused_failed", "error": err.Error(),
-		})
-	}
-}
-
-// adoptPausedPlan 把会话中最近一个暂停中的计划迁移到新 Run，保留已完成步骤继续执行。
-// 迁移失败或当前模式无法续跑时不阻断新 Run，但会写入可观测事件，避免静默丢失用户计划。
-func (s *RunService) adoptPausedPlan(ctx context.Context, principal Principal, created Run) *Plan {
-	if s.plans == nil {
-		return nil
-	}
-	plan, err := s.plans.FindPausedPlanBySession(ctx, principal.UserID, created.SessionID)
-	if err != nil || plan.ID == uuid.Nil || plan.RunID == created.ID {
-		return nil
-	}
-	if created.Mode != AgentModePlan {
-		// 非 Plan 模式无法驱动计划步骤：保持计划暂停等待显式恢复，同时让用户知道本次消息没有续跑计划。
-		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "run_mode_not_plan", "mode": string(created.Mode),
-		})
-		return nil
-	}
-	if !s.hasPlanResumeIntent(ctx, principal.UserID, created) {
-		// 暂停是用户显式控制；新任务不能无条件接管旧计划。显式“继续/恢复”或计划 Resume API 才会续跑。
-		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "resume_intent_missing",
-		})
-		return nil
-	}
-	latest, err := s.pausedPlanIsLatest(ctx, principal.UserID, created, plan)
-	if err != nil {
-		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "latest_plan_lookup_failed", "error": err.Error(),
-		})
-		return nil
-	}
-	if !latest {
-		// 用户暂停 A 后又创建了 B：“继续”不能再把 A 抢回来。此时应通过具体 Run 的 Resume API 选择计划。
-		s.emitRunEvent(ctx, created, "plan.resume_skipped", map[string]any{
-			"plan_id": plan.ID.String(), "reason": "resume_target_changed",
-		})
-		return nil
-	}
-	var rebound Plan
-	reason := "rebind_failed"
-	adopt := func(ctx context.Context) error {
-		// 旧 Run 仍在后台轮询，先取消以避免它再次生成计划。
-		if _, err := s.Cancel(ctx, principal, plan.RunID); err != nil {
-			old, getErr := s.repo.GetRun(ctx, principal.UserID, plan.RunID)
-			if getErr != nil || !RunTerminal(old.Status) {
-				reason = "cancel_previous_run_failed"
-				return err
-			}
-		}
-		var err error
-		rebound, err = s.plans.RebindPlanRun(ctx, principal.UserID, plan.ID, created.ID, plan.Revision, created.DeadlineAt, s.clock())
-		return err
-	}
-	if s.creationTransaction != nil {
-		err = s.creationTransaction(ctx, adopt)
-	} else {
-		err = adopt(ctx)
-	}
-	if err != nil {
-		s.emitRunEvent(ctx, created, "plan.resume_failed", map[string]any{
-			"plan_id": plan.ID.String(), "reason": reason, "error": err.Error(),
-		})
-		return nil
-	}
-	s.emitRunEvent(ctx, created, "plan.resumed", map[string]any{
-		"plan_id": plan.ID.String(), "previous_run_id": plan.RunID.String(),
-	})
-	return &rebound
-}
-
-// pausedPlanIsLatest 确认暂停计划仍属于会话最近一次 Plan 执行，避免恢复已经被新任务取代的旧计划。
-func (s *RunService) pausedPlanIsLatest(ctx context.Context, userID uuid.UUID, created Run, plan Plan) (bool, error) {
-	cursor := ""
-	for {
-		page, err := s.repo.ListRuns(ctx, userID, created.SessionID, 20, cursor)
-		if err != nil {
-			return false, err
-		}
-		for _, candidate := range page.Items {
-			if candidate.ID == created.ID || candidate.Mode != AgentModePlan {
-				continue
-			}
-			return candidate.ID == plan.RunID, nil
-		}
-		if page.NextCursor == "" {
-			// 没有其他 Plan Run 时，暂停计划就是当前唯一可恢复目标。
-			return true, nil
-		}
-		cursor = page.NextCursor
-	}
-}
-
-// hasPlanResumeIntent 只在当前触发消息明确表示续跑时返回 true。
-// 新消息一定是最近写入的用户消息，因此只需在既有触发消息回看窗口内确认内容。
-func (s *RunService) hasPlanResumeIntent(ctx context.Context, userID uuid.UUID, run Run) bool {
-	if run.TriggerMessageID == nil {
-		return false
-	}
-	page, err := s.sessions.ListMessages(ctx, userID, run.SessionID, triggerMessageLookback, "")
-	if err != nil {
-		return false
-	}
-	for _, message := range page.Items {
-		if message.ID == *run.TriggerMessageID && message.Role == MessageUser {
-			return isPlanResumeIntent(message.Content)
-		}
-	}
-	return false
-}
-
-// isPlanResumeIntent 识别简短的显式续跑指令，避免把包含“继续”一词的新任务误判为恢复计划。
-// 允许常见礼貌前缀与句末语气词（“请继续吧”“那就接着做”），但仍要求去掉修饰后是完整指令。
-func isPlanResumeIntent(content string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(content))
-	normalized = strings.Trim(normalized, " 。！!．.，,、~～:：")
-	for _, negative := range []string{"不要继续", "别继续", "不用继续", "不要恢复", "别恢复", "取消继续", "停止继续"} {
-		if strings.Contains(normalized, negative) {
-			return false
-		}
-	}
-	normalized = strings.TrimLeft(normalized, "请麻烦帮我那就你们")
-	normalized = strings.TrimLeft(normalized, " ，,、:：")
-	normalized = strings.TrimRight(normalized, "吧啊呀哦了呢嘛")
-	normalized = strings.TrimSpace(normalized)
-	switch normalized {
-	case "继续", "继续执行", "继续做", "继续干", "继续跑", "继续计划", "继续任务",
-		"接着", "接着执行", "接着做", "接着干", "恢复", "恢复执行", "恢复计划", "恢复任务", "续跑",
-		"continue", "continue plan", "continue execution", "resume", "resume plan", "resume execution":
-		return true
-	default:
-		return false
-	}
 }
 
 // emitRunEvent 追加 Run 事件；事件失败不影响主流程，但保证降级路径可审计。
@@ -767,7 +592,7 @@ func (s *RunService) ListAll(ctx context.Context, principal Principal, filter Ad
 	return s.repo.ListAllRuns(ctx, filter, limit, cursor)
 }
 
-// Enqueue 把非终态 Run 重新加入执行队列，用于恢复暂停的 Plan 或人工重放。
+// Enqueue 把非终态 Run 重新加入执行队列，用于人工重放。
 func (s *RunService) Enqueue(ctx context.Context, principal Principal, runID uuid.UUID) error {
 	if principal.UserID == uuid.Nil {
 		return ErrForbidden
@@ -837,7 +662,7 @@ func (s *RunService) ExtendDeadline(ctx context.Context, principal Principal, ru
 	return extender.ExtendRunDeadline(ctx, principal.UserID, runID, base.Add(extension))
 }
 
-// ResumeAfterPause 把因计划暂停而退回队列的 Run 重新入队。
+// ResumeAfterPause 把因审批暂停而退回队列的 Run 重新入队。
 // 若 Run 停在等待审批状态，只有不存在待决策审批时才自动恢复；仍有审批时保持等待，
 // 由审批决策路径推进，避免恢复动作绕过人工审批。
 func (s *RunService) ResumeAfterPause(ctx context.Context, principal Principal, runID uuid.UUID) (Run, error) {
@@ -860,7 +685,7 @@ func (s *RunService) ResumeAfterPause(ctx context.Context, principal Principal, 
 			return Run{}, err
 		}
 		if pending > 0 {
-			// 审批仍未决策：Run 保持等待，恢复计划不改变审批门禁。
+			// 审批仍未决策：Run 保持等待，恢复动作不改变审批门禁。
 			return run, nil
 		}
 		resumed, err := s.repo.ResumeRun(ctx, principal.UserID, runID, s.clock())
@@ -925,7 +750,6 @@ func (s *RunService) ResolveReconciliation(
 }
 
 // Cancel 在同一事务中取消排队、执行中或等待审批的 Run，并拒绝全部待决策审批。
-// 计划不在此处取消：暂停中的计划会被新 Run 重新绑定并恢复，取消 Run 只是释放旧执行窗口。
 func (s *RunService) Cancel(ctx context.Context, principal Principal, runID uuid.UUID) (Run, error) {
 	if principal.UserID == uuid.Nil {
 		return Run{}, ErrForbidden
@@ -959,20 +783,6 @@ func (s *RunService) ListModelCalls(ctx context.Context, principal Principal, ru
 		return []ModelCall{}, nil
 	}
 	return s.calls.ListModelCalls(ctx, principal.UserID, runID, 200)
-}
-
-// ListSupervisorTasks 读取 Run 的 Supervisor 子任务；未配置仓储时返回空列表。
-func (s *RunService) ListSupervisorTasks(ctx context.Context, principal Principal, runID uuid.UUID) ([]SupervisorTask, error) {
-	if principal.UserID == uuid.Nil {
-		return nil, ErrForbidden
-	}
-	if _, err := s.repo.GetRun(ctx, principal.UserID, runID); err != nil {
-		return nil, err
-	}
-	if s.supervisorTasks == nil {
-		return []SupervisorTask{}, nil
-	}
-	return s.supervisorTasks.ListTasks(ctx, principal.UserID, runID)
 }
 
 // RecordPayloadAccess 记录载荷查阅审计事件：理由必填并写入 Run 事件流，便于事后追责。
@@ -1154,17 +964,6 @@ func (s *RunService) DecideApproval(ctx context.Context, principal Principal, ru
 	}
 	if pending > 0 {
 		return updated, nil
-	}
-	// PlanPaused 只代表人工暂停及其恢复失败状态，审批完成不得越过该门禁。
-	// 正常工具审批使用 PlanWaitingApproval，仍按原链路自动恢复。
-	if s.plans != nil {
-		plan, planErr := s.plans.GetPlanByRun(ctx, principal.UserID, runID)
-		if planErr != nil && !errors.Is(planErr, ErrResourceNotFound) {
-			return ToolApproval{}, planErr
-		}
-		if planErr == nil && plan.Status == PlanPaused {
-			return updated, nil
-		}
 	}
 	// 全部决策完成：把等待审批的 Run 推回 running；已由 Worker 恢复的 Run 保持原状态。
 	if run.Status == RunWaitingApproval {

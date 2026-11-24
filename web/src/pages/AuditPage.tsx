@@ -8,18 +8,6 @@ import { formatDateTime, formatDuration, formatRelative, statusLabel, statusTone
 import { useClientPage, useCursorStack, useRemote } from "../lib/hooks";
 import type { AdminRun, AdminUser, Page, Run, Session } from "../lib/types";
 
-// modeLabel 把工作方式翻译成用户语言。
-function modeLabel(mode: string): string {
-  switch (mode) {
-    case "plan":
-      return "先计划再执行";
-    case "super":
-      return "多助手协作";
-    default:
-      return "边做边想";
-  }
-}
-
 // sourceLabel 把会话来源翻译成用户语言。
 function sourceLabel(source: string): string {
   switch (source) {
@@ -148,7 +136,7 @@ export default function AuditPage() {
                       <td role="cell" data-column="会话" className="max-w-[220px] truncate py-3 pr-4 text-ink-soft">{run.session_title || run.session_id.slice(0, 8)}</td>
                       <td role="cell" data-column="来源" className="py-3 pr-4"><Badge tone={run.source === "feishu" ? "info" : "neutral"}>{sourceLabel(run.source)}</Badge></td>
                       <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
-                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
+                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{run.mode === "react" ? "边做边想" : run.mode}</td>
                       <td role="cell" data-column="尝试" className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
                       <td role="cell" data-column="耗时" className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
                       <td role="cell" data-column="创建时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>
@@ -276,7 +264,7 @@ export default function AuditPage() {
                     <tr role="row" key={run.id}>
                       <td role="cell" data-row="main" className="py-3 pr-4 font-mono text-xs text-ink-soft">{run.id.slice(0, 12)}</td>
                       <td role="cell" data-column="状态" className="py-3 pr-4"><Badge tone={statusTone(run.status)}>{statusLabel(run.status)}</Badge></td>
-                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{modeLabel(run.mode)}</td>
+                      <td role="cell" data-column="工作方式" className="py-3 pr-4 text-ink-soft">{run.mode === "react" ? "边做边想" : run.mode}</td>
                       <td role="cell" data-column="尝试次数" className="py-3 pr-4 text-ink-soft">{run.attempt_no}</td>
                       <td role="cell" data-column="耗时" className="py-3 pr-4 text-xs text-muted">{formatDuration(run.started_at, run.finished_at)}</td>
                       <td role="cell" data-column="创建时间" className="py-3 pr-4 text-xs text-muted">{formatDateTime(run.created_at)}</td>

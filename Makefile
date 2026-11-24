@@ -70,7 +70,7 @@ test-coverage:
 
 test-quality:
 	go test -count=1 ./tests/quality
-	go test -count=1 -run 'TestPlan|TestSupervisor' ./internal/biz
+	go test -count=1 -run 'TestReact' ./internal/biz
 
 test-web: web-install
 	npm --prefix web test

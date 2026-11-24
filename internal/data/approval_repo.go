@@ -279,37 +279,15 @@ func (r *ToolApprovalRepository) DecideApproval(ctx context.Context, userID, run
 	return toBizApproval(record)
 }
 
-// ClaimApprovalExecution atomically authorizes dispatch against the live Run and Plan.
+// ClaimApprovalExecution atomically authorizes dispatch against the live Run.
 func (r *ToolApprovalRepository) ClaimApprovalExecution(ctx context.Context, userID, runID, approvalID uuid.UUID, fence biz.RunFence, now time.Time) (biz.ToolApproval, error) {
 	var record toolApprovalModel
 	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
-		mode, err := lockRunningRunLease(tx, userID, runID, fence, now)
-		if err != nil {
+		if err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
 			return err
 		}
-		claim := tx.Model(&toolApprovalModel{}).
-			Where("id = ? AND user_id = ? AND run_id = ? AND status = ?", approvalID, userID, runID, biz.ApprovalApproved)
-		if mode == biz.AgentModePlan {
-			plan, err := lockLatestRunPlan(tx, userID, runID)
-			if err != nil {
-				return err
-			}
-			switch biz.PlanStatus(plan.Status) {
-			case biz.PlanPaused:
-				return biz.ErrPlanPaused
-			case biz.PlanCancelled:
-				return biz.ErrPlanCancelled
-			case biz.PlanExecuting, biz.PlanWaitingApproval:
-				claim = claim.Where(`EXISTS (
-					SELECT 1 FROM plan_steps
-					WHERE plan_id = ? AND user_id = ? AND status = 'waiting_approval'
-					  AND tool_approvals.tool_call_id = 'plan-step-' || plan_steps.id::text
-				)`, plan.ID, userID)
-			default:
-				return fmt.Errorf("%w: plan is not accepting tool execution", biz.ErrResourceConflict)
-			}
-		}
-		result := claim.
+		result := tx.Model(&toolApprovalModel{}).
+			Where("id = ? AND user_id = ? AND run_id = ? AND status = ?", approvalID, userID, runID, biz.ApprovalApproved).
 			Updates(map[string]any{"status": string(biz.ApprovalExecuting), "updated_at": now})
 		if result.Error != nil {
 			return result.Error
@@ -421,24 +399,8 @@ func (r *ToolApprovalRepository) DeliverApprovalAtomically(ctx context.Context, 
 	}
 	stored := record
 	err = WithScope(ctx, r.db, Scope{UserID: approval.UserID}, func(tx *gorm.DB) error {
-		mode, err := lockRunningRunLease(tx, approval.UserID, approval.RunID, delivery.Fence, now)
-		if err != nil {
+		if err := lockRunningRunLease(tx, approval.UserID, approval.RunID, delivery.Fence, now); err != nil {
 			return err
-		}
-		if mode == biz.AgentModePlan {
-			plan, err := lockLatestRunPlan(tx, approval.UserID, approval.RunID)
-			if err != nil {
-				return err
-			}
-			switch biz.PlanStatus(plan.Status) {
-			case biz.PlanPaused:
-				return biz.ErrPlanPaused
-			case biz.PlanCancelled:
-				return biz.ErrPlanCancelled
-			case biz.PlanExecuting, biz.PlanWaitingApproval:
-			default:
-				return fmt.Errorf("%w: plan is not accepting approval delivery", biz.ErrResourceConflict)
-			}
 		}
 
 		var runSessionIDText string
@@ -466,11 +428,8 @@ func (r *ToolApprovalRepository) DeliverApprovalAtomically(ctx context.Context, 
 		var validSession bool
 		if err := tx.Raw(`SELECT EXISTS (
 			SELECT 1 FROM agent_runs AS ar
-			WHERE ar.id = ? AND ar.user_id = ? AND (ar.session_id = ? OR EXISTS (
-				SELECT 1 FROM supervisor_tasks AS st
-				WHERE st.parent_run_id = ar.id AND st.user_id = ar.user_id AND st.child_session_id = ?
-			))
-		)`, approval.RunID, approval.UserID, message.SessionID, message.SessionID).Scan(&validSession).Error; err != nil {
+			WHERE ar.id = ? AND ar.user_id = ? AND ar.session_id = ?
+		)`, approval.RunID, approval.UserID, message.SessionID).Scan(&validSession).Error; err != nil {
 			return err
 		}
 		if !validSession {

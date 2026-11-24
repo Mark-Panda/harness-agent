@@ -20,7 +20,7 @@ type runRequest struct {
 	AgentID *uuid.UUID `json:"agent_id"`
 	// AgentVersion 可选的 Agent 版本号，与 AgentID 成对出现。
 	AgentVersion *int `json:"agent_version"`
-	// Mode 编排模式：react/plan/super。
+	// Mode 编排模式：目前仅支持 react。
 	Mode biz.AgentMode `json:"mode"`
 	// TriggerMessageID 可选的触发消息 ID；缺省时取会话内最近一条用户消息。
 	TriggerMessageID *uuid.UUID `json:"trigger_message_id"`
@@ -196,7 +196,7 @@ func (h *platformHTTPHandler) runEvents(w http.ResponseWriter, r *http.Request) 
 	// Kratos 的全局 HTTP Timeout（15s）会给请求 Context 加截止时间；
 	// SSE 需要跨越多分钟执行，因此这里脱离该 Deadline，改用每轮查询超时 + 写失败检测。
 	streamCtx := context.WithoutCancel(r.Context())
-	// 长任务的 Plan/Supervisor 执行可能远超 5 分钟；连接上限应覆盖 Run 的最长执行窗口，
+	// 长任务的执行可能远超 5 分钟；连接上限应覆盖 Run 的最长执行窗口，
 	// 而不是在任务仍活跃时直接截断事件流。终态检测仍会立即关闭连接。
 	deadline := time.Now().Add(currentSSEStreamTimeout())
 	heartbeat := time.NewTicker(15 * time.Second)
@@ -401,32 +401,6 @@ func attemptResponse(call biz.ModelCall) map[string]any {
 		"duration_ms": call.DurationMS, "finish_reason": call.FinishReason, "switch_reason": call.SwitchReason,
 		"error_class": call.ErrorClass, "error_message": call.ErrorMessage,
 		"created_at": call.CreatedAt, "completed_at": call.CompletedAt,
-	}
-}
-
-// runSupervisorTasks 处理 GET /api/v1/runs/{id}/supervisor-tasks：返回 Worker 执行树。
-func (h *platformHTTPHandler) runSupervisorTasks(w http.ResponseWriter, r *http.Request) {
-	runID, ok := pathUUID(w, r)
-	if !ok {
-		return
-	}
-	tasks, err := h.service.Runs.ListSupervisorTasks(r.Context(), requestPrincipal(r), runID)
-	if err != nil {
-		writePlatformError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": mapItems(tasks, supervisorTaskResponse)})
-}
-
-// supervisorTaskResponse 构造 Supervisor 子任务出参，不包含任何凭证或隐藏推理。
-func supervisorTaskResponse(task biz.SupervisorTask) map[string]any {
-	return map[string]any{
-		"id": task.ID, "parent_run_id": task.ParentRunID, "child_session_id": task.ChildSessionID,
-		"worker_name": task.WorkerName, "worker_index": task.WorkerIndex, "task": task.Task,
-		"tool_scope": task.ToolScope, "status": task.Status, "attempts": task.Attempts,
-		"max_attempts": task.MaxAttempts, "result": task.Result, "error_code": task.ErrorCode,
-		"error_message": task.ErrorMessage, "depth": task.Depth,
-		"started_at": task.StartedAt, "finished_at": task.FinishedAt, "created_at": task.CreatedAt,
 	}
 }
 

@@ -58,9 +58,9 @@ type Session struct {
 	UserID uuid.UUID
 	// AgentID 绑定的已发布 Agent，可为空。
 	AgentID *uuid.UUID
-	// ParentSessionID Supervisor 子会话的父会话，普通会话为空。
+	// ParentSessionID 历史子会话的父会话，仅用于读取既有数据，普通会话为空。
 	ParentSessionID *uuid.UUID
-	// ParentRunID Supervisor 子会话关联的主 Run，普通会话为空。
+	// ParentRunID 历史子会话关联的主 Run，仅用于读取既有数据，普通会话为空。
 	ParentRunID *uuid.UUID
 	// Title 会话标题。
 	Title string

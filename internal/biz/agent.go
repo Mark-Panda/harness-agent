@@ -18,10 +18,6 @@ type AgentStatus string
 const (
 	// AgentModeReact ReAct 模式，多轮工具调用。
 	AgentModeReact AgentMode = "react"
-	// AgentModePlan Plan-and-Execute 模式，先规划再执行。
-	AgentModePlan AgentMode = "plan"
-	// AgentModeSupervisor Supervisor 模式，委派多个子 Agent。
-	AgentModeSupervisor AgentMode = "super"
 	// AgentDraft 草稿版本，可编辑。
 	AgentDraft AgentStatus = "draft"
 	// AgentPublished 已发布版本，内容不可变，可被会话引用。
@@ -379,7 +375,7 @@ func (s *AgentService) validate(ctx context.Context, agent *Agent, publishing bo
 	if agent.ID == uuid.Nil || agent.UserID == uuid.Nil || agent.Name == "" || len(agent.Name) > 128 || len(agent.Description) > 4096 || agent.Version <= 0 {
 		return invalid("agent identity, name, description and version are invalid")
 	}
-	if agent.Mode != AgentModeReact && agent.Mode != AgentModePlan && agent.Mode != AgentModeSupervisor {
+	if agent.Mode != AgentModeReact {
 		return invalid("unsupported agent mode")
 	}
 	// 策略 ID 与版本必须成对出现，避免引用不存在的版本。

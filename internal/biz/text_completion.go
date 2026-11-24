@@ -205,6 +205,9 @@ func suffixWithinTokenBudget(text string, budget int) string {
 	return string(runes[len(runes)-low:])
 }
 
+// textAggregateDefaultPromptTokens 在未配置全局裁剪预算时，仍为直接汇总调用提供明确上界。
+const textAggregateDefaultPromptTokens = 32_000
+
 // boundedTextAggregateBudget 给汇总调用设置确定上界；未配置全局预算时使用默认值，
 // 同时仍按模型窗口扣除输出与安全余量。
 func boundedTextAggregateBudget(configured int, minWindow int64, reserveOutput, safetyMargin int) int {

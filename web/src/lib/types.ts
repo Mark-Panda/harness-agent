@@ -248,7 +248,7 @@ export interface MCPTool {
   input_schema: Record<string, unknown> | null;
 }
 
-export type AgentMode = "react" | "plan" | "super";
+export type AgentMode = "react";
 export type AgentStatus = "draft" | "published" | "disabled" | "archived";
 
 // FeishuBotStatus 飞书机器人启停状态。
@@ -551,75 +551,6 @@ export interface ModelAttempt {
   error_message: string;
   created_at: string;
   completed_at: string | null;
-}
-
-export type PlanStatus = "planning" | "executing" | "waiting_approval" | "paused" | "completed" | "failed" | "cancelled";
-export type PlanStepStatus = "pending" | "running" | "waiting_approval" | "completed" | "failed" | "skipped" | "cancelled" | "unknown";
-
-export interface PlanStep {
-  id: string;
-  plan_id: string;
-  step_no: number;
-  title: string;
-  description: string;
-  depends_on: number[];
-  tool_name: string;
-  arguments: Record<string, unknown> | null;
-  idempotency_key: string;
-  status: PlanStepStatus;
-  attempts: number;
-  max_attempts: number;
-  execution_step_id: string | null;
-  result: Record<string, unknown> | null;
-  error_code: string;
-  error_message: string;
-  started_at: string | null;
-  finished_at: string | null;
-}
-
-export interface Plan {
-  id: string;
-  run_id: string;
-  session_id: string;
-  version: number;
-  parent_plan_id: string | null;
-  status: PlanStatus;
-  goal: string;
-  config_snapshot: Record<string, unknown> | null;
-  max_steps: number;
-  total_input_tokens: number;
-  total_output_tokens: number;
-  estimated_cost: number;
-  deadline_at: string | null;
-  error_code: string;
-  error_message: string;
-  revision: number;
-  created_at: string;
-  updated_at: string;
-  finished_at: string | null;
-  steps: PlanStep[];
-}
-
-export type SupervisorTaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled" | "unknown";
-
-export interface SupervisorTask {
-  id: string;
-  parent_run_id: string;
-  child_session_id: string;
-  worker_name: string;
-  worker_index: number;
-  task: string;
-  tool_scope: string[];
-  status: SupervisorTaskStatus;
-  attempts: number;
-  max_attempts: number;
-  result: Record<string, unknown> | null;
-  error_code: string;
-  error_message: string;
-  depth: number;
-  started_at: string | null;
-  finished_at: string | null;
-  created_at: string;
 }
 
 export interface DeletionRequest {

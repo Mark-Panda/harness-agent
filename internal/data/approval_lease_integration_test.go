@@ -57,7 +57,7 @@ func TestExpiredRunLeaseCannotReviveAfterAnotherRunClaimsSession(t *testing.T) {
 	}
 }
 
-func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
+func TestApprovalExecutionRequiresActiveRun(t *testing.T) {
 	if os.Getenv("REQUIRE_DATABASE") != "true" {
 		t.Skip("requires PostgreSQL")
 	}
@@ -74,25 +74,19 @@ func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
 	}
 	t.Cleanup(func() { admin.Exec("DELETE FROM users WHERE id = ?", user.ID) })
 	sessions, runs := NewSessionRepository(app), NewRunRepository(app)
-	approvals, plans := NewToolApprovalRepository(app), NewPlanRepository(app)
+	approvals := NewToolApprovalRepository(app)
 	runService, err := biz.NewRunService(runs, sessions, biz.WithToolApprovals(approvals))
-	if err != nil {
-		t.Fatal(err)
-	}
-	planService, err := biz.NewPlanService(plans, runService)
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal := biz.Principal{UserID: user.ID}
 	for _, tc := range []struct {
 		name string
-		mode biz.AgentMode
 		want error
 	}{
-		{"cancelled run", biz.AgentModeReact, biz.ErrResourceConflict},
-		{"expired lease", biz.AgentModeReact, biz.ErrResourceConflict},
-		{"taken over lease", biz.AgentModeReact, biz.ErrResourceConflict},
-		{"paused plan", biz.AgentModePlan, biz.ErrPlanPaused},
+		{"cancelled run", biz.ErrResourceConflict},
+		{"expired lease", biz.ErrResourceConflict},
+		{"taken over lease", biz.ErrResourceConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			session, err := sessions.CreateSession(ctx, biz.Session{
@@ -103,7 +97,7 @@ func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
 				t.Fatal(err)
 			}
 			run, err := runs.CreateRun(ctx, biz.Run{
-				ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: tc.mode, Status: biz.RunQueued,
+				ID: uuid.New(), SessionID: session.ID, UserID: user.ID, Mode: biz.AgentModeReact, Status: biz.RunQueued,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -117,21 +111,8 @@ func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			callID := "call-1"
-			if tc.mode == biz.AgentModePlan {
-				planID, stepID := uuid.New(), uuid.New()
-				callID = "plan-step-" + stepID.String()
-				if _, err := plans.CreatePlan(ctx, user.ID, biz.Plan{
-					ID: planID, UserID: user.ID, RunID: run.ID, SessionID: session.ID, Version: 1,
-					Status: biz.PlanWaitingApproval, Goal: "approved tool", MaxSteps: 1,
-					Steps: []biz.PlanStep{{ID: stepID, StepNo: 1, Title: "delete", ToolName: "delete",
-						Status: biz.PlanStepWaitingApproval, MaxAttempts: 1, IdempotencyKey: "test-tool"}},
-				}, testOutboxEvent(user.ID, "plan.created")); err != nil {
-					t.Fatal(err)
-				}
-			}
 			approval, err := approvals.CreateApproval(ctx, biz.ToolApproval{
-				RunID: run.ID, UserID: user.ID, ToolCallID: callID, ToolName: "delete",
+				RunID: run.ID, UserID: user.ID, ToolCallID: "call-1", ToolName: "delete",
 				Arguments: json.RawMessage(`{}`), RiskLevel: "high", Status: biz.ApprovalPending, IdempotencyKey: "test-tool",
 			})
 			if err != nil {
@@ -143,10 +124,6 @@ func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
 			switch tc.name {
 			case "cancelled run":
 				if _, err := runService.Cancel(ctx, principal, run.ID); err != nil {
-					t.Fatal(err)
-				}
-			case "paused plan":
-				if _, err := planService.Pause(ctx, principal, run.ID); err != nil {
 					t.Fatal(err)
 				}
 			case "taken over lease":
@@ -161,20 +138,6 @@ func TestApprovalExecutionRequiresActiveRunAndPlan(t *testing.T) {
 			stored, err := approvals.GetApproval(ctx, user.ID, approval.ID)
 			if err != nil || stored.Status != biz.ApprovalApproved {
 				t.Fatalf("approval after rejected claim = %s, %v", stored.Status, err)
-			}
-			if tc.mode == biz.AgentModePlan {
-				plan, err := plans.GetPlanByRun(ctx, user.ID, run.ID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := plans.UpdatePlan(ctx, user.ID, plan.ID, biz.PlanPaused, biz.PlanExecuting, plan.Revision,
-					biz.PlanFence{}, biz.PlanUpdate{}); err != nil {
-					t.Fatal(err)
-				}
-				claim, err = approvals.ClaimApprovalExecution(ctx, user.ID, run.ID, approval.ID, fence, now)
-				if err != nil || claim.Status != biz.ApprovalExecuting {
-					t.Fatalf("approval after plan resume = %s, %v", claim.Status, err)
-				}
 			}
 		})
 	}

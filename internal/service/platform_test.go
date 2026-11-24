@@ -31,11 +31,6 @@ func TestNewPlatformService(t *testing.T) {
 	if platform.Deletions != deletions || platform.Exports != exports {
 		t.Fatal("deletion services were not attached")
 	}
-	plans := &biz.PlanService{}
-	platform.WithPlans(plans)
-	if platform.Plans != plans {
-		t.Fatal("plan service was not attached")
-	}
 	routing := &biz.RoutingHealthService{}
 	platform.WithRoutingHealth(routing)
 	if platform.Routing != routing {

@@ -311,7 +311,7 @@ message Agent {
   string name = 3;
   // description Agent 描述。
   string description = 4;
-  // mode 编排模式：react/plan/super。
+  // mode 编排模式：目前仅支持 react。
   string mode = 5;
   // model_policy_id 引用的策略 ID，草稿可为空。
   optional string model_policy_id = 6;

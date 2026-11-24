@@ -3,7 +3,6 @@ package biz
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"testing"
 
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
@@ -95,25 +94,5 @@ func TestSummaryDialogMessagesDropsToolMessages(t *testing.T) {
 		if message.Role == MessageTool {
 			t.Fatal("tool message leaked into summary input")
 		}
-	}
-}
-
-// pausedPlanRepository 固定返回一个计划，用于验证执行前的暂停门禁。
-type pausedPlanRepository struct {
-	PlanRepository
-	plan Plan
-}
-
-func (r *pausedPlanRepository) GetPlanByRun(context.Context, uuid.UUID, uuid.UUID) (Plan, error) {
-	return r.plan, nil
-}
-
-// TestExecuteSkipsPausedPlanBeforeContext 验证暂停计划在加载历史与记忆前直接返回。
-func TestExecuteSkipsPausedPlanBeforeContext(t *testing.T) {
-	worker := &ExecutionWorker{plans: &pausedPlanRepository{plan: Plan{Status: PlanPaused}}}
-	// 未注入 sessions/memory 等依赖：若先构建上下文会直接 nil panic。
-	_, _, err := worker.execute(context.Background(), Run{ID: uuid.New(), UserID: uuid.New(), Mode: AgentModePlan}, RunFence{})
-	if !errors.Is(err, ErrPlanPaused) {
-		t.Fatalf("execute() error = %v, want ErrPlanPaused", err)
 	}
 }

@@ -1,24 +1,12 @@
 // Run 执行详情：步骤树、Attempt 切换、脱敏载荷、审批结果与受控导出。
 import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { Badge, Button, Card, ConfirmDialog, EmptyState, ErrorBanner, Field, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
-import { ApiError, mutate, requestJSON } from "../lib/api";
+import { Badge, Button, Card, EmptyState, ErrorBanner, Field, LoadingState, PageHeader, Textarea, cn } from "../components/ui";
+import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatCost, formatDateTime, formatDuration, formatNumber, statusLabel, statusTone } from "../lib/format";
 import { useRemote } from "../lib/hooks";
-import type { ExecutionPayload, ExecutionStep, ModelAttempt, Plan, Run, SupervisorTask, ToolApproval } from "../lib/types";
-
-// modeLabel 把工作方式翻译成用户语言。
-function modeLabel(mode: string): string {
-  switch (mode) {
-    case "plan":
-      return "先计划再执行";
-    case "super":
-      return "多助手协作";
-    default:
-      return "边做边想";
-  }
-}
+import type { ExecutionPayload, ExecutionStep, ModelAttempt, Run, ToolApproval } from "../lib/types";
 
 // candidateNames 从 Run 策略快照提取模型 ID 到远程模型名的映射。
 function candidateNames(snapshot: Record<string, unknown> | null | undefined): Map<string, string> {
@@ -57,20 +45,6 @@ export default function RunPage() {
   const steps = useRemote(() => requestJSON<{ steps: ExecutionStep[] }>(`/api/v1/runs/${runId}/steps`), [runId]);
   const approvals = useRemote(() => requestJSON<{ items: ToolApproval[] }>(`/api/v1/runs/${runId}/approvals`), [runId]);
   const attempts = useRemote(() => requestJSON<{ items: ModelAttempt[] }>(`/api/v1/runs/${runId}/attempts`), [runId]);
-  const supervisorTasks = useRemote(() => requestJSON<{ items: SupervisorTask[] }>(`/api/v1/runs/${runId}/supervisor-tasks`), [runId]);
-  const plan = useRemote(async () => {
-    if (run.data?.mode !== "plan") {
-      return null;
-    }
-    try {
-      return await requestJSON<Plan>(`/api/v1/runs/${runId}/plan`);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 404) {
-        return null;
-      }
-      throw error;
-    }
-  }, [runId, run.data?.mode]);
 
   const [payloads, setPayloads] = useState<ExecutionPayload[]>([]);
   const [payloadStepID, setPayloadStepID] = useState<string | null>(null);
@@ -78,13 +52,6 @@ export default function RunPage() {
   const [reason, setReason] = useState("");
   const [reasonError, setReasonError] = useState<string | null>(null);
   const [payloadBusy, setPayloadBusy] = useState(false);
-  const [planBusy, setPlanBusy] = useState(false);
-  const [planError, setPlanError] = useState<string | null>(null);
-  const [confirmPlanCancel, setConfirmPlanCancel] = useState(false);
-  const [reviseOpen, setReviseOpen] = useState(false);
-  const [reviseText, setReviseText] = useState("");
-  const [reviseError, setReviseError] = useState<string | null>(null);
-  const [reviseBusy, setReviseBusy] = useState(false);
   const [reconcileReason, setReconcileReason] = useState("");
   const [reconcileError, setReconcileError] = useState<string | null>(null);
   const [reconcileBusy, setReconcileBusy] = useState(false);
@@ -92,7 +59,7 @@ export default function RunPage() {
   const [replayError, setReplayError] = useState<string | null>(null);
 
   const orderedSteps = [...(steps.data?.steps ?? [])].sort((left, right) => left.step_seq - right.step_seq);
-  // 按 parent_step_id 还原执行树：计划步骤与 Worker 步骤作为父节点，模型与工具步骤挂在其下。
+  // 按 parent_step_id 还原执行树：父步骤作为节点，模型与工具步骤挂在其下。
   const stepRows = useMemo(() => {
     const byID = new Map(orderedSteps.map((step) => [step.id, step]));
     const children = new Map<string, ExecutionStep[]>();
@@ -167,66 +134,6 @@ export default function RunPage() {
     downloadText(`run-${runId}.json`, JSON.stringify(bundle, null, 2));
   };
 
-  // actPlan 暂停、恢复或终止计划，结束后刷新计划与 Run 状态。
-  const actPlan = async (action: "pause" | "resume" | "cancel") => {
-    setPlanBusy(true);
-    setPlanError(null);
-    try {
-      await mutate<Plan>(`/api/v1/runs/${runId}/plan/${action}`, "POST", undefined, crypto.randomUUID());
-      plan.reload();
-      run.reload();
-      setConfirmPlanCancel(false);
-    } catch (failure) {
-      setPlanError(describeError(failure));
-    } finally {
-      setPlanBusy(false);
-    }
-  };
-
-  // startRevise 以当前计划步骤预填 JSON，人工修改后提交为新版本。
-  const startRevise = () => {
-    if (!plan.data) {
-      return;
-    }
-    const draft = {
-      goal: plan.data.goal,
-      steps: plan.data.steps.map((step) => ({
-        step_no: step.step_no,
-        title: step.title,
-        description: step.description,
-        depends_on: step.depends_on ?? [],
-        tool_name: step.tool_name,
-        arguments: step.arguments ?? {},
-      })),
-    };
-    setReviseText(JSON.stringify(draft, null, 2));
-    setReviseError(null);
-    setReviseOpen(true);
-  };
-
-  // submitRevise 校验 JSON 后创建新计划版本并恢复执行。
-  const submitRevise = async () => {
-    let payload: unknown;
-    try {
-      payload = JSON.parse(reviseText);
-    } catch {
-      setReviseError("计划 JSON 格式错误。");
-      return;
-    }
-    setReviseBusy(true);
-    setReviseError(null);
-    try {
-      await mutate<Plan>(`/api/v1/runs/${runId}/plan/revise`, "POST", payload, crypto.randomUUID());
-      setReviseOpen(false);
-      plan.reload();
-      run.reload();
-    } catch (failure) {
-      setReviseError(describeError(failure));
-    } finally {
-      setReviseBusy(false);
-    }
-  };
-
   // resolveReconciliation 由所有者对未知副作用做出书面结案，避免 Run 永久停留在对账状态。
   const resolveReconciliation = async (outcome: "completed" | "failed") => {
     if (reconcileReason.trim().length < 4) {
@@ -277,7 +184,7 @@ export default function RunPage() {
       <PageHeader
         eyebrow="运行记录"
         title="这一次处理"
-        description={`${modeLabel(run.data.mode)} · 创建于 ${formatDateTime(run.data.created_at)} · 对话 ${run.data.session_id.slice(0, 8)}`}
+        description={`边做边想 · 创建于 ${formatDateTime(run.data.created_at)} · 对话 ${run.data.session_id.slice(0, 8)}`}
         actions={
           <>
             <Link to={`/sessions/${run.data.session_id}`} className="inline-flex h-10 items-center rounded-lg border border-line-strong bg-paper-raised px-4 text-sm text-ink hover:border-accent">
@@ -292,7 +199,6 @@ export default function RunPage() {
       />
       {steps.error ? <ErrorBanner message={steps.error} onRetry={steps.reload} /> : null}
       {attempts.error ? <ErrorBanner message={attempts.error} onRetry={attempts.reload} /> : null}
-      {supervisorTasks.error ? <ErrorBanner message={supervisorTasks.error} onRetry={supervisorTasks.reload} /> : null}
 
       <div className="grid gap-4 md:grid-cols-4">
         {[
@@ -314,7 +220,6 @@ export default function RunPage() {
         {[
           ["#steps", "步骤明细"],
           ["#models", "模型使用记录"],
-          ...(run.data.mode === "super" ? [["#supervisor", "协作助手明细"]] : []),
           ["#payloads", "输入与输出"],
           ["#approvals", "工具审批"],
           ["#snapshot", "配置快照"],
@@ -329,8 +234,6 @@ export default function RunPage() {
         ))}
       </nav>
       {replayError ? <ErrorBanner message={`重新投递失败：${replayError}`} /> : null}
-      {planError ? <ErrorBanner message={planError} /> : null}
-      {plan.error ? <ErrorBanner message={`计划读取失败：${plan.error}`} onRetry={plan.reload} /> : null}
 
       {run.data.status === "reconciliation_required" ? (
         <Card
@@ -352,82 +255,6 @@ export default function RunPage() {
           </div>
         </Card>
       ) : null}
-
-      {plan.data ? (
-        <Card
-          title={`处理计划 v${plan.data.version}`}
-          description={plan.data.goal}
-          actions={
-            <>
-              {(plan.data.status === "executing" || plan.data.status === "waiting_approval") ? (
-                <Button size="sm" variant="secondary" loading={planBusy} onClick={() => void actPlan("pause")}>暂停计划</Button>
-              ) : null}
-              {plan.data.status === "paused" ? (
-                <>
-                  <Button size="sm" loading={planBusy} onClick={() => void actPlan("resume")}>恢复执行</Button>
-                  <Button size="sm" variant="secondary" onClick={startRevise}>修订计划</Button>
-                </>
-              ) : null}
-              {!["completed", "failed", "cancelled"].includes(plan.data.status) ? (
-                <Button size="sm" variant="danger" onClick={() => setConfirmPlanCancel(true)}>终止计划</Button>
-              ) : null}
-            </>
-          }
-        >
-          <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
-            <Badge tone={statusTone(plan.data.status)}>{statusLabel(plan.data.status)}</Badge>
-            <span>修订 r{plan.data.revision}</span>
-            <span>Token {formatNumber(plan.data.total_input_tokens)} / {formatNumber(plan.data.total_output_tokens)}</span>
-            <span>费用 {formatCost(plan.data.estimated_cost)}</span>
-            {plan.data.deadline_at ? <span>截止 {formatDateTime(plan.data.deadline_at)}</span> : null}
-          </div>
-          {plan.data.error_message ? <p className="mt-2 text-xs text-rust">{plan.data.error_code}：{plan.data.error_message}</p> : null}
-          {reviseOpen ? (
-            <div className="mt-4 rounded-lg border border-line-strong bg-paper-deep/60 p-3">
-              <Field label="修订计划 JSON" hint="提交后创建新版本并沿用原配置快照，旧版本保留为审计历史。" error={reviseError}>
-                <Textarea className="min-h-48 font-mono text-xs" value={reviseText} onChange={(event) => setReviseText(event.target.value)} spellCheck={false} />
-              </Field>
-              <div className="mt-3 flex justify-end gap-2">
-                <Button size="sm" variant="secondary" onClick={() => setReviseOpen(false)} disabled={reviseBusy}>取消</Button>
-                <Button size="sm" loading={reviseBusy} onClick={() => void submitRevise()}>提交修订</Button>
-              </div>
-            </div>
-          ) : null}
-          <ol className="mt-4 flex flex-col gap-2">
-            {plan.data.steps.map((step) => (
-              <li key={step.id} className="rounded-lg border border-line bg-paper-deep/40 p-3 text-xs">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge tone="neutral">#{step.step_no}</Badge>
-                    <Badge tone={statusTone(step.status)}>{statusLabel(step.status)}</Badge>
-                    <span className="text-ink">{step.title}</span>
-                    {step.tool_name ? <span className="font-mono text-jade">{step.tool_name}</span> : null}
-                  </div>
-                  <span className="text-muted">尝试 {step.attempts}/{step.max_attempts}</span>
-                </div>
-                {step.description ? <p className="mt-1 text-muted">{step.description}</p> : null}
-                {step.depends_on?.length ? <p className="mt-1 text-muted">依赖步骤：{step.depends_on.join(", ")}</p> : null}
-                {step.error_message ? <p className="mt-1 text-rust">{step.error_code}：{step.error_message}</p> : null}
-                {step.result?.["content"] ? (
-                  <details className="mt-1 text-muted">
-                    <summary className="cursor-pointer text-muted">查看步骤结果</summary>
-                    <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-paper-raised p-2 font-mono text-[11px]">{String(step.result["content"])}</pre>
-                  </details>
-                ) : null}
-              </li>
-            ))}
-          </ol>
-        </Card>
-      ) : null}
-      <ConfirmDialog
-        open={confirmPlanCancel}
-        title="终止执行计划？"
-        description="终止后关联 Run 会被取消，已完成步骤保留审计事实，未执行步骤标记为跳过或取消。"
-        confirmLabel="确认终止"
-        busy={planBusy}
-        onCancel={() => setConfirmPlanCancel(false)}
-        onConfirm={() => void actPlan("cancel")}
-      />
 
       <Card id="steps" title="步骤明细" description="按顺序展示助手做了什么；失败与重试都会保留。">
         {steps.loading ? (
@@ -518,55 +345,6 @@ export default function RunPage() {
           <EmptyState title="还没有模型调用记录" description="助手可能仍在排队，或还没有进入模型调用阶段。" />
         )}
       </Card>
-
-      {run.data.mode === "super" ? (
-        <Card id="supervisor" collapsible defaultOpen={false} title="协作助手明细" description="每个子助手使用独立上下文；失败、取消或结果缺失都会如实显示。">
-          {supervisorTasks.loading ? (
-            <LoadingState />
-          ) : supervisorTasks.data && supervisorTasks.data.items.length > 0 ? (
-            (() => {
-              const failedCount = supervisorTasks.data.items.filter((task) => task.status === "failed" || task.status === "unknown").length;
-              const cancelledCount = supervisorTasks.data.items.filter((task) => task.status === "cancelled").length;
-              return (
-                <div className="flex flex-col gap-3">
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
-                    <Badge tone={failedCount + cancelledCount > 0 ? "warning" : "success"}>
-                      {failedCount + cancelledCount > 0 ? "部分失败" : "全部成功"}
-                    </Badge>
-                    <span>Worker {supervisorTasks.data!.items.length}</span>
-                    <span>失败 {failedCount}</span>
-                    <span>取消 {cancelledCount}</span>
-                  </div>
-                  {supervisorTasks.data.items.map((task) => (
-                    <article key={task.id} className="rounded-lg border border-line bg-paper-deep/40 p-3 text-xs">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Badge tone="neutral">#{task.worker_index}</Badge>
-                          <Badge tone={statusTone(task.status)}>{statusLabel(task.status)}</Badge>
-                          <span className="text-ink">{task.worker_name}</span>
-                          <span className="text-muted">尝试 {task.attempts}/{task.max_attempts}</span>
-                        </div>
-                        <Link to={`/sessions/${task.child_session_id}`} className="text-accent underline underline-offset-2">子会话</Link>
-                      </div>
-                      <p className="mt-1 text-muted">{task.task}</p>
-                      {task.tool_scope.length > 0 ? <p className="mt-1 text-muted">工具交集：{task.tool_scope.join(", ")}</p> : null}
-                      {task.error_message ? <p className="mt-1 text-rust">{task.error_code}：{task.error_message}</p> : null}
-                      {task.result?.["content"] ? (
-                        <details className="mt-1 text-muted">
-                          <summary className="cursor-pointer text-muted">查看 Worker 结果</summary>
-                          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-paper-raised p-2 font-mono text-[11px]">{String(task.result["content"])}</pre>
-                        </details>
-                      ) : null}
-                    </article>
-                  ))}
-                </div>
-              );
-            })()
-          ) : (
-            <EmptyState title="还没有 Worker 任务" description="Supervisor 仍在生成委派，或委派失败。" />
-          )}
-        </Card>
-      ) : null}
 
       <Card
         id="payloads"
