@@ -21,6 +21,7 @@ type platformCRUDFixture struct {
 	handler   http.Handler
 	auth      *fakeAuthApplication
 	principal biz.Principal
+	platform  *service.PlatformService
 	providers *mocks.MockProviderRepository
 	cipher    *mocks.MockCredentialCipher
 	models    *mocks.MockModelRepository
@@ -67,6 +68,7 @@ func newPlatformCRUDFixture(t *testing.T, role biz.Role) *platformCRUDFixture {
 	}
 	fixture.principal = biz.Principal{UserID: uuid.New(), Role: role}
 	fixture.auth = &fakeAuthApplication{principal: fixture.principal}
+	fixture.platform = platform
 	fixture.handler = NewHandler(fstest.MapFS{"index.html": {Data: []byte("Harness")}}, fixture.auth, nil, platform)
 	return fixture
 }
@@ -420,12 +422,15 @@ func TestAgentCRUDEndpoints(t *testing.T) {
 		t.Fatalf("list agents returned %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	// 读取单个 Agent。
-	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(biz.Agent{
+	// 读取单个 Agent：草稿会额外读取可继承的自动技能。
+	draft := biz.Agent{
 		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 1, Status: biz.AgentDraft,
-	}, nil)
+	}
+	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(draft, nil).Times(2)
+	fixture.agents.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return(nil, nil)
 	recorder = fixture.do(http.MethodGet, "/api/v1/agents/"+agentID.String(), "")
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"id":"`+agentID.String()+`"`) {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"id":"`+agentID.String()+`"`) ||
+		!strings.Contains(recorder.Body.String(), `"inheritable_user_skills"`) {
 		t.Fatalf("get agent returned %d %s", recorder.Code, recorder.Body.String())
 	}
 
@@ -442,8 +447,8 @@ func TestAgentCRUDEndpoints(t *testing.T) {
 	}, nil)
 	fixture.agents.EXPECT().CountAgents(gomock.Any(), userID).Return(int64(1), nil)
 	fixture.agents.EXPECT().NextAgentVersion(gomock.Any(), userID, "assistant").Return(2, nil)
-	fixture.agents.EXPECT().CreateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
+	fixture.agents.EXPECT().CreateAgentVersion(gomock.Any(), gomock.Any(), agentID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ uuid.UUID, _ biz.OutboxEvent) (biz.Agent, error) {
 			if agent.Version != 2 || agent.ID == agentID || agent.Status != biz.AgentDraft {
 				t.Fatalf("new agent version invalid: %#v", agent)
 			}
@@ -454,7 +459,6 @@ func TestAgentCRUDEndpoints(t *testing.T) {
 	if recorder.Code != http.StatusCreated || !strings.Contains(recorder.Body.String(), `"version":2`) {
 		t.Fatalf("create agent version returned %d %s", recorder.Code, recorder.Body.String())
 	}
-
 	// 发布：校验策略已发布并固化配置快照；validate 与 buildSnapshot 各读一次策略。
 	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(biz.Agent{
 		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 1, Status: biz.AgentDraft,
@@ -463,6 +467,7 @@ func TestAgentCRUDEndpoints(t *testing.T) {
 	fixture.agents.EXPECT().GetPolicy(gomock.Any(), policyID).Return(biz.ModelPolicy{
 		ID: policyID, Name: "routing", Version: 1, Status: biz.PolicyPublished, MinContextTokens: 1_000_000,
 	}, nil).Times(2)
+	fixture.agents.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return(nil, nil)
 	fixture.agents.EXPECT().ListModelsByIDs(gomock.Any(), gomock.Any()).Return([]biz.Model{}, nil)
 	fixture.agents.EXPECT().ListSkillsByIDs(gomock.Any(), gomock.Any()).Return([]biz.Skill{}, nil)
 	fixture.agents.EXPECT().ListMCPsByIDs(gomock.Any(), gomock.Any()).Return([]biz.MCP{}, nil)
@@ -483,6 +488,7 @@ func TestAgentCRUDEndpoints(t *testing.T) {
 	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(biz.Agent{
 		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 1, Status: biz.AgentDraft,
 	}, nil)
+	fixture.agents.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return(nil, nil)
 	recorder = fixture.do(http.MethodPost, "/api/v1/agents/"+agentID.String()+"/publish", "")
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "invalid_configuration") {
 		t.Fatalf("publish policy-less agent returned %d %s", recorder.Code, recorder.Body.String())

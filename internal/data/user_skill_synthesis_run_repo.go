@@ -2,12 +2,14 @@ package data
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -39,6 +41,8 @@ type userSkillSynthesisRunModel struct {
 	Confidence float64
 	// SkillID 生成的技能 ID。
 	SkillID *uuid.UUID `gorm:"type:uuid"`
+	// ResultsJSON 按助手聚合的结构化结果。
+	ResultsJSON datatypes.JSON `gorm:"column:results_json"`
 	// Attempts 当天累计执行次数。
 	Attempts int
 	// StartedAt 本次开始时间。
@@ -81,6 +85,7 @@ ON CONFLICT (user_id, run_date) DO UPDATE SET
   candidate_name = '',
   confidence = 0,
   skill_id = NULL,
+  results_json = '[]'::jsonb,
   finished_at = NULL,
   started_at = EXCLUDED.started_at,
   updated_at = EXCLUDED.updated_at,
@@ -102,17 +107,25 @@ func (r *UserSkillRepository) FinishSkillSynthesisRun(ctx context.Context, userI
 	if finishedAt.IsZero() {
 		finishedAt = time.Now().UTC()
 	}
+	results := update.Results
+	if results == nil {
+		results = []biz.SkillSynthesisRunResult{}
+	}
+	resultsJSON, err := json.Marshal(results)
+	if err != nil {
+		return biz.SkillSynthesisRun{}, err
+	}
 	var record userSkillSynthesisRunModel
-	err := WithScope(ctx, r.db, Scope{System: true, UserID: userID}, func(tx *gorm.DB) error {
+	err = WithScope(ctx, r.db, Scope{System: true, UserID: userID}, func(tx *gorm.DB) error {
 		return tx.Raw(`
 UPDATE user_skill_synthesis_runs
 SET status = ?, outcome = ?, detail = ?, sessions_scanned = ?, sessions_used = ?, messages_used = ?,
-    candidate_name = ?, confidence = ?, skill_id = ?, finished_at = ?, updated_at = ?
+    candidate_name = ?, confidence = ?, skill_id = ?, results_json = ?, finished_at = ?, updated_at = ?
 WHERE id = ? AND user_id = ?
 RETURNING *`,
 			string(update.Status), update.Outcome, truncateSkillRunDetail(update.Detail),
 			update.SessionsScanned, update.SessionsUsed, update.MessagesUsed,
-			update.CandidateName, update.Confidence, update.SkillID, finishedAt, finishedAt,
+			update.CandidateName, update.Confidence, update.SkillID, datatypes.JSON(resultsJSON), finishedAt, finishedAt,
 			runID, userID).Scan(&record).Error
 	})
 	if err != nil {
@@ -148,13 +161,20 @@ func (r *UserSkillRepository) ListSkillSynthesisRuns(ctx context.Context, userID
 
 // toBizSkillSynthesisRun 把数据库行转换为领域记录。
 func toBizSkillSynthesisRun(record userSkillSynthesisRunModel) biz.SkillSynthesisRun {
+	var results []biz.SkillSynthesisRunResult
+	if len(record.ResultsJSON) > 0 {
+		_ = json.Unmarshal(record.ResultsJSON, &results)
+	}
+	if results == nil {
+		results = []biz.SkillSynthesisRunResult{}
+	}
 	return biz.SkillSynthesisRun{
 		ID: record.ID, UserID: record.UserID, Date: record.RunDate.Format("2006-01-02"),
 		JobID: record.JobID, Status: biz.SkillSynthesisRunStatus(record.Status),
 		Outcome: record.Outcome, Detail: record.Detail,
 		SessionsScanned: record.SessionsScanned, SessionsUsed: record.SessionsUsed,
 		MessagesUsed: record.MessagesUsed, CandidateName: record.CandidateName,
-		Confidence: record.Confidence, SkillID: record.SkillID, Attempts: record.Attempts,
+		Confidence: record.Confidence, SkillID: record.SkillID, Results: results, Attempts: record.Attempts,
 		StartedAt: record.StartedAt, FinishedAt: record.FinishedAt, UpdatedAt: record.UpdatedAt,
 	}
 }

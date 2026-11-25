@@ -239,7 +239,7 @@ func TestSkillLLMExtractorPolicySelection(t *testing.T) {
 			}
 			extractor.WithUsageRecorder(usage)
 			sessions, messages := skillLLMConversations()
-			candidate, err := extractor.Extract(context.Background(), userID, sessions, messages, nil)
+			candidate, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil)
 			if err != nil || !candidate.ShouldCreate {
 				t.Fatalf("Extract() = %#v, %v", candidate, err)
 			}
@@ -272,7 +272,7 @@ func TestSkillLLMExtractorSkipsDisabledOrUnconfiguredUser(t *testing.T) {
 				t.Fatal(err)
 			}
 			sessions, messages := skillLLMConversations()
-			if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
+			if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
 				t.Fatalf("expected permanent unavailable error, got %v", err)
 			}
 		})
@@ -307,7 +307,7 @@ func TestSkillLLMExtractorDoesNotFallbackWhenUserPolicyIsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessions, messages := skillLLMConversations()
-	if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
+	if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
 		t.Fatalf("expected stale user policy to be unavailable, got %v", err)
 	}
 	if len(requests.models) != 0 || len(policies.getPolicyCalls) != 1 || policies.getPolicyCalls[0] != userPolicyID {
@@ -348,7 +348,7 @@ func TestSkillLLMExtractorUsesCandidatePriorityAndRecordsActualProvider(t *testi
 	budgets := &fakeSkillBudgetChecker{}
 	extractor.WithBudgetChecker(budgets)
 	sessions, messages := skillLLMConversations()
-	if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); err != nil {
+	if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); err != nil {
 		t.Fatalf("Extract() error = %v", err)
 	}
 	if len(requests.models) != 2 || requests.models[0] != "first-model" || requests.models[1] != "second-model" {
@@ -386,7 +386,7 @@ func TestSkillLLMExtractorBudgetExceededSkipsPaidRequest(t *testing.T) {
 	budgets := &fakeSkillBudgetChecker{err: ErrBudgetExceeded}
 	extractor.WithBudgetChecker(budgets)
 	sessions, messages := skillLLMConversations()
-	_, err = extractor.Extract(context.Background(), userID, sessions, messages, nil)
+	_, err = extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil)
 	if !errors.Is(err, ErrBudgetExceeded) || len(requests.models) != 0 || len(budgets.providers) != 1 || budgets.providers[0] != providerID {
 		t.Fatalf("Extract() requests=%#v checks=%#v err=%v", requests.models, budgets.providers, err)
 	}
@@ -414,7 +414,7 @@ func TestSkillLLMExtractorReturnsTemporaryErrorWhenAllCandidatesFail(t *testing.
 		t.Fatal(err)
 	}
 	sessions, messages := skillLLMConversations()
-	if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); err == nil || errors.Is(err, ErrUserSkillSynthesisUnavailable) {
+	if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); err == nil || errors.Is(err, ErrUserSkillSynthesisUnavailable) {
 		t.Fatalf("temporary provider failure must remain retryable, got %v", err)
 	}
 }
@@ -444,11 +444,11 @@ func TestSkillLLMExtractorValidatesConfigAndSettingsReadError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidate, err := extractor.Extract(context.Background(), userID, nil, nil, nil); err != nil || candidate.ShouldCreate {
+	if candidate, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, nil, nil, nil); err != nil || candidate.ShouldCreate {
 		t.Fatalf("empty conversations should not require settings or a model: %#v, %v", candidate, err)
 	}
 	sessions, messages := skillLLMConversations()
-	if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); !errors.Is(err, readErr) {
+	if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); !errors.Is(err, readErr) {
 		t.Fatalf("settings read error must remain retryable, got %v", err)
 	}
 }
@@ -487,7 +487,7 @@ func TestSkillLLMExtractorRejectsUnavailableCandidates(t *testing.T) {
 				t.Fatal(err)
 			}
 			sessions, messages := skillLLMConversations()
-			if _, err := extractor.Extract(context.Background(), userID, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
+			if _, err := extractor.Extract(context.Background(), userID, SkillSynthesisTarget{}, sessions, messages, nil); !errors.Is(err, ErrUserSkillSynthesisUnavailable) {
 				t.Fatalf("expected unavailable candidate error, got %v", err)
 			}
 		})
@@ -502,11 +502,15 @@ func TestBuildSkillExtractionPrompt(t *testing.T) {
 			{Role: MessageAssistant, Content: "好的，请提供本周内容"},
 		},
 	}
-	system, user, err := buildSkillExtractionPrompt(sessions, messagesBySession, 1024)
+	target := SkillSynthesisTarget{AgentID: uuid.New(), Name: "周报助手", Description: "整理周报与风险项"}
+	existing := SkillDigest{Name: "weekly-report", Description: "已存在的周报技能", Origin: UserSkillOriginAuto, PromptTemplate: "# weekly-report\n\n## 步骤\n1. 旧步骤"}
+	manual := SkillDigest{Name: "invoice-check", Description: "手动维护的发票校验技能", Origin: UserSkillOriginManual}
+	system, user, err := buildSkillExtractionPrompt(target, sessions, messagesBySession, 1024, existing, manual)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	for _, want := range []string{"should_create", "## 何时使用", "## 步骤", "## 输出格式", "## 约束", "evidence", "不可信数据"} {
+	for _, want := range []string{"should_create", "## 何时使用", "## 步骤", "## 输出格式", "## 约束", "evidence", "不可信数据",
+		"周报助手", "整理周报与风险项", "当前正文", "旧步骤", "<existing_skill>", "自动技能，可原地优化", "不可自动修改"} {
 		if !strings.Contains(system, want) {
 			t.Fatalf("system prompt missing %q", want)
 		}
@@ -524,7 +528,7 @@ func TestBuildSkillExtractionPromptTruncatesLongMessage(t *testing.T) {
 	messagesBySession := map[uuid.UUID][]Message{
 		sessions[0].ID: {{Role: MessageUser, Content: longContent}},
 	}
-	_, user, err := buildSkillExtractionPrompt(sessions, messagesBySession, 100)
+	_, user, err := buildSkillExtractionPrompt(SkillSynthesisTarget{}, sessions, messagesBySession, 100)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -534,7 +538,7 @@ func TestBuildSkillExtractionPromptTruncatesLongMessage(t *testing.T) {
 }
 
 func TestBuildSkillExtractionPromptEmpty(t *testing.T) {
-	if _, _, err := buildSkillExtractionPrompt(nil, nil, 1024); err == nil {
+	if _, _, err := buildSkillExtractionPrompt(SkillSynthesisTarget{}, nil, nil, 1024); err == nil {
 		t.Fatal("expected error for empty conversations")
 	}
 }

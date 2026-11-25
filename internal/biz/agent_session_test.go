@@ -3,7 +3,10 @@ package biz_test
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/Mark-Panda/harness-agent/internal/service/mocks"
@@ -46,6 +49,267 @@ func TestAgentAdminDeleteRequiresAdmin(t *testing.T) {
 	repo.EXPECT().DeleteAgentAdmin(gomock.Any(), gomock.Any(), agentID, gomock.Any()).Return(nil)
 	if err := service.AdminDelete(context.Background(), biz.Principal{UserID: uuid.New(), Role: biz.RoleAdmin}, agentID); err != nil {
 		t.Fatalf("admin AdminDelete() error = %v", err)
+	}
+}
+
+// TestAgentSnapshotRevisionLifecycle 验证助手快照历史读取与恢复只作用于当前用户的已发布助手。
+func TestAgentSnapshotRevisionLifecycle(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, agentID, revisionID := uuid.New(), uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	published := biz.Agent{ID: agentID, UserID: userID, Name: "assistant", Status: biz.AgentPublished, Version: 1}
+	revision := biz.AgentSnapshotRevision{
+		ID: revisionID, UserID: userID, AgentID: agentID, AgentVersion: 1,
+		ConfigSnapshot: map[string]any{"user_skills": []any{}}, Reason: "user_skill_attached",
+	}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(published, nil)
+	repo.EXPECT().ListAgentSnapshotRevisions(gomock.Any(), userID, agentID, 10).Return([]biz.AgentSnapshotRevision{revision}, nil)
+	revisions, err := service.ListSnapshotRevisions(context.Background(), principal, agentID, 10)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("ListSnapshotRevisions() = %#v, %v", revisions, err)
+	}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(published, nil)
+	repo.EXPECT().GetAgentSnapshotRevision(gomock.Any(), userID, agentID, revisionID).Return(revision, nil)
+	repo.EXPECT().RestoreAgentSnapshot(gomock.Any(), userID, agentID, revision.ConfigSnapshot, gomock.Any()).Return(nil)
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(published, nil)
+	if _, err := service.RestoreSnapshotRevision(context.Background(), principal, agentID, revisionID); err != nil {
+		t.Fatalf("RestoreSnapshotRevision() error = %v", err)
+	}
+
+	draft := published
+	draft.Status = biz.AgentDraft
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(draft, nil)
+	if _, err := service.RestoreSnapshotRevision(context.Background(), principal, agentID, revisionID); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("draft restore error = %v, want conflict", err)
+	}
+}
+
+// TestAgentUpdateRejectsStaleRevision 验证草稿在读取后被并发修改（如技能自动挂载）时更新被拒绝，避免覆盖新绑定。
+func TestAgentUpdateRejectsStaleRevision(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, agentID := uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	loadedAt := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	current := biz.Agent{ID: agentID, UserID: userID, Name: "assistant", Status: biz.AgentDraft, Version: 1, UpdatedAt: loadedAt.Add(time.Minute)}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	stale := biz.Agent{ID: agentID, UserID: userID, Description: "edited", Mode: biz.AgentModeReact, UpdatedAt: loadedAt}
+	if _, err := service.Update(context.Background(), principal, stale); !errors.Is(err, biz.ErrResourceConflict) {
+		t.Fatalf("stale Update() error = %v, want conflict", err)
+	}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	repo.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) { return agent, nil },
+	)
+	fresh := stale
+	fresh.UpdatedAt = current.UpdatedAt
+	if _, err := service.Update(context.Background(), principal, fresh); err != nil {
+		t.Fatalf("fresh Update() error = %v", err)
+	}
+
+	// 不携带 updated_at 的调用方（如 gRPC）保持原有行为，不做并发校验。
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	repo.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) { return agent, nil },
+	)
+	unconditional := stale
+	unconditional.UpdatedAt = time.Time{}
+	if _, err := service.Update(context.Background(), principal, unconditional); err != nil {
+		t.Fatalf("unconditional Update() error = %v", err)
+	}
+}
+
+// TestAgentPublishInheritsFamilyAutoUserSkills 验证发布草稿时补齐同家族已发布版本的自动技能，
+// 同时尊重显式移除、手动技能与已停用技能。
+func TestAgentPublishInheritsFamilyAutoUserSkills(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, draftID, siblingID := uuid.New(), uuid.New(), uuid.New()
+	policyID, modelID := uuid.New(), uuid.New()
+	policyVersion := 1
+	inheritID, optedOutID, manualID, disabledID, sharedID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	loadedAt := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	draft := biz.Agent{
+		ID: draftID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 2,
+		Status: biz.AgentDraft, ModelPolicyID: &policyID, ModelPolicyVersion: &policyVersion,
+		UserSkillIDs: []uuid.UUID{sharedID}, UpdatedAt: loadedAt,
+	}
+	sibling := biz.Agent{
+		ID: siblingID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 1,
+		Status:       biz.AgentPublished,
+		UserSkillIDs: []uuid.UUID{sharedID, inheritID, optedOutID, manualID, disabledID},
+	}
+	policy := biz.ModelPolicy{ID: policyID, Version: policyVersion, Status: biz.PolicyPublished,
+		Candidates: []biz.PolicyCandidate{{ModelID: modelID, Priority: 1}}}
+	skills := map[uuid.UUID]biz.UserSkill{
+		inheritID:  {ID: inheritID, UserID: userID, Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto},
+		optedOutID: {ID: optedOutID, UserID: userID, Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto},
+		manualID:   {ID: manualID, UserID: userID, Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginManual},
+		disabledID: {ID: disabledID, UserID: userID, Status: biz.UserSkillDisabled, Origin: biz.UserSkillOriginAuto},
+		sharedID:   {ID: sharedID, UserID: userID, Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto},
+	}
+	repo.EXPECT().GetAgent(gomock.Any(), userID, draftID).Return(draft, nil)
+	repo.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return([]uuid.UUID{siblingID}, nil)
+	repo.EXPECT().GetAgent(gomock.Any(), userID, siblingID).Return(sibling, nil)
+	repo.EXPECT().ListUserSkillOptOuts(gomock.Any(), userID, draftID).Return([]uuid.UUID{optedOutID}, nil)
+	repo.EXPECT().ListUserSkillsByIDs(gomock.Any(), userID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, ids []uuid.UUID) ([]biz.UserSkill, error) {
+			result := make([]biz.UserSkill, 0, len(ids))
+			for _, id := range ids {
+				if skill, ok := skills[id]; ok {
+					result = append(result, skill)
+				}
+			}
+			return result, nil
+		}).AnyTimes()
+	repo.EXPECT().GetPolicy(gomock.Any(), policyID).Return(policy, nil).Times(2)
+	repo.EXPECT().ListModelsByIDs(gomock.Any(), []uuid.UUID{modelID}).Return([]biz.Model{{ID: modelID}}, nil)
+	repo.EXPECT().ListSkillsByIDs(gomock.Any(), gomock.Any()).Return([]biz.Skill{}, nil)
+	repo.EXPECT().ListMCPsByIDs(gomock.Any(), gomock.Any()).Return([]biz.MCP{}, nil)
+	repo.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
+			got := append([]uuid.UUID{}, agent.UserSkillIDs...)
+			want := []uuid.UUID{sharedID, inheritID}
+			sort.Slice(got, func(i, j int) bool { return got[i].String() < got[j].String() })
+			sort.Slice(want, func(i, j int) bool { return want[i].String() < want[j].String() })
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("published user skills = %v, want %v", got, want)
+			}
+			if !agent.UpdatedAt.Equal(loadedAt) {
+				t.Fatalf("published updated_at = %s, want %s", agent.UpdatedAt, loadedAt)
+			}
+			return agent, nil
+		})
+	if _, err := service.Publish(context.Background(), principal, draftID); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+}
+
+// TestAgentCreateVersionCopiesUserSkillOptOuts 验证新版本沿用源版本的显式移除标记。
+func TestAgentCreateVersionCopiesUserSkillOptOuts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, sourceID := uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	policyID, policyVersion := uuid.New(), 1
+	source := biz.Agent{
+		ID: sourceID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact, Version: 1,
+		Status: biz.AgentPublished, ModelPolicyID: &policyID, ModelPolicyVersion: &policyVersion,
+	}
+	repo.EXPECT().GetAgent(gomock.Any(), userID, sourceID).Return(source, nil)
+	repo.EXPECT().CountAgents(gomock.Any(), userID).Return(int64(0), nil)
+	repo.EXPECT().NextAgentVersion(gomock.Any(), userID, "assistant").Return(2, nil)
+	repo.EXPECT().CreateAgentVersion(gomock.Any(), gomock.Any(), sourceID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, fromAgentID uuid.UUID, _ biz.OutboxEvent) (biz.Agent, error) {
+			if agent.Status != biz.AgentDraft || agent.Version != 2 || fromAgentID != sourceID {
+				t.Fatalf("created version = %#v, source = %s", agent, fromAgentID)
+			}
+			return agent, nil
+		})
+	if _, err := service.CreateVersion(context.Background(), principal, sourceID); err != nil {
+		t.Fatalf("CreateVersion() error = %v", err)
+	}
+}
+
+// TestAgentInheritableUserSkillsPreview 验证草稿预览只返回可继承的自动技能：排除已绑定、已移除、手动与停用技能。
+func TestAgentInheritableUserSkillsPreview(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, draftID, siblingID := uuid.New(), uuid.New(), uuid.New()
+	inheritID, optedOutID, manualID, disabledID, sharedID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	draft := biz.Agent{
+		ID: draftID, UserID: userID, Name: "assistant", Status: biz.AgentDraft, Version: 2,
+		UserSkillIDs: []uuid.UUID{sharedID},
+	}
+	sibling := biz.Agent{
+		ID: siblingID, UserID: userID, Name: "assistant", Status: biz.AgentPublished, Version: 1,
+		UserSkillIDs: []uuid.UUID{sharedID, inheritID, optedOutID, manualID, disabledID},
+	}
+	skills := map[uuid.UUID]biz.UserSkill{
+		inheritID:  {ID: inheritID, UserID: userID, Name: "inherit", Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto},
+		optedOutID: {ID: optedOutID, UserID: userID, Name: "opted-out", Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto},
+		manualID:   {ID: manualID, UserID: userID, Name: "manual", Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginManual},
+		disabledID: {ID: disabledID, UserID: userID, Name: "disabled", Status: biz.UserSkillDisabled, Origin: biz.UserSkillOriginAuto},
+	}
+	repo.EXPECT().GetAgent(gomock.Any(), userID, draftID).Return(draft, nil)
+	repo.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return([]uuid.UUID{siblingID}, nil)
+	repo.EXPECT().GetAgent(gomock.Any(), userID, siblingID).Return(sibling, nil)
+	repo.EXPECT().ListUserSkillOptOuts(gomock.Any(), userID, draftID).Return([]uuid.UUID{optedOutID}, nil)
+	repo.EXPECT().ListUserSkillsByIDs(gomock.Any(), userID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ uuid.UUID, ids []uuid.UUID) ([]biz.UserSkill, error) {
+			result := make([]biz.UserSkill, 0, len(ids))
+			for _, id := range ids {
+				if skill, ok := skills[id]; ok {
+					result = append(result, skill)
+				}
+			}
+			return result, nil
+		})
+	inheritable, err := service.InheritableUserSkills(context.Background(), principal, draftID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inheritable) != 1 || inheritable[0].ID != inheritID {
+		t.Fatalf("inheritable skills = %#v, want only %s", inheritable, inheritID)
+	}
+}
+
+// TestAgentUpdatePassesUserSkillOptOuts 验证显式取消继承的标记会被校验并透传到仓储。
+func TestAgentUpdatePassesUserSkillOptOuts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	repo := mocks.NewMockAgentRepository(ctrl)
+	service, err := biz.NewAgentService(repo, biz.QuotaLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, agentID, skillID := uuid.New(), uuid.New(), uuid.New()
+	principal := biz.Principal{UserID: userID, Role: biz.RoleUser}
+	current := biz.Agent{ID: agentID, UserID: userID, Name: "assistant", Status: biz.AgentDraft, Version: 1}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	conflicting := biz.Agent{ID: agentID, Mode: biz.AgentModeReact, UserSkillIDs: []uuid.UUID{skillID}, UserSkillOptOuts: []uuid.UUID{skillID}}
+	if _, err := service.Update(context.Background(), principal, conflicting); !errors.Is(err, biz.ErrInvalidConfig) {
+		t.Fatalf("conflicting opt-out error = %v, want invalid config", err)
+	}
+
+	repo.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	repo.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
+			if !reflect.DeepEqual(agent.UserSkillOptOuts, []uuid.UUID{skillID}) {
+				t.Fatalf("opt-outs = %#v, want [%s]", agent.UserSkillOptOuts, skillID)
+			}
+			return agent, nil
+		})
+	optedOut := biz.Agent{ID: agentID, Mode: biz.AgentModeReact, UserSkillOptOuts: []uuid.UUID{skillID}}
+	if _, err := service.Update(context.Background(), principal, optedOut); err != nil {
+		t.Fatalf("opt-out update error = %v", err)
 	}
 }
 
@@ -92,6 +356,7 @@ func TestAgentServiceVersionsAndImmutablePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	repo.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), principal.UserID, created.Name).Return(nil, nil)
 	repo.EXPECT().ListModelsByIDs(gomock.Any(), []uuid.UUID{modelID}).Return([]biz.Model{{ID: modelID}}, nil)
 	repo.EXPECT().ListSkillsByIDs(gomock.Any(), []uuid.UUID{skillID}).Return([]biz.Skill{{ID: skillID, Status: "published"}}, nil)
 	repo.EXPECT().ListMCPsByIDs(gomock.Any(), []uuid.UUID{mcpID}).Return([]biz.MCP{{ID: mcpID, Status: "enabled"}}, nil)
@@ -103,8 +368,8 @@ func TestAgentServiceVersionsAndImmutablePublication(t *testing.T) {
 	repo.EXPECT().GetAgent(gomock.Any(), principal.UserID, created.ID).Return(created, nil)
 	repo.EXPECT().CountAgents(gomock.Any(), principal.UserID).Return(int64(1), nil)
 	repo.EXPECT().NextAgentVersion(gomock.Any(), principal.UserID, created.Name).Return(2, nil)
-	repo.EXPECT().CreateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
+	repo.EXPECT().CreateAgentVersion(gomock.Any(), gomock.Any(), created.ID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ uuid.UUID, _ biz.OutboxEvent) (biz.Agent, error) {
 			if agent.Version != 2 || agent.ID == created.ID || agent.Status != biz.AgentDraft {
 				t.Fatalf("invalid next agent version: %#v", agent)
 			}

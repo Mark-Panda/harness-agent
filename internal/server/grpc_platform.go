@@ -359,10 +359,17 @@ func (s *platformGRPCServer) UpdateAgent(ctx context.Context, request *harnessv1
 	if err != nil {
 		return nil, err
 	}
+	// 可选并发令牌：未传时保持旧行为，传了则与当前草稿的 updated_at 严格比较。
+	var updatedAt time.Time
+	if request.GetUpdatedAt() != nil {
+		updatedAt = request.GetUpdatedAt().AsTime()
+	}
 	agent, err := s.platform.Agents.Update(ctx, principal, biz.Agent{
 		ID: agentID, Description: request.GetDescription(), Mode: biz.AgentMode(request.GetMode()),
 		ModelPolicyID: optionalUUID(request.ModelPolicyId), ModelPolicyVersion: optionalInt(request.ModelPolicyVersion),
-		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
+		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()),
+		UserSkillOptOuts: parseUUIDList(request.GetUserSkillOptouts()), MCPIDs: parseUUIDList(request.GetMcpIds()),
+		UpdatedAt: updatedAt,
 	})
 	if err != nil {
 		return nil, grpcError(err)
@@ -370,7 +377,7 @@ func (s *platformGRPCServer) UpdateAgent(ctx context.Context, request *harnessv1
 	return &harnessv1.UpdateAgentResponse{Agent: toProtoAgent(agent)}, nil
 }
 
-// GetAgent 处理 gRPC Agent 读取。
+// GetAgent 处理 gRPC Agent 读取；草稿附带发布时将继承的自动技能。
 func (s *platformGRPCServer) GetAgent(ctx context.Context, request *harnessv1.GetAgentRequest) (*harnessv1.GetAgentResponse, error) {
 	principal, err := grpcPrincipal(ctx)
 	if err != nil {
@@ -384,7 +391,17 @@ func (s *platformGRPCServer) GetAgent(ctx context.Context, request *harnessv1.Ge
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	return &harnessv1.GetAgentResponse{Agent: toProtoAgent(agent)}, nil
+	response := &harnessv1.GetAgentResponse{Agent: toProtoAgent(agent)}
+	if agent.Status == biz.AgentDraft {
+		inheritable, err := s.platform.Agents.InheritableUserSkills(ctx, principal, agentID)
+		if err != nil {
+			return nil, grpcError(err)
+		}
+		for _, skill := range inheritable {
+			response.InheritableUserSkills = append(response.InheritableUserSkills, toProtoUserSkill(skill))
+		}
+	}
+	return response, nil
 }
 
 // DeleteAgent 处理 gRPC 草稿删除。

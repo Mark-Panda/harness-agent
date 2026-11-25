@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useBlocker, useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { mutate, requestJSON } from "../lib/api";
+import { ApiError, mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { useRemote } from "../lib/hooks";
 import { MultiSelect } from "../components/MultiSelect";
@@ -48,6 +48,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const [policyID, setPolicyID] = useState("");
   const [skillIDs, setSkillIDs] = useState<string[]>([]);
   const [userSkillIDs, setUserSkillIDs] = useState<string[]>([]);
+  const [excludedInherited, setExcludedInherited] = useState<string[]>([]);
   const [mcpIDs, setMcpIDs] = useState<string[]>([]);
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -74,6 +75,9 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const publishedPolicies = (policies.data?.items ?? []).filter((policy) => policy.status === "published");
   const activeSkills = (skills.data?.items ?? []).filter((skill) => skill.status === "published");
   const activeUserSkills = (userSkills.data?.items ?? []).filter((skill) => skill.status === "published");
+  // 发布时将继承的自动技能；已手动绑定的不重复展示，取消勾选会写入本版本的移除标记。
+  const inheritableSkills = (editing.data?.inheritable_user_skills ?? [])
+    .filter((skill) => !userSkillIDs.includes(skill.id));
   const activeMCPs = (mcps.data?.items ?? []).filter((mcp) => mcp.status === "enabled");
   const selectedPolicy = publishedPolicies.find((policy) => policy.id === policyID) ?? null;
   const selectedMode = modes.find((item) => item.value === mode) ?? modes[0];
@@ -89,6 +93,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
     setPolicyID(editing.data.model_policy_id ?? "");
     setSkillIDs(editing.data.skill_ids ?? []);
     setUserSkillIDs(editing.data.user_skill_ids ?? []);
+    setExcludedInherited([]);
     setMcpIDs(editing.data.mcp_ids ?? []);
     setInitialized(true);
   }, [editing.data, initialized]);
@@ -104,7 +109,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const canLeaveModel = selectedPolicy !== null;
   // 有未保存内容时，关闭浏览器和返回列表前都先确认，避免整页填写白费。
   const defaultPolicyID = publishedPolicies[0]?.id ?? "";
-  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...userSkillIDs].sort(), [...mcpIDs].sort()]);
+  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...userSkillIDs].sort(), [...excludedInherited].sort(), [...mcpIDs].sort()]);
   const dirty = useMemo(() => {
     if (savedDraft?.signature === draftSignature) return false;
     if (isEditing && editing.data) {
@@ -115,6 +120,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         || policyID !== (editing.data.model_policy_id ?? "")
         || !sameIDs(skillIDs, editing.data.skill_ids ?? [])
         || !sameIDs(userSkillIDs, editing.data.user_skill_ids ?? [])
+        || excludedInherited.length > 0
         || !sameIDs(mcpIDs, editing.data.mcp_ids ?? []);
     }
     return name.trim().length > 0
@@ -124,7 +130,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       || skillIDs.length > 0
       || userSkillIDs.length > 0
       || mcpIDs.length > 0;
-  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, userSkillIDs, mcpIDs, draftSignature, savedDraft]);
+  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, userSkillIDs, excludedInherited, mcpIDs, draftSignature, savedDraft]);
 
   const blocker = useBlocker(({ currentLocation, nextLocation }) =>
     !allowNavigation.current && dirty && currentLocation.pathname !== nextLocation.pathname,
@@ -178,6 +184,10 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         skill_ids: skillIDs,
         user_skill_ids: userSkillIDs,
         mcp_ids: mcpIDs,
+        // 编辑时带上读取到的更新时间，服务端据此拒绝覆盖并发的自动挂载。
+        updated_at: isEditing ? editing.data?.updated_at ?? null : null,
+        // 取消继承的自动技能：写成本版本的移除标记，发布时不再补回。
+        user_skill_optouts: excludedInherited.filter((id) => !userSkillIDs.includes(id)),
       };
       const draftID = agentId ?? savedDraft?.id;
       const saved = draftID
@@ -192,7 +202,11 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       allowNavigation.current = true;
       navigate("/agents");
     } catch (failure) {
-      setError(draftSaved ? `草稿已保存，发布失败。${describeError(failure)}` : describeError(failure));
+      if (!draftSaved && isEditing && failure instanceof ApiError && failure.code === "resource_conflict") {
+        setError("助手在打开后已被其他操作更新（例如技能自动挂载或发布），请刷新页面后重新编辑，避免覆盖最新绑定。");
+      } else {
+        setError(draftSaved ? `草稿已保存，发布失败。${describeError(failure)}` : describeError(failure));
+      }
     } finally {
       setBusy(null);
     }
@@ -337,10 +351,53 @@ function AgentWizard({ agentId }: { agentId?: string }) {
                 badge: <Badge tone={skill.bundle ? "info" : "neutral"}>{skill.bundle ? `技能包 · ${skill.bundle.file_count} 文件` : `v${skill.version}`}</Badge>,
               }))}
               value={userSkillIDs}
-              onChange={setUserSkillIDs}
+              onChange={(next) => {
+                const added = next.filter((id) => !userSkillIDs.includes(id));
+                const removed = userSkillIDs.filter((id) => !next.includes(id));
+                setUserSkillIDs(next);
+                // 取消勾选即记录移除（含未绑定的继承候选）；重新勾选则撤销移除。
+                setExcludedInherited((current) => [
+                  ...current.filter((id) => !added.includes(id)),
+                  ...removed.filter((id) => !current.includes(id)),
+                ]);
+              }}
               empty={userSkills.error ? "我的技能加载失败" : "暂无已发布的个人技能"}
             />
             {userSkills.error ? <div className="mt-2"><ErrorBanner message={userSkills.error} onRetry={userSkills.reload} /></div> : null}
+            {inheritableSkills.length ? (
+              <div className="mt-3 rounded-lg border border-line bg-paper-deep/60 p-3">
+                <p className="text-sm font-medium">将从其他版本继承的自动技能</p>
+                <p className="mt-1 text-xs leading-5 text-muted">
+                  发布时会自动加入这些技能；取消勾选后本版本不再继承，之后可在上方“我的技能”中重新勾选恢复。
+                </p>
+                <ul className="mt-2 flex flex-col gap-2">
+                  {inheritableSkills.map((skill) => {
+                    const excluded = excludedInherited.includes(skill.id);
+                    return (
+                      <li key={skill.id}>
+                        <label className="flex items-start gap-2">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 size-4 shrink-0"
+                            checked={!excluded}
+                            onChange={(event) => setExcludedInherited((current) => (
+                              event.target.checked ? current.filter((id) => id !== skill.id) : [...current, skill.id]
+                            ))}
+                          />
+                          <span className="min-w-0">
+                            <span className="flex flex-wrap items-center gap-2 text-sm font-medium wrap-anywhere">
+                              {skill.name}
+                              <Badge tone="info">自动提炼</Badge>
+                            </span>
+                            <span className="mt-0.5 block text-xs leading-5 text-muted wrap-anywhere">{skill.description}</span>
+                          </span>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ) : null}
           </div>
           <div className="min-w-0">
             <MultiSelect

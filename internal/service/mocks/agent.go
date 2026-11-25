@@ -42,6 +42,21 @@ func (m *MockAgentRepository) EXPECT() *MockAgentRepositoryMockRecorder {
 	return m.recorder
 }
 
+// AttachUserSkillToAgent mocks base method.
+func (m *MockAgentRepository) AttachUserSkillToAgent(ctx context.Context, userID, agentID uuid.UUID, skill biz.UserSkill, event biz.OutboxEvent) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AttachUserSkillToAgent", ctx, userID, agentID, skill, event)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AttachUserSkillToAgent indicates an expected call of AttachUserSkillToAgent.
+func (mr *MockAgentRepositoryMockRecorder) AttachUserSkillToAgent(ctx, userID, agentID, skill, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AttachUserSkillToAgent", reflect.TypeOf((*MockAgentRepository)(nil).AttachUserSkillToAgent), ctx, userID, agentID, skill, event)
+}
+
 // CountAgents mocks base method.
 func (m *MockAgentRepository) CountAgents(ctx context.Context, userID uuid.UUID) (int64, error) {
 	m.ctrl.T.Helper()
@@ -70,6 +85,21 @@ func (m *MockAgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, 
 func (mr *MockAgentRepositoryMockRecorder) CreateAgent(ctx, agent, event any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateAgent", reflect.TypeOf((*MockAgentRepository)(nil).CreateAgent), ctx, agent, event)
+}
+
+// CreateAgentVersion mocks base method.
+func (m *MockAgentRepository) CreateAgentVersion(ctx context.Context, agent biz.Agent, sourceAgentID uuid.UUID, event biz.OutboxEvent) (biz.Agent, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateAgentVersion", ctx, agent, sourceAgentID, event)
+	ret0, _ := ret[0].(biz.Agent)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateAgentVersion indicates an expected call of CreateAgentVersion.
+func (mr *MockAgentRepositoryMockRecorder) CreateAgentVersion(ctx, agent, sourceAgentID, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateAgentVersion", reflect.TypeOf((*MockAgentRepository)(nil).CreateAgentVersion), ctx, agent, sourceAgentID, event)
 }
 
 // DeleteAgent mocks base method.
@@ -130,6 +160,21 @@ func (mr *MockAgentRepositoryMockRecorder) GetAgentAdmin(ctx, agentID any) *gomo
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAgentAdmin", reflect.TypeOf((*MockAgentRepository)(nil).GetAgentAdmin), ctx, agentID)
 }
 
+// GetAgentSnapshotRevision mocks base method.
+func (m *MockAgentRepository) GetAgentSnapshotRevision(ctx context.Context, userID, agentID, revisionID uuid.UUID) (biz.AgentSnapshotRevision, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetAgentSnapshotRevision", ctx, userID, agentID, revisionID)
+	ret0, _ := ret[0].(biz.AgentSnapshotRevision)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetAgentSnapshotRevision indicates an expected call of GetAgentSnapshotRevision.
+func (mr *MockAgentRepositoryMockRecorder) GetAgentSnapshotRevision(ctx, userID, agentID, revisionID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAgentSnapshotRevision", reflect.TypeOf((*MockAgentRepository)(nil).GetAgentSnapshotRevision), ctx, userID, agentID, revisionID)
+}
+
 // GetPolicy mocks base method.
 func (m *MockAgentRepository) GetPolicy(ctx context.Context, policyID uuid.UUID) (biz.ModelPolicy, error) {
 	m.ctrl.T.Helper()
@@ -143,6 +188,21 @@ func (m *MockAgentRepository) GetPolicy(ctx context.Context, policyID uuid.UUID)
 func (mr *MockAgentRepositoryMockRecorder) GetPolicy(ctx, policyID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetPolicy", reflect.TypeOf((*MockAgentRepository)(nil).GetPolicy), ctx, policyID)
+}
+
+// ListAgentSnapshotRevisions mocks base method.
+func (m *MockAgentRepository) ListAgentSnapshotRevisions(ctx context.Context, userID, agentID uuid.UUID, limit int) ([]biz.AgentSnapshotRevision, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListAgentSnapshotRevisions", ctx, userID, agentID, limit)
+	ret0, _ := ret[0].([]biz.AgentSnapshotRevision)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListAgentSnapshotRevisions indicates an expected call of ListAgentSnapshotRevisions.
+func (mr *MockAgentRepositoryMockRecorder) ListAgentSnapshotRevisions(ctx, userID, agentID, limit any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAgentSnapshotRevisions", reflect.TypeOf((*MockAgentRepository)(nil).ListAgentSnapshotRevisions), ctx, userID, agentID, limit)
 }
 
 // ListAgents mocks base method.
@@ -205,6 +265,21 @@ func (mr *MockAgentRepositoryMockRecorder) ListModelsByIDs(ctx, modelIDs any) *g
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListModelsByIDs", reflect.TypeOf((*MockAgentRepository)(nil).ListModelsByIDs), ctx, modelIDs)
 }
 
+// ListPublishedAgentIDsByName mocks base method.
+func (m *MockAgentRepository) ListPublishedAgentIDsByName(ctx context.Context, userID uuid.UUID, name string) ([]uuid.UUID, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListPublishedAgentIDsByName", ctx, userID, name)
+	ret0, _ := ret[0].([]uuid.UUID)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListPublishedAgentIDsByName indicates an expected call of ListPublishedAgentIDsByName.
+func (mr *MockAgentRepositoryMockRecorder) ListPublishedAgentIDsByName(ctx, userID, name any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListPublishedAgentIDsByName", reflect.TypeOf((*MockAgentRepository)(nil).ListPublishedAgentIDsByName), ctx, userID, name)
+}
+
 // ListSkillsByIDs mocks base method.
 func (m *MockAgentRepository) ListSkillsByIDs(ctx context.Context, skillIDs []uuid.UUID) ([]biz.Skill, error) {
 	m.ctrl.T.Helper()
@@ -218,6 +293,21 @@ func (m *MockAgentRepository) ListSkillsByIDs(ctx context.Context, skillIDs []uu
 func (mr *MockAgentRepositoryMockRecorder) ListSkillsByIDs(ctx, skillIDs any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListSkillsByIDs", reflect.TypeOf((*MockAgentRepository)(nil).ListSkillsByIDs), ctx, skillIDs)
+}
+
+// ListUserSkillOptOuts mocks base method.
+func (m *MockAgentRepository) ListUserSkillOptOuts(ctx context.Context, userID, agentID uuid.UUID) ([]uuid.UUID, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListUserSkillOptOuts", ctx, userID, agentID)
+	ret0, _ := ret[0].([]uuid.UUID)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListUserSkillOptOuts indicates an expected call of ListUserSkillOptOuts.
+func (mr *MockAgentRepositoryMockRecorder) ListUserSkillOptOuts(ctx, userID, agentID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListUserSkillOptOuts", reflect.TypeOf((*MockAgentRepository)(nil).ListUserSkillOptOuts), ctx, userID, agentID)
 }
 
 // ListUserSkillsByIDs mocks base method.
@@ -248,6 +338,34 @@ func (m *MockAgentRepository) NextAgentVersion(ctx context.Context, userID uuid.
 func (mr *MockAgentRepositoryMockRecorder) NextAgentVersion(ctx, userID, name any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NextAgentVersion", reflect.TypeOf((*MockAgentRepository)(nil).NextAgentVersion), ctx, userID, name)
+}
+
+// RefreshUserSkillOnBoundAgents mocks base method.
+func (m *MockAgentRepository) RefreshUserSkillOnBoundAgents(ctx context.Context, userID uuid.UUID, skill biz.UserSkill, event biz.OutboxEvent) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RefreshUserSkillOnBoundAgents", ctx, userID, skill, event)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RefreshUserSkillOnBoundAgents indicates an expected call of RefreshUserSkillOnBoundAgents.
+func (mr *MockAgentRepositoryMockRecorder) RefreshUserSkillOnBoundAgents(ctx, userID, skill, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RefreshUserSkillOnBoundAgents", reflect.TypeOf((*MockAgentRepository)(nil).RefreshUserSkillOnBoundAgents), ctx, userID, skill, event)
+}
+
+// RestoreAgentSnapshot mocks base method.
+func (m *MockAgentRepository) RestoreAgentSnapshot(ctx context.Context, userID, agentID uuid.UUID, snapshot map[string]any, event biz.OutboxEvent) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RestoreAgentSnapshot", ctx, userID, agentID, snapshot, event)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RestoreAgentSnapshot indicates an expected call of RestoreAgentSnapshot.
+func (mr *MockAgentRepositoryMockRecorder) RestoreAgentSnapshot(ctx, userID, agentID, snapshot, event any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RestoreAgentSnapshot", reflect.TypeOf((*MockAgentRepository)(nil).RestoreAgentSnapshot), ctx, userID, agentID, snapshot, event)
 }
 
 // UpdateAgent mocks base method.

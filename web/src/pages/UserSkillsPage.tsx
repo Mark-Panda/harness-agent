@@ -8,7 +8,7 @@ import { mutate, requestJSON, uploadSkillPackage } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
 import { useClientPage, useRemote } from "../lib/hooks";
-import type { UserSkill, UserSkillInput, UserSkillOrigin, UserSkillSynthesisPolicy, UserSkillSynthesisRun, UserSkillSynthesisSettings, UserSkillSynthesisSettingsInput } from "../lib/types";
+import type { UserSkill, UserSkillInput, UserSkillOrigin, UserSkillRevision, UserSkillSynthesisPolicy, UserSkillSynthesisRun, UserSkillSynthesisSettings, UserSkillSynthesisSettingsInput } from "../lib/types";
 
 interface UserSkillList {
   items: UserSkill[];
@@ -179,7 +179,7 @@ function SynthesisSettingsCard() {
   };
 
   return (
-    <Card title="自动提炼设置" description="每天从有效对话中提炼技能草稿。这里决定是否分析你的对话，以及由哪个已发布的模型策略执行提炼。">
+    <Card title="自动提炼设置" description="每天按助手分析有效对话，自动生成并发布技能，直接绑定到对应助手；已有同类自动技能会原地优化并保留历史。群聊共享会话不参与个人技能提炼。这里决定是否分析你的对话，以及由哪个已发布的模型策略执行提炼。">
       {settings.loading && !settings.data ? (
         <LoadingState />
       ) : settings.error ? (
@@ -230,12 +230,14 @@ function SynthesisSettingsCard() {
 // synthesisOutcomeLabels 把提炼结果原因翻译成用户语言。
 const synthesisOutcomeLabels: Record<string, string> = {
   created: "已生成技能",
+  optimized: "已优化已有技能",
   not_worthwhile: "没有值得沉淀的技能",
   low_confidence: "置信度不足",
   no_activity: "没有有效对话",
   no_new_messages: "上次提炼后没有新对话",
   duplicate_skill: "已有同类技能",
   invalid_candidate: "格式校验未通过",
+  agent_missing: "会话助手已不存在",
   daily_limit_reached: "达到每日上限",
   disabled: "你已关闭自动提炼",
   model_unavailable: "提炼模型不可用",
@@ -307,6 +309,16 @@ function SynthesisRunsCard() {
                 {run.confidence > 0 ? ` · 置信度 ${run.confidence.toFixed(2)}` : ""}
               </p>
               {run.detail ? <p className="text-xs leading-5 text-muted">{run.detail}</p> : null}
+              {run.results?.length ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {run.results.map((result, index) => (
+                    <span key={`${run.id}-${index}`} className="rounded border border-line bg-paper-deep px-2 py-0.5 text-[11px] text-ink-soft">
+                      {result.agent_name || "通用"} · {synthesisOutcomeLabels[result.outcome] ?? result.outcome}
+                      {result.skill_name ? ` · ${result.skill_name}` : ""}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
               <p className="text-[11px] text-muted">
                 {formatDateTime(run.started_at)}
                 {run.finished_at ? ` → ${formatDateTime(run.finished_at)}` : ""}
@@ -322,6 +334,73 @@ function SynthesisRunsCard() {
   );
 }
 
+// UserSkillHistoryDrawer 展示技能被原地优化前的历史快照，并支持恢复。
+function UserSkillHistoryDrawer({ skill, onClose, onRestored }: { skill: UserSkill; onClose: () => void; onRestored: () => void }) {
+  const history = useRemote(
+    () => requestJSON<{ items: UserSkillRevision[] }>(`/api/v1/user-skills/${skill.id}/revisions?limit=20`),
+    [skill.id],
+  );
+  const toast = useToast();
+  const [pending, setPending] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const revisions = history.data?.items ?? [];
+  const restore = async (revision: UserSkillRevision) => {
+    setBusy(true);
+    try {
+      await mutate<UserSkill>(`/api/v1/user-skills/${skill.id}/revisions/${revision.id}/restore`, "POST", undefined, crypto.randomUUID());
+      toast.show("已恢复历史版本", "success");
+      setPending(null);
+      history.reload();
+      onRestored();
+    } catch (failure) {
+      toast.show(describeError(failure), "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <FormDrawer
+      title={`${skill.name} · 历史版本`}
+      description="每次原地优化前保存的内容快照，最近的在前。恢复后当前内容也会保留为一条历史。"
+      onSubmit={(event) => event.preventDefault()}
+      onCancel={onClose}
+    >
+      <div className="sm:col-span-2 flex flex-col gap-3">
+        {history.error ? <ErrorBanner message={history.error} onRetry={history.reload} /> : null}
+        {history.loading && !history.data ? (
+          <LoadingState />
+        ) : revisions.length === 0 ? (
+          <EmptyState title="还没有历史版本" description="技能首次被自动优化后会在这里保留旧内容。" />
+        ) : (
+          revisions.map((revision) => (
+            <article key={revision.id} className="rounded-lg border border-line bg-paper-deep/40 p-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                <Badge tone="neutral">v{revision.version}</Badge>
+                <span>{formatDateTime(revision.created_at)}</span>
+                <span>置信度 {Math.round(revision.confidence * 100)}%</span>
+                <div className="ml-auto flex items-center gap-2">
+                  {pending === revision.id ? (
+                    <>
+                      <Button size="sm" variant="secondary" disabled={busy} onClick={() => setPending(null)}>取消</Button>
+                      <Button size="sm" loading={busy} onClick={() => void restore(revision)}>确认恢复</Button>
+                    </>
+                  ) : (
+                    <Button size="sm" variant="secondary" onClick={() => setPending(revision.id)}>恢复此版本</Button>
+                  )}
+                </div>
+              </div>
+              <p className="mt-2 text-sm text-ink">{revision.description || "无描述"}</p>
+              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-paper-raised p-2 text-[11px] leading-5 text-ink-soft">
+                {revision.prompt_template}
+              </pre>
+            </article>
+          ))
+        )}
+      </div>
+    </FormDrawer>
+  );
+}
+
 export default function UserSkillsPage() {
   const skills = useRemote(() => requestJSON<UserSkillList>("/api/v1/user-skills?limit=200"), []);
   const toast = useToast();
@@ -330,6 +409,7 @@ export default function UserSkillsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyID, setBusyID] = useState<string | null>(null);
   const [bundleSkill, setBundleSkill] = useState<UserSkill | null>(null);
+  const [historySkill, setHistorySkill] = useState<UserSkill | null>(null);
   const [importing, setImporting] = useState(false);
   const importRef = useRef<HTMLInputElement | null>(null);
   const skillItems = skills.data?.items ?? [];
@@ -391,7 +471,7 @@ export default function UserSkillsPage() {
       <PageHeader
         eyebrow="工作区 · 能力"
         title="我的技能"
-        description="这里是你私有的技能库。开启每日技能提炼后，系统会从有效对话中生成待确认草稿；也可以手动创建或导入标准 SKILL 包。发布后即可在助手中勾选使用。"
+        description="这里是你私有的技能库。开启每日技能提炼后，系统会按助手从有效对话中生成并发布技能，直接绑定到对应助手；同类技能会原地优化并保留历史。也可以手动创建或导入标准 SKILL 包，发布后即可在助手中勾选使用。"
         actions={
           <>
             <input
@@ -438,6 +518,7 @@ export default function UserSkillsPage() {
                         <Badge tone="neutral">v{skill.version}</Badge>
                         <Badge tone={statusTone(skill.status)}>{statusLabel(skill.status)}</Badge>
                         <Badge tone={skill.origin === "auto" ? "info" : "neutral"}>{originLabel(skill.origin)}</Badge>
+                        {skill.user_edited_at ? <Badge tone="warning">已手动修改</Badge> : null}
                         {skill.origin === "auto" ? <Badge tone="neutral">置信度 {Math.round(skill.confidence * 100)}%</Badge> : null}
                         {skill.bundle ? <Badge tone="info">技能包 · {skill.bundle.file_count} 文件</Badge> : null}
                         {skill.bundle?.has_scripts ? <Badge tone={skill.bundle.execution_enabled ? "warning" : "neutral"}>{skill.bundle.execution_enabled ? "脚本可执行" : "含脚本"}</Badge> : null}
@@ -448,6 +529,9 @@ export default function UserSkillsPage() {
                     <div className="flex items-center gap-2">
                       {skill.bundle ? (
                         <Button size="sm" variant="secondary" onClick={() => setBundleSkill(skill)}>文件</Button>
+                      ) : null}
+                      {skill.origin === "auto" ? (
+                        <Button size="sm" variant="ghost" onClick={() => setHistorySkill(skill)}>历史</Button>
                       ) : null}
                       {skill.status !== "published" ? (
                         <Button size="sm" variant="secondary" loading={busy} disabled={busyID !== null && !busy} onClick={() => void runAction(skill, "publish", "技能已发布")}>发布</Button>
@@ -489,12 +573,13 @@ export default function UserSkillsPage() {
         ) : (
           <EmptyState
             title="还没有技能"
-            description="开启每日技能提炼后，有效对话会在第二天生成待确认草稿；也可以现在手动创建或导入标准 SKILL 包。"
+            description="开启每日技能提炼后，系统会按助手从有效对话中生成并发布技能，直接绑定到对应助手；也可以现在手动创建或导入标准 SKILL 包。"
             action={<Button size="sm" onClick={() => setEditing("new")}>新建技能</Button>}
           />
         )}
         <Pager page={paging.page} totalPages={paging.totalPages} total={skillItems.length} busy={skills.loading} onChange={paging.setPage} />
       </Card>
+      {historySkill ? <UserSkillHistoryDrawer skill={historySkill} onClose={() => setHistorySkill(null)} onRestored={() => skills.reload()} /> : null}
       <ConfirmDialog
         open={deleting !== null}
         title={`删除技能 ${deleting?.name ?? ""}？`}

@@ -1,8 +1,10 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // agentModel 对应 agents 表：用户私有 Agent 版本。
@@ -88,6 +91,38 @@ type agentUserSkillModel struct {
 // TableName 指定 Agent 用户技能绑定表名。
 func (agentUserSkillModel) TableName() string { return "agent_user_skills" }
 
+// agentUserSkillOptOutModel 对应 agent_user_skill_optouts 表：助手版本显式移除的用户技能。
+// 自动挂载与发布继承会跳过这里的技能，从而尊重“按版本移除”的用户意图。
+type agentUserSkillOptOutModel struct {
+	// UserID 所属用户，RLS 隔离键。
+	UserID uuid.UUID `gorm:"column:user_id;type:uuid;primaryKey"`
+	// AgentID 执行移除操作的助手版本 ID。
+	AgentID uuid.UUID `gorm:"column:agent_id;type:uuid;primaryKey"`
+	// UserSkillID 被显式移除的用户技能 ID。
+	UserSkillID uuid.UUID `gorm:"column:user_skill_id;type:uuid;primaryKey"`
+	// CreatedAt 移除时间。
+	CreatedAt time.Time `gorm:"not null"`
+}
+
+// TableName 指定助手用户技能移除标记表名。
+func (agentUserSkillOptOutModel) TableName() string {
+	return "agent_user_skill_optouts"
+}
+
+// agentSnapshotRevisionModel 对应 agent_snapshot_revisions 表：发布快照原地更新前的历史。
+type agentSnapshotRevisionModel struct {
+	ID             uuid.UUID      `gorm:"type:uuid;primaryKey"`
+	UserID         uuid.UUID      `gorm:"type:uuid;not null"`
+	AgentID        uuid.UUID      `gorm:"column:agent_id;type:uuid;not null"`
+	AgentVersion   int            `gorm:"column:agent_version;not null"`
+	ConfigSnapshot datatypes.JSON `gorm:"column:config_snapshot;not null"`
+	Reason         string         `gorm:"not null;default:''"`
+	CreatedAt      time.Time      `gorm:"not null"`
+}
+
+// TableName 指定助手快照历史表名。
+func (agentSnapshotRevisionModel) TableName() string { return "agent_snapshot_revisions" }
+
 // skillModel 是 skills 表的只读摘要，用于发布快照校验。
 type skillModel struct {
 	// ID Skill 主键。
@@ -139,6 +174,16 @@ func NewAgentRepository(db *gorm.DB) *AgentRepository {
 
 // CreateAgent 在用户 scope 事务内创建 Agent 版本、绑定与审计事件。
 func (r *AgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, event biz.OutboxEvent) (biz.Agent, error) {
+	return r.createAgent(ctx, agent, uuid.Nil, event)
+}
+
+// CreateAgentVersion 在同一事务内创建新版本并复制源版本的显式移除标记。
+func (r *AgentRepository) CreateAgentVersion(ctx context.Context, agent biz.Agent, sourceAgentID uuid.UUID, event biz.OutboxEvent) (biz.Agent, error) {
+	return r.createAgent(ctx, agent, sourceAgentID, event)
+}
+
+// createAgent 是创建版本的共享实现；inheritFrom 非空时复制该版本的显式移除标记。
+func (r *AgentRepository) createAgent(ctx context.Context, agent biz.Agent, inheritFrom uuid.UUID, event biz.OutboxEvent) (biz.Agent, error) {
 	record, skills, userSkills, mcps, err := fromBizAgent(agent)
 	if err != nil {
 		return biz.Agent{}, err
@@ -149,6 +194,11 @@ func (r *AgentRepository) CreateAgent(ctx context.Context, agent biz.Agent, even
 		}
 		if err := createAgentBindings(tx, skills, userSkills, mcps); err != nil {
 			return err
+		}
+		if inheritFrom != uuid.Nil {
+			if err := copyUserSkillOptOuts(tx, agent.UserID, inheritFrom, agent.ID); err != nil {
+				return err
+			}
 		}
 		return appendOutbox(tx, event)
 	})
@@ -165,7 +215,12 @@ func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, even
 		return biz.Agent{}, err
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: agent.UserID}, func(tx *gorm.DB) error {
-		result := tx.Model(&agentModel{}).Where("id = ? AND user_id = ? AND status = ?", agent.ID, agent.UserID, biz.AgentDraft).Updates(map[string]any{
+		query := tx.Model(&agentModel{}).Where("id = ? AND user_id = ? AND status = ?", agent.ID, agent.UserID, biz.AgentDraft)
+		// 乐观并发：把期望的 updated_at 放进 UPDATE 条件，避免校验与写入之间被自动挂载插入而丢绑定。
+		if !agent.UpdatedAt.IsZero() {
+			query = query.Where("updated_at = ?", agent.UpdatedAt)
+		}
+		result := query.Updates(map[string]any{
 			"description": record.Description, "mode": record.Mode, "model_policy_id": record.ModelPolicyID,
 			"model_policy_version": record.ModelPolicyVersion, "config_snapshot": record.ConfigSnapshot,
 			"status": record.Status, "updated_at": time.Now().UTC(),
@@ -174,7 +229,13 @@ func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, even
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return fmt.Errorf("%w: agent is missing or not a draft", biz.ErrResourceConflict)
+			return fmt.Errorf("%w: agent is missing, not a draft, or was modified concurrently", biz.ErrResourceConflict)
+		}
+		// 记录用户显式移除的用户技能，自动挂载与发布继承时会跳过这些技能。
+		var previousUserSkillIDs []uuid.UUID
+		if err := tx.Model(&agentUserSkillModel{}).Where("agent_id = ? AND user_id = ?", agent.ID, agent.UserID).
+			Pluck("user_skill_id", &previousUserSkillIDs).Error; err != nil {
+			return err
 		}
 		if err := tx.Delete(&agentSkillModel{}, "agent_id = ? AND user_id = ?", agent.ID, agent.UserID).Error; err != nil {
 			return err
@@ -186,6 +247,17 @@ func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, even
 			return err
 		}
 		if err := createAgentBindings(tx, skills, userSkills, mcps); err != nil {
+			return err
+		}
+		nextUserSkillIDs := make([]uuid.UUID, 0, len(userSkills))
+		for _, binding := range userSkills {
+			nextUserSkillIDs = append(nextUserSkillIDs, binding.UserSkillID)
+		}
+		if err := syncUserSkillOptOuts(tx, agent.UserID, agent.ID, previousUserSkillIDs, nextUserSkillIDs); err != nil {
+			return err
+		}
+		// 显式取消继承的技能即使从未绑定也写入移除标记，发布时不再被同家族继承。
+		if err := recordUserSkillOptOuts(tx, agent.UserID, agent.ID, agent.UserSkillOptOuts); err != nil {
 			return err
 		}
 		return appendOutbox(tx, event)
@@ -283,6 +355,339 @@ func (r *AgentRepository) GetAgent(ctx context.Context, userID, agentID uuid.UUI
 		return biz.Agent{}, catalogError("get agent", err)
 	}
 	return toBizAgent(record, skillIDs, userSkillIDs, mcpIDs)
+}
+
+// AttachUserSkillToAgent 为指定 Agent 追加用户技能绑定，并在已发布快照中同步技能内容。
+// 返回 false 表示该版本已显式移除该技能，按语义跳过挂载；不创建新版本。
+func (r *AgentRepository) AttachUserSkillToAgent(ctx context.Context, userID, agentID uuid.UUID, skill biz.UserSkill, event biz.OutboxEvent) (bool, error) {
+	attached := false
+	changed := false
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var record agentModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&record, "id = ? AND user_id = ?", agentID, userID).Error; err != nil {
+			return err
+		}
+		// 用户在当前版本显式移除过该技能时不再自动挂回，尊重“按版本移除”语义。
+		var optOutCount int64
+		if err := tx.Model(&agentUserSkillOptOutModel{}).
+			Where("user_id = ? AND agent_id = ? AND user_skill_id = ?", userID, agentID, skill.ID).
+			Count(&optOutCount).Error; err != nil {
+			return err
+		}
+		if optOutCount > 0 {
+			return nil
+		}
+		attached = true
+		binding := agentUserSkillModel{
+			AgentID: agentID, UserSkillID: skill.ID, UserID: userID, CreatedAt: time.Now().UTC(),
+		}
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 0 {
+			changed = true
+		}
+		if record.Status != string(biz.AgentPublished) {
+			if !changed {
+				return nil
+			}
+			// 草稿绑定变化也要推进 updated_at，让并发的草稿编辑能通过乐观并发发现冲突。
+			if err := tx.Model(&agentModel{}).Where("id = ? AND user_id = ?", agentID, userID).
+				Update("updated_at", time.Now().UTC()).Error; err != nil {
+				return err
+			}
+			return appendOutbox(tx, event)
+		}
+		updated, snapshotChanged, err := refreshAgentUserSkillSnapshot(record.ConfigSnapshot, skill)
+		if err != nil {
+			return err
+		}
+		if snapshotChanged {
+			if err := insertAgentSnapshotRevision(tx, userID, agentID, record.Version, record.ConfigSnapshot, "user_skill_attached"); err != nil {
+				return err
+			}
+			if err := tx.Model(&agentModel{}).Where("id = ? AND user_id = ?", agentID, userID).
+				Updates(map[string]any{
+					"config_snapshot": datatypes.JSON(updated), "updated_at": time.Now().UTC(),
+				}).Error; err != nil {
+				return err
+			}
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		return appendOutbox(tx, event)
+	})
+	if err != nil {
+		return false, catalogError("attach user skill to agent", err)
+	}
+	return attached, nil
+}
+
+// ListPublishedAgentIDsByName 返回同名助手的全部已发布版本 ID，按版本升序。
+func (r *AgentRepository) ListPublishedAgentIDsByName(ctx context.Context, userID uuid.UUID, name string) ([]uuid.UUID, error) {
+	var ids []uuid.UUID
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&agentModel{}).
+			Where("user_id = ? AND name = ? AND status = ?", userID, name, string(biz.AgentPublished)).
+			Order("version").Pluck("id", &ids).Error
+	})
+	if err != nil {
+		return nil, catalogError("list published agent ids by name", err)
+	}
+	return ids, nil
+}
+
+// ListUserSkillOptOuts 返回助手版本显式移除的用户技能 ID，按 ID 升序。
+func (r *AgentRepository) ListUserSkillOptOuts(ctx context.Context, userID, agentID uuid.UUID) ([]uuid.UUID, error) {
+	var ids []uuid.UUID
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&agentUserSkillOptOutModel{}).
+			Where("user_id = ? AND agent_id = ?", userID, agentID).
+			Order("user_skill_id").Pluck("user_skill_id", &ids).Error
+	})
+	if err != nil {
+		return nil, catalogError("list agent user skill opt-outs", err)
+	}
+	return ids, nil
+}
+
+// RefreshUserSkillOnBoundAgents 刷新所有绑定该技能的已发布 Agent 快照；单个助手失败不阻断其他助手。
+func (r *AgentRepository) RefreshUserSkillOnBoundAgents(ctx context.Context, userID uuid.UUID, skill biz.UserSkill, event biz.OutboxEvent) error {
+	var agentIDs []uuid.UUID
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&agentUserSkillModel{}).
+			Where("user_id = ? AND user_skill_id = ?", userID, skill.ID).
+			Order("agent_id").Pluck("agent_id", &agentIDs).Error
+	})
+	if err != nil {
+		return catalogError("list agents bound to user skill", err)
+	}
+	var firstErr error
+	for _, agentID := range agentIDs {
+		if _, err := r.AttachUserSkillToAgent(ctx, userID, agentID, skill, event); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// maxAgentSnapshotRevisions 是单个助手保留的发布快照历史上限。
+const maxAgentSnapshotRevisions = 20
+
+// ListAgentSnapshotRevisions 按时间倒序读取助手发布快照历史。
+func (r *AgentRepository) ListAgentSnapshotRevisions(ctx context.Context, userID, agentID uuid.UUID, limit int) ([]biz.AgentSnapshotRevision, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var records []agentSnapshotRevisionModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND agent_id = ?", userID, agentID).
+			Order("created_at DESC").Limit(limit).Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list agent snapshot revisions", err)
+	}
+	revisions := make([]biz.AgentSnapshotRevision, 0, len(records))
+	for _, record := range records {
+		revision, err := toBizAgentSnapshotRevision(record)
+		if err != nil {
+			return nil, err
+		}
+		revisions = append(revisions, revision)
+	}
+	return revisions, nil
+}
+
+// GetAgentSnapshotRevision 读取单条助手发布快照历史。
+func (r *AgentRepository) GetAgentSnapshotRevision(ctx context.Context, userID, agentID, revisionID uuid.UUID) (biz.AgentSnapshotRevision, error) {
+	var record agentSnapshotRevisionModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("id = ? AND user_id = ? AND agent_id = ?", revisionID, userID, agentID).First(&record).Error
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return biz.AgentSnapshotRevision{}, fmt.Errorf("%w: agent snapshot revision not found", biz.ErrResourceNotFound)
+		}
+		return biz.AgentSnapshotRevision{}, catalogError("get agent snapshot revision", err)
+	}
+	return toBizAgentSnapshotRevision(record)
+}
+
+// RestoreAgentSnapshot 用历史快照覆盖当前发布快照，并把当前快照保留为新的历史。
+func (r *AgentRepository) RestoreAgentSnapshot(ctx context.Context, userID, agentID uuid.UUID, snapshot map[string]any, event biz.OutboxEvent) error {
+	encoded, err := json.Marshal(nonNilMap(snapshot))
+	if err != nil {
+		return err
+	}
+	err = WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var record agentModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&record, "id = ? AND user_id = ?", agentID, userID).Error; err != nil {
+			return err
+		}
+		if record.Status != string(biz.AgentPublished) {
+			return fmt.Errorf("%w: only published agents have restorable snapshots", biz.ErrResourceConflict)
+		}
+		if err := insertAgentSnapshotRevision(tx, userID, agentID, record.Version, record.ConfigSnapshot, "snapshot_restored"); err != nil {
+			return err
+		}
+		if err := tx.Model(&agentModel{}).Where("id = ? AND user_id = ?", agentID, userID).
+			Updates(map[string]any{
+				"config_snapshot": datatypes.JSON(encoded), "updated_at": time.Now().UTC(),
+			}).Error; err != nil {
+			return err
+		}
+		// 快照恢复同时还原技能绑定与移除标记，避免运行时注入与绑定表不一致。
+		if err := restoreUserSkillBindings(tx, userID, agentID, snapshot); err != nil {
+			return err
+		}
+		return appendOutbox(tx, event)
+	})
+	if err != nil {
+		return catalogError("restore agent snapshot", err)
+	}
+	return nil
+}
+
+// insertAgentSnapshotRevision 记录更新前的发布快照，并裁剪超出上限的历史。
+func insertAgentSnapshotRevision(tx *gorm.DB, userID, agentID uuid.UUID, version int, snapshot datatypes.JSON, reason string) error {
+	if len(snapshot) == 0 || string(snapshot) == "{}" {
+		return nil
+	}
+	record := agentSnapshotRevisionModel{
+		ID: uuid.New(), UserID: userID, AgentID: agentID, AgentVersion: version,
+		ConfigSnapshot: snapshot, Reason: reason, CreatedAt: time.Now().UTC(),
+	}
+	if err := tx.Create(&record).Error; err != nil {
+		return err
+	}
+	return tx.Exec(`
+DELETE FROM agent_snapshot_revisions
+WHERE id IN (
+  SELECT id FROM agent_snapshot_revisions
+  WHERE user_id = ? AND agent_id = ?
+  ORDER BY created_at DESC
+  OFFSET ?
+)`, userID, agentID, maxAgentSnapshotRevisions).Error
+}
+
+// toBizAgentSnapshotRevision 把快照历史行转换为领域结构。
+func toBizAgentSnapshotRevision(record agentSnapshotRevisionModel) (biz.AgentSnapshotRevision, error) {
+	snapshot := map[string]any{}
+	if len(record.ConfigSnapshot) > 0 {
+		if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
+			return biz.AgentSnapshotRevision{}, err
+		}
+	}
+	return biz.AgentSnapshotRevision{
+		ID: record.ID, UserID: record.UserID, AgentID: record.AgentID, AgentVersion: record.AgentVersion,
+		ConfigSnapshot: snapshot, Reason: record.Reason, CreatedAt: record.CreatedAt,
+	}, nil
+}
+
+// refreshAgentUserSkillSnapshot 把用户技能内容写入 Agent 发布快照；内容未变化时返回 false。
+func refreshAgentUserSkillSnapshot(raw datatypes.JSON, skill biz.UserSkill) ([]byte, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	snapshot := map[string]any{}
+	// 使用 UseNumber 保留快照中的原始数值，避免价格等字段被 float64 重新序列化后失真。
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&snapshot); err != nil {
+		return nil, false, err
+	}
+	if len(snapshot) == 0 {
+		return nil, false, nil
+	}
+	entries := make([]map[string]any, 0)
+	switch existing := snapshot["user_skills"].(type) {
+	case []any:
+		for _, item := range existing {
+			if entry, ok := item.(map[string]any); ok {
+				entries = append(entries, entry)
+			}
+		}
+	}
+	changed := false
+	found := false
+	for index, entry := range entries {
+		entryID := fmt.Sprint(entry["id"])
+		if entryID == "<nil>" || entryID == "" {
+			// 兼容早期快照使用 Go 字段名 ID 的形态。
+			entryID = fmt.Sprint(entry["ID"])
+		}
+		if entryID != skill.ID.String() {
+			continue
+		}
+		found = true
+		if fmt.Sprint(entry["prompt_template"]) != skill.PromptTemplate ||
+			fmt.Sprint(entry["description"]) != skill.Description ||
+			fmt.Sprint(entry["status"]) != string(skill.Status) ||
+			!jsonValuesEqual(entry["parameters"], skill.Parameters) ||
+			userSkillSnapshotBundleDigest(entry) != skill.Bundle.Digest {
+			entries[index] = userSkillSnapshotEntry(entry, skill)
+			changed = true
+		}
+		break
+	}
+	if !found {
+		entries = append(entries, userSkillSnapshotEntry(nil, skill))
+		changed = true
+	}
+	if !changed {
+		return nil, false, nil
+	}
+	snapshot["user_skills"] = entries
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, false, err
+	}
+	return encoded, true, nil
+}
+
+// userSkillSnapshotEntry 生成或更新快照中的用户技能条目，保留历史条目中的额外字段。
+func userSkillSnapshotEntry(existing map[string]any, skill biz.UserSkill) map[string]any {
+	entry := existing
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	entry["id"] = skill.ID.String()
+	entry["name"] = skill.Name
+	entry["version"] = skill.Version
+	entry["description"] = skill.Description
+	entry["prompt_template"] = skill.PromptTemplate
+	entry["parameters"] = skill.Parameters
+	entry["status"] = string(skill.Status)
+	entry["origin"] = string(skill.Origin)
+	entry["source_session_ids"] = skill.SourceSessionIDs
+	entry["confidence"] = skill.Confidence
+	entry["bundle"] = skill.Bundle
+	entry["updated_at"] = skill.UpdatedAt
+	return entry
+}
+
+// jsonValuesEqual 以 JSON 表示比较两个值，兼容 json.Number 与 float64 的差异。
+func jsonValuesEqual(left, right any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return bytes.Equal(leftJSON, rightJSON)
+}
+
+// userSkillSnapshotBundleDigest 读取快照条目中的技能包摘要。
+func userSkillSnapshotBundleDigest(entry map[string]any) string {
+	bundle, ok := entry["bundle"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprint(bundle["digest"])
 }
 
 // ListAgents 按创建时间与 ID 降序游标分页，多取一条用于判断是否还有下一页；默认排除已归档版本。
@@ -534,6 +939,128 @@ func createAgentBindings(tx *gorm.DB, skills []agentSkillModel, userSkills []age
 		}
 	}
 	return nil
+}
+
+// syncUserSkillOptOuts 根据本次更新的绑定差异维护显式移除标记：
+// 被移除的技能写入标记，被重新加回或新绑定的技能清除标记。
+func syncUserSkillOptOuts(tx *gorm.DB, userID, agentID uuid.UUID, previous, next []uuid.UUID) error {
+	previousSet := make(map[uuid.UUID]struct{}, len(previous))
+	for _, id := range previous {
+		previousSet[id] = struct{}{}
+	}
+	nextSet := make(map[uuid.UUID]struct{}, len(next))
+	for _, id := range next {
+		nextSet[id] = struct{}{}
+	}
+	now := time.Now().UTC()
+	optOuts := make([]agentUserSkillOptOutModel, 0)
+	restored := make([]uuid.UUID, 0)
+	for _, id := range previous {
+		if _, exists := nextSet[id]; !exists {
+			optOuts = append(optOuts, agentUserSkillOptOutModel{UserID: userID, AgentID: agentID, UserSkillID: id, CreatedAt: now})
+		}
+	}
+	for _, id := range next {
+		if _, exists := previousSet[id]; !exists {
+			restored = append(restored, id)
+		}
+	}
+	if len(optOuts) > 0 {
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&optOuts).Error; err != nil {
+			return err
+		}
+	}
+	if len(restored) > 0 {
+		if err := tx.Where("user_id = ? AND agent_id = ? AND user_skill_id IN ?", userID, agentID, restored).
+			Delete(&agentUserSkillOptOutModel{}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyUserSkillOptOuts 在同一事务内把源版本的显式移除标记复制到新版本。
+func copyUserSkillOptOuts(tx *gorm.DB, userID, fromAgentID, toAgentID uuid.UUID) error {
+	return tx.Exec(`INSERT INTO agent_user_skill_optouts (user_id, agent_id, user_skill_id)
+SELECT user_id, ?, user_skill_id FROM agent_user_skill_optouts WHERE user_id = ? AND agent_id = ?
+ON CONFLICT DO NOTHING`, toAgentID, userID, fromAgentID).Error
+}
+
+// recordUserSkillOptOuts 记录显式取消继承的技能；即使从未绑定也写入移除标记。
+func recordUserSkillOptOuts(tx *gorm.DB, userID, agentID uuid.UUID, skillIDs []uuid.UUID) error {
+	if len(skillIDs) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	optOuts := make([]agentUserSkillOptOutModel, 0, len(skillIDs))
+	for _, id := range skillIDs {
+		optOuts = append(optOuts, agentUserSkillOptOutModel{UserID: userID, AgentID: agentID, UserSkillID: id, CreatedAt: now})
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&optOuts).Error
+}
+
+// restoreUserSkillBindings 用快照中的用户技能列表还原绑定表，并同步移除标记。
+// 已删除或不属于当前用户的技能无法恢复绑定，但仍保留在冻结快照中。
+func restoreUserSkillBindings(tx *gorm.DB, userID, agentID uuid.UUID, snapshot map[string]any) error {
+	desired := snapshotUserSkillIDs(snapshot)
+	if len(desired) > 0 {
+		var existing []uuid.UUID
+		if err := tx.Model(&userSkillModel{}).Where("user_id = ? AND id IN ?", userID, desired).
+			Pluck("id", &existing).Error; err != nil {
+			return err
+		}
+		desired = existing
+	}
+	var previous []uuid.UUID
+	if err := tx.Model(&agentUserSkillModel{}).Where("agent_id = ? AND user_id = ?", agentID, userID).
+		Pluck("user_skill_id", &previous).Error; err != nil {
+		return err
+	}
+	if err := tx.Delete(&agentUserSkillModel{}, "agent_id = ? AND user_id = ?", agentID, userID).Error; err != nil {
+		return err
+	}
+	if len(desired) > 0 {
+		now := time.Now().UTC()
+		bindings := make([]agentUserSkillModel, 0, len(desired))
+		for _, id := range desired {
+			bindings = append(bindings, agentUserSkillModel{AgentID: agentID, UserSkillID: id, UserID: userID, CreatedAt: now})
+		}
+		if err := tx.Create(&bindings).Error; err != nil {
+			return err
+		}
+	}
+	return syncUserSkillOptOuts(tx, userID, agentID, previous, desired)
+}
+
+// snapshotUserSkillIDs 从发布快照中提取用户技能 ID，忽略非法或重复项。
+func snapshotUserSkillIDs(snapshot map[string]any) []uuid.UUID {
+	raw, exists := snapshot["user_skills"]
+	if !exists {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var entries []struct {
+		ID uuid.UUID `json:"id"`
+	}
+	if err := json.Unmarshal(encoded, &entries); err != nil {
+		return nil
+	}
+	seen := make(map[uuid.UUID]struct{}, len(entries))
+	ids := make([]uuid.UUID, 0, len(entries))
+	for _, entry := range entries {
+		if entry.ID == uuid.Nil {
+			continue
+		}
+		if _, duplicate := seen[entry.ID]; duplicate {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+		ids = append(ids, entry.ID)
+	}
+	return ids
 }
 
 // toBizAgent 将主记录与绑定 ID 组装为领域聚合，并解码配置快照 JSON。

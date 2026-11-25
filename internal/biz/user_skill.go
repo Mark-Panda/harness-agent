@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,10 +74,36 @@ type UserSkill struct {
 	Confidence float64 `json:"confidence"`
 	// Bundle 标准技能包元数据；零值表示仅提示词技能。
 	Bundle SkillBundleInfo `json:"bundle"`
+	// UserEditedAt 用户最后一次手动编辑时间；非空时自动提炼不再覆盖该技能。
+	UserEditedAt *time.Time `json:"user_edited_at,omitempty"`
 	// CreatedAt 创建时间（UTC）。
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt 更新时间（UTC）。
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// UserSkillRevision 是用户技能被原地更新前的历史内容，用于误覆盖恢复与审计。
+type UserSkillRevision struct {
+	// ID 历史记录唯一标识。
+	ID uuid.UUID `json:"id"`
+	// UserID 所属用户，RLS 隔离键。
+	UserID uuid.UUID `json:"user_id"`
+	// SkillID 所属技能。
+	SkillID uuid.UUID `json:"skill_id"`
+	// Version 更新前的技能版本号。
+	Version int `json:"version"`
+	// Description 更新前的技能描述。
+	Description string `json:"description"`
+	// PromptTemplate 更新前的提示词正文。
+	PromptTemplate string `json:"prompt_template"`
+	// Parameters 更新前的参数定义。
+	Parameters map[string]any `json:"parameters"`
+	// SourceSessionIDs 更新前的来源会话。
+	SourceSessionIDs []uuid.UUID `json:"source_session_ids"`
+	// Confidence 更新前的置信度。
+	Confidence float64 `json:"confidence"`
+	// CreatedAt 历史快照写入时间（UTC）。
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // UserSkillSynthesisSettings 是用户级每日技能提炼设置。
@@ -123,6 +151,22 @@ const (
 	SkillSynthesisRunFailed SkillSynthesisRunStatus = "failed"
 )
 
+// SkillSynthesisRunResult 是单次提炼中单个助手的结构化结果。
+type SkillSynthesisRunResult struct {
+	// AgentName 助手名称。
+	AgentName string `json:"agent_name,omitempty"`
+	// Outcome 分组结果原因。
+	Outcome string `json:"outcome"`
+	// Detail 分组结果说明。
+	Detail string `json:"detail,omitempty"`
+	// SkillID 本次创建、优化或复用的技能 ID。
+	SkillID *uuid.UUID `json:"skill_id,omitempty"`
+	// SkillName 技能名称。
+	SkillName string `json:"skill_name,omitempty"`
+	// Confidence 候选置信度。
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
 // SkillSynthesisRun 是每日技能提炼的执行记录；同一用户同一天只保留一条。
 type SkillSynthesisRun struct {
 	// ID 记录唯一标识。
@@ -151,6 +195,8 @@ type SkillSynthesisRun struct {
 	Confidence float64
 	// SkillID 生成的用户技能 ID。
 	SkillID *uuid.UUID
+	// Results 按助手聚合的结构化结果。
+	Results []SkillSynthesisRunResult
 	// Attempts 当天累计执行次数。
 	Attempts int
 	// StartedAt 本次开始时间（UTC）。
@@ -181,6 +227,8 @@ type SkillSynthesisRunUpdate struct {
 	Confidence float64
 	// SkillID 生成的技能 ID。
 	SkillID *uuid.UUID
+	// Results 按助手聚合的结构化结果。
+	Results []SkillSynthesisRunResult
 	// FinishedAt 结束时间。
 	FinishedAt time.Time
 }
@@ -213,6 +261,10 @@ type UserSkillRepository interface {
 	ListUserSkills(ctx context.Context, userID uuid.UUID, limit int) ([]UserSkill, error)
 	// ListUserSkillsByIDs 批量读取用户技能，用于 Agent 快照校验。
 	ListUserSkillsByIDs(ctx context.Context, userID uuid.UUID, skillIDs []uuid.UUID) ([]UserSkill, error)
+	// ListUserSkillRevisions 按时间倒序读取技能历史快照。
+	ListUserSkillRevisions(ctx context.Context, userID, skillID uuid.UUID, limit int) ([]UserSkillRevision, error)
+	// GetUserSkillRevision 读取单条技能历史快照。
+	GetUserSkillRevision(ctx context.Context, userID, skillID, revisionID uuid.UUID) (UserSkillRevision, error)
 	// PublishUserSkill 将技能状态置为 published。
 	PublishUserSkill(ctx context.Context, userID, skillID uuid.UUID, event OutboxEvent) (UserSkill, error)
 	// DisableUserSkill 将技能状态置为 disabled。
@@ -537,6 +589,89 @@ func (s *UserSkillService) CreateAuto(ctx context.Context, userID uuid.UUID, ski
 	return created, nil
 }
 
+// OptimizeAuto 原地更新自动提炼技能的内容，保留 ID、名称、版本、状态与 Agent 绑定。
+// 只有 auto 来源且未停用的技能允许被后续提炼优化；手动技能不会被自动改写。
+func (s *UserSkillService) OptimizeAuto(ctx context.Context, userID uuid.UUID, skill UserSkill) (UserSkill, error) {
+	if userID == uuid.Nil {
+		return UserSkill{}, ErrForbidden
+	}
+	current, err := s.repo.GetUserSkill(ctx, userID, skill.ID)
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if current.Origin != UserSkillOriginAuto {
+		return UserSkill{}, fmt.Errorf("%w: only auto skills can be optimized", ErrUserSkillStatusConflict)
+	}
+	if current.Status == UserSkillDisabled {
+		return UserSkill{}, fmt.Errorf("%w: disabled skills cannot be optimized", ErrUserSkillStatusConflict)
+	}
+	if current.UserEditedAt != nil {
+		return UserSkill{}, fmt.Errorf("%w: user-edited skills must not be optimized automatically", ErrUserSkillStatusConflict)
+	}
+	// 名称、版本与生命周期由已挂载技能保持，避免打断 Agent 绑定与历史追溯。
+	skill.UserID = userID
+	skill.Name = current.Name
+	skill.Version = current.Version
+	skill.Status = current.Status
+	skill.Origin = current.Origin
+	skill.CreatedAt = current.CreatedAt
+	skill.SourceSessionIDs = mergeSourceSessionIDs(current.SourceSessionIDs, skill.SourceSessionIDs)
+	if skill.Confidence < current.Confidence {
+		skill.Confidence = current.Confidence
+	}
+	if err := validateJSONSize(skill.Parameters, 64*1024); err != nil {
+		return UserSkill{}, err
+	}
+	if err := validateSynthesizedSkillStructure(SkillCandidate{
+		ShouldCreate: true, Name: skill.Name, Description: skill.Description,
+		PromptTemplate: skill.PromptTemplate, Parameters: skill.Parameters,
+	}); err != nil {
+		return UserSkill{}, err
+	}
+	updated, err := s.repo.UpdateUserSkill(ctx, skill, mutationEvent(userID, "user_skill.auto_optimized", "user_skill", skill.ID))
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if s.bundles == nil {
+		return updated, nil
+	}
+	info, files, err := buildAutoSkillBundle(updated)
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if err := s.bundles.ReplaceUserSkillBundle(ctx, userID, updated.ID, info, files,
+		mutationEvent(userID, "user_skill.bundle_optimized", "user_skill", updated.ID)); err != nil {
+		return UserSkill{}, err
+	}
+	updated.Bundle = info
+	return updated, nil
+}
+
+// maxSkillSourceSessions 技能保留的来源会话上限，避免反复优化后 JSON 无限增长。
+const maxSkillSourceSessions = 100
+
+// mergeSourceSessionIDs 合并来源会话并去重，保留最近的 maxSkillSourceSessions 条。
+func mergeSourceSessionIDs(existing, incoming []uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{}, len(existing)+len(incoming))
+	merged := make([]uuid.UUID, 0, len(existing)+len(incoming))
+	for _, ids := range [][]uuid.UUID{existing, incoming} {
+		for _, id := range ids {
+			if id == uuid.Nil {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			merged = append(merged, id)
+		}
+	}
+	if len(merged) > maxSkillSourceSessions {
+		merged = merged[len(merged)-maxSkillSourceSessions:]
+	}
+	return merged
+}
+
 // Update 更新技能正文；仅 auto_generated 状态可修改，已发布技能不可原地编辑。
 func (s *UserSkillService) Update(ctx context.Context, principal Principal, skill UserSkill) (UserSkill, error) {
 	if principal.UserID == uuid.Nil {
@@ -560,7 +695,24 @@ func (s *UserSkillService) Update(ctx context.Context, principal Principal, skil
 	if err := validateUserSkill(&skill); err != nil {
 		return UserSkill{}, err
 	}
-	return s.repo.UpdateUserSkill(ctx, skill, mutationEvent(principal.UserID, "user_skill.updated", "user_skill", skill.ID))
+	editedAt := time.Now().UTC()
+	skill.UserEditedAt = &editedAt
+	updated, err := s.repo.UpdateUserSkill(ctx, skill, mutationEvent(principal.UserID, "user_skill.updated", "user_skill", skill.ID))
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if s.bundles != nil && isAutoSkillBundle(current) {
+		info, files, err := buildAutoSkillBundle(updated)
+		if err != nil {
+			return UserSkill{}, err
+		}
+		if err := s.bundles.ReplaceUserSkillBundle(ctx, principal.UserID, updated.ID, info, files,
+			mutationEvent(principal.UserID, "user_skill.bundle_updated", "user_skill", updated.ID)); err != nil {
+			return UserSkill{}, err
+		}
+		updated.Bundle = info
+	}
+	return updated, nil
 }
 
 // Publish 发布技能，使其可被 Agent 引用。
@@ -610,6 +762,66 @@ func (s *UserSkillService) List(ctx context.Context, principal Principal, limit 
 		limit = 50
 	}
 	return s.repo.ListUserSkills(ctx, principal.UserID, limit)
+}
+
+// ListRevisions 列出技能被原地更新前的历史快照。
+func (s *UserSkillService) ListRevisions(ctx context.Context, principal Principal, skillID uuid.UUID, limit int) ([]UserSkillRevision, error) {
+	if principal.UserID == uuid.Nil {
+		return nil, ErrForbidden
+	}
+	if _, err := s.repo.GetUserSkill(ctx, principal.UserID, skillID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	return s.repo.ListUserSkillRevisions(ctx, principal.UserID, skillID, limit)
+}
+
+// RestoreRevision 把技能内容恢复到指定历史快照；当前内容会作为新历史保留。
+func (s *UserSkillService) RestoreRevision(ctx context.Context, principal Principal, skillID, revisionID uuid.UUID) (UserSkill, error) {
+	if principal.UserID == uuid.Nil {
+		return UserSkill{}, ErrForbidden
+	}
+	current, err := s.repo.GetUserSkill(ctx, principal.UserID, skillID)
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if current.Status == UserSkillDisabled {
+		return UserSkill{}, fmt.Errorf("%w: disabled skills cannot restore revisions", ErrUserSkillStatusConflict)
+	}
+	revision, err := s.repo.GetUserSkillRevision(ctx, principal.UserID, skillID, revisionID)
+	if err != nil {
+		return UserSkill{}, err
+	}
+	restored := current
+	restored.Description = revision.Description
+	restored.PromptTemplate = revision.PromptTemplate
+	restored.Parameters = revision.Parameters
+	restored.SourceSessionIDs = revision.SourceSessionIDs
+	restored.Confidence = revision.Confidence
+	editedAt := time.Now().UTC()
+	restored.UserEditedAt = &editedAt
+	if err := validateUserSkill(&restored); err != nil {
+		return UserSkill{}, err
+	}
+	updated, err := s.repo.UpdateUserSkill(ctx, restored,
+		mutationEvent(principal.UserID, "user_skill.revision_restored", "user_skill", skillID))
+	if err != nil {
+		return UserSkill{}, err
+	}
+	if s.bundles != nil && isAutoSkillBundle(current) {
+		info, files, err := buildAutoSkillBundle(updated)
+		if err != nil {
+			return UserSkill{}, err
+		}
+		if err := s.bundles.ReplaceUserSkillBundle(ctx, principal.UserID, updated.ID, info, files,
+			mutationEvent(principal.UserID, "user_skill.bundle_restored", "user_skill", updated.ID)); err != nil {
+			return UserSkill{}, err
+		}
+		updated.Bundle = info
+	}
+	return updated, nil
 }
 
 // validateUserSkill 校验名称、模板长度、状态与参数 JSON 大小。
@@ -681,11 +893,27 @@ type SkillDigest struct {
 	Name string
 	// Description 技能用途描述。
 	Description string
+	// Origin 技能来源：自动技能可原地优化，手动技能不可修改。
+	Origin UserSkillOrigin
+	// UserEdited 用户是否手动编辑过；手动编辑过的自动技能不再自动覆盖。
+	UserEdited bool
+	// PromptTemplate 已有技能正文；仅目标助手已绑定的少量自动技能会携带，供模型原地改进。
+	PromptTemplate string
+}
+
+// SkillSynthesisTarget 描述本次技能提炼面向的助手。
+type SkillSynthesisTarget struct {
+	// AgentID 会话绑定的助手版本 ID；为空表示未绑定助手的通用提炼。
+	AgentID uuid.UUID
+	// Name 助手名称。
+	Name string
+	// Description 助手职责描述。
+	Description string
 }
 
 // SkillExtractor 从当日有效对话中提炼可复用技能。
 type SkillExtractor interface {
-	Extract(ctx context.Context, userID uuid.UUID, sessions []Session, messagesBySession map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error)
+	Extract(ctx context.Context, userID uuid.UUID, target SkillSynthesisTarget, sessions []Session, messagesBySession map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error)
 }
 
 // SkillSynthesisTask 是异步技能提炼任务载荷。
@@ -890,6 +1118,18 @@ func (m *SkillSynthesisMaintenance) RunOnce(ctx context.Context) error {
 	return nil
 }
 
+// SkillSynthesisAgentBinder 描述提炼 Worker 自动挂载技能所需的助手能力。
+// 绑定与技能更新都直接作用于原助手，不创建新的助手版本。
+type SkillSynthesisAgentBinder interface {
+	// Get 读取会话绑定的助手版本。
+	Get(ctx context.Context, principal Principal, agentID uuid.UUID) (Agent, error)
+	// AttachUserSkillToAgentFamily 把已发布的用户技能绑定到同名助手的全部已发布版本。
+	// 返回实际绑定（未被显式移除）的版本数量。
+	AttachUserSkillToAgentFamily(ctx context.Context, principal Principal, sourceAgentID uuid.UUID, skill UserSkill) (int, error)
+	// RefreshBoundAgentsForUserSkill 刷新所有已绑定该技能的助手快照。
+	RefreshBoundAgentsForUserSkill(ctx context.Context, principal Principal, skill UserSkill) error
+}
+
 // SkillSynthesisWorkerDependencies 聚合技能提炼 Worker 依赖。
 type SkillSynthesisWorkerDependencies struct {
 	// Jobs 持久化任务队列。
@@ -904,6 +1144,8 @@ type SkillSynthesisWorkerDependencies struct {
 	Extractor SkillExtractor
 	// Runs 每日提炼执行记录仓储；为空时不记录执行事实。
 	Runs SkillSynthesisRunRepository
+	// Agents 自动挂载技能所需的助手版本能力；为空时不自动挂载。
+	Agents SkillSynthesisAgentBinder
 	// Logger 结构化日志。
 	Logger *slog.Logger
 	// Clock 当前时间函数。
@@ -918,6 +1160,7 @@ type SkillSynthesisWorker struct {
 	userSkills *UserSkillService
 	extractor  SkillExtractor
 	runs       SkillSynthesisRunRepository
+	agents     SkillSynthesisAgentBinder
 	config     SkillSynthesisConfig
 	clock      func() time.Time
 	logger     *slog.Logger
@@ -939,7 +1182,7 @@ func NewSkillSynthesisWorker(dependencies SkillSynthesisWorkerDependencies, conf
 	return &SkillSynthesisWorker{
 		jobs: dependencies.Jobs, settings: dependencies.Settings, sessions: dependencies.Sessions,
 		userSkills: dependencies.UserSkills, extractor: dependencies.Extractor, runs: dependencies.Runs,
-		config: config.normalize(), clock: clock, logger: logger,
+		agents: dependencies.Agents, config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
 
@@ -1028,6 +1271,7 @@ func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
 	var candidateName string
 	var confidence float64
 	var skillID *uuid.UUID
+	var runResults []SkillSynthesisRunResult
 	var scanNotes []string
 	scanFailed := false
 	finished := false
@@ -1042,7 +1286,7 @@ func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
 		update := SkillSynthesisRunUpdate{
 			Status: status, Outcome: outcome, Detail: detail,
 			SessionsScanned: sessionsScanned, SessionsUsed: sessionsUsed, MessagesUsed: messagesUsed,
-			CandidateName: candidateName, Confidence: confidence, SkillID: skillID, FinishedAt: w.clock(),
+			CandidateName: candidateName, Confidence: confidence, SkillID: skillID, Results: runResults, FinishedAt: w.clock(),
 		}
 		if _, err := w.runs.FinishSkillSynthesisRun(context.WithoutCancel(ctx), record.UserID, record.ID, update); err != nil {
 			w.logger.Warn("finish skill synthesis run failed", "user_id", record.UserID, "run_id", record.ID, "error", err)
@@ -1190,93 +1434,478 @@ func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
 		return
 	}
 
-	existingSkills := w.existingUserSkills(runCtx, task.UserID)
-	candidate, err := w.extractor.Extract(runCtx, task.UserID, sessions, messagesBySession, existingSkillDigests(existingSkills))
-	if err != nil {
-		if errors.Is(err, ErrUserSkillSynthesisUnavailable) {
-			w.logger.Warn("skill synthesis unavailable; completing job", "job_id", job.ID, "error", err)
-			finishRun(SkillSynthesisRunSkipped, "model_unavailable", sanitizeExecutionError(err))
-			complete()
-			return
-		}
-		finishRun(SkillSynthesisRunFailed, "extraction_failed", sanitizeExecutionError(err))
-		fail(err)
-		return
+	groups, skippedSharedSessions := groupSkillSynthesisSessions(sessions, messagesBySession)
+	if skippedSharedSessions > 0 {
+		scanNotes = append(scanNotes, fmt.Sprintf("%d 个群聊共享会话不参与技能提炼", skippedSharedSessions))
 	}
-	candidateName = candidate.Name
-	confidence = candidate.Confidence
-	if !candidate.ShouldCreate || candidate.Confidence < w.config.MinConfidence {
-		w.logger.Info("skill synthesis skipped", "user_id", task.UserID,
-			"should_create", candidate.ShouldCreate, "confidence", candidate.Confidence,
-			"duplicate_of", candidate.DuplicateOf)
-		outcome, detail := "not_worthwhile", "模型判断当前对话没有值得沉淀的复用技能"
-		switch {
-		case candidate.DuplicateOf != "":
-			outcome, detail = "duplicate_skill", fmt.Sprintf("已有相似技能「%s」，未重复创建", candidate.DuplicateOf)
-		case candidate.ShouldCreate:
-			outcome = "low_confidence"
-			detail = fmt.Sprintf("候选技能置信度 %.2f 低于阈值 %.2f", candidate.Confidence, w.config.MinConfidence)
+	if len(groups) == 0 {
+		sessionsUsed, messagesUsed = 0, 0
+		outcome, detail := "no_activity", "会话中没有可用于提炼的用户或助手消息"
+		if hasWatermark {
+			outcome, detail = "no_new_messages", "上次提炼后没有新的可提炼消息"
 		}
-		advanceWatermark()
 		finishRun(SkillSynthesisRunSkipped, outcome, detail)
 		complete()
 		return
 	}
-	if err := validateSynthesizedSkill(&candidate, sessions, messagesBySession); err != nil {
-		advanceWatermark()
-		finishRun(SkillSynthesisRunSkipped, "invalid_candidate", fmt.Sprintf("格式校验未通过：%v", err))
-		complete()
-		return
-	}
-	scanNotes = append(scanNotes, synthesizedSkillWarnings(candidate)...)
-	sourceIDs := make([]uuid.UUID, 0, len(messagesBySession))
-	for id := range messagesBySession {
-		sourceIDs = append(sourceIDs, id)
-	}
-	if matched, ok := findDuplicateSkill(candidate, sourceIDs, existingSkills); ok {
-		advanceWatermark()
-		finishRun(SkillSynthesisRunSkipped, "duplicate_skill", fmt.Sprintf("已有相似技能「%s」，未重复创建", matched.Name))
-		complete()
-		return
-	}
-	// 每日自动技能额度：到上限后只推进水位，不继续生成。
-	if w.config.MaxSkillsPerUserPerDay > 0 && w.runs != nil {
-		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		count, countErr := w.runs.CountAutoUserSkillsSince(runCtx, task.UserID, dayStart)
-		if countErr != nil {
-			w.logger.Warn("count daily auto skills failed; continuing", "user_id", task.UserID, "error", countErr)
-		} else if count >= w.config.MaxSkillsPerUserPerDay {
-			advanceWatermark()
-			finishRun(SkillSynthesisRunSkipped, "daily_limit_reached",
-				fmt.Sprintf("今天已自动生成 %d 个技能，达到上限 %d", count, w.config.MaxSkillsPerUserPerDay))
-			complete()
-			return
+	sessionsUsed, messagesUsed = 0, 0
+	for _, group := range groups {
+		sessionsUsed += len(group.sessions)
+		for _, messages := range group.messagesBySession {
+			messagesUsed += len(messages)
 		}
 	}
-	if err := lease.check(); err != nil {
-		w.logger.Warn("skill synthesis job lease lost before save", "job_id", job.ID, "error", err)
-		return
+
+	existingSkills := w.existingUserSkills(runCtx, task.UserID)
+	principal := Principal{UserID: task.UserID}
+	daily := newSkillSynthesisDailyCounter(w.runs, task.UserID, now, w.config.MaxSkillsPerUserPerDay, w.logger)
+	var results []skillSynthesisGroupResult
+	for _, group := range groups {
+		if err := lease.check(); err != nil {
+			w.logger.Warn("skill synthesis job lease lost before group extraction", "job_id", job.ID, "error", err)
+			return
+		}
+		result, err := w.synthesizeSkillGroup(runCtx, principal, group, existingSkills, daily)
+		if err != nil {
+			if errors.Is(err, ErrUserSkillSynthesisUnavailable) {
+				w.logger.Warn("skill synthesis unavailable; completing job", "job_id", job.ID, "error", err)
+				finishRun(SkillSynthesisRunSkipped, "model_unavailable", sanitizeExecutionError(err))
+				complete()
+				return
+			}
+			finishRun(SkillSynthesisRunFailed, "extraction_failed", sanitizeExecutionError(err))
+			fail(err)
+			return
+		}
+		results = append(results, result)
+		if result.candidateName != "" && skillID == nil {
+			candidateName, confidence = result.candidateName, result.confidence
+		}
+		if result.skill != nil {
+			existingSkills = upsertUserSkill(existingSkills, *result.skill)
+			if skillID == nil {
+				candidateName = result.skill.Name
+				confidence = result.skill.Confidence
+				skillID = &result.skill.ID
+			}
+		}
 	}
 
-	skill := UserSkill{
+	advanceWatermark()
+	status, outcome, detail := summarizeSkillSynthesisResults(results)
+	runResults = make([]SkillSynthesisRunResult, 0, len(results))
+	for _, result := range results {
+		item := SkillSynthesisRunResult{
+			AgentName: result.agentName, Outcome: result.outcome, Detail: result.detail,
+			Confidence: result.confidence,
+		}
+		if result.skill != nil {
+			item.SkillID = &result.skill.ID
+			item.SkillName = result.skill.Name
+			item.Confidence = result.skill.Confidence
+		}
+		runResults = append(runResults, item)
+	}
+	finishRun(status, outcome, detail)
+	complete()
+}
+
+// skillSynthesisGroup 是按助手聚合的一次提炼输入。
+type skillSynthesisGroup struct {
+	// agentID 会话绑定的助手版本 ID；uuid.Nil 表示未绑定助手的通用提炼。
+	agentID uuid.UUID
+	// sessions 该助手需要分析的会话。
+	sessions []Session
+	// messagesBySession 会话 ID 到有效消息的映射。
+	messagesBySession map[uuid.UUID][]Message
+	// latestMessageAt 该组最近一条有效消息时间，用于排序。
+	latestMessageAt time.Time
+}
+
+// skillSynthesisGroupResult 是单个助手分组的提炼结果。
+type skillSynthesisGroupResult struct {
+	// agentName 助手名称，用于执行记录。
+	agentName string
+	// candidateName 模型给出的候选技能名，用于执行记录。
+	candidateName string
+	// confidence 模型给出的候选置信度。
+	confidence float64
+	// outcome 分组结果原因。
+	outcome string
+	// detail 分组结果说明。
+	detail string
+	// skill 本次创建或优化的技能，未产出时为空。
+	skill *UserSkill
+}
+
+// groupSkillSynthesisSessions 按助手聚合会话，跳过群聊共享投影会话。
+func groupSkillSynthesisSessions(sessions []Session, messagesBySession map[uuid.UUID][]Message) ([]skillSynthesisGroup, int) {
+	grouped := make(map[uuid.UUID]*skillSynthesisGroup)
+	order := make([]uuid.UUID, 0)
+	skippedShared := 0
+	for _, session := range sessions {
+		messages := messagesBySession[session.ID]
+		if len(messages) == 0 {
+			continue
+		}
+		// 群聊共享投影会话不属于个人助手上下文，避免把群聊内容沉淀成个人技能。
+		if session.FeishuGroupProjection {
+			skippedShared++
+			continue
+		}
+		key := uuid.Nil
+		if session.AgentID != nil {
+			key = *session.AgentID
+		}
+		group, ok := grouped[key]
+		if !ok {
+			group = &skillSynthesisGroup{agentID: key, messagesBySession: map[uuid.UUID][]Message{}}
+			grouped[key] = group
+			order = append(order, key)
+		}
+		group.sessions = append(group.sessions, session)
+		group.messagesBySession[session.ID] = messages
+		if latest := messages[len(messages)-1].CreatedAt; latest.After(group.latestMessageAt) {
+			group.latestMessageAt = latest
+		}
+	}
+	groups := make([]skillSynthesisGroup, 0, len(order))
+	for _, key := range order {
+		groups = append(groups, *grouped[key])
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		return groups[i].latestMessageAt.After(groups[j].latestMessageAt)
+	})
+	return groups, skippedShared
+}
+
+// skillSynthesisDailyCounter 在单次提炼内复用每日额度查询，避免每个分组重复计数。
+type skillSynthesisDailyCounter struct {
+	runs     SkillSynthesisRunRepository
+	userID   uuid.UUID
+	dayStart time.Time
+	limit    int
+	logger   *slog.Logger
+	loaded   bool
+	count    int
+}
+
+// newSkillSynthesisDailyCounter 构造每日额度计数器。
+func newSkillSynthesisDailyCounter(runs SkillSynthesisRunRepository, userID uuid.UUID, now time.Time, limit int, logger *slog.Logger) *skillSynthesisDailyCounter {
+	return &skillSynthesisDailyCounter{
+		runs: runs, userID: userID, limit: limit, logger: logger,
+		dayStart: time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC),
+	}
+}
+
+// canCreate 判断今天是否还能创建新的自动技能；计数失败时降级放行。
+func (c *skillSynthesisDailyCounter) canCreate(ctx context.Context) bool {
+	if c.limit <= 0 {
+		return true
+	}
+	if !c.loaded && c.runs != nil {
+		count, err := c.runs.CountAutoUserSkillsSince(ctx, c.userID, c.dayStart)
+		if err != nil {
+			if c.logger != nil {
+				c.logger.Warn("count daily auto skills failed; continuing", "user_id", c.userID, "error", err)
+			}
+		} else {
+			c.count = count
+			c.loaded = true
+		}
+	}
+	return c.count < c.limit
+}
+
+// recordCreated 记录当天新增一个自动技能。
+func (c *skillSynthesisDailyCounter) recordCreated() {
+	c.count++
+}
+
+// synthesizeSkillGroup 针对单个助手分组执行提炼、去重、保存、发布与挂载。
+// 返回错误表示任务应重试；业务跳过均通过结果表达。
+func (w *SkillSynthesisWorker) synthesizeSkillGroup(ctx context.Context, principal Principal, group skillSynthesisGroup, existing []UserSkill, daily *skillSynthesisDailyCounter) (skillSynthesisGroupResult, error) {
+	result := skillSynthesisGroupResult{}
+	target := SkillSynthesisTarget{AgentID: group.agentID}
+	var targetAgent Agent
+	if group.agentID != uuid.Nil && w.agents != nil {
+		agent, err := w.agents.Get(ctx, principal, group.agentID)
+		if err != nil {
+			if errors.Is(err, ErrResourceNotFound) {
+				result.outcome, result.detail = "agent_missing", "会话绑定的助手已不存在，跳过"
+				return result, nil
+			}
+			return result, err
+		}
+		targetAgent = agent
+		target.Name, target.Description = agent.Name, agent.Description
+	}
+	result.agentName = target.Name
+	candidate, err := w.extractor.Extract(ctx, principal.UserID, target, group.sessions, group.messagesBySession, existingSkillDigestsForAgent(existing, targetAgent))
+	if err != nil {
+		return result, err
+	}
+	result.candidateName, result.confidence = candidate.Name, candidate.Confidence
+	if !candidate.ShouldCreate || candidate.Confidence < w.config.MinConfidence {
+		result.outcome, result.detail = skippedSkillCandidateOutcome(candidate, w.config.MinConfidence)
+		return result, nil
+	}
+	if err := validateSynthesizedSkill(&candidate, group.sessions, group.messagesBySession); err != nil {
+		result.outcome, result.detail = "invalid_candidate", fmt.Sprintf("格式校验未通过：%v", err)
+		result.detail = joinSynthesisDetails(result.detail, synthesizedSkillWarnings(candidate)...)
+		return result, nil
+	}
+	warnings := synthesizedSkillWarnings(candidate)
+	sourceIDs := make([]uuid.UUID, 0, len(group.messagesBySession))
+	for id := range group.messagesBySession {
+		sourceIDs = append(sourceIDs, id)
+	}
+	if matched, ok := findDuplicateSkill(candidate, sourceIDs, existing); ok {
+		if matched.Origin != UserSkillOriginAuto {
+			result.outcome, result.detail = "duplicate_skill", fmt.Sprintf("已有相似的手动技能「%s」，未重复创建", matched.Name)
+			return result, nil
+		}
+		if matched.Status == UserSkillDisabled {
+			result.outcome, result.detail = "duplicate_skill", fmt.Sprintf("已有相似技能「%s」但已停用，未自动更新", matched.Name)
+			return result, nil
+		}
+		if matched.UserEditedAt != nil {
+			result.outcome, result.detail = "duplicate_skill",
+				fmt.Sprintf("技能「%s」已被用户手动修改，未自动覆盖", matched.Name)
+			return result, nil
+		}
+		if candidate.Confidence < matched.Confidence {
+			result.outcome, result.detail = "duplicate_skill",
+				fmt.Sprintf("已有相似技能「%s」置信度更高，未自动更新", matched.Name)
+			return result, nil
+		}
+		// 同名但既未挂载到当前助手、也不来自同一批会话时视为命名冲突，避免覆盖已有技能。
+		if !skillCandidateRelatedToExisting(matched, sourceIDs, targetAgent) {
+			result.outcome, result.detail = "duplicate_skill",
+				fmt.Sprintf("已有同名技能「%s」但未挂载到当前助手，未自动覆盖", matched.Name)
+			return result, nil
+		}
+		// 内容完全一致且技能包与当前正文匹配时不做无意义写入，但仍确保技能已发布并挂载到当前助手。
+		if matched.PromptTemplate == candidate.PromptTemplate && matched.Description == candidate.Description &&
+			reflect.DeepEqual(matched.Parameters, candidate.Parameters) && autoSkillBundleCurrent(matched) {
+			published, err := w.publishAutoSkill(ctx, principal, matched)
+			if err != nil {
+				return result, err
+			}
+			result.skill = &published
+			result.outcome, result.detail = "duplicate_skill",
+				fmt.Sprintf("已有相似技能「%s」且内容一致，未重复创建", matched.Name)
+			result.detail = joinSynthesisDetails(result.detail, w.mountSkillToAgent(ctx, principal, targetAgent, published))
+			return result, nil
+		}
+		optimized, err := w.userSkills.OptimizeAuto(ctx, principal.UserID, UserSkill{
+			ID: matched.ID, Description: candidate.Description, PromptTemplate: candidate.PromptTemplate,
+			Parameters: candidate.Parameters, SourceSessionIDs: sourceIDs, Confidence: candidate.Confidence,
+		})
+		if err != nil {
+			return result, err
+		}
+		published, err := w.publishAutoSkill(ctx, principal, optimized)
+		if err != nil {
+			return result, err
+		}
+		result.skill = &published
+		result.outcome = "optimized"
+		result.detail = fmt.Sprintf("已原地优化技能「%s」", published.Name)
+		result.detail = joinSynthesisDetails(result.detail, warnings...)
+		result.detail = joinSynthesisDetails(result.detail, w.mountSkillToAgent(ctx, principal, targetAgent, published))
+		return result, nil
+	}
+	if !daily.canCreate(ctx) {
+		result.outcome, result.detail = "daily_limit_reached",
+			fmt.Sprintf("今天已自动生成 %d 个技能，达到上限 %d", daily.count, daily.limit)
+		return result, nil
+	}
+	created, err := w.userSkills.CreateAuto(ctx, principal.UserID, UserSkill{
 		Name: candidate.Name, Description: candidate.Description,
 		PromptTemplate: candidate.PromptTemplate, Parameters: candidate.Parameters,
 		SourceSessionIDs: sourceIDs, Confidence: candidate.Confidence,
-	}
-	created, err := w.userSkills.CreateAuto(runCtx, task.UserID, skill)
+	})
 	if err != nil {
-		finishRun(SkillSynthesisRunFailed, "create_failed", sanitizeExecutionError(err))
-		fail(err)
-		return
+		return result, err
 	}
-	skillID = &created.ID
-	candidateName = created.Name
-	confidence = created.Confidence
-	w.logger.Info("user skill auto created", "user_id", task.UserID, "skill_id", created.ID,
-		"name", created.Name, "confidence", created.Confidence)
-	advanceWatermark()
-	finishRun(SkillSynthesisRunCompleted, "created", fmt.Sprintf("已生成技能「%s」", created.Name))
-	complete()
+	daily.recordCreated()
+	published, err := w.publishAutoSkill(ctx, principal, created)
+	if err != nil {
+		return result, err
+	}
+	result.skill = &published
+	result.outcome = "created"
+	result.detail = fmt.Sprintf("已生成技能「%s」并发布", published.Name)
+	result.detail = joinSynthesisDetails(result.detail, warnings...)
+	result.detail = joinSynthesisDetails(result.detail, w.mountSkillToAgent(ctx, principal, targetAgent, published))
+	return result, nil
+}
+
+// skillCandidateRelatedToExisting 判断同名候选是否属于当前助手的已有技能，避免无关内容覆盖。
+// 只有“已挂载到当前助手”或“与已有技能来自同一批会话”才允许原地优化。
+func skillCandidateRelatedToExisting(matched UserSkill, sourceIDs []uuid.UUID, agent Agent) bool {
+	if agent.ID != uuid.Nil && containsUUID(agent.UserSkillIDs, matched.ID) {
+		return true
+	}
+	return sessionSetOverlap(sessionIDSet(sourceIDs), sessionIDSet(matched.SourceSessionIDs)) > 0
+}
+
+// skippedSkillCandidateOutcome 把候选跳过原因转成执行记录文案。
+func skippedSkillCandidateOutcome(candidate SkillCandidate, minConfidence float64) (string, string) {
+	if !candidate.ShouldCreate {
+		if candidate.DuplicateOf != "" {
+			return "duplicate_skill", fmt.Sprintf("已有相似技能「%s」，未重复创建", candidate.DuplicateOf)
+		}
+		return "not_worthwhile", "模型判断当前对话没有值得沉淀的复用技能"
+	}
+	return "low_confidence", fmt.Sprintf("候选技能置信度 %.2f 低于阈值 %.2f", candidate.Confidence, minConfidence)
+}
+
+// publishAutoSkill 把自动技能发布为可被 Agent 绑定的状态。
+func (w *SkillSynthesisWorker) publishAutoSkill(ctx context.Context, principal Principal, skill UserSkill) (UserSkill, error) {
+	if skill.Status == UserSkillPublished {
+		return skill, nil
+	}
+	if skill.Status != UserSkillAutoGenerated {
+		return UserSkill{}, fmt.Errorf("%w: skill %s cannot be published from status %s",
+			ErrUserSkillStatusConflict, skill.ID, skill.Status)
+	}
+	return w.userSkills.Publish(ctx, principal, skill.ID)
+}
+
+// mountSkillToAgent 把技能直接绑定到原助手并同步其已发布快照；失败只记录说明，不回滚技能。
+// 不创建新的助手版本，助手版本号保持不变。
+func (w *SkillSynthesisWorker) mountSkillToAgent(ctx context.Context, principal Principal, agent Agent, skill UserSkill) string {
+	if w.agents == nil {
+		return "未配置自动挂载"
+	}
+	if agent.ID == uuid.Nil {
+		return "会话未绑定助手，未自动挂载"
+	}
+	detail := ""
+	// 先刷新所有已绑定助手，再绑定当前助手，保证并发时不出现反向加锁。
+	if err := w.agents.RefreshBoundAgentsForUserSkill(ctx, principal, skill); err != nil {
+		w.logger.Warn("refresh agents bound to user skill failed", "user_id", principal.UserID,
+			"skill_id", skill.ID, "error", err)
+		detail = fmt.Sprintf("同步已绑定助手失败：%v", sanitizeExecutionError(err))
+	}
+	attached, err := w.agents.AttachUserSkillToAgentFamily(ctx, principal, agent.ID, skill)
+	if err != nil {
+		w.logger.Warn("attach user skill to agent failed", "user_id", principal.UserID,
+			"agent_id", agent.ID, "skill_id", skill.ID, "error", err)
+		return joinSynthesisDetails(detail, fmt.Sprintf("自动挂载失败：%v", sanitizeExecutionError(err)))
+	}
+	if attached == 0 {
+		w.logger.Info("skill auto attach skipped by per-version removal", "user_id", principal.UserID,
+			"agent_id", agent.ID, "agent_name", agent.Name, "skill_id", skill.ID)
+		return joinSynthesisDetails(detail, fmt.Sprintf("助手「%s」已按版本移除该技能，未自动挂载", agent.Name))
+	}
+	bindDetail := fmt.Sprintf("已绑定到助手「%s」", agent.Name)
+	if agent.Status != AgentPublished {
+		bindDetail += "（助手当前未发布，发布后生效）"
+	}
+	detail = joinSynthesisDetails(bindDetail, detail)
+	w.logger.Info("skill auto attached to agent", "user_id", principal.UserID, "agent_id", agent.ID,
+		"agent_name", agent.Name, "skill_id", skill.ID)
+	return detail
+}
+
+// containsUUID 判断 UUID 切片是否包含目标值。
+func containsUUID(values []uuid.UUID, target uuid.UUID) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+// autoSkillBundleCurrent 判断已保存的技能包是否与当前技能正文一致。
+// 内容更新成功但技能包写入失败时，摘要会不一致，后续提炼需要重新生成技能包。
+func autoSkillBundleCurrent(skill UserSkill) bool {
+	if skill.Bundle.Empty() {
+		return false
+	}
+	info, _, err := buildAutoSkillBundle(skill)
+	if err != nil {
+		return false
+	}
+	return info.Digest != "" && skill.Bundle.Digest == info.Digest
+}
+
+// isAutoSkillBundle 判断技能包是否由自动提炼生成，避免覆盖导入包中的脚本与参考资料。
+func isAutoSkillBundle(skill UserSkill) bool {
+	return skill.Origin == UserSkillOriginAuto && skill.Bundle.FileCount == 1 &&
+		!skill.Bundle.HasScripts && skill.Bundle.Entrypoint == "SKILL.md"
+}
+
+// upsertUserSkill 用最新技能覆盖已有快照，供同一次提炼内后续分组判重。
+func upsertUserSkill(skills []UserSkill, updated UserSkill) []UserSkill {
+	for index := range skills {
+		if skills[index].ID == updated.ID {
+			skills[index] = updated
+			return skills
+		}
+	}
+	return append(skills, updated)
+}
+
+// summarizeSkillSynthesisResults 聚合多助手分组的执行结果。
+func summarizeSkillSynthesisResults(results []skillSynthesisGroupResult) (SkillSynthesisRunStatus, string, string) {
+	if len(results) == 0 {
+		return SkillSynthesisRunSkipped, "not_worthwhile", "没有可提炼的助手会话"
+	}
+	status, outcome := SkillSynthesisRunSkipped, "not_worthwhile"
+	details := make([]string, 0, len(results))
+	for _, result := range results {
+		if result.detail == "" {
+			continue
+		}
+		if result.agentName != "" {
+			details = append(details, result.agentName+"："+result.detail)
+		} else {
+			details = append(details, result.detail)
+		}
+	}
+	for _, result := range results {
+		if result.outcome == "created" {
+			status, outcome = SkillSynthesisRunCompleted, "created"
+			break
+		}
+	}
+	if outcome != "created" {
+		for _, result := range results {
+			if result.outcome == "optimized" {
+				status, outcome = SkillSynthesisRunCompleted, "optimized"
+				break
+			}
+		}
+	}
+	if outcome == "not_worthwhile" {
+		for _, result := range results {
+			if result.outcome != "" && result.outcome != "not_worthwhile" {
+				outcome = result.outcome
+				break
+			}
+		}
+	}
+	return status, outcome, joinSynthesisDetails("", details...)
+}
+
+// joinSynthesisDetails 合并非空说明并限制执行记录长度。
+func joinSynthesisDetails(base string, extras ...string) string {
+	const maxDetailRunes = 1200
+	parts := make([]string, 0, 1+len(extras))
+	if trimmed := strings.TrimSpace(base); trimmed != "" {
+		parts = append(parts, trimmed)
+	}
+	for _, extra := range extras {
+		if trimmed := strings.TrimSpace(extra); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return truncateRunes(strings.Join(parts, "；"), maxDetailRunes)
 }
 
 // existingUserSkills 读取已有技能全量视图，供提示去重与确定性判重共用。
@@ -1292,15 +1921,65 @@ func (w *SkillSynthesisWorker) existingUserSkills(ctx context.Context, userID uu
 	return skills
 }
 
+// 技能摘要提示预算：技能数量、正文数量与单段长度都需要收敛，避免提示过长。
+const (
+	maxSkillDigests                = 30
+	maxSkillDigestPrompts          = 2
+	maxSkillDigestPromptRunes      = 4000
+	maxSkillDigestDescriptionRunes = 200
+)
+
 // existingSkillDigests 从已有技能派生提示词摘要，最多 30 条，避免提示过长。
 func existingSkillDigests(skills []UserSkill) []SkillDigest {
-	const maxDigests = 30
-	digests := make([]SkillDigest, 0, min(len(skills), maxDigests))
+	digests := make([]SkillDigest, 0, min(len(skills), maxSkillDigests))
 	for _, skill := range skills {
-		if len(digests) >= maxDigests {
+		if len(digests) >= maxSkillDigests {
 			break
 		}
-		digests = append(digests, SkillDigest{Name: skill.Name, Description: truncateRunes(skill.Description, 200)})
+		digests = append(digests, SkillDigest{
+			Name: skill.Name, Description: truncateRunes(skill.Description, maxSkillDigestDescriptionRunes),
+			Origin: skill.Origin, UserEdited: skill.UserEditedAt != nil,
+		})
+	}
+	return digests
+}
+
+// existingSkillDigestsForAgent 为定向助手的提炼准备摘要；已挂载技能的正文一并提供给模型改进。
+func existingSkillDigestsForAgent(skills []UserSkill, agent Agent) []SkillDigest {
+	if agent.ID == uuid.Nil || len(agent.UserSkillIDs) == 0 {
+		return existingSkillDigests(skills)
+	}
+	bound := make(map[uuid.UUID]struct{}, len(agent.UserSkillIDs))
+	for _, id := range agent.UserSkillIDs {
+		bound[id] = struct{}{}
+	}
+	digests := make([]SkillDigest, 0, min(len(skills), maxSkillDigests))
+	seen := make(map[uuid.UUID]struct{}, len(skills))
+	prompts := 0
+	// 已挂载技能优先，并最多携带两份正文，控制提示规模。
+	for _, skill := range skills {
+		if _, ok := bound[skill.ID]; !ok || prompts >= maxSkillDigestPrompts || len(digests) >= maxSkillDigests {
+			continue
+		}
+		seen[skill.ID] = struct{}{}
+		digests = append(digests, SkillDigest{
+			Name: skill.Name, Description: truncateRunes(skill.Description, maxSkillDigestDescriptionRunes),
+			Origin: skill.Origin, UserEdited: skill.UserEditedAt != nil,
+			PromptTemplate: truncateRunes(skill.PromptTemplate, maxSkillDigestPromptRunes),
+		})
+		prompts++
+	}
+	for _, skill := range skills {
+		if len(digests) >= maxSkillDigests {
+			break
+		}
+		if _, ok := seen[skill.ID]; ok {
+			continue
+		}
+		digests = append(digests, SkillDigest{
+			Name: skill.Name, Description: truncateRunes(skill.Description, maxSkillDigestDescriptionRunes),
+			Origin: skill.Origin, UserEdited: skill.UserEditedAt != nil,
+		})
 	}
 	return digests
 }

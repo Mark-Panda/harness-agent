@@ -1,12 +1,79 @@
 // 助手列表：用“我的助手”替代“Agent 编排”，突出创建、发布与开始对话。
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { FormDrawer } from "../components/FormDrawer";
+import { useToast } from "../components/Toast";
 import { ActionLink, Badge, Button, Callout, Card, ConfirmDialog, CursorPager, EmptyState, ErrorBanner, Field, LoadingState, MenuItem, PageHeader, RowMenu, Select } from "../components/ui";
 import { mutate, requestJSON } from "../lib/api";
 import { describeError } from "../lib/errors";
 import { formatDateTime, statusLabel, statusTone } from "../lib/format";
 import { useCursorStack, useRemote } from "../lib/hooks";
-import type { Agent, FeishuBotOption, MCP, ModelPolicy, Page, Skill } from "../lib/types";
+import type { Agent, AgentSnapshotRevision, FeishuBotOption, MCP, ModelPolicy, Page, Skill } from "../lib/types";
+
+// AgentSnapshotHistoryDrawer 展示助手发布快照的历史版本并支持恢复。
+function AgentSnapshotHistoryDrawer({ agent, onClose, onRestored }: { agent: Agent; onClose: () => void; onRestored: () => void }) {
+  const history = useRemote(
+    () => requestJSON<{ items: AgentSnapshotRevision[] }>(`/api/v1/agents/${agent.id}/snapshot-revisions?limit=20`),
+    [agent.id],
+  );
+  const toast = useToast();
+  const [pending, setPending] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const revisions = history.data?.items ?? [];
+  const restore = async (revision: AgentSnapshotRevision) => {
+    setBusy(true);
+    try {
+      await mutate<Agent>(`/api/v1/agents/${agent.id}/snapshot-revisions/${revision.id}/restore`, "POST", undefined, crypto.randomUUID());
+      toast.show("已恢复快照历史", "success");
+      onRestored();
+      onClose();
+    } catch (failure) {
+      toast.show(describeError(failure), "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <FormDrawer
+      title={`${agent.name} · 快照历史`}
+      description="技能自动绑定或快照恢复前的发布快照，最近的在前。恢复只影响后续新对话。"
+      onSubmit={(event) => event.preventDefault()}
+      onCancel={onClose}
+    >
+      <div className="sm:col-span-2 flex flex-col gap-3">
+        {history.error ? <ErrorBanner message={history.error} onRetry={history.reload} /> : null}
+        {history.loading && !history.data ? (
+          <LoadingState />
+        ) : revisions.length === 0 ? (
+          <EmptyState title="还没有快照历史" description="技能自动绑定或恢复快照后会在这里保留旧快照。" />
+        ) : (
+          revisions.map((revision) => (
+            <article key={revision.id} className="rounded-lg border border-line bg-paper-deep/40 p-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                <Badge tone="neutral">v{revision.agent_version}</Badge>
+                <span>{formatDateTime(revision.created_at)}</span>
+                <span>{revision.reason || "快照更新"}</span>
+                <div className="ml-auto flex items-center gap-2">
+                  {pending === revision.id ? (
+                    <>
+                      <Button size="sm" variant="secondary" disabled={busy} onClick={() => setPending(null)}>取消</Button>
+                      <Button size="sm" loading={busy} onClick={() => void restore(revision)}>确认恢复</Button>
+                    </>
+                  ) : (
+                    <Button size="sm" variant="secondary" onClick={() => setPending(revision.id)}>恢复此快照</Button>
+                  )}
+                </div>
+              </div>
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-paper-raised p-2 text-[11px] leading-5 text-ink-soft">
+                {JSON.stringify(revision.config_snapshot, null, 2)}
+              </pre>
+            </article>
+          ))
+        )}
+      </div>
+    </FormDrawer>
+  );
+}
 
 export default function AgentsPage() {
   const paging = useCursorStack();
@@ -26,6 +93,7 @@ export default function AgentsPage() {
   const [deleting, setDeleting] = useState<Agent | null>(null);
   const [unpublishing, setUnpublishing] = useState<Agent | null>(null);
   const [archiving, setArchiving] = useState<Agent | null>(null);
+  const [historyAgent, setHistoryAgent] = useState<Agent | null>(null);
   const [bindingAgent, setBindingAgent] = useState<Agent | null>(null);
   const [unbinding, setUnbinding] = useState<Agent | null>(null);
   const [bindingBotID, setBindingBotID] = useState("");
@@ -180,6 +248,9 @@ export default function AgentsPage() {
                           <MenuItem disabled={busy} onClick={() => setUnpublishing(agent)}>取消发布</MenuItem>
                         ) : null}
                         {agent.status === "published" ? (
+                          <MenuItem disabled={busy} onClick={() => setHistoryAgent(agent)}>快照历史</MenuItem>
+                        ) : null}
+                        {agent.status === "published" ? (
                           botByAgent.get(agent.id) ? (
                             <MenuItem disabled={busy} onClick={() => setUnbinding(agent)}>解绑飞书机器人</MenuItem>
                           ) : (
@@ -285,10 +356,14 @@ export default function AgentsPage() {
         />
       ) : null}
 
+      {historyAgent ? (
+        <AgentSnapshotHistoryDrawer agent={historyAgent} onClose={() => setHistoryAgent(null)} onRestored={agents.reload} />
+      ) : null}
+
       <ConfirmDialog
         open={publishing !== null}
         title={`发布「${publishing?.name ?? ""}」？`}
-        description="发布后配置会冻结为快照，并出现在对话页的助手列表中。之后要修改，请创建新版本。"
+        description="发布后配置会冻结为快照；技能自动绑定会原位同步快照并保留快照历史，新对话立即生效。"
         confirmLabel="确认发布"
         tone="primary"
         busy={busy}

@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -173,12 +174,852 @@ type fakeSkillExtractor struct {
 	err       error
 	calls     int
 	existing  []SkillDigest
+	targets   []SkillSynthesisTarget
+	byAgent   map[uuid.UUID]SkillCandidate
 }
 
-func (f *fakeSkillExtractor) Extract(_ context.Context, _ uuid.UUID, _ []Session, _ map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error) {
+func (f *fakeSkillExtractor) Extract(_ context.Context, _ uuid.UUID, target SkillSynthesisTarget, _ []Session, _ map[uuid.UUID][]Message, existing []SkillDigest) (SkillCandidate, error) {
 	f.calls++
 	f.existing = existing
+	f.targets = append(f.targets, target)
+	if candidate, ok := f.byAgent[target.AgentID]; ok {
+		return candidate, f.err
+	}
 	return f.candidate, f.err
+}
+
+// fakeSkillSynthesisAgents 是 SkillSynthesisAgentBinder 的内存桩，模拟原助手直接绑定与快照刷新。
+type fakeSkillSynthesisAgents struct {
+	agents        map[uuid.UUID]Agent
+	attached      map[uuid.UUID]uuid.UUID
+	attachedOrder []uuid.UUID
+	refreshed     []uuid.UUID
+	attachErr     error
+	attachSkipped bool
+	refreshErr    error
+}
+
+func newFakeSkillSynthesisAgents(agents ...Agent) *fakeSkillSynthesisAgents {
+	store := &fakeSkillSynthesisAgents{agents: map[uuid.UUID]Agent{}, attached: map[uuid.UUID]uuid.UUID{}}
+	for _, agent := range agents {
+		store.agents[agent.ID] = agent
+	}
+	return store
+}
+
+func (f *fakeSkillSynthesisAgents) Get(_ context.Context, principal Principal, agentID uuid.UUID) (Agent, error) {
+	agent, ok := f.agents[agentID]
+	if !ok || agent.UserID != principal.UserID {
+		return Agent{}, ErrResourceNotFound
+	}
+	return agent, nil
+}
+
+func (f *fakeSkillSynthesisAgents) AttachUserSkill(_ context.Context, principal Principal, agentID uuid.UUID, skill UserSkill) (bool, error) {
+	if f.attachErr != nil {
+		return false, f.attachErr
+	}
+	if f.attachSkipped {
+		return false, nil
+	}
+	agent, ok := f.agents[agentID]
+	if !ok || agent.UserID != principal.UserID {
+		return false, ErrResourceNotFound
+	}
+	if !containsUUID(agent.UserSkillIDs, skill.ID) {
+		agent.UserSkillIDs = append(agent.UserSkillIDs, skill.ID)
+	}
+	f.agents[agentID] = agent
+	f.attached[skill.ID] = agentID
+	f.attachedOrder = append(f.attachedOrder, agentID)
+	return true, nil
+}
+
+func (f *fakeSkillSynthesisAgents) AttachUserSkillToAgentFamily(ctx context.Context, principal Principal, sourceAgentID uuid.UUID, skill UserSkill) (int, error) {
+	source, ok := f.agents[sourceAgentID]
+	if !ok || source.UserID != principal.UserID {
+		return 0, ErrResourceNotFound
+	}
+	agentIDs := make([]uuid.UUID, 0)
+	for _, agent := range f.agents {
+		if agent.UserID == principal.UserID && agent.Name == source.Name && agent.Status == AgentPublished {
+			agentIDs = append(agentIDs, agent.ID)
+		}
+	}
+	if len(agentIDs) == 0 {
+		agentIDs = append(agentIDs, sourceAgentID)
+	}
+	sort.Slice(agentIDs, func(i, j int) bool { return agentIDs[i].String() < agentIDs[j].String() })
+	attached := 0
+	for _, agentID := range agentIDs {
+		ok, err := f.AttachUserSkill(ctx, principal, agentID, skill)
+		if err != nil {
+			return attached, err
+		}
+		if ok {
+			attached++
+		}
+	}
+	return attached, nil
+}
+
+func (f *fakeSkillSynthesisAgents) RefreshBoundAgentsForUserSkill(_ context.Context, principal Principal, skill UserSkill) error {
+	if f.refreshErr != nil {
+		return f.refreshErr
+	}
+	for _, agent := range f.agents {
+		if agent.UserID == principal.UserID && containsUUID(agent.UserSkillIDs, skill.ID) {
+			f.refreshed = append(f.refreshed, agent.ID)
+		}
+	}
+	return nil
+}
+
+// TestSkillSynthesisWorkerSynthesizesPerAgentAndMounts 验证按助手分组提炼并自动发布挂载。
+func TestSkillSynthesisWorkerSynthesizesPerAgentAndMounts(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	agentA := Agent{ID: uuid.New(), UserID: userID, Name: "report-agent", Description: "整理周报", Version: 1, Status: AgentPublished}
+	agentB := Agent{ID: uuid.New(), UserID: userID, Name: "ticket-agent", Description: "排查工单", Version: 2, Status: AgentPublished}
+	firstID, secondID := uuid.New(), uuid.New()
+	first := Session{ID: firstID, UserID: userID, AgentID: &agentA.ID, Title: "周报会话", Status: SessionActive}
+	second := Session{ID: secondID, UserID: userID, AgentID: &agentB.ID, Title: "工单会话", Status: SessionActive}
+	now := time.Now().UTC()
+	firstMessages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: now.Add(-2 * time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: now.Add(-time.Minute)},
+	}
+	secondMessages := []Message{
+		{Role: MessageUser, Content: "这个工单的锁屏指令没有生效，请排查", CreatedAt: now.Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "我先核对设备状态与指令下发记录", CreatedAt: now},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{first, second},
+		messages: map[uuid.UUID][]Message{firstID: firstMessages, secondID: secondMessages},
+	}
+	repo := newFakeUserSkillRepository()
+	skills, _ := NewUserSkillService(repo)
+	ticketCandidate := validWorkerCandidate(second, secondMessages, "ticket-triage")
+	ticketCandidate.Description = "把设备指令未生效的排查过程整理成可复用步骤，适用于同类工单反复出现时。"
+	ticketCandidate.PromptTemplate = "# ticket-triage\n\n## 何时使用\n设备指令未生效时使用。\n\n## 步骤\n1. 核对设备在线状态。\n2. 检查指令下发记录。\n\n## 输出格式\nMarkdown。\n\n## 约束\n不得编造。"
+	extractor := &fakeSkillExtractor{byAgent: map[uuid.UUID]SkillCandidate{
+		agentA.ID: validWorkerCandidate(first, firstMessages, "weekly-report"),
+		agentB.ID: ticketCandidate,
+	}}
+	agents := newFakeSkillSynthesisAgents(agentA, agentB)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: skills, Extractor: extractor, Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if extractor.calls != 2 {
+		t.Fatalf("expected one extraction per agent, got %d", extractor.calls)
+	}
+	if len(repo.skills) != 2 {
+		t.Fatalf("expected 2 skills, got %d", len(repo.skills))
+	}
+	for _, skill := range repo.skills {
+		if skill.Status != UserSkillPublished {
+			t.Fatalf("auto skill was not published: %#v", skill)
+		}
+	}
+	if len(agents.attached) != 2 {
+		t.Fatalf("expected both agents to receive a skill, got %#v", agents.attached)
+	}
+	for _, agentID := range []uuid.UUID{agentA.ID, agentB.ID} {
+		if len(agents.agents[agentID].UserSkillIDs) != 1 {
+			t.Fatalf("agent %s bindings = %#v", agents.agents[agentID].Name, agents.agents[agentID].UserSkillIDs)
+		}
+	}
+	if agents.agents[agentA.ID].Version != 1 || agents.agents[agentB.ID].Version != 2 {
+		t.Fatalf("agent version changed: a=%d b=%d", agents.agents[agentA.ID].Version, agents.agents[agentB.ID].Version)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "created" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerAttachesToAllPublishedVersions 验证同名助手的全部已发布版本都会获得技能绑定。
+func TestSkillSynthesisWorkerAttachesToAllPublishedVersions(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	agentV1 := Agent{ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报", Version: 1, Status: AgentPublished}
+	agentV2 := Agent{ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报 v2", Version: 2, Status: AgentPublished}
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &agentV1.ID, Title: "周报会话", Status: SessionActive}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	repo := newFakeUserSkillRepository()
+	agents := newFakeSkillSynthesisAgents(agentV1, agentV2)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: &fakeSkillSessionReader{
+			sessions: []Session{session},
+			messages: map[uuid.UUID][]Message{sessionID: messages},
+		},
+		UserSkills: mustUserSkillService(t, repo), Extractor: &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(repo.skills))
+	}
+	var skillID uuid.UUID
+	for id := range repo.skills {
+		skillID = id
+	}
+	if len(agents.attachedOrder) != 2 {
+		t.Fatalf("expected both versions to be attached, got %#v", agents.attachedOrder)
+	}
+	for _, agent := range []Agent{agentV1, agentV2} {
+		stored := agents.agents[agent.ID]
+		if stored.Version != agent.Version || !containsUUID(stored.UserSkillIDs, skillID) {
+			t.Fatalf("agent %s was not attached: %#v", agent.Name, stored)
+		}
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "created" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerOptimizesMountedSkill 验证重复候选原地优化已挂载技能并刷新助手版本。
+func TestSkillSynthesisWorkerOptimizesMountedSkill(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	agent := Agent{
+		ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报", Version: 1, Status: AgentPublished,
+	}
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &agent.ID, Title: "周报会话"}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报，并补充风险项", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报和风险项整理结果", CreatedAt: time.Now().UTC()},
+	}
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	repo := newFakeUserSkillRepository()
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: "weekly-report", Version: 1,
+		Description: "把重复出现的周报整理过程沉淀为可复用步骤，适用于每周固定汇报。",
+		PromptTemplate: "# weekly-report\n\n## 何时使用\n每周需要汇报进展时使用。\n\n## 步骤\n1. 汇总进展。\n\n" +
+			"## 输出格式\nMarkdown。\n\n## 约束\n不得编造。",
+		Status: UserSkillPublished, Origin: UserSkillOriginAuto,
+		SourceSessionIDs: []uuid.UUID{sessionID}, Confidence: 0.7,
+	}
+	repo.skills[existing.ID] = existing
+	agent.UserSkillIDs = []uuid.UUID{existing.ID}
+	agent.ConfigSnapshot = map[string]any{"user_skills": []map[string]any{{
+		"id": existing.ID.String(), "name": existing.Name, "description": existing.Description,
+		"prompt_template": existing.PromptTemplate, "parameters": map[string]any{},
+	}}}
+	agents := newFakeSkillSynthesisAgents(agent)
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	candidate.PromptTemplate = strings.Replace(candidate.PromptTemplate, "1. 收集证据。", "1. 收集证据。\n2. 汇总风险项。", 1)
+	runs := &fakeSkillSynthesisRuns{}
+	bundles := &fakeUserSkillBundleRepository{repo: repo}
+	userSkills := mustUserSkillService(t, repo)
+	userSkills.WithBundles(bundles)
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: userSkills, Extractor: &fakeSkillExtractor{candidate: candidate},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("optimization created a new skill: %d", len(repo.skills))
+	}
+	optimized := repo.skills[existing.ID]
+	if optimized.PromptTemplate == existing.PromptTemplate || !strings.Contains(optimized.PromptTemplate, "汇总风险项") {
+		t.Fatalf("skill was not optimized in place: %#v", optimized)
+	}
+	if optimized.Status != UserSkillPublished || optimized.Origin != UserSkillOriginAuto {
+		t.Fatalf("optimized skill lost lifecycle state: %#v", optimized)
+	}
+	if optimized.Confidence < existing.Confidence {
+		t.Fatalf("optimized confidence regressed: %v", optimized.Confidence)
+	}
+	if optimized.Bundle.Format != SkillBundleFormat || len(bundles.files) != 1 ||
+		!strings.Contains(string(bundles.files[0].Content), "汇总风险项") {
+		t.Fatalf("optimized bundle was not rebuilt: %#v files=%d", optimized.Bundle, len(bundles.files))
+	}
+	if agents.agents[agent.ID].Version != 1 || !containsUUID(agents.agents[agent.ID].UserSkillIDs, existing.ID) {
+		t.Fatalf("agent was not refreshed in place: %#v", agents.agents[agent.ID])
+	}
+	if len(agents.refreshed) != 1 || agents.refreshed[0] != agent.ID {
+		t.Fatalf("bound agent snapshot was not refreshed: %#v", agents.refreshed)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "optimized" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsRemountForIdenticalMountedSkill 验证内容一致且已挂载时不重复写入或创建版本。
+func TestSkillSynthesisWorkerSkipsRemountForIdenticalMountedSkill(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, Title: "周报会话", Status: SessionActive}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	agent := Agent{
+		ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报",
+		Version: 1, Status: AgentPublished,
+	}
+	session.AgentID = &agent.ID
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: candidate.Name, Version: 1,
+		Description: candidate.Description, PromptTemplate: candidate.PromptTemplate,
+		Parameters: map[string]any{}, Status: UserSkillPublished, Origin: UserSkillOriginAuto,
+		SourceSessionIDs: []uuid.UUID{sessionID}, Confidence: 0.7,
+	}
+	bundleInfo, _, err := buildAutoSkillBundle(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Bundle = bundleInfo
+	repo := newFakeUserSkillRepository()
+	repo.skills[existing.ID] = existing
+	agent.UserSkillIDs = []uuid.UUID{existing.ID}
+	agent.ConfigSnapshot = map[string]any{"user_skills": []map[string]any{{
+		"id": existing.ID.String(), "name": existing.Name, "description": existing.Description,
+		"prompt_template": existing.PromptTemplate, "parameters": existing.Parameters,
+	}}}
+	agents := newFakeSkillSynthesisAgents(agent)
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	bundles := &fakeUserSkillBundleRepository{repo: repo}
+	userSkills := mustUserSkillService(t, repo)
+	userSkills.WithBundles(bundles)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: userSkills, Extractor: &fakeSkillExtractor{candidate: candidate},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current := repo.skills[existing.ID]
+	if current.Confidence != existing.Confidence || current.PromptTemplate != existing.PromptTemplate {
+		t.Fatalf("identical skill was rewritten: %#v", current)
+	}
+	if len(bundles.files) != 0 {
+		t.Fatalf("identical skill bundle was rewritten: %d files", len(bundles.files))
+	}
+	if agents.attached[existing.ID] != agent.ID || agents.agents[agent.ID].Version != 1 {
+		t.Fatalf("identical skill was not attached in place: %#v", agents.agents[agent.ID])
+	}
+	if len(agents.refreshed) != 1 || agents.refreshed[0] != agent.ID {
+		t.Fatalf("bound agent snapshot was not refreshed: %#v", agents.refreshed)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" ||
+		!strings.Contains(runs.finished[0].Detail, "内容一致") {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerMountsIdenticalSkillWithoutRewrite 验证内容一致但尚未挂载时只补挂载、不重写技能。
+func TestSkillSynthesisWorkerMountsIdenticalSkillWithoutRewrite(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, Title: "周报会话", Status: SessionActive}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	agent := Agent{
+		ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报",
+		Version: 1, Status: AgentPublished,
+	}
+	session.AgentID = &agent.ID
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: candidate.Name, Version: 1,
+		Description: candidate.Description, PromptTemplate: candidate.PromptTemplate,
+		Parameters: map[string]any{}, Status: UserSkillPublished, Origin: UserSkillOriginAuto,
+		SourceSessionIDs: []uuid.UUID{sessionID}, Confidence: 0.7,
+	}
+	bundleInfo, _, err := buildAutoSkillBundle(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Bundle = bundleInfo
+	repo := newFakeUserSkillRepository()
+	repo.skills[existing.ID] = existing
+	agents := newFakeSkillSynthesisAgents(agent)
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	bundles := &fakeUserSkillBundleRepository{repo: repo}
+	userSkills := mustUserSkillService(t, repo)
+	userSkills.WithBundles(bundles)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: userSkills, Extractor: &fakeSkillExtractor{candidate: candidate},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current := repo.skills[existing.ID]
+	if current.Confidence != existing.Confidence || current.PromptTemplate != existing.PromptTemplate {
+		t.Fatalf("identical skill was rewritten: %#v", current)
+	}
+	if len(bundles.files) != 0 {
+		t.Fatalf("identical skill bundle was rewritten: %d files", len(bundles.files))
+	}
+	if !containsUUID(agents.agents[agent.ID].UserSkillIDs, existing.ID) || agents.agents[agent.ID].Version != 1 {
+		t.Fatalf("identical skill was not attached in place: %#v", agents.agents[agent.ID])
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" ||
+		!strings.Contains(runs.finished[0].Detail, "已绑定") {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerRebuildsStaleBundle 验证正文一致但技能包摘要过期时会重新生成技能包。
+func TestSkillSynthesisWorkerRebuildsStaleBundle(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, Title: "周报会话", Status: SessionActive}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	agent := Agent{
+		ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报",
+		Version: 1, Status: AgentPublished,
+	}
+	session.AgentID = &agent.ID
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: candidate.Name, Version: 1,
+		Description: candidate.Description, PromptTemplate: candidate.PromptTemplate,
+		Parameters: map[string]any{}, Status: UserSkillPublished, Origin: UserSkillOriginAuto,
+		SourceSessionIDs: []uuid.UUID{sessionID}, Confidence: 0.7,
+		Bundle: SkillBundleInfo{Format: SkillBundleFormat, Entrypoint: "SKILL.md", FileCount: 1, Digest: "stale"},
+	}
+	repo := newFakeUserSkillRepository()
+	repo.skills[existing.ID] = existing
+	agent.UserSkillIDs = []uuid.UUID{existing.ID}
+	agent.ConfigSnapshot = map[string]any{"user_skills": []map[string]any{{
+		"id": existing.ID.String(), "name": existing.Name, "description": existing.Description,
+		"prompt_template": existing.PromptTemplate, "parameters": existing.Parameters,
+	}}}
+	agents := newFakeSkillSynthesisAgents(agent)
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	bundles := &fakeUserSkillBundleRepository{repo: repo}
+	userSkills := mustUserSkillService(t, repo)
+	userSkills.WithBundles(bundles)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: userSkills, Extractor: &fakeSkillExtractor{candidate: candidate},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(bundles.files) != 1 || !strings.Contains(string(bundles.files[0].Content), "## 步骤") {
+		t.Fatalf("stale bundle was not rebuilt: %#v", bundles.files)
+	}
+	current := repo.skills[existing.ID]
+	if current.Bundle.Digest == "" || current.Bundle.Digest != bundles.info.Digest {
+		t.Fatalf("bundle digest was not refreshed: %#v", current.Bundle)
+	}
+	if agents.agents[agent.ID].Version != 1 || !containsUUID(agents.agents[agent.ID].UserSkillIDs, existing.ID) {
+		t.Fatalf("bundle repair changed the agent version: %#v", agents.agents[agent.ID])
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "optimized" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsUnrelatedSameNameSkill 验证同名但未挂载且来源不同的技能不会被覆盖。
+func TestSkillSynthesisWorkerSkipsUnrelatedSameNameSkill(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, Title: "周报会话", Status: SessionActive}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	candidate := validWorkerCandidate(session, messages, "weekly-report")
+	agent := Agent{
+		ID: uuid.New(), UserID: userID, Name: "weekly-agent", Description: "整理周报",
+		Version: 1, Status: AgentPublished,
+	}
+	session.AgentID = &agent.ID
+	existing := UserSkill{
+		ID: uuid.New(), UserID: userID, Name: "weekly-report", Version: 1,
+		Description:    "处理发票报销与凭证归档的固定流程，适用于财务报销场景。",
+		PromptTemplate: "# weekly-report\n\n## 何时使用\n处理发票报销时使用。\n\n## 步骤\n1. 核对发票信息。\n\n## 输出格式\nMarkdown。\n\n## 约束\n不得编造。",
+		Parameters:     map[string]any{}, Status: UserSkillPublished, Origin: UserSkillOriginAuto,
+		SourceSessionIDs: []uuid.UUID{uuid.New()}, Confidence: 0.8,
+	}
+	repo := newFakeUserSkillRepository()
+	repo.skills[existing.ID] = existing
+	agents := newFakeSkillSynthesisAgents(agent)
+	reader := &fakeSkillSessionReader{
+		sessions: []Session{session},
+		messages: map[uuid.UUID][]Message{sessionID: messages},
+	}
+	bundles := &fakeUserSkillBundleRepository{repo: repo}
+	userSkills := mustUserSkillService(t, repo)
+	userSkills.WithBundles(bundles)
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: reader, UserSkills: userSkills, Extractor: &fakeSkillExtractor{candidate: candidate},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	current := repo.skills[existing.ID]
+	if current.PromptTemplate != existing.PromptTemplate || current.Confidence != existing.Confidence {
+		t.Fatalf("unrelated same-name skill was overwritten: %#v", current)
+	}
+	if len(bundles.files) != 0 {
+		t.Fatalf("unrelated skill bundle was rewritten: %d files", len(bundles.files))
+	}
+	if len(agents.agents[agent.ID].UserSkillIDs) != 0 {
+		t.Fatalf("unrelated skill was attached: %#v", agents.agents[agent.ID].UserSkillIDs)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" ||
+		!strings.Contains(runs.finished[0].Detail, "未自动覆盖") {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerDoesNotOptimizeManualOrDisabledSkill 验证手动与停用技能不会被自动改写。
+func TestSkillSynthesisWorkerDoesNotOptimizeManualOrDisabledSkill(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		origin UserSkillOrigin
+		status UserSkillStatus
+	}{
+		{"manual", UserSkillOriginManual, UserSkillPublished},
+		{"disabled", UserSkillOriginAuto, UserSkillDisabled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			userID := uuid.New()
+			jobs := newFakeJobQueue()
+			job := makeSkillSynthesisJob(userID)
+			jobs.jobs[job.ID] = job
+			jobs.statuses[job.ID] = "pending"
+			sessionID := uuid.New()
+			session := Session{ID: sessionID, UserID: userID, Title: "周报会话"}
+			messages := []Message{
+				{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+				{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+			}
+			reader := &fakeSkillSessionReader{
+				sessions: []Session{session},
+				messages: map[uuid.UUID][]Message{sessionID: messages},
+			}
+			repo := newFakeUserSkillRepository()
+			existing := UserSkill{
+				ID: uuid.New(), UserID: userID, Name: "weekly-report", Version: 1,
+				Description: "已有技能描述", PromptTemplate: "已有正文",
+				Status: tc.status, Origin: tc.origin,
+			}
+			repo.skills[existing.ID] = existing
+			runs := &fakeSkillSynthesisRuns{}
+			worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+				Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+				Sessions: reader, UserSkills: mustUserSkillService(t, repo),
+				Extractor: &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")},
+				Runs:      runs,
+			}, SkillSynthesisConfig{MinConfidence: 0.5})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worker.ProcessOne(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(repo.skills) != 1 {
+				t.Fatalf("skill count changed: %d", len(repo.skills))
+			}
+			if repo.skills[existing.ID].PromptTemplate != "已有正文" || repo.skills[existing.ID].Status != tc.status {
+				t.Fatalf("skill was modified: %#v", repo.skills[existing.ID])
+			}
+			if len(runs.finished) != 1 || runs.finished[0].Outcome != "duplicate_skill" {
+				t.Fatalf("run outcome = %#v", runs.finished)
+			}
+		})
+	}
+}
+
+// TestSkillSynthesisWorkerReportsAttachFailure 验证绑定失败不影响技能发布，并把原因写入执行记录。
+func TestSkillSynthesisWorkerReportsAttachFailure(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	agent := Agent{ID: uuid.New(), UserID: userID, Name: "weekly-agent", Version: 1, Status: AgentPublished}
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &agent.ID, Title: "周报会话"}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	repo := newFakeUserSkillRepository()
+	agents := newFakeSkillSynthesisAgents(agent)
+	agents.attachErr = errors.New("agent unavailable")
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: &fakeSkillSessionReader{
+			sessions: []Session{session},
+			messages: map[uuid.UUID][]Message{sessionID: messages},
+		},
+		UserSkills: mustUserSkillService(t, repo), Extractor: &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 || repo.skills[firstSkillID(repo)].Status != UserSkillPublished {
+		t.Fatalf("skill should remain published after attach failure: %#v", repo.skills)
+	}
+	if len(agents.agents[agent.ID].UserSkillIDs) != 0 {
+		t.Fatalf("failed attach changed agent bindings: %#v", agents.agents[agent.ID].UserSkillIDs)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "created" ||
+		!strings.Contains(runs.finished[0].Detail, "自动挂载失败") {
+		t.Fatalf("run detail = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerReportsRemovedVersionSkip 验证按版本移除后的挂载跳过会如实写入执行记录。
+func TestSkillSynthesisWorkerReportsRemovedVersionSkip(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	agent := Agent{ID: uuid.New(), UserID: userID, Name: "weekly-agent", Version: 1, Status: AgentPublished}
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &agent.ID, Title: "周报会话"}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	repo := newFakeUserSkillRepository()
+	agents := newFakeSkillSynthesisAgents(agent)
+	agents.attachSkipped = true
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: &fakeSkillSessionReader{
+			sessions: []Session{session},
+			messages: map[uuid.UUID][]Message{sessionID: messages},
+		},
+		UserSkills: mustUserSkillService(t, repo), Extractor: &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 || repo.skills[firstSkillID(repo)].Status != UserSkillPublished {
+		t.Fatalf("skill should remain published after skipped attach: %#v", repo.skills)
+	}
+	if len(agents.agents[agent.ID].UserSkillIDs) != 0 {
+		t.Fatalf("skipped attach changed agent bindings: %#v", agents.agents[agent.ID].UserSkillIDs)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "created" ||
+		!strings.Contains(runs.finished[0].Detail, "已按版本移除该技能") {
+		t.Fatalf("run detail = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerReportsBoundAgentRefreshFailure 验证其他助手快照刷新失败只记录说明。
+func TestSkillSynthesisWorkerReportsBoundAgentRefreshFailure(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	agent := Agent{ID: uuid.New(), UserID: userID, Name: "weekly-agent", Version: 1, Status: AgentPublished}
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &agent.ID, Title: "周报会话"}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	repo := newFakeUserSkillRepository()
+	agents := newFakeSkillSynthesisAgents(agent)
+	agents.refreshErr = errors.New("snapshot refresh failed")
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: &fakeSkillSessionReader{
+			sessions: []Session{session},
+			messages: map[uuid.UUID][]Message{sessionID: messages},
+		},
+		UserSkills: mustUserSkillService(t, repo), Extractor: &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")},
+		Agents: agents, Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.skills) != 1 {
+		t.Fatalf("skill was not created: %#v", repo.skills)
+	}
+	if len(agents.agents[agent.ID].UserSkillIDs) != 1 {
+		t.Fatalf("agent binding was not created: %#v", agents.agents[agent.ID].UserSkillIDs)
+	}
+	if agents.agents[agent.ID].Version != 1 {
+		t.Fatalf("agent version changed: %#v", agents.agents[agent.ID])
+	}
+	if len(runs.finished) != 1 || !strings.Contains(runs.finished[0].Detail, "同步已绑定助手失败") {
+		t.Fatalf("run detail = %#v", runs.finished)
+	}
+}
+
+// TestSkillSynthesisWorkerSkipsMissingAgent 验证会话绑定的助手不存在时跳过且不调用模型。
+func TestSkillSynthesisWorkerSkipsMissingAgent(t *testing.T) {
+	userID := uuid.New()
+	jobs := newFakeJobQueue()
+	job := makeSkillSynthesisJob(userID)
+	jobs.jobs[job.ID] = job
+	jobs.statuses[job.ID] = "pending"
+	missingAgentID := uuid.New()
+	sessionID := uuid.New()
+	session := Session{ID: sessionID, UserID: userID, AgentID: &missingAgentID, Title: "失效会话"}
+	messages := []Message{
+		{Role: MessageUser, Content: "请帮我整理一份本周工作周报", CreatedAt: time.Now().UTC().Add(-time.Minute)},
+		{Role: MessageAssistant, Content: "好的，这是本周工作周报的整理结果", CreatedAt: time.Now().UTC()},
+	}
+	extractor := &fakeSkillExtractor{candidate: validWorkerCandidate(session, messages, "weekly-report")}
+	runs := &fakeSkillSynthesisRuns{}
+	worker, err := NewSkillSynthesisWorker(SkillSynthesisWorkerDependencies{
+		Jobs: jobs, Settings: &fakeSkillSynthesisSettingsStore{defaultEnabled: true},
+		Sessions: &fakeSkillSessionReader{
+			sessions: []Session{session},
+			messages: map[uuid.UUID][]Message{sessionID: messages},
+		},
+		UserSkills: mustUserSkillService(t, newFakeUserSkillRepository()), Extractor: extractor,
+		Agents: newFakeSkillSynthesisAgents(), Runs: runs,
+	}, SkillSynthesisConfig{MinConfidence: 0.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if extractor.calls != 0 {
+		t.Fatalf("missing agent should not trigger extraction: %d", extractor.calls)
+	}
+	if len(runs.finished) != 1 || runs.finished[0].Outcome != "agent_missing" {
+		t.Fatalf("run outcome = %#v", runs.finished)
+	}
+	if len(runs.advanced) != 1 {
+		t.Fatalf("permanent missing agent should advance watermark: %#v", runs.advanced)
+	}
+}
+
+// mustUserSkillService 构造测试用用户技能服务。
+func mustUserSkillService(t *testing.T, repo UserSkillRepository) *UserSkillService {
+	t.Helper()
+	service, err := NewUserSkillService(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
+}
+
+// firstSkillID 返回假仓库中唯一的技能 ID。
+func firstSkillID(repo *fakeUserSkillRepository) uuid.UUID {
+	for id := range repo.skills {
+		return id
+	}
+	return uuid.Nil
 }
 
 func makeSkillSynthesisJob(userID uuid.UUID) Job {

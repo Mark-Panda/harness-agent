@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"math"
 	"reflect"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	harnessv1 "github.com/Mark-Panda/harness-agent/api/harness/v1"
 	"github.com/Mark-Panda/harness-agent/internal/biz"
 	"github.com/google/uuid"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -382,6 +384,65 @@ func TestTimestamp(t *testing.T) {
 	got := timestamp(value)
 	if got == nil || !got.AsTime().Equal(value) || got.AsTime().Location() != time.UTC {
 		t.Fatalf("timestamp = %v", got)
+	}
+}
+
+// TestGRPCAgentUpdateConvertsOptOutsAndUpdatedAt 验证 gRPC 更新透传显式移除与并发令牌。
+func TestGRPCAgentUpdateConvertsOptOutsAndUpdatedAt(t *testing.T) {
+	fixture := newPlatformCRUDFixture(t, biz.RoleUser)
+	grpcServer := &platformGRPCServer{platform: fixture.platform}
+	userID, agentID, skillID := fixture.principal.UserID, uuid.New(), uuid.New()
+	loadedAt := time.Now().UTC().Truncate(time.Microsecond)
+	current := biz.Agent{
+		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact,
+		Version: 1, Status: biz.AgentDraft, UpdatedAt: loadedAt,
+	}
+	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	fixture.agents.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
+			if !reflect.DeepEqual(agent.UserSkillOptOuts, []uuid.UUID{skillID}) {
+				t.Fatalf("opt-outs = %#v, want [%s]", agent.UserSkillOptOuts, skillID)
+			}
+			if !agent.UpdatedAt.Equal(loadedAt) {
+				t.Fatalf("updated_at = %s, want %s", agent.UpdatedAt, loadedAt)
+			}
+			return agent, nil
+		})
+	response, err := grpcServer.UpdateAgent(biz.WithPrincipal(context.Background(), fixture.principal), &harnessv1.UpdateAgentRequest{
+		Id: agentID.String(), Mode: "react", UserSkillOptouts: []string{skillID.String()},
+		UpdatedAt: timestamppb.New(loadedAt),
+	})
+	if err != nil || response.GetAgent().GetId() != agentID.String() {
+		t.Fatalf("UpdateAgent() = %#v, %v", response, err)
+	}
+}
+
+// TestGRPCAgentGetReturnsInheritableUserSkills 验证草稿读取返回可继承的自动技能。
+func TestGRPCAgentGetReturnsInheritableUserSkills(t *testing.T) {
+	fixture := newPlatformCRUDFixture(t, biz.RoleUser)
+	grpcServer := &platformGRPCServer{platform: fixture.platform}
+	userID, agentID, siblingID := fixture.principal.UserID, uuid.New(), uuid.New()
+	skillID := uuid.New()
+	draft := biz.Agent{
+		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact,
+		Version: 2, Status: biz.AgentDraft,
+	}
+	sibling := biz.Agent{
+		ID: siblingID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact,
+		Version: 1, Status: biz.AgentPublished, UserSkillIDs: []uuid.UUID{skillID},
+	}
+	skill := biz.UserSkill{ID: skillID, UserID: userID, Name: "weekly-report", Status: biz.UserSkillPublished, Origin: biz.UserSkillOriginAuto}
+	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(draft, nil).Times(2)
+	fixture.agents.EXPECT().ListPublishedAgentIDsByName(gomock.Any(), userID, "assistant").Return([]uuid.UUID{siblingID}, nil)
+	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, siblingID).Return(sibling, nil)
+	fixture.agents.EXPECT().ListUserSkillOptOuts(gomock.Any(), userID, agentID).Return(nil, nil)
+	fixture.agents.EXPECT().ListUserSkillsByIDs(gomock.Any(), userID, []uuid.UUID{skillID}).Return([]biz.UserSkill{skill}, nil)
+	response, err := grpcServer.GetAgent(biz.WithPrincipal(context.Background(), fixture.principal), &harnessv1.GetAgentRequest{Id: agentID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.GetInheritableUserSkills()) != 1 || response.GetInheritableUserSkills()[0].GetName() != "weekly-report" {
+		t.Fatalf("inheritable skills = %#v", response.GetInheritableUserSkills())
 	}
 }
 

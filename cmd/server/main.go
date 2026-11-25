@@ -1038,6 +1038,7 @@ func run() error {
 		skillSynthesisWorker, err := biz.NewSkillSynthesisWorker(biz.SkillSynthesisWorkerDependencies{
 			Jobs: jobRepository, Settings: userSkillRepository, Sessions: sessionRepository, UserSkills: userSkillService,
 			Runs:      userSkillRepository,
+			Agents:    agentService,
 			Extractor: skillExtractor, Logger: slog.Default(),
 		}, biz.SkillSynthesisConfig{
 			Enabled:                cfg.Agent.Memory.SkillSynthesis.Enabled,

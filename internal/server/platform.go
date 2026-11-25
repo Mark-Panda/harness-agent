@@ -97,6 +97,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("POST /api/v1/agents/{id}/publish", "agent", handler.publishAgent)
 	handleWrite("POST /api/v1/agents/{id}/unpublish", "agent", handler.unpublishAgent)
 	handleWrite("POST /api/v1/agents/{id}/archive", "agent", handler.archiveAgent)
+	handle("GET /api/v1/agents/{id}/snapshot-revisions", handler.listAgentSnapshotRevisions)
+	handleWrite("POST /api/v1/agents/{id}/snapshot-revisions/{revisionId}/restore", "agent", handler.restoreAgentSnapshotRevision)
 	// 用户级技能提炼设置：开关与模型策略均归属于当前登录用户。
 	handle("GET /api/v1/user-skill-synthesis/settings", handler.getUserSkillSynthesisSettings)
 	handleWrite("PUT /api/v1/user-skill-synthesis/settings", "user_skill_synthesis_settings", handler.updateUserSkillSynthesisSettings)
@@ -113,6 +115,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 	handleWrite("PUT /api/v1/user-skills/{id}/bundle/execution", "user_skill", handler.setUserSkillBundleExecution)
 	handle("GET /api/v1/user-skills", handler.listUserSkills)
 	handle("GET /api/v1/user-skills/{id}", handler.getUserSkill)
+	handle("GET /api/v1/user-skills/{id}/revisions", handler.listUserSkillRevisions)
+	handleWrite("POST /api/v1/user-skills/{id}/revisions/{revisionId}/restore", "user_skill", handler.restoreUserSkillRevision)
 	handleWrite("PUT /api/v1/user-skills/{id}", "user_skill", handler.updateUserSkill)
 	handleWrite("DELETE /api/v1/user-skills/{id}", "user_skill", handler.deleteUserSkill)
 	handleWrite("POST /api/v1/user-skills/{id}/publish", "user_skill", handler.publishUserSkill)
@@ -280,8 +284,12 @@ type agentRequest struct {
 	SkillIDs []uuid.UUID `json:"skill_ids"`
 	// UserSkillIDs 绑定的用户级技能。
 	UserSkillIDs []uuid.UUID `json:"user_skill_ids"`
+	// UserSkillOptOuts 显式取消继承/移除的用户技能，仅用于草稿更新。
+	UserSkillOptOuts []uuid.UUID `json:"user_skill_optouts"`
 	// MCPIDs 绑定的 MCP。
 	MCPIDs []uuid.UUID `json:"mcp_ids"`
+	// UpdatedAt 读取草稿时拿到的更新时间，用于乐观并发校验；为空时不校验。
+	UpdatedAt *time.Time `json:"updated_at"`
 }
 
 // sessionRequest 是创建会话的请求体。
@@ -930,13 +938,53 @@ func (h *platformHTTPHandler) deleteAgent(w http.ResponseWriter, r *http.Request
 	writePlatformResult(w, http.StatusNoContent, nil, h.service.Agents.Delete(r.Context(), requestPrincipal(r), id))
 }
 
-// getAgent 处理 GET /api/v1/agents/{id}：读取当前用户 Agent。
+// getAgent 处理 GET /api/v1/agents/{id}：读取当前用户 Agent；草稿附带发布时将继承的自动技能。
 func (h *platformHTTPHandler) getAgent(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathUUID(w, r)
 	if !ok {
 		return
 	}
 	agent, err := h.service.Agents.Get(r.Context(), requestPrincipal(r), id)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, nil, err)
+		return
+	}
+	payload := agentResponse(agent)
+	if agent.Status == biz.AgentDraft {
+		inheritable, err := h.service.Agents.InheritableUserSkills(r.Context(), requestPrincipal(r), id)
+		if err != nil {
+			writePlatformResult(w, http.StatusOK, nil, err)
+			return
+		}
+		payload["inheritable_user_skills"] = inheritable
+	}
+	writePlatformResult(w, http.StatusOK, payload, nil)
+}
+
+// listAgentSnapshotRevisions 处理 GET /api/v1/agents/{id}/snapshot-revisions：列出助手快照历史。
+func (h *platformHTTPHandler) listAgentSnapshotRevisions(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	revisions, err := h.service.Agents.ListSnapshotRevisions(r.Context(), requestPrincipal(r), id, limit)
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": revisions}, err)
+}
+
+// restoreAgentSnapshotRevision 处理 POST /api/v1/agents/{id}/snapshot-revisions/{revisionId}/restore：
+// 恢复助手发布快照历史。
+func (h *platformHTTPHandler) restoreAgentSnapshotRevision(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	revisionID, err := uuid.Parse(r.PathValue("revisionId"))
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_revision_id")
+		return
+	}
+	agent, err := h.service.Agents.RestoreSnapshotRevision(r.Context(), requestPrincipal(r), id, revisionID)
 	writePlatformResult(w, http.StatusOK, agentResponse(agent), err)
 }
 
@@ -1409,7 +1457,11 @@ func policyInput(request policyRequest) biz.ModelPolicy {
 
 // agentInput 将 HTTP 请求体转换为 Agent 领域实体（user_id 不来自客户端）。
 func agentInput(request agentRequest) biz.Agent {
-	return biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, UserSkillIDs: request.UserSkillIDs, MCPIDs: request.MCPIDs}
+	agent := biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, UserSkillIDs: request.UserSkillIDs, UserSkillOptOuts: request.UserSkillOptOuts, MCPIDs: request.MCPIDs}
+	if request.UpdatedAt != nil {
+		agent.UpdatedAt = *request.UpdatedAt
+	}
+	return agent
 }
 
 // mcpInput 将 HTTP 请求体转换为 MCP 入参。
@@ -1618,6 +1670,44 @@ func (h *platformHTTPHandler) getUserSkill(w http.ResponseWriter, r *http.Reques
 	}
 	skill, err := h.service.UserSkills.Get(r.Context(), requestPrincipal(r), id)
 	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+}
+
+// listUserSkillRevisions 处理 GET /api/v1/user-skills/{id}/revisions：列出技能历史更新快照。
+func (h *platformHTTPHandler) listUserSkillRevisions(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	revisions, err := h.service.UserSkills.ListRevisions(r.Context(), requestPrincipal(r), id, limit)
+	writePlatformResult(w, http.StatusOK, map[string]any{"items": revisions}, err)
+}
+
+// restoreUserSkillRevision 处理 POST /api/v1/user-skills/{id}/revisions/{revisionId}/restore：
+// 恢复历史快照并同步所有绑定该技能的助手快照。
+func (h *platformHTTPHandler) restoreUserSkillRevision(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathUUID(w, r)
+	if !ok {
+		return
+	}
+	revisionID, err := uuid.Parse(r.PathValue("revisionId"))
+	if err != nil {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_revision_id")
+		return
+	}
+	principal := requestPrincipal(r)
+	skill, err := h.service.UserSkills.RestoreRevision(r.Context(), principal, id, revisionID)
+	if err != nil {
+		writePlatformResult(w, http.StatusOK, userSkillResponse(skill), err)
+		return
+	}
+	if h.service.Agents != nil {
+		if refreshErr := h.service.Agents.RefreshBoundAgentsForUserSkill(r.Context(), principal, skill); refreshErr != nil {
+			writePlatformResult(w, http.StatusOK, userSkillResponse(skill), refreshErr)
+			return
+		}
+	}
+	writePlatformResult(w, http.StatusOK, userSkillResponse(skill), nil)
 }
 
 // deleteUserSkill 处理 DELETE /api/v1/user-skills/{id}：删除当前用户技能。

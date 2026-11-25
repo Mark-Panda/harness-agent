@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -35,12 +36,30 @@ type userSkillModel struct {
 	BundleHasScripts bool           `gorm:"not null;default:false"`
 	BundleExecutable bool           `gorm:"column:bundle_execution_enabled;not null;default:false"`
 	BundleDigest     string         `gorm:"not null;default:''"`
+	UserEditedAt     *time.Time     `gorm:"column:user_edited_at"`
 	CreatedAt        time.Time      `gorm:"not null"`
 	UpdatedAt        time.Time      `gorm:"not null"`
 }
 
 // TableName 指定表名。
 func (userSkillModel) TableName() string { return "user_skills" }
+
+// userSkillRevisionModel 对应 user_skill_revisions 表：技能原地更新前的历史快照。
+type userSkillRevisionModel struct {
+	ID               uuid.UUID      `gorm:"type:uuid;primaryKey"`
+	UserID           uuid.UUID      `gorm:"type:uuid;not null"`
+	SkillID          uuid.UUID      `gorm:"column:skill_id;type:uuid;not null"`
+	Version          int            `gorm:"not null"`
+	Description      string         `gorm:"not null;default:''"`
+	PromptTemplate   string         `gorm:"column:prompt_template;not null"`
+	ParametersJSON   datatypes.JSON `gorm:"column:parameters_json;not null"`
+	SourceSessionIDs datatypes.JSON `gorm:"column:source_session_ids;not null"`
+	Confidence       float64        `gorm:"not null"`
+	CreatedAt        time.Time      `gorm:"not null"`
+}
+
+// TableName 指定表名。
+func (userSkillRevisionModel) TableName() string { return "user_skill_revisions" }
 
 // userSkillSynthesisSettingsModel 对应 user_skill_synthesis_settings 表。
 type userSkillSynthesisSettingsModel struct {
@@ -91,8 +110,8 @@ func fromBizUserSkill(skill biz.UserSkill) (userSkillModel, error) {
 		BundleFormat: skill.Bundle.Format, BundleEntrypoint: skill.Bundle.Entrypoint,
 		BundleFileCount: skill.Bundle.FileCount, BundleTotalBytes: skill.Bundle.TotalBytes,
 		BundleHasScripts: skill.Bundle.HasScripts, BundleExecutable: skill.Bundle.ExecutionEnabled,
-		BundleDigest: skill.Bundle.Digest,
-		CreatedAt:    skill.CreatedAt, UpdatedAt: skill.UpdatedAt,
+		BundleDigest: skill.Bundle.Digest, UserEditedAt: skill.UserEditedAt,
+		CreatedAt: skill.CreatedAt, UpdatedAt: skill.UpdatedAt,
 	}, nil
 }
 
@@ -127,7 +146,8 @@ func toUserSkill(record userSkillModel) (biz.UserSkill, error) {
 			HasScripts: record.BundleHasScripts, ExecutionEnabled: record.BundleExecutable,
 			Digest: record.BundleDigest,
 		},
-		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+		UserEditedAt: record.UserEditedAt,
+		CreatedAt:    record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}, nil
 }
 
@@ -154,16 +174,56 @@ func (r *UserSkillRepository) CreateUserSkill(ctx context.Context, skill biz.Use
 	return r.GetUserSkill(ctx, skill.UserID, skill.ID)
 }
 
-// UpdateUserSkill 更新技能正文；仅 auto_generated 状态可修改。
+// maxUserSkillRevisions 是单个技能保留的历史快照上限。
+const maxUserSkillRevisions = 50
+
+// UpdateUserSkill 更新技能正文、来源会话与置信度，并在同一事务内保留更新前的历史快照。
+// 状态流转由服务层保证。
 func (r *UserSkillRepository) UpdateUserSkill(ctx context.Context, skill biz.UserSkill, event biz.OutboxEvent) (biz.UserSkill, error) {
 	record, err := fromBizUserSkill(skill)
 	if err != nil {
 		return biz.UserSkill{}, err
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: skill.UserID}, func(tx *gorm.DB) error {
+		var current userSkillModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&current, "id = ? AND user_id = ?", skill.ID, skill.UserID).Error; err != nil {
+			return err
+		}
+		// 内容未变化时只更新元数据，不产生无意义的历史快照。
+		revisionInserted := false
+		if current.Description != record.Description ||
+			current.PromptTemplate != record.PromptTemplate ||
+			!jsonContentEqual(current.ParametersJSON, record.ParametersJSON) {
+			revision := userSkillRevisionModel{
+				ID: uuid.New(), UserID: current.UserID, SkillID: current.ID, Version: current.Version,
+				Description: current.Description, PromptTemplate: current.PromptTemplate,
+				ParametersJSON: current.ParametersJSON, SourceSessionIDs: current.SourceSessionIDs,
+				Confidence: current.Confidence, CreatedAt: time.Now().UTC(),
+			}
+			if err := tx.Create(&revision).Error; err != nil {
+				return err
+			}
+			revisionInserted = true
+		}
+		if revisionInserted {
+			// 每个技能只保留最近 maxUserSkillRevisions 条历史，避免长期无限增长。
+			if err := tx.Exec(`
+DELETE FROM user_skill_revisions
+WHERE id IN (
+  SELECT id FROM user_skill_revisions
+  WHERE user_id = ? AND skill_id = ?
+  ORDER BY created_at DESC
+  OFFSET ?
+)`, skill.UserID, skill.ID, maxUserSkillRevisions).Error; err != nil {
+				return err
+			}
+		}
 		result := tx.Model(&userSkillModel{}).Where("id = ? AND user_id = ?", skill.ID, skill.UserID).Updates(map[string]any{
 			"description": record.Description, "prompt_template": record.PromptTemplate,
-			"parameters_json": record.ParametersJSON, "updated_at": time.Now().UTC(),
+			"parameters_json": record.ParametersJSON, "source_session_ids": record.SourceSessionIDs,
+			"confidence": record.Confidence, "user_edited_at": record.UserEditedAt,
+			"updated_at": time.Now().UTC(),
 		})
 		if result.Error != nil {
 			return result.Error
@@ -238,6 +298,84 @@ func (r *UserSkillRepository) ListUserSkillsByIDs(ctx context.Context, userID uu
 		result = append(result, skill)
 	}
 	return result, nil
+}
+
+// ListUserSkillRevisions 按时间倒序读取技能历史快照。
+func (r *UserSkillRepository) ListUserSkillRevisions(ctx context.Context, userID, skillID uuid.UUID, limit int) ([]biz.UserSkillRevision, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	var records []userSkillRevisionModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("user_id = ? AND skill_id = ?", userID, skillID).
+			Order("created_at DESC").Limit(limit).Find(&records).Error
+	})
+	if err != nil {
+		return nil, catalogError("list user skill revisions", err)
+	}
+	revisions := make([]biz.UserSkillRevision, 0, len(records))
+	for _, record := range records {
+		revision, err := toBizUserSkillRevision(record)
+		if err != nil {
+			return nil, err
+		}
+		revisions = append(revisions, revision)
+	}
+	return revisions, nil
+}
+
+// GetUserSkillRevision 读取单条技能历史快照。
+func (r *UserSkillRepository) GetUserSkillRevision(ctx context.Context, userID, skillID, revisionID uuid.UUID) (biz.UserSkillRevision, error) {
+	var record userSkillRevisionModel
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Where("id = ? AND user_id = ? AND skill_id = ?", revisionID, userID, skillID).First(&record).Error
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return biz.UserSkillRevision{}, fmt.Errorf("%w: skill revision not found", biz.ErrResourceNotFound)
+		}
+		return biz.UserSkillRevision{}, catalogError("get user skill revision", err)
+	}
+	return toBizUserSkillRevision(record)
+}
+
+// toBizUserSkillRevision 把历史快照行转换为领域结构。
+func toBizUserSkillRevision(record userSkillRevisionModel) (biz.UserSkillRevision, error) {
+	var parameters map[string]any
+	if len(record.ParametersJSON) > 0 {
+		if err := json.Unmarshal(record.ParametersJSON, &parameters); err != nil {
+			return biz.UserSkillRevision{}, err
+		}
+	}
+	if parameters == nil {
+		parameters = map[string]any{}
+	}
+	var sourceIDs []uuid.UUID
+	if len(record.SourceSessionIDs) > 0 {
+		if err := json.Unmarshal(record.SourceSessionIDs, &sourceIDs); err != nil {
+			return biz.UserSkillRevision{}, err
+		}
+	}
+	if sourceIDs == nil {
+		sourceIDs = []uuid.UUID{}
+	}
+	return biz.UserSkillRevision{
+		ID: record.ID, UserID: record.UserID, SkillID: record.SkillID, Version: record.Version,
+		Description: record.Description, PromptTemplate: record.PromptTemplate, Parameters: parameters,
+		SourceSessionIDs: sourceIDs, Confidence: record.Confidence, CreatedAt: record.CreatedAt,
+	}, nil
+}
+
+// jsonContentEqual 按语义比较两段 JSON，避免 JSONB 文本格式差异造成误判。
+func jsonContentEqual(left, right datatypes.JSON) bool {
+	if string(left) == string(right) {
+		return true
+	}
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 // PublishUserSkill 将技能状态置为 published。

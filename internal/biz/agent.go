@@ -3,6 +3,7 @@ package biz
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,6 +53,8 @@ type Agent struct {
 	SkillIDs []uuid.UUID
 	// UserSkillIDs 绑定的用户级技能列表（仅当前用户的 published 技能）。
 	UserSkillIDs []uuid.UUID
+	// UserSkillOptOuts 草稿更新时显式移除的用户技能；仅作为写入口令，不参与读取与响应。
+	UserSkillOptOuts []uuid.UUID
 	// MCPIDs 绑定的 MCP 列表。
 	MCPIDs []uuid.UUID
 	// Status 版本生命周期状态。
@@ -119,10 +122,30 @@ type AdminAgent struct {
 	Username string
 }
 
+// AgentSnapshotRevision 是助手发布快照原地更新前的历史快照。
+type AgentSnapshotRevision struct {
+	// ID 历史记录唯一标识。
+	ID uuid.UUID `json:"id"`
+	// UserID 所属用户，RLS 隔离键。
+	UserID uuid.UUID `json:"user_id"`
+	// AgentID 所属助手版本。
+	AgentID uuid.UUID `json:"agent_id"`
+	// AgentVersion 助手版本号。
+	AgentVersion int `json:"agent_version"`
+	// ConfigSnapshot 更新前的发布快照。
+	ConfigSnapshot map[string]any `json:"config_snapshot"`
+	// Reason 写入历史的原因。
+	Reason string `json:"reason"`
+	// CreatedAt 写入时间（UTC）。
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // AgentRepository 定义用户私有 Agent 的持久化契约，所有方法强制携带 userID。
 type AgentRepository interface {
 	// CreateAgent 创建 Agent 版本及绑定并写入审计事件。
 	CreateAgent(ctx context.Context, agent Agent, event OutboxEvent) (Agent, error)
+	// CreateAgentVersion 创建新版本，并在同一事务内复制源版本的显式移除标记。
+	CreateAgentVersion(ctx context.Context, agent Agent, sourceAgentID uuid.UUID, event OutboxEvent) (Agent, error)
 	// UpdateAgent 更新草稿 Agent 及绑定。
 	UpdateAgent(ctx context.Context, agent Agent, event OutboxEvent) (Agent, error)
 	// DeleteAgent 删除草稿 Agent。
@@ -131,6 +154,21 @@ type AgentRepository interface {
 	UpdateAgentStatus(ctx context.Context, userID, agentID uuid.UUID, from, to AgentStatus, clearSnapshot bool, event OutboxEvent) error
 	// GetAgent 按用户与 ID 读取 Agent。
 	GetAgent(ctx context.Context, userID, agentID uuid.UUID) (Agent, error)
+	// AttachUserSkillToAgent 为指定 Agent 版本追加用户技能绑定，并在已发布快照中同步技能内容。
+	// 返回 false 表示该版本已显式移除该技能，按语义跳过挂载。
+	AttachUserSkillToAgent(ctx context.Context, userID, agentID uuid.UUID, skill UserSkill, event OutboxEvent) (bool, error)
+	// ListPublishedAgentIDsByName 返回同名助手的全部已发布版本 ID。
+	ListPublishedAgentIDsByName(ctx context.Context, userID uuid.UUID, name string) ([]uuid.UUID, error)
+	// RefreshUserSkillOnBoundAgents 刷新所有绑定该用户技能的已发布 Agent 快照。
+	RefreshUserSkillOnBoundAgents(ctx context.Context, userID uuid.UUID, skill UserSkill, event OutboxEvent) error
+	// ListUserSkillOptOuts 返回助手版本显式移除的用户技能 ID。
+	ListUserSkillOptOuts(ctx context.Context, userID, agentID uuid.UUID) ([]uuid.UUID, error)
+	// ListAgentSnapshotRevisions 按时间倒序读取助手快照历史。
+	ListAgentSnapshotRevisions(ctx context.Context, userID, agentID uuid.UUID, limit int) ([]AgentSnapshotRevision, error)
+	// GetAgentSnapshotRevision 读取单条助手快照历史。
+	GetAgentSnapshotRevision(ctx context.Context, userID, agentID, revisionID uuid.UUID) (AgentSnapshotRevision, error)
+	// RestoreAgentSnapshot 用历史快照覆盖当前助手快照，并保留当前快照作为新历史。
+	RestoreAgentSnapshot(ctx context.Context, userID, agentID uuid.UUID, snapshot map[string]any, event OutboxEvent) error
 	// ListAgents 按用户游标分页列出 Agent；includeArchived 为 false 时排除已归档版本。
 	ListAgents(ctx context.Context, userID uuid.UUID, includeArchived bool, limit int, cursor string) (Page[Agent], error)
 	// ListAllAgents 跨用户游标分页列出助手，仅供管理员只读审计。
@@ -208,7 +246,8 @@ func (s *AgentService) CreateVersion(ctx context.Context, principal Principal, s
 	source.Version = version
 	source.Status = AgentDraft
 	source.ConfigSnapshot = nil
-	return s.repo.CreateAgent(ctx, source, mutationEvent(principal.UserID, "agent.version_created", "agent", source.ID))
+	// 新版本沿用源版本的显式移除标记，避免用户已移除的自动技能在下次提炼时被重新挂回。
+	return s.repo.CreateAgentVersion(ctx, source, sourceAgentID, mutationEvent(principal.UserID, "agent.version_created", "agent", source.ID))
 }
 
 // Update 仅允许修改草稿；名称与版本号由服务端保持，防止绕过唯一约束。
@@ -220,8 +259,20 @@ func (s *AgentService) Update(ctx context.Context, principal Principal, agent Ag
 	if err != nil {
 		return Agent{}, err
 	}
+	// 乐观并发：客户端带回读取时的 updated_at，若期间被自动挂载等操作修改则拒绝，避免覆盖新绑定。
+	if !agent.UpdatedAt.IsZero() && !agent.UpdatedAt.Equal(current.UpdatedAt) {
+		return Agent{}, fmt.Errorf("%w: agent was modified after it was loaded; reload and retry", ErrResourceConflict)
+	}
 	if current.Status != AgentDraft {
 		return Agent{}, fmt.Errorf("%w: only draft agents can be updated", ErrResourceConflict)
+	}
+	if err := uniqueUUIDs(agent.UserSkillOptOuts); err != nil {
+		return Agent{}, err
+	}
+	for _, id := range agent.UserSkillOptOuts {
+		if containsUUID(agent.UserSkillIDs, id) {
+			return Agent{}, invalid("a user skill cannot be both bound and explicitly removed")
+		}
 	}
 	agent.UserID = principal.UserID
 	agent.Name = current.Name
@@ -245,6 +296,10 @@ func (s *AgentService) Publish(ctx context.Context, principal Principal, agentID
 	}
 	if agent.Status != AgentDraft {
 		return Agent{}, fmt.Errorf("%w: only draft agents can be published", ErrResourceConflict)
+	}
+	// 发布前继承同家族已发布版本的自动技能，避免草稿创建后发生的自动挂载丢失。
+	if err := s.inheritFamilyAutoUserSkills(ctx, &agent); err != nil {
+		return Agent{}, err
 	}
 	if err := s.validate(ctx, &agent, true); err != nil {
 		return Agent{}, err
@@ -316,6 +371,190 @@ func (s *AgentService) Delete(ctx context.Context, principal Principal, agentID 
 func (s *AgentService) Get(ctx context.Context, principal Principal, agentID uuid.UUID) (Agent, error) {
 	if principal.UserID == uuid.Nil {
 		return Agent{}, ErrForbidden
+	}
+	return s.repo.GetAgent(ctx, principal.UserID, agentID)
+}
+
+// AttachUserSkillToAgentFamily 把技能绑定到同名助手的全部已发布版本；没有已发布版本时退回来源版本。
+// 返回实际未被显式移除的版本数量，不创建新版本，覆盖旧会话、新会话与飞书机器人可能使用的各个已发布版本。
+func (s *AgentService) AttachUserSkillToAgentFamily(ctx context.Context, principal Principal, sourceAgentID uuid.UUID, skill UserSkill) (int, error) {
+	if principal.UserID == uuid.Nil {
+		return 0, ErrForbidden
+	}
+	source, err := s.repo.GetAgent(ctx, principal.UserID, sourceAgentID)
+	if err != nil {
+		return 0, err
+	}
+	agentIDs, err := s.repo.ListPublishedAgentIDsByName(ctx, principal.UserID, source.Name)
+	if err != nil {
+		return 0, err
+	}
+	if len(agentIDs) == 0 {
+		agentIDs = []uuid.UUID{sourceAgentID}
+	}
+	sort.Slice(agentIDs, func(i, j int) bool { return agentIDs[i].String() < agentIDs[j].String() })
+	attached := 0
+	for _, agentID := range agentIDs {
+		ok, err := s.AttachUserSkill(ctx, principal, agentID, skill)
+		if err != nil {
+			return attached, err
+		}
+		if ok {
+			attached++
+		}
+	}
+	return attached, nil
+}
+
+// InheritableUserSkills 返回草稿发布时将继承的同家族自动技能，供前端确认或取消。
+func (s *AgentService) InheritableUserSkills(ctx context.Context, principal Principal, agentID uuid.UUID) ([]UserSkill, error) {
+	if principal.UserID == uuid.Nil {
+		return nil, ErrForbidden
+	}
+	agent, err := s.repo.GetAgent(ctx, principal.UserID, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if agent.Status != AgentDraft {
+		return []UserSkill{}, nil
+	}
+	return s.familyInheritableAutoUserSkills(ctx, agent)
+}
+
+// inheritFamilyAutoUserSkills 在发布时继承同名已发布版本的自动技能。
+// 草稿创建后发生的自动挂载由此补齐；用户在当前版本显式移除过的技能保持移除，
+// 手动技能与已停用技能不继承，避免覆盖用户的版本级选择。
+func (s *AgentService) inheritFamilyAutoUserSkills(ctx context.Context, agent *Agent) error {
+	skills, err := s.familyInheritableAutoUserSkills(ctx, *agent)
+	if err != nil {
+		return err
+	}
+	for _, skill := range skills {
+		agent.UserSkillIDs = append(agent.UserSkillIDs, skill.ID)
+	}
+	return nil
+}
+
+// familyInheritableAutoUserSkills 计算发布会继承的自动技能：同家族已发布版本绑定、
+// 当前版本未绑定且未被显式移除，并仍然处于已发布状态的自动技能。
+func (s *AgentService) familyInheritableAutoUserSkills(ctx context.Context, agent Agent) ([]UserSkill, error) {
+	siblings, err := s.repo.ListPublishedAgentIDsByName(ctx, agent.UserID, agent.Name)
+	if err != nil || len(siblings) == 0 {
+		return nil, err
+	}
+	bound := make(map[uuid.UUID]struct{}, len(agent.UserSkillIDs))
+	for _, id := range agent.UserSkillIDs {
+		bound[id] = struct{}{}
+	}
+	candidates := make(map[uuid.UUID]struct{})
+	for _, siblingID := range siblings {
+		sibling, err := s.repo.GetAgent(ctx, agent.UserID, siblingID)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range sibling.UserSkillIDs {
+			if _, exists := bound[id]; !exists {
+				candidates[id] = struct{}{}
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	optOuts, err := s.repo.ListUserSkillOptOuts(ctx, agent.UserID, agent.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range optOuts {
+		delete(candidates, id)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	ids := make([]uuid.UUID, 0, len(candidates))
+	for id := range candidates {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	skills, err := s.repo.ListUserSkillsByIDs(ctx, agent.UserID, ids)
+	if err != nil {
+		return nil, err
+	}
+	inheritable := make([]UserSkill, 0, len(skills))
+	for _, skill := range skills {
+		if skill.Status != UserSkillPublished || skill.Origin != UserSkillOriginAuto {
+			continue
+		}
+		inheritable = append(inheritable, skill)
+	}
+	sort.Slice(inheritable, func(i, j int) bool { return inheritable[i].ID.String() < inheritable[j].ID.String() })
+	return inheritable, nil
+}
+
+// AttachUserSkill 把已发布的用户技能直接绑定到指定助手版本，并在已发布快照中同步技能内容。
+// 返回 false 表示该版本显式移除过该技能，挂载被按语义跳过。
+func (s *AgentService) AttachUserSkill(ctx context.Context, principal Principal, agentID uuid.UUID, skill UserSkill) (bool, error) {
+	if principal.UserID == uuid.Nil {
+		return false, ErrForbidden
+	}
+	if agentID == uuid.Nil || skill.ID == uuid.Nil || skill.UserID != principal.UserID {
+		return false, invalid("agent and user skill must belong to the current user")
+	}
+	if skill.Status != UserSkillPublished {
+		return false, invalid("only published user skills can be attached to an agent")
+	}
+	return s.repo.AttachUserSkillToAgent(ctx, principal.UserID, agentID, skill,
+		mutationEvent(principal.UserID, "agent.user_skill_attached", "agent", agentID))
+}
+
+// RefreshBoundAgentsForUserSkill 刷新所有绑定该技能的已发布助手快照，让技能更新只改内容、不升版本。
+func (s *AgentService) RefreshBoundAgentsForUserSkill(ctx context.Context, principal Principal, skill UserSkill) error {
+	if principal.UserID == uuid.Nil {
+		return ErrForbidden
+	}
+	if skill.ID == uuid.Nil || skill.UserID != principal.UserID {
+		return invalid("user skill must belong to the current user")
+	}
+	if skill.Status != UserSkillPublished {
+		return invalid("only published user skills can refresh agent snapshots")
+	}
+	return s.repo.RefreshUserSkillOnBoundAgents(ctx, principal.UserID, skill,
+		mutationEvent(principal.UserID, "user_skill.agent_snapshots_refreshed", "user_skill", skill.ID))
+}
+
+// ListSnapshotRevisions 列出助手发布快照的历史版本。
+func (s *AgentService) ListSnapshotRevisions(ctx context.Context, principal Principal, agentID uuid.UUID, limit int) ([]AgentSnapshotRevision, error) {
+	if principal.UserID == uuid.Nil {
+		return nil, ErrForbidden
+	}
+	if _, err := s.repo.GetAgent(ctx, principal.UserID, agentID); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	return s.repo.ListAgentSnapshotRevisions(ctx, principal.UserID, agentID, limit)
+}
+
+// RestoreSnapshotRevision 把助手发布快照恢复到指定历史版本；当前快照会作为新历史保留。
+func (s *AgentService) RestoreSnapshotRevision(ctx context.Context, principal Principal, agentID, revisionID uuid.UUID) (Agent, error) {
+	if principal.UserID == uuid.Nil {
+		return Agent{}, ErrForbidden
+	}
+	agent, err := s.repo.GetAgent(ctx, principal.UserID, agentID)
+	if err != nil {
+		return Agent{}, err
+	}
+	if agent.Status != AgentPublished {
+		return Agent{}, fmt.Errorf("%w: only published agents have restorable snapshots", ErrResourceConflict)
+	}
+	revision, err := s.repo.GetAgentSnapshotRevision(ctx, principal.UserID, agentID, revisionID)
+	if err != nil {
+		return Agent{}, err
+	}
+	if err := s.repo.RestoreAgentSnapshot(ctx, principal.UserID, agentID, revision.ConfigSnapshot,
+		mutationEvent(principal.UserID, "agent.snapshot_restored", "agent", agentID)); err != nil {
+		return Agent{}, err
 	}
 	return s.repo.GetAgent(ctx, principal.UserID, agentID)
 }

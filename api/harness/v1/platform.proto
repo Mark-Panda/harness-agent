@@ -373,6 +373,10 @@ message UpdateAgentRequest {
   repeated string mcp_ids = 7;
   // user_skill_ids 绑定的用户级技能列表。
   repeated string user_skill_ids = 8;
+  // user_skill_optouts 显式取消继承或移除的用户技能。
+  repeated string user_skill_optouts = 9;
+  // updated_at 读取草稿时的时间戳，用于乐观并发校验；为空时不校验。
+  google.protobuf.Timestamp updated_at = 10;
 }
 
 // GetAgentRequest 是读取 Agent 的入参。
@@ -728,7 +732,11 @@ message PublishPolicyResponse { ModelPolicy policy = 1; }
 message CreatePolicyVersionResponse { ModelPolicy policy = 1; }
 message CreateAgentResponse { Agent agent = 1; }
 message UpdateAgentResponse { Agent agent = 1; }
-message GetAgentResponse { Agent agent = 1; }
+message GetAgentResponse {
+  Agent agent = 1;
+  // inheritable_user_skills 草稿发布会从同助手其他版本继承的自动技能。
+  repeated UserSkill inheritable_user_skills = 2;
+}
 message DeleteAgentResponse {}
 message PublishAgentResponse { Agent agent = 1; }
 message CreateAgentVersionResponse { Agent agent = 1; }

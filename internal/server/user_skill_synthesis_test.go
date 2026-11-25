@@ -57,6 +57,16 @@ func (f *fakeUserSkillSynthesisStore) ListUserSkillsByIDs(context.Context, uuid.
 	return nil, errNotImplemented
 }
 
+// ListUserSkillRevisions 未被设置接口使用。
+func (f *fakeUserSkillSynthesisStore) ListUserSkillRevisions(context.Context, uuid.UUID, uuid.UUID, int) ([]biz.UserSkillRevision, error) {
+	return nil, errNotImplemented
+}
+
+// GetUserSkillRevision 未被设置接口使用。
+func (f *fakeUserSkillSynthesisStore) GetUserSkillRevision(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (biz.UserSkillRevision, error) {
+	return biz.UserSkillRevision{}, errNotImplemented
+}
+
 // PublishUserSkill 未被设置接口使用。
 func (f *fakeUserSkillSynthesisStore) PublishUserSkill(context.Context, uuid.UUID, uuid.UUID, biz.OutboxEvent) (biz.UserSkill, error) {
 	return biz.UserSkill{}, errNotImplemented

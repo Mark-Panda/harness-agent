@@ -2102,7 +2102,11 @@ type UpdateAgentRequest struct {
 	// mcp_ids 绑定的 MCP 列表。
 	McpIds []string `protobuf:"bytes,7,rep,name=mcp_ids,json=mcpIds,proto3" json:"mcp_ids,omitempty"`
 	// user_skill_ids 绑定的用户级技能列表。
-	UserSkillIds  []string `protobuf:"bytes,8,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	UserSkillIds []string `protobuf:"bytes,8,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	// user_skill_optouts 显式取消继承或移除的用户技能。
+	UserSkillOptouts []string `protobuf:"bytes,9,rep,name=user_skill_optouts,json=userSkillOptouts,proto3" json:"user_skill_optouts,omitempty"`
+	// updated_at 读取草稿时的时间戳，用于乐观并发校验；为空时不校验。
+	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2189,6 +2193,20 @@ func (x *UpdateAgentRequest) GetMcpIds() []string {
 func (x *UpdateAgentRequest) GetUserSkillIds() []string {
 	if x != nil {
 		return x.UserSkillIds
+	}
+	return nil
+}
+
+func (x *UpdateAgentRequest) GetUserSkillOptouts() []string {
+	if x != nil {
+		return x.UserSkillOptouts
+	}
+	return nil
+}
+
+func (x *UpdateAgentRequest) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
 	}
 	return nil
 }
@@ -5197,10 +5215,12 @@ func (x *UpdateAgentResponse) GetAgent() *Agent {
 }
 
 type GetAgentResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Agent         *Agent                 `protobuf:"bytes,1,opt,name=agent,proto3" json:"agent,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Agent *Agent                 `protobuf:"bytes,1,opt,name=agent,proto3" json:"agent,omitempty"`
+	// inheritable_user_skills 草稿发布会从同助手其他版本继承的自动技能。
+	InheritableUserSkills []*UserSkill `protobuf:"bytes,2,rep,name=inheritable_user_skills,json=inheritableUserSkills,proto3" json:"inheritable_user_skills,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *GetAgentResponse) Reset() {
@@ -5236,6 +5256,13 @@ func (*GetAgentResponse) Descriptor() ([]byte, []int) {
 func (x *GetAgentResponse) GetAgent() *Agent {
 	if x != nil {
 		return x.Agent
+	}
+	return nil
+}
+
+func (x *GetAgentResponse) GetInheritableUserSkills() []*UserSkill {
+	if x != nil {
+		return x.InheritableUserSkills
 	}
 	return nil
 }
@@ -5732,7 +5759,7 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\amcp_ids\x18\a \x03(\tR\x06mcpIds\x12$\n" +
 	"\x0euser_skill_ids\x18\b \x03(\tR\fuserSkillIdsB\x12\n" +
 	"\x10_model_policy_idB\x17\n" +
-	"\x15_model_policy_version\"\xc7\x02\n" +
+	"\x15_model_policy_version\"\xb0\x03\n" +
 	"\x12UpdateAgentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
@@ -5741,7 +5768,11 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x14model_policy_version\x18\x05 \x01(\x05H\x01R\x12modelPolicyVersion\x88\x01\x01\x12\x1b\n" +
 	"\tskill_ids\x18\x06 \x03(\tR\bskillIds\x12\x17\n" +
 	"\amcp_ids\x18\a \x03(\tR\x06mcpIds\x12$\n" +
-	"\x0euser_skill_ids\x18\b \x03(\tR\fuserSkillIdsB\x12\n" +
+	"\x0euser_skill_ids\x18\b \x03(\tR\fuserSkillIds\x12,\n" +
+	"\x12user_skill_optouts\x18\t \x03(\tR\x10userSkillOptouts\x129\n" +
+	"\n" +
+	"updated_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAtB\x12\n" +
 	"\x10_model_policy_idB\x17\n" +
 	"\x15_model_policy_version\"!\n" +
 	"\x0fGetAgentRequest\x12\x0e\n" +
@@ -5935,9 +5966,10 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x13CreateAgentResponse\x12'\n" +
 	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\">\n" +
 	"\x13UpdateAgentResponse\x12'\n" +
-	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\";\n" +
+	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\"\x8a\x01\n" +
 	"\x10GetAgentResponse\x12'\n" +
-	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\"\x15\n" +
+	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\x12M\n" +
+	"\x17inheritable_user_skills\x18\x02 \x03(\v2\x15.harness.v1.UserSkillR\x15inheritableUserSkills\"\x15\n" +
 	"\x13DeleteAgentResponse\"?\n" +
 	"\x14PublishAgentResponse\x12'\n" +
 	"\x05agent\x18\x01 \x01(\v2\x11.harness.v1.AgentR\x05agent\"E\n" +
@@ -6138,138 +6170,140 @@ var file_harness_v1_platform_proto_depIdxs = []int32{
 	94,  // 22: harness.v1.Agent.config_snapshot:type_name -> google.protobuf.Struct
 	93,  // 23: harness.v1.Agent.created_at:type_name -> google.protobuf.Timestamp
 	93,  // 24: harness.v1.Agent.updated_at:type_name -> google.protobuf.Timestamp
-	25,  // 25: harness.v1.ListAgentsResponse.items:type_name -> harness.v1.Agent
-	94,  // 26: harness.v1.UserSkill.parameters:type_name -> google.protobuf.Struct
-	93,  // 27: harness.v1.UserSkill.created_at:type_name -> google.protobuf.Timestamp
-	93,  // 28: harness.v1.UserSkill.updated_at:type_name -> google.protobuf.Timestamp
-	94,  // 29: harness.v1.CreateUserSkillRequest.parameters:type_name -> google.protobuf.Struct
-	94,  // 30: harness.v1.UpdateUserSkillRequest.parameters:type_name -> google.protobuf.Struct
-	34,  // 31: harness.v1.ListUserSkillsResponse.items:type_name -> harness.v1.UserSkill
-	43,  // 32: harness.v1.ListUserSkillSynthesisPoliciesResponse.items:type_name -> harness.v1.SynthesisPolicyOption
-	34,  // 33: harness.v1.CreateUserSkillResponse.skill:type_name -> harness.v1.UserSkill
-	34,  // 34: harness.v1.UpdateUserSkillResponse.skill:type_name -> harness.v1.UserSkill
-	34,  // 35: harness.v1.GetUserSkillResponse.skill:type_name -> harness.v1.UserSkill
-	34,  // 36: harness.v1.PublishUserSkillResponse.skill:type_name -> harness.v1.UserSkill
-	34,  // 37: harness.v1.DisableUserSkillResponse.skill:type_name -> harness.v1.UserSkill
-	93,  // 38: harness.v1.UserSkillSynthesisSettings.created_at:type_name -> google.protobuf.Timestamp
-	93,  // 39: harness.v1.UserSkillSynthesisSettings.updated_at:type_name -> google.protobuf.Timestamp
-	52,  // 40: harness.v1.GetUserSkillSynthesisSettingsResponse.settings:type_name -> harness.v1.UserSkillSynthesisSettings
-	52,  // 41: harness.v1.UpdateUserSkillSynthesisSettingsResponse.settings:type_name -> harness.v1.UserSkillSynthesisSettings
-	93,  // 42: harness.v1.Session.last_message_at:type_name -> google.protobuf.Timestamp
-	93,  // 43: harness.v1.Session.created_at:type_name -> google.protobuf.Timestamp
-	93,  // 44: harness.v1.Session.updated_at:type_name -> google.protobuf.Timestamp
-	57,  // 45: harness.v1.UpdateSessionMemoryPolicyResponse.session:type_name -> harness.v1.Session
-	57,  // 46: harness.v1.ListSessionsResponse.items:type_name -> harness.v1.Session
-	94,  // 47: harness.v1.ChatMessage.tool_calls:type_name -> google.protobuf.Struct
-	93,  // 48: harness.v1.ChatMessage.created_at:type_name -> google.protobuf.Timestamp
-	65,  // 49: harness.v1.ListMessagesResponse.items:type_name -> harness.v1.ChatMessage
-	0,   // 50: harness.v1.CreateProviderResponse.provider:type_name -> harness.v1.Provider
-	0,   // 51: harness.v1.UpdateProviderResponse.provider:type_name -> harness.v1.Provider
-	0,   // 52: harness.v1.GetProviderResponse.provider:type_name -> harness.v1.Provider
-	8,   // 53: harness.v1.CreateModelResponse.model:type_name -> harness.v1.Model
-	8,   // 54: harness.v1.UpdateModelResponse.model:type_name -> harness.v1.Model
-	8,   // 55: harness.v1.GetModelResponse.model:type_name -> harness.v1.Model
-	16,  // 56: harness.v1.CreatePolicyResponse.policy:type_name -> harness.v1.ModelPolicy
-	16,  // 57: harness.v1.UpdatePolicyResponse.policy:type_name -> harness.v1.ModelPolicy
-	16,  // 58: harness.v1.GetPolicyResponse.policy:type_name -> harness.v1.ModelPolicy
-	16,  // 59: harness.v1.PublishPolicyResponse.policy:type_name -> harness.v1.ModelPolicy
-	16,  // 60: harness.v1.CreatePolicyVersionResponse.policy:type_name -> harness.v1.ModelPolicy
-	25,  // 61: harness.v1.CreateAgentResponse.agent:type_name -> harness.v1.Agent
-	25,  // 62: harness.v1.UpdateAgentResponse.agent:type_name -> harness.v1.Agent
-	25,  // 63: harness.v1.GetAgentResponse.agent:type_name -> harness.v1.Agent
-	25,  // 64: harness.v1.PublishAgentResponse.agent:type_name -> harness.v1.Agent
-	25,  // 65: harness.v1.CreateAgentVersionResponse.agent:type_name -> harness.v1.Agent
-	57,  // 66: harness.v1.CreateSessionResponse.session:type_name -> harness.v1.Session
-	57,  // 67: harness.v1.GetSessionResponse.session:type_name -> harness.v1.Session
-	57,  // 68: harness.v1.ArchiveSessionResponse.session:type_name -> harness.v1.Session
-	65,  // 69: harness.v1.AppendMessageResponse.message:type_name -> harness.v1.ChatMessage
-	1,   // 70: harness.v1.ProviderService.CreateProvider:input_type -> harness.v1.CreateProviderRequest
-	2,   // 71: harness.v1.ProviderService.UpdateProvider:input_type -> harness.v1.UpdateProviderRequest
-	3,   // 72: harness.v1.ProviderService.GetProvider:input_type -> harness.v1.GetProviderRequest
-	4,   // 73: harness.v1.ProviderService.DeleteProvider:input_type -> harness.v1.DeleteProviderRequest
-	5,   // 74: harness.v1.ProviderService.ListProviders:input_type -> harness.v1.ListProvidersRequest
-	9,   // 75: harness.v1.ModelCatalogService.CreateModel:input_type -> harness.v1.CreateModelRequest
-	10,  // 76: harness.v1.ModelCatalogService.UpdateModel:input_type -> harness.v1.UpdateModelRequest
-	11,  // 77: harness.v1.ModelCatalogService.GetModel:input_type -> harness.v1.GetModelRequest
-	12,  // 78: harness.v1.ModelCatalogService.DeleteModel:input_type -> harness.v1.DeleteModelRequest
-	13,  // 79: harness.v1.ModelCatalogService.ListModels:input_type -> harness.v1.ListModelsRequest
-	17,  // 80: harness.v1.ModelPolicyService.CreatePolicy:input_type -> harness.v1.CreatePolicyRequest
-	18,  // 81: harness.v1.ModelPolicyService.UpdatePolicy:input_type -> harness.v1.UpdatePolicyRequest
-	19,  // 82: harness.v1.ModelPolicyService.GetPolicy:input_type -> harness.v1.GetPolicyRequest
-	20,  // 83: harness.v1.ModelPolicyService.DeletePolicy:input_type -> harness.v1.DeletePolicyRequest
-	21,  // 84: harness.v1.ModelPolicyService.PublishPolicy:input_type -> harness.v1.PublishPolicyRequest
-	22,  // 85: harness.v1.ModelPolicyService.CreatePolicyVersion:input_type -> harness.v1.CreatePolicyVersionRequest
-	23,  // 86: harness.v1.ModelPolicyService.ListPolicies:input_type -> harness.v1.ListPoliciesRequest
-	26,  // 87: harness.v1.AgentService.CreateAgent:input_type -> harness.v1.CreateAgentRequest
-	27,  // 88: harness.v1.AgentService.UpdateAgent:input_type -> harness.v1.UpdateAgentRequest
-	28,  // 89: harness.v1.AgentService.GetAgent:input_type -> harness.v1.GetAgentRequest
-	29,  // 90: harness.v1.AgentService.DeleteAgent:input_type -> harness.v1.DeleteAgentRequest
-	30,  // 91: harness.v1.AgentService.PublishAgent:input_type -> harness.v1.PublishAgentRequest
-	31,  // 92: harness.v1.AgentService.CreateAgentVersion:input_type -> harness.v1.CreateAgentVersionRequest
-	32,  // 93: harness.v1.AgentService.ListAgents:input_type -> harness.v1.ListAgentsRequest
-	35,  // 94: harness.v1.UserSkillService.CreateUserSkill:input_type -> harness.v1.CreateUserSkillRequest
-	36,  // 95: harness.v1.UserSkillService.UpdateUserSkill:input_type -> harness.v1.UpdateUserSkillRequest
-	37,  // 96: harness.v1.UserSkillService.GetUserSkill:input_type -> harness.v1.GetUserSkillRequest
-	38,  // 97: harness.v1.UserSkillService.DeleteUserSkill:input_type -> harness.v1.DeleteUserSkillRequest
-	39,  // 98: harness.v1.UserSkillService.PublishUserSkill:input_type -> harness.v1.PublishUserSkillRequest
-	40,  // 99: harness.v1.UserSkillService.DisableUserSkill:input_type -> harness.v1.DisableUserSkillRequest
-	41,  // 100: harness.v1.UserSkillService.ListUserSkills:input_type -> harness.v1.ListUserSkillsRequest
-	53,  // 101: harness.v1.UserSkillService.GetUserSkillSynthesisSettings:input_type -> harness.v1.GetUserSkillSynthesisSettingsRequest
-	55,  // 102: harness.v1.UserSkillService.UpdateUserSkillSynthesisSettings:input_type -> harness.v1.UpdateUserSkillSynthesisSettingsRequest
-	44,  // 103: harness.v1.UserSkillService.ListUserSkillSynthesisPolicies:input_type -> harness.v1.ListUserSkillSynthesisPoliciesRequest
-	60,  // 104: harness.v1.ConversationService.CreateSession:input_type -> harness.v1.CreateSessionRequest
-	61,  // 105: harness.v1.ConversationService.GetSession:input_type -> harness.v1.GetSessionRequest
-	62,  // 106: harness.v1.ConversationService.ArchiveSession:input_type -> harness.v1.ArchiveSessionRequest
-	58,  // 107: harness.v1.ConversationService.UpdateSessionMemoryPolicy:input_type -> harness.v1.UpdateSessionMemoryPolicyRequest
-	63,  // 108: harness.v1.ConversationService.ListSessions:input_type -> harness.v1.ListSessionsRequest
-	66,  // 109: harness.v1.ConversationService.AppendMessage:input_type -> harness.v1.AppendMessageRequest
-	67,  // 110: harness.v1.ConversationService.ListMessages:input_type -> harness.v1.ListMessagesRequest
-	69,  // 111: harness.v1.ProviderService.CreateProvider:output_type -> harness.v1.CreateProviderResponse
-	70,  // 112: harness.v1.ProviderService.UpdateProvider:output_type -> harness.v1.UpdateProviderResponse
-	71,  // 113: harness.v1.ProviderService.GetProvider:output_type -> harness.v1.GetProviderResponse
-	72,  // 114: harness.v1.ProviderService.DeleteProvider:output_type -> harness.v1.DeleteProviderResponse
-	6,   // 115: harness.v1.ProviderService.ListProviders:output_type -> harness.v1.ListProvidersResponse
-	73,  // 116: harness.v1.ModelCatalogService.CreateModel:output_type -> harness.v1.CreateModelResponse
-	74,  // 117: harness.v1.ModelCatalogService.UpdateModel:output_type -> harness.v1.UpdateModelResponse
-	75,  // 118: harness.v1.ModelCatalogService.GetModel:output_type -> harness.v1.GetModelResponse
-	76,  // 119: harness.v1.ModelCatalogService.DeleteModel:output_type -> harness.v1.DeleteModelResponse
-	14,  // 120: harness.v1.ModelCatalogService.ListModels:output_type -> harness.v1.ListModelsResponse
-	77,  // 121: harness.v1.ModelPolicyService.CreatePolicy:output_type -> harness.v1.CreatePolicyResponse
-	78,  // 122: harness.v1.ModelPolicyService.UpdatePolicy:output_type -> harness.v1.UpdatePolicyResponse
-	79,  // 123: harness.v1.ModelPolicyService.GetPolicy:output_type -> harness.v1.GetPolicyResponse
-	80,  // 124: harness.v1.ModelPolicyService.DeletePolicy:output_type -> harness.v1.DeletePolicyResponse
-	81,  // 125: harness.v1.ModelPolicyService.PublishPolicy:output_type -> harness.v1.PublishPolicyResponse
-	82,  // 126: harness.v1.ModelPolicyService.CreatePolicyVersion:output_type -> harness.v1.CreatePolicyVersionResponse
-	24,  // 127: harness.v1.ModelPolicyService.ListPolicies:output_type -> harness.v1.ListPoliciesResponse
-	83,  // 128: harness.v1.AgentService.CreateAgent:output_type -> harness.v1.CreateAgentResponse
-	84,  // 129: harness.v1.AgentService.UpdateAgent:output_type -> harness.v1.UpdateAgentResponse
-	85,  // 130: harness.v1.AgentService.GetAgent:output_type -> harness.v1.GetAgentResponse
-	86,  // 131: harness.v1.AgentService.DeleteAgent:output_type -> harness.v1.DeleteAgentResponse
-	87,  // 132: harness.v1.AgentService.PublishAgent:output_type -> harness.v1.PublishAgentResponse
-	88,  // 133: harness.v1.AgentService.CreateAgentVersion:output_type -> harness.v1.CreateAgentVersionResponse
-	33,  // 134: harness.v1.AgentService.ListAgents:output_type -> harness.v1.ListAgentsResponse
-	46,  // 135: harness.v1.UserSkillService.CreateUserSkill:output_type -> harness.v1.CreateUserSkillResponse
-	47,  // 136: harness.v1.UserSkillService.UpdateUserSkill:output_type -> harness.v1.UpdateUserSkillResponse
-	48,  // 137: harness.v1.UserSkillService.GetUserSkill:output_type -> harness.v1.GetUserSkillResponse
-	49,  // 138: harness.v1.UserSkillService.DeleteUserSkill:output_type -> harness.v1.DeleteUserSkillResponse
-	50,  // 139: harness.v1.UserSkillService.PublishUserSkill:output_type -> harness.v1.PublishUserSkillResponse
-	51,  // 140: harness.v1.UserSkillService.DisableUserSkill:output_type -> harness.v1.DisableUserSkillResponse
-	42,  // 141: harness.v1.UserSkillService.ListUserSkills:output_type -> harness.v1.ListUserSkillsResponse
-	54,  // 142: harness.v1.UserSkillService.GetUserSkillSynthesisSettings:output_type -> harness.v1.GetUserSkillSynthesisSettingsResponse
-	56,  // 143: harness.v1.UserSkillService.UpdateUserSkillSynthesisSettings:output_type -> harness.v1.UpdateUserSkillSynthesisSettingsResponse
-	45,  // 144: harness.v1.UserSkillService.ListUserSkillSynthesisPolicies:output_type -> harness.v1.ListUserSkillSynthesisPoliciesResponse
-	89,  // 145: harness.v1.ConversationService.CreateSession:output_type -> harness.v1.CreateSessionResponse
-	90,  // 146: harness.v1.ConversationService.GetSession:output_type -> harness.v1.GetSessionResponse
-	91,  // 147: harness.v1.ConversationService.ArchiveSession:output_type -> harness.v1.ArchiveSessionResponse
-	59,  // 148: harness.v1.ConversationService.UpdateSessionMemoryPolicy:output_type -> harness.v1.UpdateSessionMemoryPolicyResponse
-	64,  // 149: harness.v1.ConversationService.ListSessions:output_type -> harness.v1.ListSessionsResponse
-	92,  // 150: harness.v1.ConversationService.AppendMessage:output_type -> harness.v1.AppendMessageResponse
-	68,  // 151: harness.v1.ConversationService.ListMessages:output_type -> harness.v1.ListMessagesResponse
-	111, // [111:152] is the sub-list for method output_type
-	70,  // [70:111] is the sub-list for method input_type
-	70,  // [70:70] is the sub-list for extension type_name
-	70,  // [70:70] is the sub-list for extension extendee
-	0,   // [0:70] is the sub-list for field type_name
+	93,  // 25: harness.v1.UpdateAgentRequest.updated_at:type_name -> google.protobuf.Timestamp
+	25,  // 26: harness.v1.ListAgentsResponse.items:type_name -> harness.v1.Agent
+	94,  // 27: harness.v1.UserSkill.parameters:type_name -> google.protobuf.Struct
+	93,  // 28: harness.v1.UserSkill.created_at:type_name -> google.protobuf.Timestamp
+	93,  // 29: harness.v1.UserSkill.updated_at:type_name -> google.protobuf.Timestamp
+	94,  // 30: harness.v1.CreateUserSkillRequest.parameters:type_name -> google.protobuf.Struct
+	94,  // 31: harness.v1.UpdateUserSkillRequest.parameters:type_name -> google.protobuf.Struct
+	34,  // 32: harness.v1.ListUserSkillsResponse.items:type_name -> harness.v1.UserSkill
+	43,  // 33: harness.v1.ListUserSkillSynthesisPoliciesResponse.items:type_name -> harness.v1.SynthesisPolicyOption
+	34,  // 34: harness.v1.CreateUserSkillResponse.skill:type_name -> harness.v1.UserSkill
+	34,  // 35: harness.v1.UpdateUserSkillResponse.skill:type_name -> harness.v1.UserSkill
+	34,  // 36: harness.v1.GetUserSkillResponse.skill:type_name -> harness.v1.UserSkill
+	34,  // 37: harness.v1.PublishUserSkillResponse.skill:type_name -> harness.v1.UserSkill
+	34,  // 38: harness.v1.DisableUserSkillResponse.skill:type_name -> harness.v1.UserSkill
+	93,  // 39: harness.v1.UserSkillSynthesisSettings.created_at:type_name -> google.protobuf.Timestamp
+	93,  // 40: harness.v1.UserSkillSynthesisSettings.updated_at:type_name -> google.protobuf.Timestamp
+	52,  // 41: harness.v1.GetUserSkillSynthesisSettingsResponse.settings:type_name -> harness.v1.UserSkillSynthesisSettings
+	52,  // 42: harness.v1.UpdateUserSkillSynthesisSettingsResponse.settings:type_name -> harness.v1.UserSkillSynthesisSettings
+	93,  // 43: harness.v1.Session.last_message_at:type_name -> google.protobuf.Timestamp
+	93,  // 44: harness.v1.Session.created_at:type_name -> google.protobuf.Timestamp
+	93,  // 45: harness.v1.Session.updated_at:type_name -> google.protobuf.Timestamp
+	57,  // 46: harness.v1.UpdateSessionMemoryPolicyResponse.session:type_name -> harness.v1.Session
+	57,  // 47: harness.v1.ListSessionsResponse.items:type_name -> harness.v1.Session
+	94,  // 48: harness.v1.ChatMessage.tool_calls:type_name -> google.protobuf.Struct
+	93,  // 49: harness.v1.ChatMessage.created_at:type_name -> google.protobuf.Timestamp
+	65,  // 50: harness.v1.ListMessagesResponse.items:type_name -> harness.v1.ChatMessage
+	0,   // 51: harness.v1.CreateProviderResponse.provider:type_name -> harness.v1.Provider
+	0,   // 52: harness.v1.UpdateProviderResponse.provider:type_name -> harness.v1.Provider
+	0,   // 53: harness.v1.GetProviderResponse.provider:type_name -> harness.v1.Provider
+	8,   // 54: harness.v1.CreateModelResponse.model:type_name -> harness.v1.Model
+	8,   // 55: harness.v1.UpdateModelResponse.model:type_name -> harness.v1.Model
+	8,   // 56: harness.v1.GetModelResponse.model:type_name -> harness.v1.Model
+	16,  // 57: harness.v1.CreatePolicyResponse.policy:type_name -> harness.v1.ModelPolicy
+	16,  // 58: harness.v1.UpdatePolicyResponse.policy:type_name -> harness.v1.ModelPolicy
+	16,  // 59: harness.v1.GetPolicyResponse.policy:type_name -> harness.v1.ModelPolicy
+	16,  // 60: harness.v1.PublishPolicyResponse.policy:type_name -> harness.v1.ModelPolicy
+	16,  // 61: harness.v1.CreatePolicyVersionResponse.policy:type_name -> harness.v1.ModelPolicy
+	25,  // 62: harness.v1.CreateAgentResponse.agent:type_name -> harness.v1.Agent
+	25,  // 63: harness.v1.UpdateAgentResponse.agent:type_name -> harness.v1.Agent
+	25,  // 64: harness.v1.GetAgentResponse.agent:type_name -> harness.v1.Agent
+	34,  // 65: harness.v1.GetAgentResponse.inheritable_user_skills:type_name -> harness.v1.UserSkill
+	25,  // 66: harness.v1.PublishAgentResponse.agent:type_name -> harness.v1.Agent
+	25,  // 67: harness.v1.CreateAgentVersionResponse.agent:type_name -> harness.v1.Agent
+	57,  // 68: harness.v1.CreateSessionResponse.session:type_name -> harness.v1.Session
+	57,  // 69: harness.v1.GetSessionResponse.session:type_name -> harness.v1.Session
+	57,  // 70: harness.v1.ArchiveSessionResponse.session:type_name -> harness.v1.Session
+	65,  // 71: harness.v1.AppendMessageResponse.message:type_name -> harness.v1.ChatMessage
+	1,   // 72: harness.v1.ProviderService.CreateProvider:input_type -> harness.v1.CreateProviderRequest
+	2,   // 73: harness.v1.ProviderService.UpdateProvider:input_type -> harness.v1.UpdateProviderRequest
+	3,   // 74: harness.v1.ProviderService.GetProvider:input_type -> harness.v1.GetProviderRequest
+	4,   // 75: harness.v1.ProviderService.DeleteProvider:input_type -> harness.v1.DeleteProviderRequest
+	5,   // 76: harness.v1.ProviderService.ListProviders:input_type -> harness.v1.ListProvidersRequest
+	9,   // 77: harness.v1.ModelCatalogService.CreateModel:input_type -> harness.v1.CreateModelRequest
+	10,  // 78: harness.v1.ModelCatalogService.UpdateModel:input_type -> harness.v1.UpdateModelRequest
+	11,  // 79: harness.v1.ModelCatalogService.GetModel:input_type -> harness.v1.GetModelRequest
+	12,  // 80: harness.v1.ModelCatalogService.DeleteModel:input_type -> harness.v1.DeleteModelRequest
+	13,  // 81: harness.v1.ModelCatalogService.ListModels:input_type -> harness.v1.ListModelsRequest
+	17,  // 82: harness.v1.ModelPolicyService.CreatePolicy:input_type -> harness.v1.CreatePolicyRequest
+	18,  // 83: harness.v1.ModelPolicyService.UpdatePolicy:input_type -> harness.v1.UpdatePolicyRequest
+	19,  // 84: harness.v1.ModelPolicyService.GetPolicy:input_type -> harness.v1.GetPolicyRequest
+	20,  // 85: harness.v1.ModelPolicyService.DeletePolicy:input_type -> harness.v1.DeletePolicyRequest
+	21,  // 86: harness.v1.ModelPolicyService.PublishPolicy:input_type -> harness.v1.PublishPolicyRequest
+	22,  // 87: harness.v1.ModelPolicyService.CreatePolicyVersion:input_type -> harness.v1.CreatePolicyVersionRequest
+	23,  // 88: harness.v1.ModelPolicyService.ListPolicies:input_type -> harness.v1.ListPoliciesRequest
+	26,  // 89: harness.v1.AgentService.CreateAgent:input_type -> harness.v1.CreateAgentRequest
+	27,  // 90: harness.v1.AgentService.UpdateAgent:input_type -> harness.v1.UpdateAgentRequest
+	28,  // 91: harness.v1.AgentService.GetAgent:input_type -> harness.v1.GetAgentRequest
+	29,  // 92: harness.v1.AgentService.DeleteAgent:input_type -> harness.v1.DeleteAgentRequest
+	30,  // 93: harness.v1.AgentService.PublishAgent:input_type -> harness.v1.PublishAgentRequest
+	31,  // 94: harness.v1.AgentService.CreateAgentVersion:input_type -> harness.v1.CreateAgentVersionRequest
+	32,  // 95: harness.v1.AgentService.ListAgents:input_type -> harness.v1.ListAgentsRequest
+	35,  // 96: harness.v1.UserSkillService.CreateUserSkill:input_type -> harness.v1.CreateUserSkillRequest
+	36,  // 97: harness.v1.UserSkillService.UpdateUserSkill:input_type -> harness.v1.UpdateUserSkillRequest
+	37,  // 98: harness.v1.UserSkillService.GetUserSkill:input_type -> harness.v1.GetUserSkillRequest
+	38,  // 99: harness.v1.UserSkillService.DeleteUserSkill:input_type -> harness.v1.DeleteUserSkillRequest
+	39,  // 100: harness.v1.UserSkillService.PublishUserSkill:input_type -> harness.v1.PublishUserSkillRequest
+	40,  // 101: harness.v1.UserSkillService.DisableUserSkill:input_type -> harness.v1.DisableUserSkillRequest
+	41,  // 102: harness.v1.UserSkillService.ListUserSkills:input_type -> harness.v1.ListUserSkillsRequest
+	53,  // 103: harness.v1.UserSkillService.GetUserSkillSynthesisSettings:input_type -> harness.v1.GetUserSkillSynthesisSettingsRequest
+	55,  // 104: harness.v1.UserSkillService.UpdateUserSkillSynthesisSettings:input_type -> harness.v1.UpdateUserSkillSynthesisSettingsRequest
+	44,  // 105: harness.v1.UserSkillService.ListUserSkillSynthesisPolicies:input_type -> harness.v1.ListUserSkillSynthesisPoliciesRequest
+	60,  // 106: harness.v1.ConversationService.CreateSession:input_type -> harness.v1.CreateSessionRequest
+	61,  // 107: harness.v1.ConversationService.GetSession:input_type -> harness.v1.GetSessionRequest
+	62,  // 108: harness.v1.ConversationService.ArchiveSession:input_type -> harness.v1.ArchiveSessionRequest
+	58,  // 109: harness.v1.ConversationService.UpdateSessionMemoryPolicy:input_type -> harness.v1.UpdateSessionMemoryPolicyRequest
+	63,  // 110: harness.v1.ConversationService.ListSessions:input_type -> harness.v1.ListSessionsRequest
+	66,  // 111: harness.v1.ConversationService.AppendMessage:input_type -> harness.v1.AppendMessageRequest
+	67,  // 112: harness.v1.ConversationService.ListMessages:input_type -> harness.v1.ListMessagesRequest
+	69,  // 113: harness.v1.ProviderService.CreateProvider:output_type -> harness.v1.CreateProviderResponse
+	70,  // 114: harness.v1.ProviderService.UpdateProvider:output_type -> harness.v1.UpdateProviderResponse
+	71,  // 115: harness.v1.ProviderService.GetProvider:output_type -> harness.v1.GetProviderResponse
+	72,  // 116: harness.v1.ProviderService.DeleteProvider:output_type -> harness.v1.DeleteProviderResponse
+	6,   // 117: harness.v1.ProviderService.ListProviders:output_type -> harness.v1.ListProvidersResponse
+	73,  // 118: harness.v1.ModelCatalogService.CreateModel:output_type -> harness.v1.CreateModelResponse
+	74,  // 119: harness.v1.ModelCatalogService.UpdateModel:output_type -> harness.v1.UpdateModelResponse
+	75,  // 120: harness.v1.ModelCatalogService.GetModel:output_type -> harness.v1.GetModelResponse
+	76,  // 121: harness.v1.ModelCatalogService.DeleteModel:output_type -> harness.v1.DeleteModelResponse
+	14,  // 122: harness.v1.ModelCatalogService.ListModels:output_type -> harness.v1.ListModelsResponse
+	77,  // 123: harness.v1.ModelPolicyService.CreatePolicy:output_type -> harness.v1.CreatePolicyResponse
+	78,  // 124: harness.v1.ModelPolicyService.UpdatePolicy:output_type -> harness.v1.UpdatePolicyResponse
+	79,  // 125: harness.v1.ModelPolicyService.GetPolicy:output_type -> harness.v1.GetPolicyResponse
+	80,  // 126: harness.v1.ModelPolicyService.DeletePolicy:output_type -> harness.v1.DeletePolicyResponse
+	81,  // 127: harness.v1.ModelPolicyService.PublishPolicy:output_type -> harness.v1.PublishPolicyResponse
+	82,  // 128: harness.v1.ModelPolicyService.CreatePolicyVersion:output_type -> harness.v1.CreatePolicyVersionResponse
+	24,  // 129: harness.v1.ModelPolicyService.ListPolicies:output_type -> harness.v1.ListPoliciesResponse
+	83,  // 130: harness.v1.AgentService.CreateAgent:output_type -> harness.v1.CreateAgentResponse
+	84,  // 131: harness.v1.AgentService.UpdateAgent:output_type -> harness.v1.UpdateAgentResponse
+	85,  // 132: harness.v1.AgentService.GetAgent:output_type -> harness.v1.GetAgentResponse
+	86,  // 133: harness.v1.AgentService.DeleteAgent:output_type -> harness.v1.DeleteAgentResponse
+	87,  // 134: harness.v1.AgentService.PublishAgent:output_type -> harness.v1.PublishAgentResponse
+	88,  // 135: harness.v1.AgentService.CreateAgentVersion:output_type -> harness.v1.CreateAgentVersionResponse
+	33,  // 136: harness.v1.AgentService.ListAgents:output_type -> harness.v1.ListAgentsResponse
+	46,  // 137: harness.v1.UserSkillService.CreateUserSkill:output_type -> harness.v1.CreateUserSkillResponse
+	47,  // 138: harness.v1.UserSkillService.UpdateUserSkill:output_type -> harness.v1.UpdateUserSkillResponse
+	48,  // 139: harness.v1.UserSkillService.GetUserSkill:output_type -> harness.v1.GetUserSkillResponse
+	49,  // 140: harness.v1.UserSkillService.DeleteUserSkill:output_type -> harness.v1.DeleteUserSkillResponse
+	50,  // 141: harness.v1.UserSkillService.PublishUserSkill:output_type -> harness.v1.PublishUserSkillResponse
+	51,  // 142: harness.v1.UserSkillService.DisableUserSkill:output_type -> harness.v1.DisableUserSkillResponse
+	42,  // 143: harness.v1.UserSkillService.ListUserSkills:output_type -> harness.v1.ListUserSkillsResponse
+	54,  // 144: harness.v1.UserSkillService.GetUserSkillSynthesisSettings:output_type -> harness.v1.GetUserSkillSynthesisSettingsResponse
+	56,  // 145: harness.v1.UserSkillService.UpdateUserSkillSynthesisSettings:output_type -> harness.v1.UpdateUserSkillSynthesisSettingsResponse
+	45,  // 146: harness.v1.UserSkillService.ListUserSkillSynthesisPolicies:output_type -> harness.v1.ListUserSkillSynthesisPoliciesResponse
+	89,  // 147: harness.v1.ConversationService.CreateSession:output_type -> harness.v1.CreateSessionResponse
+	90,  // 148: harness.v1.ConversationService.GetSession:output_type -> harness.v1.GetSessionResponse
+	91,  // 149: harness.v1.ConversationService.ArchiveSession:output_type -> harness.v1.ArchiveSessionResponse
+	59,  // 150: harness.v1.ConversationService.UpdateSessionMemoryPolicy:output_type -> harness.v1.UpdateSessionMemoryPolicyResponse
+	64,  // 151: harness.v1.ConversationService.ListSessions:output_type -> harness.v1.ListSessionsResponse
+	92,  // 152: harness.v1.ConversationService.AppendMessage:output_type -> harness.v1.AppendMessageResponse
+	68,  // 153: harness.v1.ConversationService.ListMessages:output_type -> harness.v1.ListMessagesResponse
+	113, // [113:154] is the sub-list for method output_type
+	72,  // [72:113] is the sub-list for method input_type
+	72,  // [72:72] is the sub-list for extension type_name
+	72,  // [72:72] is the sub-list for extension extendee
+	0,   // [0:72] is the sub-list for field type_name
 }
 
 func init() { file_harness_v1_platform_proto_init() }

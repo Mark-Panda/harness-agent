@@ -184,10 +184,21 @@ export interface UserSkillSynthesisRun {
   candidate_name: string;
   confidence: number;
   skill_id: string | null;
+  results: UserSkillSynthesisRunResult[];
   attempts: number;
   started_at: string;
   finished_at: string | null;
   updated_at: string;
+}
+
+// UserSkillSynthesisRunResult 是单次提炼中单个助手的结构化结果。
+export interface UserSkillSynthesisRunResult {
+  agent_name?: string;
+  outcome: string;
+  detail?: string;
+  skill_id?: string;
+  skill_name?: string;
+  confidence?: number;
 }
 
 // UserSkill 是用户私有技能，可由每日对话提炼或手动创建。
@@ -204,6 +215,7 @@ export interface UserSkill {
   source_session_ids: string[];
   confidence: number;
   bundle: SkillBundleInfo | null;
+  user_edited_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -214,6 +226,20 @@ export interface UserSkillInput {
   description: string;
   prompt_template: string;
   parameters: Record<string, unknown>;
+}
+
+// UserSkillRevision 是技能原地更新前的历史内容快照。
+export interface UserSkillRevision {
+  id: string;
+  user_id: string;
+  skill_id: string;
+  version: number;
+  description: string;
+  prompt_template: string;
+  parameters: Record<string, unknown>;
+  source_session_ids: string[];
+  confidence: number;
+  created_at: string;
 }
 
 export type MCPStatus = "enabled" | "disabled";
@@ -309,6 +335,8 @@ export interface Agent {
   status: AgentStatus;
   created_at: string;
   updated_at: string;
+  // 草稿发布会从同助手其他版本继承的自动技能；仅草稿返回。
+  inheritable_user_skills?: UserSkill[];
 }
 
 export interface AgentInput {
@@ -320,6 +348,21 @@ export interface AgentInput {
   skill_ids: string[];
   user_skill_ids: string[];
   mcp_ids: string[];
+  // 仅编辑草稿时携带：读取时的更新时间，用于乐观并发校验。
+  updated_at?: string | null;
+  // 仅编辑草稿时携带：显式取消继承或移除的用户技能。
+  user_skill_optouts?: string[];
+}
+
+// AgentSnapshotRevision 是助手发布快照原地更新前的历史版本。
+export interface AgentSnapshotRevision {
+  id: string;
+  user_id: string;
+  agent_id: string;
+  agent_version: number;
+  config_snapshot: Record<string, unknown>;
+  reason: string;
+  created_at: string;
 }
 
 export type SessionStatus = "active" | "archived" | "deleted";
