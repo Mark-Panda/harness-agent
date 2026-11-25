@@ -109,7 +109,8 @@ services:
       - ALL
     mem_limit: 1g
     cpus: 2
-    stop_grace_period: 30s
+    # role=all 时也会执行 Worker，宽限期需覆盖排空、终态写与退队。
+    stop_grace_period: 150s
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health/ready | grep -Eq '^[{].*\"status\":\"(ready|degraded)\"[}]'"]
       interval: 5s
@@ -124,6 +125,8 @@ services:
     environment:
       <<: *app-environment
       WORKER_ROLE: worker
+      # worker 角色必须显式声明池过滤，避免漏配时静默抢占全部 lane；* 表示启动全部池。
+      WORKER_POOLS: "*"
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,7 +144,8 @@ services:
       - ALL
     mem_limit: 1g
     cpus: 2
-    stop_grace_period: 60s
+    # 宽限期需覆盖 agent.worker.drain_timeout（默认 90s），留出收尾余量。
+    stop_grace_period: 150s
     # Worker 不监听 HTTP，镜像内置的 /health/ready 健康检查不适用。
     healthcheck:
       disable: true

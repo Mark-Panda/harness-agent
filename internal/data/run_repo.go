@@ -569,6 +569,32 @@ func (r *RunRepository) RenewRunLease(ctx context.Context, userID, runID uuid.UU
 	return catalogError("renew run lease", err)
 }
 
+// ReleaseRunLease 在栅栏有效时清空租约归属与到期时间，Run 状态保持 running。
+// 与认领/续约共用会话级 advisory lock，避免与同会话的 ClaimRun 交错。
+func (r *RunRepository) ReleaseRunLease(ctx context.Context, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) error {
+	if fence.Owner == "" || fence.Token <= 0 {
+		return fmt.Errorf("%w: valid fence is required", biz.ErrInvalidConfig)
+	}
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		var run runModel
+		if err := tx.Select("session_id").Take(&run, "id = ? AND user_id = ?", runID, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: run lease is no longer valid", biz.ErrResourceConflict)
+			}
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-session:"+run.SessionID.String()).Error; err != nil {
+			return err
+		}
+		if _, err := lockRunningRunLease(tx, userID, runID, fence, now); err != nil {
+			return err
+		}
+		return tx.Model(&runModel{}).Where("id = ? AND user_id = ?", runID, userID).
+			Updates(map[string]any{"lease_owner": "", "lease_expires_at": nil, "updated_at": now}).Error
+	})
+	return catalogError("release run lease", err)
+}
+
 // lockRunningRunLease holds the Run through the caller's transaction and checks expiry after the lock.
 func lockRunningRunLease(tx *gorm.DB, userID, runID uuid.UUID, fence biz.RunFence, now time.Time) (biz.AgentMode, error) {
 	var run struct{ Mode biz.AgentMode }
@@ -1052,3 +1078,6 @@ func toBizRunEvent(record runEventModel) (biz.RunEvent, error) {
 }
 
 var _ biz.RunRepository = (*RunRepository)(nil)
+
+// 编译期断言停机租约释放能力实现。
+var _ biz.RunLeaseReleaser = (*RunRepository)(nil)

@@ -162,6 +162,13 @@ type RunRepository interface {
 	SetRunAttempt(ctx context.Context, userID, runID uuid.UUID, attemptNo int, fence RunFence) error
 }
 
+// RunLeaseReleaser 是可选能力：Worker 停机时主动释放 Run 租约，
+// 让其他副本立即接管，而不必等待租约自然过期。未实现时保持原有租约过期回收语义。
+type RunLeaseReleaser interface {
+	// ReleaseRunLease 在栅栏有效时清空租约归属与到期时间，Run 状态保持 running。
+	ReleaseRunLease(ctx context.Context, userID, runID uuid.UUID, fence RunFence, now time.Time) error
+}
+
 // RunSnapshotRepository 提供 Run 创建时固化 Agent、策略与模型快照的读取能力。
 type RunSnapshotRepository interface {
 	// GetAgent 按用户与 ID 读取已发布 Agent 版本。
@@ -345,6 +352,17 @@ func (s *RunService) create(ctx context.Context, principal Principal, input Crea
 	configSnapshot, policySnapshot, err := s.buildRunSnapshots(ctx, principal, input, groupPolicyID)
 	if err != nil {
 		return Run{}, err
+	}
+	// 创建前预检排队容量：避免超限时先落一条失败 Run，再返回 429。
+	// 入队事务内仍会加用户锁严格复核，预检只负责快速失败与友好状态码。
+	if limiter, ok := s.enqueuer.(RunBacklogLimiter); ok {
+		hasCapacity, err := limiter.HasRunCapacity(ctx, principal.UserID)
+		if err != nil {
+			return Run{}, err
+		}
+		if !hasCapacity {
+			return Run{}, ErrQueueSaturated
+		}
 	}
 	deadline := s.clock().Add(s.deadline)
 	run := Run{

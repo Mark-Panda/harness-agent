@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mark-Panda/harness-agent/internal/platform/workerpool"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
@@ -355,7 +356,7 @@ type WorkerConfig struct {
 	Role string `yaml:"role"`
 	// Components 逗号分隔的 Worker 组件：execution/background/feishu/deletion；为空启动全部。
 	Components string `yaml:"components"`
-	// PoolFilter 逗号分隔的执行池名称；为空启动全部 pools。
+	// PoolFilter 逗号分隔的执行池名称；worker 角色必须显式配置，* 表示全部 pools。
 	PoolFilter string `yaml:"pool_filter"`
 	// Pools 是执行资源池配置；为空时使用单池兼容模式。
 	Pools []WorkerPoolConfig `yaml:"pools"`
@@ -369,6 +370,10 @@ type WorkerConfig struct {
 	Lease Duration `yaml:"lease"`
 	// Heartbeat 租约续约间隔，必须小于 Lease。
 	Heartbeat Duration `yaml:"heartbeat"`
+	// DrainTimeout 停机排空在途任务的最长时间；为零时回退到 server.shutdown_timeout。
+	DrainTimeout Duration `yaml:"drain_timeout"`
+	// MaxPendingRunsPerUser 单用户排队中的 agent.run 任务上限，防止单用户积压拖慢其他租户；0 表示不限制。
+	MaxPendingRunsPerUser int `yaml:"max_pending_runs_per_user"`
 	// CancelPoll 取消状态轮询间隔。
 	CancelPoll Duration `yaml:"cancel_poll"`
 	// RequestTimeout 单次模型 HTTP 调用超时。
@@ -415,7 +420,7 @@ type WorkerConfig struct {
 type WorkerPoolConfig struct {
 	// Name 资源池名称，必须在配置内唯一，用于日志、租约与指标。
 	Name string `yaml:"name"`
-	// Lanes 认领的 lane 列表；为空表示不按 lane 过滤。
+	// Lanes 认领的 lane 列表；显式资源池必须至少声明一个，单池兼容模式由 pools 为空触发。
 	Lanes []string `yaml:"lanes"`
 	// Concurrency 单实例并发执行 Run 数；零值回退到 worker.concurrency。
 	Concurrency int `yaml:"concurrency"`
@@ -727,16 +732,20 @@ func (c Config) Validate() error {
 		if worker.Concurrency <= 0 {
 			return fmt.Errorf("agent.worker.concurrency must be positive")
 		}
-		seenPools := make(map[string]struct{}, len(worker.Pools))
+		// 执行 Worker 只认领 agent.run，因此资源池只能声明 Run lane；
+		// 拼错或声明 background/feishu 会让该池永远领不到任务，必须在启动时拒绝。
+		seenPools := make(map[string]string, len(worker.Pools))
+		claimedLanes := make(map[string]string, len(worker.Pools))
 		for index, pool := range worker.Pools {
 			name := strings.TrimSpace(pool.Name)
 			if name == "" {
 				return fmt.Errorf("agent.worker.pools[%d].name is required", index)
 			}
-			if _, exists := seenPools[name]; exists {
+			key := strings.ToLower(name)
+			if _, exists := seenPools[key]; exists {
 				return fmt.Errorf("agent.worker.pools contains duplicate name %q", name)
 			}
-			seenPools[name] = struct{}{}
+			seenPools[key] = name
 			if pool.Concurrency < 0 || pool.GlobalConcurrency < 0 {
 				return fmt.Errorf("agent.worker.pools[%d] concurrency must not be negative", index)
 			}
@@ -749,13 +758,58 @@ func (c Config) Validate() error {
 			if pool.Heartbeat.Duration > 0 && pool.Lease.Duration > 0 && pool.Heartbeat.Duration >= pool.Lease.Duration {
 				return fmt.Errorf("agent.worker.pools[%d].heartbeat must be shorter than lease", index)
 			}
+			// 显式池声明空 lanes 会认领全部 Run lane，静默破坏池隔离。
+			if len(pool.Lanes) == 0 {
+				return fmt.Errorf("agent.worker.pools[%d].lanes must not be empty", index)
+			}
+			for _, raw := range pool.Lanes {
+				lane := strings.ToLower(strings.TrimSpace(raw))
+				if lane == "" {
+					return fmt.Errorf("agent.worker.pools[%d].lanes must not contain empty lane", index)
+				}
+				if !workerpool.IsRunLane(lane) {
+					return fmt.Errorf("agent.worker.pools[%d].lanes contains unsupported run lane %q", index, lane)
+				}
+				if owner, exists := claimedLanes[lane]; exists {
+					if strings.EqualFold(owner, name) {
+						return fmt.Errorf("agent.worker.pools[%d].lanes contains duplicate lane %q", index, lane)
+					}
+					return fmt.Errorf("agent.worker.pools lane %q is claimed by both %q and %q", lane, owner, name)
+				}
+				claimedLanes[lane] = name
+			}
 		}
-		for _, name := range csvValues(worker.PoolFilter) {
-			if len(seenPools) > 0 {
-				if _, exists := seenPools[name]; !exists {
-					return fmt.Errorf("agent.worker.pool_filter references unknown pool %q", name)
+		filters := csvValues(worker.PoolFilter)
+		// 只有会启动 execution 组件的 worker 进程才需要池过滤：
+		// 漏配会让该 Deployment 静默启动全部池并抢占其他池的 lane，确需全部池时显式写 "*"。
+		// background/feishu/deletion 单组件进程不认领 agent.run，不受此约束。
+		if strings.EqualFold(strings.TrimSpace(worker.Role), "worker") && workerStartsExecution(worker) &&
+			len(worker.Pools) > 0 && len(filters) == 0 {
+			return fmt.Errorf("agent.worker.pool_filter is required for worker role; use * to start all pools")
+		}
+		if len(filters) > 1 {
+			for _, name := range filters {
+				if name == "*" {
+					return fmt.Errorf("agent.worker.pool_filter must not combine * with pool names")
 				}
 			}
+		}
+		if len(seenPools) == 0 && len(filters) > 0 && !(len(filters) == 1 && filters[0] == "*") {
+			return fmt.Errorf("agent.worker.pool_filter requires agent.worker.pools to be configured")
+		}
+		for _, name := range filters {
+			if name == "*" {
+				continue
+			}
+			if _, exists := seenPools[name]; !exists {
+				return fmt.Errorf("agent.worker.pool_filter references unknown pool %q", name)
+			}
+		}
+		if worker.DrainTimeout.Duration < 0 {
+			return fmt.Errorf("agent.worker.drain_timeout must not be negative")
+		}
+		if worker.MaxPendingRunsPerUser < 0 {
+			return fmt.Errorf("agent.worker.max_pending_runs_per_user must not be negative")
 		}
 		if worker.PollInterval.Duration <= 0 || worker.Lease.Duration <= 0 || worker.CancelPoll.Duration <= 0 || worker.RequestTimeout.Duration <= 0 {
 			return fmt.Errorf("agent.worker intervals and request timeout must be positive")
@@ -1115,6 +1169,20 @@ func (c Config) validateCredentials() error {
 		keyIDs[key.ID] = struct{}{}
 	}
 	return nil
+}
+
+// workerStartsExecution 判断当前 worker 配置是否会启动 execution 组件；组件为空表示全部启动。
+func workerStartsExecution(worker WorkerConfig) bool {
+	components := csvValues(worker.Components)
+	if len(components) == 0 {
+		return true
+	}
+	for _, component := range components {
+		if component == "execution" {
+			return true
+		}
+	}
+	return false
 }
 
 // csvValues 把逗号分隔的环境变量配置转换为去空、去重的稳定列表。

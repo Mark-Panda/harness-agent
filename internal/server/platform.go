@@ -1371,6 +1371,10 @@ func writePlatformError(w http.ResponseWriter, err error) {
 		writeErrorCode(w, http.StatusForbidden, "quota_exceeded")
 	case errors.Is(err, biz.ErrBudgetExceeded):
 		writeErrorCode(w, http.StatusTooManyRequests, "budget_exceeded")
+	case errors.Is(err, biz.ErrQueueSaturated):
+		// 排队已满属于可重试的容量限制，不应让客户端把它当作参数或权限错误。
+		w.Header().Set("Retry-After", "5")
+		writeErrorCode(w, http.StatusTooManyRequests, "run_queue_saturated")
 	case errors.Is(err, biz.ErrResourceNotFound):
 		writeErrorCode(w, http.StatusNotFound, "resource_not_found")
 	case errors.Is(err, biz.ErrResourceConflict):

@@ -1419,6 +1419,12 @@ PR 至少 1 名评审通过，禁止直接推送 `main`。
 
 **剩余边界**：
 
+- Worker 停机先停止认领并等待在途任务收敛（`agent.worker.drain_timeout`，默认 90s，需小于 Pod 的 `terminationGracePeriodSeconds`）；排空覆盖执行、摘要、飞书、删除、向量化、事实提取、技能提炼与周期维护扫描。超时后取消执行，未产生流式增量的任务退回队列并主动释放 Run 租约，其他副本可立即接管；退队与租约释放带独立 5s 超时，避免 DB 抖动拖长停机。
+- 已推送流式增量的 Run 停机时按中断失败收敛，不自动重试，避免用户看到重复内容；这是“不重复输出”与“不中断”之间的明确取舍。
+- 单用户排队上限由 `agent.worker.max_pending_runs_per_user` 控制（默认 100，0 表示不限制）：创建 Run 前预检并返回 429 `run_queue_saturated`，入队事务内再用用户级 advisory lock 严格复核；人工重放（`RequeueRun`）同样受该上限约束。
+- HPA 使用的 `harness_jobs_pending` 会统计已到期 pending 与「dead 但 Run 仍活跃」的可回收任务，避免恢复场景下池已打满却不扩容；审批等待等未到期任务仍不计入。
+- `worker` 角色必须显式配置 `agent.worker.pool_filter`（`*` 表示全部池），漏配会在启动时失败，避免静默抢占其他池的 lane；显式 `pools` 必须至少声明一个 lane。
+- 停机或租约失效导致的重新执行遵循至少一次语义：外部工具可能被重复调用，接入方应为有副作用的工具提供幂等键。
 - 租户级资源池尚未默认启用；`tenant_key` 字段已预留，当前主要按用户并发舱壁保证公平性。
 - 飞书回复 Worker 的单群聊并发限制仍是进程内 `keyedLimiter`，默认保持单副本；多副本需要改为 Redis 分布式限流或按 `chat_id` 路由。
 - 队列仍基于 PostgreSQL；高认领 QPS 场景需要评估分区、部分索引或外部消息队列。

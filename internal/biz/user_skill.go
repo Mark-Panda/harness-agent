@@ -832,14 +832,22 @@ func (m *SkillSynthesisMaintenance) Start(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
 		}
-		if err := m.RunOnce(ctx); err != nil && ctx.Err() == nil {
-			m.logger.Warn("skill synthesis maintenance failed", "error", err)
-		}
+		// 在途扫描计入排空，避免停机时截断批量维护。
+		func() {
+			finishJob := beginJob()
+			defer finishJob("skill_synthesis_maintenance")
+			if err := m.RunOnce(ctx); err != nil && ctx.Err() == nil {
+				m.logger.Warn("skill synthesis maintenance failed", "error", err)
+			}
+		}()
 		timer.Reset(m.config.Interval)
 	}
 }
@@ -961,6 +969,9 @@ func (w *SkillSynthesisWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -996,6 +1007,9 @@ func (w *SkillSynthesisWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 加载当日有效对话、调用 LLM 提炼并在通过阈值时创建用户技能草稿。
 func (w *SkillSynthesisWorker) handle(ctx context.Context, job Job) {
+	// 计入在途任务，停机排空会等待本次技能提炼完成或超时后再取消。
+	finishJob := beginJob()
+	defer finishJob("skill_synthesis")
 	runCtx, lease := beginJobLease(ctx, w.jobs, job, "skill-synthesis", w.config.Lease, w.config.Heartbeat, w.clock)
 	defer lease.stop()
 	complete := func() {

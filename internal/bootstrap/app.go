@@ -256,6 +256,12 @@ func Run(role string) error {
 		role = cfg.Agent.Worker.Role
 	}
 	role = normalizeRole(role)
+	// cmd/worker 直接以 worker 角色启动时配置里的 role 可能为空，这里兜底校验：
+	// 配了多个池却没有 pool_filter 会让该进程静默启动全部池并抢占其他池的 lane。
+	if role == RoleWorker && cfg.Agent.Worker.Enabled && workerComponentEnabled(cfg.Agent.Worker, "execution") &&
+		len(cfg.Agent.Worker.Pools) > 0 && strings.TrimSpace(cfg.Agent.Worker.PoolFilter) == "" {
+		return fmt.Errorf("worker role requires agent.worker.pool_filter; use * to start all pools")
+	}
 	runAPI := role == RoleAll || role == RoleAPI
 	runWorkers := role == RoleAll || role == RoleWorker
 	// 结构化日志先于其他组件初始化：后续构造的 Worker 与 Service 共享统一级别、JSON 格式与关联 ID 注入。
@@ -431,7 +437,7 @@ func Run(role string) error {
 		return err
 	}
 	summaryRepository := data.NewSummaryRepository(appDB)
-	jobRepository := data.NewJobRepository(appDB)
+	jobRepository := data.NewJobRepository(appDB, data.WithMaxPendingRunsPerUser(cfg.Agent.Worker.MaxPendingRunsPerUser))
 	memoryRepository := data.NewMemoryRepository(appDB)
 	factRepository := data.NewFactRepository(appDB)
 	userSkillRepository := data.NewUserSkillRepository(appDB)
@@ -845,7 +851,9 @@ func Run(role string) error {
 			// 停机顺序：先 readiness 摘流，再等待在途任务收敛，最后取消领取并等待 Worker 退出。
 			kratos.BeforeStop(func(ctx context.Context) error {
 				server.SetReady(false)
-				deadline := time.NewTimer(10 * time.Second)
+				// 先停止认领，再等待在途任务收敛，避免排空期间继续接收新任务。
+				biz.BeginWorkerDrain()
+				deadline := time.NewTimer(workerDrainTimeout(cfg))
 				defer deadline.Stop()
 				ticker := time.NewTicker(100 * time.Millisecond)
 				defer ticker.Stop()
@@ -875,12 +883,14 @@ func Run(role string) error {
 		return err
 	}
 	var workers sync.WaitGroup
-	// 队列深度指标在 API 与 Worker 角色都采集，供 /metrics 与 HPA 使用。
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		collectJobQueueMetrics(workerContext, jobRepository, jobQueueMetricsInterval)
-	}()
+	// 队列深度指标只由暴露 /metrics 的 API 进程采集；Worker-only 进程没有 HTTP 服务，采集无意义。
+	if runAPI {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			collectJobQueueMetrics(workerContext, jobRepository, jobQueueMetricsInterval)
+		}()
+	}
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
@@ -1221,11 +1231,12 @@ func Run(role string) error {
 	if app != nil {
 		runErr = app.Run()
 	} else {
-		// Worker-only 进程没有 HTTP 服务，等待 SIGTERM/SIGINT 后优雅退出。
+		// Worker-only 进程没有 HTTP 服务，等待 SIGTERM/SIGINT 后先排空在途任务再退出。
 		slog.Info("worker-only role started", "role", role, "worker_id", workerID)
 		signalContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		<-signalContext.Done()
 		stopSignal()
+		drainWorkers(workerDrainTimeout(cfg))
 	}
 	stopWorker()
 	workers.Wait()

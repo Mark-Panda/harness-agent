@@ -383,6 +383,9 @@ func (w *MemoryEmbedWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -419,6 +422,9 @@ func (w *MemoryEmbedWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 解析任务、读取来源消息并按索引版本批量写入向量，全程续约并遵守 fencing 租约。
 func (w *MemoryEmbedWorker) handle(ctx context.Context, job Job) {
+	// 计入在途任务，停机排空会等待本批向量化完成或超时后再取消。
+	finishJob := beginJob()
+	defer finishJob("memory_embed")
 	runCtx, lease := beginJobLease(ctx, w.jobs, job, w.config.WorkerID, w.config.Lease, w.config.Heartbeat, w.clock)
 	defer lease.stop()
 	logLeaseLost := func(err error) {
@@ -949,12 +955,20 @@ func (m *MemoryMaintenance) Start(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
 		}
-		m.RunOnce(ctx)
+		// 在途扫描计入排空，避免停机时截断批量维护。
+		func() {
+			finishJob := beginJob()
+			defer finishJob("memory_maintenance")
+			m.RunOnce(ctx)
+		}()
 		timer.Reset(m.config.Interval)
 	}
 }

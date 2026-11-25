@@ -230,6 +230,9 @@ func (w *FeishuEventWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return

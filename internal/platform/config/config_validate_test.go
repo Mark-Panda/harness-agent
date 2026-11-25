@@ -490,9 +490,23 @@ func TestValidateWorkerRoleAndPools(t *testing.T) {
 		Name: "react", Lanes: []string{"react"}, Concurrency: 4, GlobalConcurrency: 8,
 		Lease: dur(60 * time.Second), Heartbeat: dur(20 * time.Second),
 	}}
+	cfg.Agent.Worker.PoolFilter = "react"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid worker pools rejected: %v", err)
 	}
+
+	// worker 角色漏配 pool_filter 会静默启动全部池，必须拒绝。
+	cfg.Agent.Worker.PoolFilter = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "pool_filter is required") {
+		t.Fatalf("expected explicit pool_filter error, got %v", err)
+	}
+	// 不启动 execution 的组件不受池过滤约束。
+	cfg.Agent.Worker.Components = "background,feishu"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("non-execution worker should not require pool_filter: %v", err)
+	}
+	cfg.Agent.Worker.Components = ""
+	cfg.Agent.Worker.PoolFilter = "react"
 
 	cfg.Agent.Worker.Role = "invalid"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "worker.role") {
@@ -503,5 +517,111 @@ func TestValidateWorkerRoleAndPools(t *testing.T) {
 	cfg.Agent.Worker.Pools = append(cfg.Agent.Worker.Pools, cfg.Agent.Worker.Pools[0])
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("expected duplicate pool error, got %v", err)
+	}
+}
+
+// TestValidateWorkerPoolLanes 校验资源池 lane 与 pool_filter 的启动期约束。
+func TestValidateWorkerPoolLanes(t *testing.T) {
+	cases := []struct {
+		name            string
+		pools           []WorkerPoolConfig
+		filter          string
+		drainNegative   bool
+		pendingNegative bool
+		wantErr         string
+	}{
+		{
+			name:    "unsupported lane",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{"reakt"}}},
+			wantErr: "unsupported run lane",
+		},
+		{
+			name:    "background lane on execution pool",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{"background"}}},
+			wantErr: "unsupported run lane",
+		},
+		{
+			name: "lane claimed by two pools",
+			pools: []WorkerPoolConfig{
+				{Name: "react-a", Lanes: []string{"react"}},
+				{Name: "react-b", Lanes: []string{"react"}},
+			},
+			wantErr: "claimed by both",
+		},
+		{
+			name:    "duplicate lane in one pool",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{"react", "REACT"}}},
+			wantErr: "duplicate lane",
+		},
+		{
+			name:    "empty lane",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{" "}}},
+			wantErr: "must not contain empty lane",
+		},
+		{
+			name:    "missing lanes",
+			pools:   []WorkerPoolConfig{{Name: "react"}},
+			wantErr: "lanes must not be empty",
+		},
+		{
+			name:    "filter without pools",
+			filter:  "react",
+			wantErr: "requires agent.worker.pools",
+		},
+		{
+			name:    "filter case insensitive",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{"react"}}},
+			filter:  "REACT",
+			wantErr: "",
+		},
+		{
+			name:   "star starts all pools",
+			pools:  []WorkerPoolConfig{{Name: "react", Lanes: []string{"react"}}, {Name: "plan", Lanes: []string{"plan"}}},
+			filter: "*",
+		},
+		{
+			name:    "star mixed with names",
+			pools:   []WorkerPoolConfig{{Name: "react", Lanes: []string{"react"}}},
+			filter:  "*,plan",
+			wantErr: "must not combine *",
+		},
+		{
+			name:          "negative drain timeout",
+			pools:         []WorkerPoolConfig{{Name: "react", Lanes: []string{"react"}}},
+			filter:        "react",
+			drainNegative: true,
+			wantErr:       "drain_timeout",
+		},
+		{
+			name:            "negative pending cap",
+			pools:           []WorkerPoolConfig{{Name: "react", Lanes: []string{"react"}}},
+			filter:          "react",
+			pendingNegative: true,
+			wantErr:         "max_pending_runs_per_user",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newValidConfig()
+			enableWorker(cfg)
+			cfg.Agent.Worker.Pools = tc.pools
+			cfg.Agent.Worker.PoolFilter = tc.filter
+			if tc.drainNegative {
+				cfg.Agent.Worker.DrainTimeout = dur(-time.Second)
+			}
+			if tc.pendingNegative {
+				cfg.Agent.Worker.MaxPendingRunsPerUser = -1
+			}
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }

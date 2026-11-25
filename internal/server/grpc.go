@@ -102,6 +102,8 @@ func grpcError(err error) error {
 		return status.Error(codes.PermissionDenied, "forbidden")
 	case errors.Is(err, biz.ErrQuotaExceeded):
 		return status.Error(codes.ResourceExhausted, "quota_exceeded")
+	case errors.Is(err, biz.ErrQueueSaturated):
+		return status.Error(codes.ResourceExhausted, "run_queue_saturated")
 	case errors.Is(err, biz.ErrResourceNotFound):
 		return status.Error(codes.NotFound, "resource_not_found")
 	case errors.Is(err, biz.ErrResourceConflict):

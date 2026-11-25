@@ -64,11 +64,27 @@ func (jobModel) TableName() string { return "jobs" }
 // JobRepository 是 jobs 表的 GORM 实现，使用 SKIP LOCKED 支持多 Worker 并发认领。
 type JobRepository struct {
 	db *gorm.DB
+	// maxPendingRunsPerUser 单用户排队中的 Run 上限；0 表示不限制。
+	maxPendingRunsPerUser int
+}
+
+// JobRepositoryOption 定制任务仓库行为。
+type JobRepositoryOption func(*JobRepository)
+
+// WithMaxPendingRunsPerUser 限制单用户排队中的 Run 任务数，防止单用户积压拖慢其他租户；0 表示不限制。
+func WithMaxPendingRunsPerUser(limit int) JobRepositoryOption {
+	return func(repository *JobRepository) {
+		repository.maxPendingRunsPerUser = limit
+	}
 }
 
 // NewJobRepository 构造任务仓库。
-func NewJobRepository(db *gorm.DB) *JobRepository {
-	return &JobRepository{db: db}
+func NewJobRepository(db *gorm.DB, options ...JobRepositoryOption) *JobRepository {
+	repository := &JobRepository{db: db}
+	for _, option := range options {
+		option(repository)
+	}
+	return repository
 }
 
 // lockJobForWrite 在结果写事务中锁定并复核租约，行锁持有到提交，封闭前置检查与写入之间的失租窗口。
@@ -116,6 +132,23 @@ func (r *JobRepository) EnqueueRunLane(ctx context.Context, userID, runID uuid.U
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		// 限制单用户排队深度：只统计 pending，且排除本次 Run 已有的任务，
+		// 保证审批恢复等重复入队不会被自己的任务挡住。
+		// 先取用户级事务锁，避免并发入队同时读到低于上限后各自插入造成超限。
+		if r.maxPendingRunsPerUser > 0 {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-pending:"+userID.String()).Error; err != nil {
+				return err
+			}
+			var pending int64
+			if err := tx.Model(&jobModel{}).
+				Where("user_id = ? AND job_type = ? AND status = ? AND dedupe_key <> ?", userID, "agent.run", "pending", dedupe).
+				Count(&pending).Error; err != nil {
+				return err
+			}
+			if pending >= int64(r.maxPendingRunsPerUser) {
+				return fmt.Errorf("%w: too many pending runs for user", biz.ErrQueueSaturated)
+			}
+		}
 		// dedupe_key 上是部分唯一索引，ON CONFLICT 不指定列才能匹配到该索引。
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record)
 		if result.Error != nil {
@@ -150,6 +183,23 @@ func (r *JobRepository) HasRunJob(ctx context.Context, userID, runID uuid.UUID) 
 	return count > 0, catalogError("check run job", err)
 }
 
+// HasRunCapacity 预检用户排队深度；未配置上限或未超限时返回 true。
+func (r *JobRepository) HasRunCapacity(ctx context.Context, userID uuid.UUID) (bool, error) {
+	if r.maxPendingRunsPerUser <= 0 {
+		return true, nil
+	}
+	var pending int64
+	err := WithScope(ctx, r.db, Scope{UserID: userID}, func(tx *gorm.DB) error {
+		return tx.Model(&jobModel{}).
+			Where("user_id = ? AND job_type = ? AND status = ?", userID, "agent.run", "pending").
+			Count(&pending).Error
+	})
+	if err != nil {
+		return false, catalogError("check run backlog", err)
+	}
+	return pending < int64(r.maxPendingRunsPerUser), nil
+}
+
 // RequeueRun 把同一 Run 的失败或死信任务重置为 pending，供人工重放。
 func (r *JobRepository) RequeueRun(ctx context.Context, runID uuid.UUID, now time.Time) error {
 	if runID == uuid.Nil {
@@ -160,6 +210,27 @@ func (r *JobRepository) RequeueRun(ctx context.Context, runID uuid.UUID, now tim
 	}
 	dedupe := "run:" + runID.String()
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		// 人工重放同样受排队上限约束，避免通过 replay 绕过积压保护。
+		if r.maxPendingRunsPerUser > 0 {
+			var owner struct{ UserID *uuid.UUID }
+			if err := tx.Model(&jobModel{}).Select("user_id").Where("dedupe_key = ?", dedupe).Limit(1).Find(&owner).Error; err != nil {
+				return err
+			}
+			if owner.UserID != nil {
+				if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "run-pending:"+owner.UserID.String()).Error; err != nil {
+					return err
+				}
+				var pending int64
+				if err := tx.Model(&jobModel{}).
+					Where("user_id = ? AND job_type = ? AND status = ? AND dedupe_key <> ?", *owner.UserID, "agent.run", "pending", dedupe).
+					Count(&pending).Error; err != nil {
+					return err
+				}
+				if pending >= int64(r.maxPendingRunsPerUser) {
+					return fmt.Errorf("%w: too many pending runs for user", biz.ErrQueueSaturated)
+				}
+			}
+		}
 		result := tx.Model(&jobModel{}).
 			Where("dedupe_key = ? AND status IN ?", dedupe, []string{"failed", "dead"}).
 			Updates(map[string]any{
@@ -590,15 +661,26 @@ type JobQueueStat struct {
 func (r *JobRepository) StatsByLane(ctx context.Context) ([]JobQueueStat, error) {
 	var stats []JobQueueStat
 	err := WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
+		// pending 只统计可立即执行的任务：审批等待、会话串行与舱壁退回的任务 available_at 在将来，
+		// 计入队列深度会让 HPA 为当下不可执行的任务扩容。
+		// 与 ClaimLane 保持一致：dead 但 Run 仍活跃的任务可被重新认领，必须计入待执行深度，
+		// 否则恢复场景下池已打满而 HPA 看不到积压。
 		return tx.Raw(`
-SELECT lane,
-  count(*) FILTER (WHERE status = 'pending') AS pending,
-  count(*) FILTER (WHERE status = 'running') AS running,
-  min(available_at) FILTER (WHERE status = 'pending') AS oldest_available_at
-FROM jobs
-WHERE status IN ('pending', 'running')
-GROUP BY lane
-ORDER BY lane`).Scan(&stats).Error
+SELECT j.lane,
+  count(*) FILTER (
+    WHERE (j.status = 'pending' AND j.available_at <= now())
+       OR (j.status = 'dead' AND j.dedupe_key LIKE 'run:%' AND EXISTS (
+            SELECT 1 FROM agent_runs AS ar
+            WHERE ar.user_id = j.user_id
+              AND j.dedupe_key = 'run:' || ar.id::text
+              AND ar.status IN ('queued', 'running', 'waiting_approval')))
+  ) AS pending,
+  count(*) FILTER (WHERE j.status = 'running') AS running,
+  min(j.available_at) FILTER (WHERE j.status = 'pending' AND j.available_at <= now()) AS oldest_available_at
+FROM jobs AS j
+WHERE j.status IN ('pending', 'running', 'dead')
+GROUP BY j.lane
+ORDER BY j.lane`).Scan(&stats).Error
 	})
 	if err != nil {
 		return nil, catalogError("job queue stats", err)

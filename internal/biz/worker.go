@@ -60,6 +60,28 @@ const (
 	attachmentInjectUserTurns = 3
 )
 
+// jobReleaseTimeout 是停机退队与 Run 租约释放的独立超时；
+// 这些写操作必须脱离取消信号，但也不能在 DB 抖动时无限拖长停机。
+const jobReleaseTimeout = 5 * time.Second
+
+// shutdownSettleTimeout 是停机阶段终态写入的上限，避免尾段写拖过 Pod grace。
+const shutdownSettleTimeout = 10 * time.Second
+
+// detachedWriteContext 让写操作脱离取消信号，但保留调用方设置的截止时间。
+// 停机场景传入带超时的上下文即可给落库写一个明确上限；普通执行路径没有截止时间，行为不变。
+func detachedWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(detached, deadline)
+	}
+	return context.WithCancel(detached)
+}
+
+// releaseWriteContext 是退队写的专用上下文：脱离取消并附加独立的短超时。
+func releaseWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), jobReleaseTimeout)
+}
+
 // compactToolResults 压缩较早且过长的工具结果，保留首尾关键片段。
 // 只作用于最近若干条之前的历史，确保当前步骤的完整观测不被削弱。
 func compactToolResults(messages []react.Message, keepRecent int) []react.Message {
@@ -416,6 +438,10 @@ func (w *ExecutionWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		// 停机排空阶段不再认领新任务，让在途 Run 在终止宽限期内自然收敛。
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -468,13 +494,15 @@ func (w *ExecutionWorker) ProcessOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// limiterKeys 返回池级并发槽位键；不同资源池使用独立键，避免跨池共享同一配额。
+// limiterKeys 返回并发槽位键：全局配额按池隔离，用户配额跨池共享。
 func (w *ExecutionWorker) limiterKeys(userID uuid.UUID) (string, string) {
-	if w.config.PoolName == "" || w.config.PoolName == "default" {
-		return "global", "user:" + userID.String()
+	globalKey := "global"
+	if w.config.PoolName != "" && w.config.PoolName != "default" {
+		globalKey = "pool:" + w.config.PoolName + ":global"
 	}
-	prefix := "pool:" + w.config.PoolName + ":"
-	return prefix + "global", prefix + "user:" + userID.String()
+	// per_user_concurrency 的语义是“单用户 Run 并发上限”：按池拆分后仍须跨池共享，
+	// 否则用户的实际上限会被放大为各池之和。
+	return globalKey, "user:" + userID.String()
 }
 
 // tryAcquire 尝试获取舱壁槽位；Redis 故障时降级放行，避免缓存故障阻断全部执行。
@@ -695,6 +723,34 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 	}
 
 	if executionErr != nil {
+		// 进程停机导致的中断不是执行失败：不写失败终态、不消耗执行次数，把任务原样退回队列。
+		// 放在状态机分支之前，避免停机时被误判为流式失败而对用户可见。
+		if ctx.Err() != nil {
+			releaseCtx := context.WithoutCancel(ctx)
+			// 已推送流式增量的 Run 不能自动重试：重跑会产生重复内容，沿用原有的中断收敛。
+			if streamed {
+				failureClass = "streamed_shutdown"
+				settleCtx, cancel := context.WithTimeout(releaseCtx, shutdownSettleTimeout)
+				w.settleRunJob(settleCtx, job, run, fence, RunJobSettlement{
+					Status: RunFailed, Code: "execution_aborted", Message: "服务重启导致流式执行中断，请重试",
+				})
+				cancel()
+				return
+			}
+			w.logger.Info("worker shutting down; release run job", "job_id", job.ID, "run_id", run.ID)
+			// 先释放 Run 租约再释放 Job：若顺序相反，其他副本可能在两次写之间认领到
+			// 仍被旧租约占用的 Run，从而触发 30s 的退避等待。
+			if releaser, ok := w.runs.(RunLeaseReleaser); ok {
+				leaseCtx, cancel := context.WithTimeout(releaseCtx, jobReleaseTimeout)
+				err := releaser.ReleaseRunLease(leaseCtx, run.UserID, run.ID, fence, w.clock())
+				cancel()
+				if err != nil {
+					w.logger.Warn("release run lease failed", "run_id", run.ID, "error", err)
+				}
+			}
+			w.releaseJob(releaseCtx, job, w.config.PollInterval, "worker shutting down")
+			return
+		}
 		// 计划暂停：把 Run 退回队列并释放任务等待人工恢复，不写失败终态。
 		// 暂停轮询间隔必须显著大于审批轮询，避免用户长时间暂停时持续重建上下文。
 		if errors.Is(executionErr, ErrPlanPaused) || errors.Is(executionErr, ErrPlanRevisionConflict) {
@@ -770,7 +826,8 @@ func (w *ExecutionWorker) handle(ctx context.Context, job Job) {
 
 // settleRunJob 提交 Run 状态与事件。失败时保留原结论，下次认领仅重试收敛。
 func (w *ExecutionWorker) settleRunJob(ctx context.Context, job Job, run Run, fence RunFence, settlement RunJobSettlement) {
-	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := detachedWriteContext(ctx)
+	defer cancel()
 	var err error
 	switch settlement.Status {
 	case RunCompleted:
@@ -2689,7 +2746,9 @@ func (w *ExecutionWorker) retryJob(ctx context.Context, job Job, retryAt time.Ti
 		w.deferRunSettlement(ctx, job, nil, retryAt.Sub(w.clock()))
 		return
 	}
-	if err := w.jobs.Fail(context.WithoutCancel(ctx), job.ID, w.config.WorkerID, job.FencingToken, retryAt, reason, w.clock()); err != nil {
+	writeCtx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	if err := w.jobs.Fail(writeCtx, job.ID, w.config.WorkerID, job.FencingToken, retryAt, reason, w.clock()); err != nil {
 		w.logger.Error("release run job failed", "job_id", job.ID, "error", err)
 	}
 }
@@ -2697,7 +2756,9 @@ func (w *ExecutionWorker) retryJob(ctx context.Context, job Job, retryAt time.Ti
 // deferRunSettlement 在不消耗执行次数的前提下重试。若队列也不可写，保留原租约供后续接管。
 func (w *ExecutionWorker) deferRunSettlement(ctx context.Context, job Job, settlement *RunJobSettlement, delay time.Duration) {
 	now := w.clock()
-	if err := w.jobs.DeferRunSettlement(context.WithoutCancel(ctx), job, settlement, now.Add(delay), now); err != nil {
+	writeCtx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	if err := w.jobs.DeferRunSettlement(writeCtx, job, settlement, now.Add(delay), now); err != nil {
 		w.logger.Warn("defer run settlement failed", "job_id", job.ID, "error", err)
 	}
 }
@@ -3244,7 +3305,10 @@ func (w *ExecutionWorker) releaseJob(ctx context.Context, job Job, delay time.Du
 		return
 	}
 	retryAt := w.clock().Add(delay)
-	if err := w.jobs.Release(ctx, job.ID, w.config.WorkerID, job.FencingToken, retryAt, w.clock()); err != nil {
+	// 退队必须在上下文取消后仍能落库，同时保留独立超时，避免 DB 抖动把停机无限拖长。
+	releaseCtx, cancel := releaseWriteContext(ctx)
+	defer cancel()
+	if err := w.jobs.Release(releaseCtx, job.ID, w.config.WorkerID, job.FencingToken, retryAt, w.clock()); err != nil {
 		w.logger.Warn("release job failed", "job_id", job.ID, "reason", reason, "error", err)
 	}
 }

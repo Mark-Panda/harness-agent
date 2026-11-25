@@ -303,6 +303,9 @@ func (w *DeletionWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -339,6 +342,9 @@ func (w *DeletionWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 按资源类型执行清理，成功写完成事件，失败按预算退避。
 func (w *DeletionWorker) handle(ctx context.Context, request DeletionRequest) {
+	// 计入在途任务，停机排空会等待删除完成或超时后再取消。
+	finishJob := beginJob()
+	defer finishJob("deletion")
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	// 单次 panic 不得终止进程：记录堆栈后把请求退回重试，避免请求停留在租约里无人推进。

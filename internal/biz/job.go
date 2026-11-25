@@ -2,10 +2,15 @@ package biz
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/Mark-Panda/harness-agent/internal/platform/workerpool"
 	"github.com/google/uuid"
 )
+
+// ErrQueueSaturated 表示用户排队中的 Run 已达到上限，稍后重试即可，不应作为执行失败记录。
+var ErrQueueSaturated = errors.New("run queue is saturated")
 
 // JobWriteFence 标识允许提交任务结果的租约；数据层必须在写事务内复核，不能只依赖 Worker 前置检查。
 type JobWriteFence struct {
@@ -52,17 +57,18 @@ type Job struct {
 }
 
 // 资源池 lane 取值。agent.run 按 Agent 模式分池，后台与飞书任务使用独立池。
+// 常量定义收敛在 workerpool 包，避免配置校验与领域层各维护一份。
 const (
 	// JobLaneReact ReAct 执行池。
-	JobLaneReact = "react"
+	JobLaneReact = workerpool.LaneReact
 	// JobLanePlan Plan-and-Execute 执行池。
-	JobLanePlan = "plan"
+	JobLanePlan = workerpool.LanePlan
 	// JobLaneSupervisor Supervisor 执行池。
-	JobLaneSupervisor = "super"
+	JobLaneSupervisor = workerpool.LaneSupervisor
 	// JobLaneBackground 摘要、向量化、事实提取、技能提炼等后台任务池。
-	JobLaneBackground = "background"
+	JobLaneBackground = workerpool.LaneBackground
 	// JobLaneFeishu 飞书事件消费池。
-	JobLaneFeishu = "feishu"
+	JobLaneFeishu = workerpool.LaneFeishu
 )
 
 // RunLane 返回 Agent Run 对应的资源池；未知模式返回空串，由兼容任务兜底。
@@ -215,4 +221,10 @@ type RunLaneEnqueuer interface {
 // RunJobLookup lets an idempotent Create distinguish an existing job from a Run that still needs enqueue.
 type RunJobLookup interface {
 	HasRunJob(ctx context.Context, userID, runID uuid.UUID) (bool, error)
+}
+
+// RunBacklogLimiter 是可选能力：在创建 Run 之前预检用户的待执行队列是否还有容量。
+// 预检用于避免超限时留下失败 Run；入队事务内仍会再做一次严格校验。
+type RunBacklogLimiter interface {
+	HasRunCapacity(ctx context.Context, userID uuid.UUID) (bool, error)
 }

@@ -390,12 +390,20 @@ func (m *SummaryMaintenance) Start(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
 		}
-		m.RunOnce(ctx)
+		// 在途扫描计入排空，避免停机时截断批量维护。
+		func() {
+			finishJob := beginJob()
+			defer finishJob("summary_maintenance")
+			m.RunOnce(ctx)
+		}()
 		timer.Reset(m.config.Interval)
 	}
 }
@@ -578,6 +586,9 @@ func (w *SummaryWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return

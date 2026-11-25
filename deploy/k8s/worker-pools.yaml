@@ -3,7 +3,13 @@
 #   1. 镜像内已包含 /app/harness-worker（Dockerfile 已构建）；
 #   2. configs/config.yaml 中已配置 agent.worker.pools；
 #   3. 集群已安装 Prometheus Adapter，并将 harness_jobs_pending 暴露为带 lane 标签的 External 指标；
-#   4. Secret harness-runtime 注入数据库、Redis、JWT、凭证加密等环境变量。
+#      每个 API 副本都会导出同一份全库队列深度，聚合必须用 max 而不是 sum：
+#        max(harness_jobs_pending) by (lane)
+#   4. 单池有效副本上限 = ceil(pool.global_concurrency / pool.concurrency)，HPA maxReplicas 不应超过该值；
+#      超出部分抢不到池级全局舱壁槽位只会空转，需要更高并发时先调大 global_concurrency。
+#   5. agent.worker.drain_timeout（默认 90s）必须小于 terminationGracePeriodSeconds；
+#      停机时 Worker 会先排空在途任务，超时后释放 Job 与 Run 租约供其他副本立即接管。
+#   6. Secret harness-runtime 注入数据库、Redis、JWT、凭证加密等环境变量。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,7 +23,8 @@ spec:
     metadata:
       labels: {app: harness-worker, pool: react}
     spec:
-      terminationGracePeriodSeconds: 120
+      # drain 90s + 终态写入超时 10s + 退队 5s，留出进程退出余量。
+      terminationGracePeriodSeconds: 150
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -55,7 +62,8 @@ spec:
     kind: Deployment
     name: harness-worker-react
   minReplicas: 1
-  maxReplicas: 10
+  # 8 全局并发 / 单副本 4 并发 = 最多 2 个有效副本。
+  maxReplicas: 2
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300
@@ -121,7 +129,8 @@ spec:
     kind: Deployment
     name: harness-worker-plan
   minReplicas: 1
-  maxReplicas: 4
+  # 4 全局并发 / 单副本 2 并发 = 最多 2 个有效副本。
+  maxReplicas: 2
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 600
@@ -187,7 +196,8 @@ spec:
     kind: Deployment
     name: harness-worker-super
   minReplicas: 1
-  maxReplicas: 4
+  # 4 全局并发 / 单副本 2 并发 = 最多 2 个有效副本。
+  maxReplicas: 2
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 600
@@ -215,7 +225,8 @@ spec:
     metadata:
       labels: {app: harness-worker, component: background}
     spec:
-      terminationGracePeriodSeconds: 120
+      # drain 90s + 批次收尾写（DB 超时 30s）需完整落在 grace 内。
+      terminationGracePeriodSeconds: 150
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -281,7 +292,7 @@ spec:
     metadata:
       labels: {app: harness-worker, component: feishu}
     spec:
-      terminationGracePeriodSeconds: 120
+      terminationGracePeriodSeconds: 150
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -307,3 +318,81 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: harness-worker-deletion
+  labels: {app: harness-worker, component: deletion}
+spec:
+  # 删除/注销请求不在 jobs.lane 体系内，必须独立部署；API 角色不会消费。
+  replicas: 1
+  selector:
+    matchLabels: {app: harness-worker, component: deletion}
+  template:
+    metadata:
+      labels: {app: harness-worker, component: deletion}
+    spec:
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: worker
+          image: harness-agent:latest
+          command: ["/app/harness-worker"]
+          envFrom:
+            - secretRef: {name: harness-runtime}
+          env:
+            - {name: WORKER_ROLE, value: worker}
+            - {name: WORKER_COMPONENTS, value: deletion}
+          resources:
+            requests: {cpu: "100m", memory: "256Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# PodDisruptionBudget：节点排空/驱逐时至少保留一个副本，避免单个池整体中断。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: harness-worker-react
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: harness-worker, pool: react}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: harness-worker-plan
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: harness-worker, pool: plan}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: harness-worker-super
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: harness-worker, pool: super}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: harness-worker-background
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: harness-worker, component: background}

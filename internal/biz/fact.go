@@ -579,6 +579,9 @@ func (w *FactExtractionWorker) loop(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		if WorkerDraining() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -615,6 +618,9 @@ func (w *FactExtractionWorker) ProcessOne(ctx context.Context) (bool, error) {
 
 // handle 加载来源消息、提取事实并按策略写入，全程续约并在关键写入前检查 fencing 租约。
 func (w *FactExtractionWorker) handle(ctx context.Context, job Job) {
+	// 计入在途任务，停机排空会等待本批事实提取完成或超时后再取消。
+	finishJob := beginJob()
+	defer finishJob("fact_extract")
 	runCtx, lease := beginJobLease(ctx, w.jobs, job, w.config.WorkerID, w.config.Lease, w.config.Heartbeat, w.clock)
 	defer lease.stop()
 	logLeaseLost := func(err error) {

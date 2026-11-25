@@ -94,8 +94,9 @@ agent:
     role: ${WORKER_ROLE}
     # Worker 组件过滤（逗号分隔）：execution/background/feishu/deletion；为空启动全部。
     components: ${WORKER_COMPONENTS}
-    # 执行池过滤（逗号分隔）：仅启动指定 pools，供每个池独立 Deployment/HPA；为空启动全部。
-    pool_filter: ${WORKER_POOLS}
+    # 执行池过滤（逗号分隔）：仅启动指定 pools，供每个池独立 Deployment/HPA；* 表示全部池。
+    # 必须加引号：WORKER_POOLS=* 直接替换到未引用标量会让 YAML 把它解析成别名锚点。
+    pool_filter: "${WORKER_POOLS}"
     # 执行资源池：每个池只认领对应 lane 的 agent.run 任务，独立并发与租约。
     # 不配置时使用单池兼容模式，认领全部 agent.run 任务。
     pools:
@@ -130,6 +131,11 @@ agent:
     lease: 60s
     # 租约续约间隔，必须小于 lease。
     heartbeat: 20s
+    # 停机排空在途任务的最长时间；未配置时回退到 server.shutdown_timeout。
+    # 应小于 Pod 的 terminationGracePeriodSeconds，避免排空被 SIGKILL 截断。
+    drain_timeout: 90s
+    # 单用户排队中的 Run 上限，防止单个用户批量提交长期占用资源池；0 表示不限制。
+    max_pending_runs_per_user: 100
     # 取消状态轮询间隔。
     cancel_poll: 2s
     # 单次模型 HTTP 调用超时。
