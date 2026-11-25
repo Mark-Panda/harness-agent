@@ -426,7 +426,7 @@ func (e *DeletionExecutor) DeleteAccount(ctx context.Context, userID uuid.UUID) 
 			return err
 		}
 		// 用户业务表全部按 user_id 清理；审计相关表（audit_logs/outbox_events/deletion_requests）保留。
-		// 顺序必须满足外键依赖：先删 Run/历史计划/Binding 等引用方，再删 Session，最后删 Agent，
+		// 顺序必须满足外键依赖：先删 Run/Binding 等引用方，再删 Session，最后删 Agent，
 		// 否则 agent_runs、sessions、binding 仍引用 agents 时会触发外键拒绝。
 		statements := []string{
 			"DELETE FROM jobs WHERE user_id = ?",
@@ -435,10 +435,6 @@ func (e *DeletionExecutor) DeleteAccount(ctx context.Context, userID uuid.UUID) 
 			"DELETE FROM model_calls WHERE user_id = ?",
 			"DELETE FROM execution_steps WHERE user_id = ?",
 			"DELETE FROM run_events WHERE user_id = ?",
-			// 历史 Plan/Supervisor 表已不再写入，但可能仍存有旧用户数据，账号删除必须一并清理。
-			"DELETE FROM supervisor_tasks WHERE user_id = ?",
-			"DELETE FROM plan_steps WHERE user_id = ?",
-			"DELETE FROM plans WHERE user_id = ?",
 			"DELETE FROM feishu_outbound_messages WHERE user_id = ?",
 			"DELETE FROM external_conversation_bindings WHERE user_id = ?",
 			"DELETE FROM feishu_group_messages WHERE sender_user_id = ?",
