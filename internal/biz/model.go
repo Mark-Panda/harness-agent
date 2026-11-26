@@ -40,6 +40,10 @@ type ModelCapabilities struct {
 	Tools bool `json:"tools"`
 	// StructuredOutput 是否支持结构化 JSON 输出。
 	StructuredOutput bool `json:"structured_output"`
+	// DisableThinking 是否在请求中关闭供应商思考模式。
+	// DeepSeek 等思考模型在携带 tools 时要求回传历史 reasoning_content；
+	// 当前实现不持久化推理内容，因此对这类模型必须显式关闭思考模式。
+	DisableThinking bool `json:"disable_thinking"`
 }
 
 // Model 是某个供应商下的具体部署，保存上下文窗口、能力、价格与核验信息。

@@ -48,6 +48,8 @@ type PlatformService struct {
 	FeishuBotBindings *biz.FeishuBotBindingService
 	// UserSkills 当前用户私有技能（含每日对话自动提炼）的管理用例。
 	UserSkills *biz.UserSkillService
+	// BuiltinTools 平台内置工具目录及启用状态，供前端选择 Agent 绑定。
+	BuiltinTools []BuiltinTool
 }
 
 // WithFeishuBots 附加飞书机器人注册与助手绑定能力。

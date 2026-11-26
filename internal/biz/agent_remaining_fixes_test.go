@@ -53,6 +53,8 @@ func TestRestrictSharedGroupToolsKeepsOnlyLowRisk(t *testing.T) {
 		sharedGroupTestTool{name: "search", risk: "low"},
 		sharedGroupTestTool{name: "shell", risk: "high"},
 		sharedGroupTestTool{name: "write_file", risk: "medium"},
+		// 低风险内置工具同样不能在共享群聊暴露：它会直接读取宿主文件。
+		approvalBoundTestTool{Tool: sharedGroupTestTool{name: builtinToolReadFile, risk: "low"}, target: builtinToolIdentity(builtinToolReadFile)},
 	}}
 	filtered := restrictSharedGroupTools(registry)
 	if filtered == nil {
@@ -61,9 +63,9 @@ func TestRestrictSharedGroupToolsKeepsOnlyLowRisk(t *testing.T) {
 	if _, ok := filtered.Lookup("search"); !ok {
 		t.Fatal("low risk tool is missing")
 	}
-	for _, name := range []string{"shell", "write_file"} {
+	for _, name := range []string{"shell", "write_file", builtinToolReadFile} {
 		if _, ok := filtered.Lookup(name); ok {
-			t.Fatalf("non-low risk tool %q must not be exposed", name)
+			t.Fatalf("non-exposable tool %q must not be exposed", name)
 		}
 	}
 	if len(filtered.List()) != 1 {

@@ -8,6 +8,7 @@ import (
 	"github.com/Mark-Panda/harness-agent/pkg/agent/react"
 	"github.com/Mark-Panda/harness-agent/pkg/feishu"
 	"github.com/Mark-Panda/harness-agent/pkg/logging"
+	"github.com/Mark-Panda/harness-agent/pkg/mcp"
 	"github.com/google/uuid"
 )
 
@@ -33,6 +34,10 @@ type lowRiskOnlyRegistry struct {
 func (r lowRiskOnlyRegistry) Lookup(name string) (react.Tool, bool) {
 	tool, ok := r.inner.Lookup(name)
 	if !ok || tool.RiskLevel() != "low" {
+		return nil, false
+	}
+	// 内置工具直接操作宿主文件、执行命令或发起外发请求，共享群聊没有审批责任人，一律不暴露。
+	if _, isBuiltin := builtinToolName(mcp.IdentityOf(tool)); isBuiltin {
 		return nil, false
 	}
 	return tool, true

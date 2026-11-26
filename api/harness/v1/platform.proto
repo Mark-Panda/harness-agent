@@ -94,6 +94,8 @@ message ModelCapabilities {
   bool tools = 2;
   // structured_output 是否支持结构化 JSON 输出。
   bool structured_output = 3;
+  // disable_thinking 是否在请求中关闭供应商思考模式。
+  bool disable_thinking = 4;
 }
 
 // Model 是供应商下具体模型部署的对外视图。
@@ -333,6 +335,8 @@ message Agent {
   google.protobuf.Timestamp updated_at = 14;
   // user_skill_ids 绑定的用户级技能列表。
   repeated string user_skill_ids = 15;
+  // builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+  repeated string builtin_tools = 16;
 }
 
 // CreateAgentRequest 是创建 Agent 草稿的入参。
@@ -353,6 +357,8 @@ message CreateAgentRequest {
   repeated string mcp_ids = 7;
   // user_skill_ids 绑定的用户级技能列表。
   repeated string user_skill_ids = 8;
+  // builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+  repeated string builtin_tools = 9;
 }
 
 // UpdateAgentRequest 是更新 Agent 草稿的入参；名称与版本由服务端保持。
@@ -377,6 +383,11 @@ message UpdateAgentRequest {
   repeated string user_skill_optouts = 9;
   // updated_at 读取草稿时的时间戳，用于乐观并发校验；为空时不校验。
   google.protobuf.Timestamp updated_at = 10;
+  // builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+  repeated string builtin_tools = 11;
+  // replace_builtin_tools 是否用 builtin_tools 全量替换现有绑定。
+  // 为 false 时保留现有绑定，避免未携带该字段的更新意外放宽工具权限。
+  optional bool replace_builtin_tools = 12;
 }
 
 // GetAgentRequest 是读取 Agent 的入参。

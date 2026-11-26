@@ -80,6 +80,8 @@ type ModelRef struct {
 	Tools bool
 	// StructuredOutput 是否要求结构化输出能力。
 	StructuredOutput bool
+	// DisableThinking 是否在请求体关闭供应商思考模式，用于不支持回传推理内容的工具循环。
+	DisableThinking bool
 }
 
 // ChatToolCall 是协议层的工具调用表示。
@@ -344,6 +346,11 @@ func (c *Client) doChat(ctx context.Context, request ChatRequest, onDelta func(s
 		"messages":    request.Messages,
 		"max_tokens":  outputBudget,
 		"temperature": request.Temperature,
+	}
+	// 思考模型携带 tools 时必须回传历史 reasoning_content；本系统不持久化推理内容，
+	// 因此对声明了该能力的模型显式关闭思考模式，避免工具循环第二次调用被供应商拒绝。
+	if request.Model.DisableThinking {
+		body["thinking"] = map[string]any{"type": "disabled"}
 	}
 	if len(request.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(request.Tools))

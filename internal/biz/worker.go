@@ -121,6 +121,8 @@ type WorkerConfig struct {
 	RequireSandboxForHighRisk bool
 	// SkillExecution 标准技能包脚本执行护栏；生产环境必须保持关闭。
 	SkillExecution SkillExecutionConfig
+	// BuiltinTools 内置 shell/HTTP 工具的启用与执行护栏。
+	BuiltinTools BuiltinToolConfig
 	// ReactMaxSteps 单次 ReAct Run 允许的最大模型步数，默认 12。
 	ReactMaxSteps int
 	// RunDeadline 单次 Run 的总时长上限，默认 5 分钟。
@@ -292,6 +294,7 @@ type ExecutionWorker struct {
 	attachments      AttachmentTextReader
 	skillBundles     SkillBundleReader
 	skillExecSem     chan struct{}
+	builtinExecSem   chan struct{}
 	factTrigger      FactTrigger
 	mcps             MCPCredentialRepository
 	mcpClient        func(endpoint string, authHeaders http.Header, timeout time.Duration, allowPrivate bool) (*mcp.Client, error)
@@ -343,10 +346,11 @@ func NewExecutionWorker(dependencies ExecutionWorkerDependencies, config WorkerC
 		summaries: dependencies.Summaries, summary: dependencies.SummaryTrigger,
 		memory: dependencies.Memory, memoryTrigger: dependencies.MemoryTrigger,
 		facts: dependencies.Facts, factTrigger: dependencies.FactTrigger,
-		attachments:   dependencies.Attachments,
-		skillBundles:  dependencies.SkillBundles,
-		skillExecSem:  make(chan struct{}, maxSkillConcurrentScripts),
-		globalLimiter: dependencies.GlobalLimiter, userLimiter: dependencies.UserLimiter,
+		attachments:    dependencies.Attachments,
+		skillBundles:   dependencies.SkillBundles,
+		skillExecSem:   make(chan struct{}, maxSkillConcurrentScripts),
+		builtinExecSem: make(chan struct{}, maxBuiltinConcurrentShells),
+		globalLimiter:  dependencies.GlobalLimiter, userLimiter: dependencies.UserLimiter,
 		health: dependencies.Health, config: config.normalize(), clock: clock, logger: logger,
 	}, nil
 }
@@ -1369,6 +1373,7 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 	ctx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
 	ctx = context.WithValue(ctx, runToolFenceContextKey{}, fence)
+	ctx = withRunToolIdentity(ctx, run)
 	if run.Mode == AgentModeReact && run.AttemptNo > 0 {
 		if err := w.recoverInterruptedReactTools(ctx, run); err != nil {
 			return react.Result{}, false, err
@@ -1384,10 +1389,8 @@ func (w *ExecutionWorker) execute(ctx context.Context, run Run, fence RunFence) 
 		return react.Result{}, false, err
 	}
 	defer cleanupSkills()
-	if skillTools != nil {
-		// 内置技能工具优先于外部 MCP 工具，避免同名工具被外部实现覆盖。
-		tools = combineToolRegistries(skillTools, tools)
-	}
+	// 内置工具优先级最高：同名外部工具不得覆盖平台能力；随后是技能工具与 MCP。
+	tools = combineToolRegistries(w.prepareBuiltinTools(run), skillTools, tools)
 	if isFeishuSharedGroup(run) {
 		// 共享群聊的工具面必须在审批与执行前收窄，避免高风险工具被群内任意成员触发。
 		tools = restrictSharedGroupTools(tools)
@@ -2224,6 +2227,7 @@ func (w *ExecutionWorker) buildCandidates(ctx context.Context, run Run) ([]model
 				RemoteModelName: candidate.RemoteModelName, ContextWindowTokens: candidate.ContextWindowTokens,
 				MaxOutputTokens: candidate.MaxOutputTokens, Tools: candidate.Capabilities.Tools,
 				StructuredOutput: candidate.Capabilities.StructuredOutput,
+				DisableThinking:  candidate.Capabilities.DisableThinking,
 			},
 			BaseURL: baseURL, APIKey: apiKey,
 			InputPricePerMillion: candidate.InputPricePerMillion, OutputPricePerMillion: candidate.OutputPricePerMillion,
@@ -2531,6 +2535,8 @@ func failureDetails(err error) (string, string) {
 		return "unparsed_tool_call", "模型把工具调用写进了正文，通常表示本轮没有下发可用工具或上游网关不支持原生工具调用"
 	case errors.Is(err, ErrMCPToolsUnavailable):
 		return "mcp_tools_unavailable", "本轮 MCP 工具不可用（可能被限流、鉴权失败或网络异常），请稍后重试或检查 MCP 服务状态"
+	case errors.Is(err, ErrBuiltinIdentityMissing):
+		return "builtin_identity_missing", "内置工具缺少运行身份，已拒绝执行"
 	case errors.Is(err, react.ErrContentFiltered):
 		return "content_filtered", "模型输出被内容审核拦截"
 	case errors.Is(err, react.ErrStepLimit):
@@ -3147,7 +3153,8 @@ func (w *ExecutionWorker) executeApprovedTool(ctx context.Context, run Run, fenc
 		}
 		return w.deliverApprovalResult(ctx, run, fence, finished)
 	}
-	toolContext, cancel := context.WithTimeout(ctx, w.config.MCPTimeout)
+	toolTimeout := w.toolExecutionTimeout(tool, claimed.Arguments)
+	toolContext, cancel := context.WithTimeout(ctx, toolTimeout)
 	toolContext = mcp.WithIdempotencyKey(toolContext, claimed.IdempotencyKey)
 	risk := tool.RiskLevel()
 	if claimed.RiskLevel == "critical" || !requiresSandbox(risk) && requiresSandbox(claimed.RiskLevel) {
@@ -3155,14 +3162,22 @@ func (w *ExecutionWorker) executeApprovedTool(ctx context.Context, run Run, fenc
 	}
 	var output json.RawMessage
 	var invokeErr error
-	if w.config.RequireSandboxForHighRisk && requiresSandbox(risk) {
-		output, invokeErr = w.invokeSandboxTool(toolContext, sandbox.Request{
-			MCP: &sandbox.MCPTarget{
+	builtinName, isBuiltin := builtinToolName(claimed.MCPBinding)
+	if w.config.RequireSandboxForHighRisk && (requiresSandbox(risk) || isBuiltin) {
+		request := sandbox.Request{RiskLevel: risk, Arguments: claimed.Arguments, TimeoutMS: toolTimeout.Milliseconds()}
+		if isBuiltin {
+			// 内置工具以工具名转发给 Runner；审批目标不是 MCP 服务，不能走 /execute/mcp。
+			// 同时携带用户与 Run 维度，Runner 据此隔离工作区，避免跨用户共享文件。
+			request.Tool = builtinName
+			request.UserID = &run.UserID
+			request.RunID = &run.ID
+		} else {
+			request.MCP = &sandbox.MCPTarget{
 				UserID: run.UserID, ServerID: claimed.MCPBinding.ServerID, OriginalName: claimed.MCPBinding.OriginalName,
 				EndpointFingerprint: claimed.MCPBinding.EndpointFingerprint,
-			},
-			RiskLevel: risk, Arguments: claimed.Arguments,
-		})
+			}
+		}
+		output, invokeErr = w.invokeSandboxTool(toolContext, request)
 	} else {
 		output, invokeErr = w.invokeTool(toolContext, tool, claimed.Arguments)
 	}
@@ -3463,22 +3478,81 @@ func requiresSandbox(riskLevel string) bool {
 	return riskLevel == "high" || riskLevel == "critical"
 }
 
-// invokeTool 按风险等级选择执行路径；开启强制沙箱后高风险工具只允许 Sandbox Runner 执行。
+// invokeTool 按风险等级选择执行路径；开启强制沙箱后高风险与全部内置工具只允许 Sandbox Runner 执行。
 // 关键约束：Sandbox 不可用或未配置时必须失败关闭，绝不回退到进程内执行。
 func (w *ExecutionWorker) invokeTool(ctx context.Context, tool react.Tool, arguments json.RawMessage) (json.RawMessage, error) {
-	if w.config.RequireSandboxForHighRisk && requiresSandbox(tool.RiskLevel()) {
-		return w.invokeSandboxTool(ctx, sandbox.Request{
+	if w.config.RequireSandboxForHighRisk && w.requiresSandboxTool(tool) {
+		request := sandbox.Request{
 			Tool: tool.Spec().Name, Arguments: arguments, RiskLevel: tool.RiskLevel(),
-		})
+			// 内置工具使用各自配置的超时，避免被 MCPTimeout 截断或放大。
+			TimeoutMS: w.toolExecutionTimeout(tool, arguments).Milliseconds(),
+		}
+		if _, isBuiltin := builtinToolName(mcp.IdentityOf(tool)); isBuiltin {
+			identity, ok := ctx.Value(runToolIdentityContextKey{}).(runToolIdentity)
+			if !ok || identity.UserID == uuid.Nil {
+				return nil, ErrBuiltinIdentityMissing
+			}
+			// 内置工具必须携带用户与 Run 维度，Runner 才能隔离工作区并审计。
+			request.UserID = &identity.UserID
+			request.RunID = &identity.RunID
+		}
+		return w.invokeSandboxTool(ctx, request)
 	}
 	return normalizeToolOutcome(tool.Invoke(ctx, arguments))
+}
+
+// requiresSandboxTool 判断工具是否必须转发 Sandbox Runner。
+// 内置文件/检索工具即使风险等级为 low/medium 也必须走沙箱：
+// 生产环境不允许应用进程直接访问或修改宿主机文件。
+func (w *ExecutionWorker) requiresSandboxTool(tool react.Tool) bool {
+	if requiresSandbox(tool.RiskLevel()) {
+		return true
+	}
+	_, isBuiltin := builtinToolName(mcp.IdentityOf(tool))
+	return isBuiltin
+}
+
+// toolExecutionTimeout 计算单次工具执行超时：内置 shell/http 使用各自配置，
+// 并允许模型在参数中请求更短超时；其余工具沿用 MCPTimeout。
+func (w *ExecutionWorker) toolExecutionTimeout(tool react.Tool, arguments json.RawMessage) time.Duration {
+	timeout := w.config.MCPTimeout
+	if _, isBuiltin := builtinToolName(mcp.IdentityOf(tool)); isBuiltin {
+		switch tool.Spec().Name {
+		case builtinToolShell:
+			timeout = shorterRequestedTimeout(w.config.BuiltinTools.Shell.normalize().Timeout, arguments)
+		case builtinToolHTTP:
+			timeout = shorterRequestedTimeout(w.config.BuiltinTools.HTTP.normalize().Timeout, arguments)
+		}
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return timeout
+}
+
+// shorterRequestedTimeout 在模型要求更短超时时收窄服务端配置上限。
+func shorterRequestedTimeout(timeout time.Duration, arguments json.RawMessage) time.Duration {
+	var request struct {
+		TimeoutSeconds int `json:"timeout_seconds"`
+	}
+	if len(arguments) == 0 || json.Unmarshal(arguments, &request) != nil || request.TimeoutSeconds <= 0 {
+		return timeout
+	}
+	requested := time.Duration(request.TimeoutSeconds) * time.Second
+	if requested < timeout {
+		return requested
+	}
+	return timeout
 }
 
 func (w *ExecutionWorker) invokeSandboxTool(ctx context.Context, request sandbox.Request) (json.RawMessage, error) {
 	if w.sandbox == nil {
 		return nil, ErrSandboxRequired
 	}
-	request.TimeoutMS = w.config.MCPTimeout.Milliseconds()
+	if request.TimeoutMS <= 0 {
+		// 未显式指定时沿用 MCPTimeout，保证旧调用路径仍有有界超时。
+		request.TimeoutMS = w.config.MCPTimeout.Milliseconds()
+	}
 	response, err := w.sandbox.Execute(ctx, request)
 	if err != nil {
 		return normalizeToolOutcome(nil, err)
@@ -3504,6 +3578,19 @@ func normalizeToolOutcome(output json.RawMessage, err error) (json.RawMessage, e
 type parentStepContextKey struct{}
 
 type runToolFenceContextKey struct{}
+
+// runToolIdentity 是内置工具沙箱调用所需的用户与 Run 维度。
+type runToolIdentity struct {
+	UserID uuid.UUID
+	RunID  uuid.UUID
+}
+
+type runToolIdentityContextKey struct{}
+
+// withRunToolIdentity 把内置工具的用户与 Run 维度写入上下文。
+func withRunToolIdentity(ctx context.Context, run Run) context.Context {
+	return context.WithValue(ctx, runToolIdentityContextKey{}, runToolIdentity{UserID: run.UserID, RunID: run.ID})
+}
 
 // withParentStep 把父步骤写入上下文，供执行步骤落库时建立父子关系。
 func withParentStep(ctx context.Context, parentID uuid.UUID) context.Context {

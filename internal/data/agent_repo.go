@@ -35,6 +35,8 @@ type agentModel struct {
 	Version int
 	// ConfigSnapshot 发布时固化的配置快照 JSON。
 	ConfigSnapshot datatypes.JSON
+	// BuiltinTools Agent 绑定的内置工具名称；NULL 表示继承平台配置。
+	BuiltinTools datatypes.JSON
 	// Status 生命周期：draft/published/disabled。
 	Status string
 	// CreatedAt 创建时间。
@@ -223,7 +225,8 @@ func (r *AgentRepository) UpdateAgent(ctx context.Context, agent biz.Agent, even
 		result := query.Updates(map[string]any{
 			"description": record.Description, "mode": record.Mode, "model_policy_id": record.ModelPolicyID,
 			"model_policy_version": record.ModelPolicyVersion, "config_snapshot": record.ConfigSnapshot,
-			"status": record.Status, "updated_at": time.Now().UTC(),
+			"builtin_tools": record.BuiltinTools,
+			"status":        record.Status, "updated_at": time.Now().UTC(),
 		})
 		if result.Error != nil {
 			return result.Error
@@ -901,6 +904,14 @@ func fromBizAgent(agent biz.Agent) (agentModel, []agentSkillModel, []agentUserSk
 	if err != nil {
 		return agentModel{}, nil, nil, nil, err
 	}
+	var builtinTools datatypes.JSON
+	if agent.BuiltinTools != nil {
+		encoded, err := json.Marshal(agent.BuiltinTools)
+		if err != nil {
+			return agentModel{}, nil, nil, nil, err
+		}
+		builtinTools = datatypes.JSON(encoded)
+	}
 	skills := make([]agentSkillModel, 0, len(agent.SkillIDs))
 	for _, skillID := range agent.SkillIDs {
 		skills = append(skills, agentSkillModel{AgentID: agent.ID, SkillID: skillID, UserID: agent.UserID, Config: datatypes.JSON([]byte("{}"))})
@@ -917,7 +928,7 @@ func fromBizAgent(agent biz.Agent) (agentModel, []agentSkillModel, []agentUserSk
 	return agentModel{
 		ID: agent.ID, UserID: agent.UserID, Name: agent.Name, Description: agent.Description, Mode: string(agent.Mode),
 		ModelPolicyID: agent.ModelPolicyID, ModelPolicyVersion: agent.ModelPolicyVersion, Version: agent.Version,
-		ConfigSnapshot: datatypes.JSON(snapshot), Status: string(agent.Status),
+		ConfigSnapshot: datatypes.JSON(snapshot), BuiltinTools: builtinTools, Status: string(agent.Status),
 	}, skills, userSkills, mcps, nil
 }
 
@@ -1069,11 +1080,17 @@ func toBizAgent(record agentModel, skillIDs, userSkillIDs, mcpIDs []uuid.UUID) (
 	if err := json.Unmarshal(record.ConfigSnapshot, &snapshot); err != nil {
 		return biz.Agent{}, err
 	}
+	var builtinTools []string
+	if len(record.BuiltinTools) > 0 {
+		if err := json.Unmarshal(record.BuiltinTools, &builtinTools); err != nil {
+			return biz.Agent{}, err
+		}
+	}
 	return biz.Agent{
 		ID: record.ID, UserID: record.UserID, Name: record.Name, Description: record.Description, Mode: biz.AgentMode(record.Mode),
 		ModelPolicyID: record.ModelPolicyID, ModelPolicyVersion: record.ModelPolicyVersion, Version: record.Version,
-		ConfigSnapshot: snapshot, SkillIDs: skillIDs, UserSkillIDs: userSkillIDs, MCPIDs: mcpIDs, Status: biz.AgentStatus(record.Status),
-		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+		ConfigSnapshot: snapshot, SkillIDs: skillIDs, UserSkillIDs: userSkillIDs, MCPIDs: mcpIDs, BuiltinTools: builtinTools,
+		Status: biz.AgentStatus(record.Status), CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}, nil
 }
 

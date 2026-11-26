@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -141,6 +142,65 @@ type AgentConfig struct {
 	Memory           MemoryConfig           `yaml:"memory"`
 	Sandbox          SandboxConfig          `yaml:"sandbox"`
 	Skills           SkillExecutionConfig   `yaml:"skills"`
+	Tools            BuiltinToolsConfig     `yaml:"tools"`
+}
+
+// BuiltinToolsConfig 配置平台内置的 shell 与 HTTP 工具；默认关闭。
+type BuiltinToolsConfig struct {
+	// Shell shell_exec 工具配置。
+	Shell BuiltinShellConfig `yaml:"shell"`
+	// HTTP http_request 工具配置。
+	HTTP BuiltinHTTPConfig `yaml:"http"`
+	// Files 文件操作与代码检索工具配置。
+	Files BuiltinFilesConfig `yaml:"files"`
+}
+
+// BuiltinFilesConfig 配置文件操作与代码检索工具的本机执行护栏。
+type BuiltinFilesConfig struct {
+	// Enabled 是否向模型暴露文件与检索工具。
+	Enabled bool `yaml:"enabled"`
+	// AllowLocalExecution 是否允许在本机进程访问文件；仅开发环境可开启。
+	AllowLocalExecution bool `yaml:"allow_local_execution"`
+	// Root 工具可访问的基础目录；运行时按用户 ID 派生子目录，为空时使用系统临时目录。
+	Root string `yaml:"root"`
+	// MaxReadBytes 单次读取的最大字节数，零值使用默认 256KB。
+	MaxReadBytes int `yaml:"max_read_bytes"`
+	// MaxWriteBytes 单次写入或编辑的最大字节数，零值使用默认 256KB。
+	MaxWriteBytes int `yaml:"max_write_bytes"`
+	// MaxResults 列表、匹配与搜索结果的最大条数，零值使用默认 200。
+	MaxResults int `yaml:"max_results"`
+}
+
+// BuiltinShellConfig 配置 shell_exec 的本机执行护栏。
+type BuiltinShellConfig struct {
+	// Enabled 是否向模型暴露 shell_exec。
+	Enabled bool `yaml:"enabled"`
+	// AllowLocalExecution 是否允许在本机进程执行命令；仅开发环境可开启。
+	AllowLocalExecution bool `yaml:"allow_local_execution"`
+	// AllowUnsafeLocalExecution 显式确认本机 Shell 共享服务进程用户与密钥环境，仅供可信单用户开发环境。
+	AllowUnsafeLocalExecution bool `yaml:"allow_unsafe_local_execution"`
+	// Timeout 单次命令执行超时，零值使用默认 30 秒。
+	Timeout Duration `yaml:"timeout"`
+	// MaxOutputBytes 单次输出截断上限，零值使用默认 64KB。
+	MaxOutputBytes int `yaml:"max_output_bytes"`
+	// WorkDir 命令工作目录的基础路径；运行时按用户 ID 派生子目录，为空时使用系统临时目录。
+	WorkDir string `yaml:"workdir"`
+	// ShellPath 指定 Shell 解释器；为空时优先 bash，其次 sh。
+	ShellPath string `yaml:"shell_path"`
+}
+
+// BuiltinHTTPConfig 配置 http_request 的本机执行护栏。
+type BuiltinHTTPConfig struct {
+	// Enabled 是否向模型暴露 http_request。
+	Enabled bool `yaml:"enabled"`
+	// AllowLocalExecution 是否允许在本机进程发起请求；仅开发环境可开启。
+	AllowLocalExecution bool `yaml:"allow_local_execution"`
+	// Timeout 单次请求超时，零值使用默认 30 秒。
+	Timeout Duration `yaml:"timeout"`
+	// MaxResponseBytes 响应正文保留上限，零值使用默认 1MB。
+	MaxResponseBytes int64 `yaml:"max_response_bytes"`
+	// MaxRedirects 最大重定向次数，零值使用默认 5。
+	MaxRedirects int `yaml:"max_redirects"`
 }
 
 // SkillExecutionConfig 配置标准技能包脚本的本机执行护栏。
@@ -681,6 +741,56 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.Skills.EnableLocalExecution && c.Agent.Skills.MaxOutputBytes < 0 {
 		return fmt.Errorf("agent.skills.max_output_bytes must not be negative")
+	}
+	// 内置 shell/HTTP 工具属于高风险能力：本机执行仅限开发环境；
+	// 非开发环境必须由强制 Sandbox Runner 承接，二者都没有时拒绝启动。
+	if tools := c.Agent.Tools; tools.Shell.Enabled {
+		if tools.Shell.AllowLocalExecution && !tools.Shell.AllowUnsafeLocalExecution {
+			return fmt.Errorf("agent.tools.shell.allow_local_execution requires allow_unsafe_local_execution")
+		}
+		if (tools.Shell.AllowLocalExecution || tools.Shell.AllowUnsafeLocalExecution) && c.Environment != "development" {
+			return fmt.Errorf("agent.tools.shell local execution is only allowed in development")
+		}
+		if !tools.Shell.AllowLocalExecution && !c.Agent.Sandbox.RequireForHighRisk {
+			return fmt.Errorf("agent.tools.shell requires local execution or an enforced sandbox runner")
+		}
+		if tools.Shell.Timeout.Duration <= 0 || tools.Shell.MaxOutputBytes <= 0 {
+			return fmt.Errorf("agent.tools.shell timeout and max_output_bytes must be positive")
+		}
+		// Sandbox 客户端自身有整体调用超时；工具超时超过它会被静默截断。
+		if !tools.Shell.AllowLocalExecution && c.Agent.Sandbox.RequireForHighRisk &&
+			c.Agent.Sandbox.Timeout.Duration > 0 && tools.Shell.Timeout.Duration > c.Agent.Sandbox.Timeout.Duration {
+			return fmt.Errorf("agent.tools.shell.timeout must not exceed agent.sandbox.timeout")
+		}
+	}
+	if tools := c.Agent.Tools; tools.HTTP.Enabled {
+		if tools.HTTP.AllowLocalExecution && c.Environment != "development" {
+			return fmt.Errorf("agent.tools.http.allow_local_execution is only allowed in development")
+		}
+		if !tools.HTTP.AllowLocalExecution && !c.Agent.Sandbox.RequireForHighRisk {
+			return fmt.Errorf("agent.tools.http requires local execution or an enforced sandbox runner")
+		}
+		if tools.HTTP.Timeout.Duration <= 0 || tools.HTTP.MaxResponseBytes <= 0 || tools.HTTP.MaxRedirects < 0 {
+			return fmt.Errorf("agent.tools.http timeout, max_response_bytes and max_redirects must be valid")
+		}
+		if !tools.HTTP.AllowLocalExecution && c.Agent.Sandbox.RequireForHighRisk &&
+			c.Agent.Sandbox.Timeout.Duration > 0 && tools.HTTP.Timeout.Duration > c.Agent.Sandbox.Timeout.Duration {
+			return fmt.Errorf("agent.tools.http.timeout must not exceed agent.sandbox.timeout")
+		}
+	}
+	if files := c.Agent.Tools.Files; files.Enabled {
+		if files.AllowLocalExecution && c.Environment != "development" {
+			return fmt.Errorf("agent.tools.files.allow_local_execution is only allowed in development")
+		}
+		if !files.AllowLocalExecution && !c.Agent.Sandbox.RequireForHighRisk {
+			return fmt.Errorf("agent.tools.files requires local execution or an enforced sandbox runner")
+		}
+		if files.MaxReadBytes <= 0 || files.MaxWriteBytes <= 0 || files.MaxResults <= 0 {
+			return fmt.Errorf("agent.tools.files read, write and result limits must be positive")
+		}
+		if strings.TrimSpace(files.Root) != "" && !filepath.IsAbs(files.Root) {
+			return fmt.Errorf("agent.tools.files.root must be an absolute path")
+		}
 	}
 	worker := c.Agent.Worker
 	if worker.Enabled {

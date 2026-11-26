@@ -61,6 +61,55 @@ func TestChatSuccessAndToolCalls(t *testing.T) {
 	}
 }
 
+// TestChatDisablesThinkingWhenConfigured 验证关闭思考模式的模型会在请求体带上 thinking 参数。
+func TestChatDisablesThinkingWhenConfigured(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		disableThinking bool
+		wantThinking    bool
+	}{
+		{name: "disabled", disableThinking: true, wantThinking: true},
+		{name: "default", disableThinking: false, wantThinking: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var received map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+					t.Fatal(err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"req-thinking","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, "secret-key", 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Chat(context.Background(), ChatRequest{
+				Model: ModelRef{
+					ProviderID: "p", ModelID: "m", RemoteModelName: "deepseek-flash",
+					ContextWindowTokens: 1_000_000, MaxOutputTokens: 1024, DisableThinking: testCase.disableThinking,
+				},
+				Messages:        []ChatMessage{{Role: "user", Content: "hello"}},
+				MaxOutputTokens: 1024,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			thinking, exists := received["thinking"]
+			if exists != testCase.wantThinking {
+				t.Fatalf("thinking field exists = %v, want %v (body=%v)", exists, testCase.wantThinking, received)
+			}
+			if exists {
+				payload, ok := thinking.(map[string]any)
+				if !ok || payload["type"] != "disabled" {
+					t.Fatalf("thinking payload = %#v", thinking)
+				}
+			}
+		})
+	}
+}
+
 // TestChatContextBudgetOverflow 验证窗口内预算溢出会被拒绝，避免供应商侧 400。
 func TestChatContextBudgetOverflow(t *testing.T) {
 	client, err := NewClient("https://models.example.com", "secret-key", time.Second)

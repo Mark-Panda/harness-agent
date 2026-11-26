@@ -342,6 +342,7 @@ func (s *platformGRPCServer) CreateAgent(ctx context.Context, request *harnessv1
 		Name: request.GetName(), Description: request.GetDescription(), Mode: biz.AgentMode(request.GetMode()),
 		ModelPolicyID: optionalUUID(request.ModelPolicyId), ModelPolicyVersion: optionalInt(request.ModelPolicyVersion),
 		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()), MCPIDs: parseUUIDList(request.GetMcpIds()),
+		BuiltinTools: request.GetBuiltinTools(),
 	})
 	if err != nil {
 		return nil, grpcError(err)
@@ -364,12 +365,21 @@ func (s *platformGRPCServer) UpdateAgent(ctx context.Context, request *harnessv1
 	if request.GetUpdatedAt() != nil {
 		updatedAt = request.GetUpdatedAt().AsTime()
 	}
+	currentBuiltinTools := []string(nil)
+	if !request.GetReplaceBuiltinTools() {
+		current, err := s.platform.Agents.Get(ctx, principal, agentID)
+		if err != nil {
+			return nil, grpcError(err)
+		}
+		currentBuiltinTools = current.BuiltinTools
+	}
 	agent, err := s.platform.Agents.Update(ctx, principal, biz.Agent{
 		ID: agentID, Description: request.GetDescription(), Mode: biz.AgentMode(request.GetMode()),
 		ModelPolicyID: optionalUUID(request.ModelPolicyId), ModelPolicyVersion: optionalInt(request.ModelPolicyVersion),
 		SkillIDs: parseUUIDList(request.GetSkillIds()), UserSkillIDs: parseUUIDList(request.GetUserSkillIds()),
 		UserSkillOptOuts: parseUUIDList(request.GetUserSkillOptouts()), MCPIDs: parseUUIDList(request.GetMcpIds()),
-		UpdatedAt: updatedAt,
+		UpdatedAt:    updatedAt,
+		BuiltinTools: resolveBuiltinToolsUpdate(request.GetReplaceBuiltinTools(), request.GetBuiltinTools(), currentBuiltinTools),
 	})
 	if err != nil {
 		return nil, grpcError(err)
@@ -697,7 +707,8 @@ func fromProtoModel(providerID, modelID, remoteName, kind string, contextTokens 
 	}
 	if capabilities != nil {
 		model.Capabilities = biz.ModelCapabilities{
-			Streaming: capabilities.GetStreaming(), Tools: capabilities.GetTools(), StructuredOutput: capabilities.GetStructuredOutput(),
+			Streaming: capabilities.GetStreaming(), Tools: capabilities.GetTools(),
+			StructuredOutput: capabilities.GetStructuredOutput(), DisableThinking: capabilities.GetDisableThinking(),
 		}
 	}
 	if verifiedAt != nil {
@@ -722,7 +733,8 @@ func toProtoModel(model biz.Model) *harnessv1.Model {
 		Id: model.ID.String(), ProviderId: model.ProviderID.String(), RemoteModelName: model.RemoteModelName,
 		Kind: string(model.Kind), ContextWindowTokens: model.ContextWindowTokens, MaxOutputTokens: clampInt32(model.MaxOutputTokens),
 		Capabilities: &harnessv1.ModelCapabilities{
-			Streaming: model.Capabilities.Streaming, Tools: model.Capabilities.Tools, StructuredOutput: model.Capabilities.StructuredOutput,
+			Streaming: model.Capabilities.Streaming, Tools: model.Capabilities.Tools,
+			StructuredOutput: model.Capabilities.StructuredOutput, DisableThinking: model.Capabilities.DisableThinking,
 		},
 		InputPricePerMillion: model.InputPricePerMillion, OutputPricePerMillion: model.OutputPricePerMillion,
 		DataRegion: model.DataRegion, VerificationSource: model.VerificationSource, Status: string(model.Status),
@@ -750,12 +762,25 @@ func toProtoPolicy(policy biz.ModelPolicy) *harnessv1.ModelPolicy {
 	return result
 }
 
+// resolveBuiltinToolsUpdate 明确 gRPC 更新语义：
+// 未声明替换时保留现有绑定；声明替换但未给名称时表示禁用全部。
+func resolveBuiltinToolsUpdate(replace bool, requested, current []string) []string {
+	if !replace {
+		return current
+	}
+	if requested == nil {
+		return []string{}
+	}
+	return requested
+}
+
 // toProtoAgent 转换 Agent 出参，包含发布快照。
 func toProtoAgent(agent biz.Agent) *harnessv1.Agent {
 	result := &harnessv1.Agent{
 		Id: agent.ID.String(), UserId: agent.UserID.String(), Name: agent.Name, Description: agent.Description,
 		Mode: string(agent.Mode), Version: clampInt32(agent.Version), ConfigSnapshot: toProtoStruct(agent.ConfigSnapshot),
-		SkillIds: uuidStrings(agent.SkillIDs), UserSkillIds: uuidStrings(agent.UserSkillIDs), McpIds: uuidStrings(agent.MCPIDs), Status: string(agent.Status),
+		SkillIds: uuidStrings(agent.SkillIDs), UserSkillIds: uuidStrings(agent.UserSkillIDs), McpIds: uuidStrings(agent.MCPIDs),
+		BuiltinTools: append([]string(nil), agent.BuiltinTools...), Status: string(agent.Status),
 		CreatedAt: timestamp(agent.CreatedAt), UpdatedAt: timestamp(agent.UpdatedAt),
 	}
 	if agent.ModelPolicyID != nil {

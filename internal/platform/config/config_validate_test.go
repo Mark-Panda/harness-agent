@@ -259,6 +259,57 @@ func TestValidate(t *testing.T) {
 		{name: "sandbox http with insecure allowed", mutate: func(c *Config) {
 			c.Agent.Sandbox = SandboxConfig{RequireForHighRisk: true, Endpoint: "http://sandbox.internal", Token: "tok", Timeout: dur(10 * time.Second), MaxResponseBytes: 1024, AllowInsecure: true}
 		}},
+		// 内置工具
+		{name: "builtin shell local in development", mutate: func(c *Config) {
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, AllowLocalExecution: true, AllowUnsafeLocalExecution: true, Timeout: dur(30 * time.Second), MaxOutputBytes: 65536}
+		}},
+		{name: "builtin shell local without unsafe ack", mutate: func(c *Config) {
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, AllowLocalExecution: true, Timeout: dur(30 * time.Second), MaxOutputBytes: 65536}
+		}, wantErr: "requires allow_unsafe_local_execution"},
+		{name: "builtin shell local outside development", mutate: func(c *Config) {
+			c.Environment = "staging"
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, AllowLocalExecution: true, AllowUnsafeLocalExecution: true, Timeout: dur(30 * time.Second), MaxOutputBytes: 65536}
+		}, wantErr: "agent.tools.shell local execution is only allowed in development"},
+		{name: "builtin shell without execution path", mutate: func(c *Config) {
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, Timeout: dur(30 * time.Second), MaxOutputBytes: 65536}
+		}, wantErr: "agent.tools.shell requires local execution or an enforced sandbox runner"},
+		{name: "builtin shell sandbox backed", mutate: func(c *Config) {
+			c.Agent.Sandbox = SandboxConfig{RequireForHighRisk: true, Endpoint: "https://sandbox.internal", Token: "tok", Timeout: dur(10 * time.Second), MaxResponseBytes: 1024}
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, Timeout: dur(10 * time.Second), MaxOutputBytes: 65536}
+		}},
+		{name: "builtin shell exceeds sandbox timeout", mutate: func(c *Config) {
+			c.Agent.Sandbox = SandboxConfig{RequireForHighRisk: true, Endpoint: "https://sandbox.internal", Token: "tok", Timeout: dur(10 * time.Second), MaxResponseBytes: 1024}
+			c.Agent.Tools.Shell = BuiltinShellConfig{Enabled: true, Timeout: dur(30 * time.Second), MaxOutputBytes: 65536}
+		}, wantErr: "agent.tools.shell.timeout must not exceed agent.sandbox.timeout"},
+		{name: "builtin http sandbox backed", mutate: func(c *Config) {
+			c.Agent.Sandbox = SandboxConfig{RequireForHighRisk: true, Endpoint: "https://sandbox.internal", Token: "tok", Timeout: dur(10 * time.Second), MaxResponseBytes: 1024}
+			c.Agent.Tools.HTTP = BuiltinHTTPConfig{Enabled: true, Timeout: dur(10 * time.Second), MaxResponseBytes: 1024}
+		}},
+		{name: "builtin http exceeds sandbox timeout", mutate: func(c *Config) {
+			c.Agent.Sandbox = SandboxConfig{RequireForHighRisk: true, Endpoint: "https://sandbox.internal", Token: "tok", Timeout: dur(10 * time.Second), MaxResponseBytes: 1024}
+			c.Agent.Tools.HTTP = BuiltinHTTPConfig{Enabled: true, Timeout: dur(30 * time.Second), MaxResponseBytes: 1024}
+		}, wantErr: "agent.tools.http.timeout must not exceed agent.sandbox.timeout"},
+		{name: "builtin http without execution path", mutate: func(c *Config) {
+			c.Agent.Tools.HTTP = BuiltinHTTPConfig{Enabled: true, Timeout: dur(30 * time.Second), MaxResponseBytes: 1024}
+		}, wantErr: "agent.tools.http requires local execution or an enforced sandbox runner"},
+		{name: "builtin http negative redirects", mutate: func(c *Config) {
+			c.Agent.Tools.HTTP = BuiltinHTTPConfig{Enabled: true, AllowLocalExecution: true, Timeout: dur(30 * time.Second), MaxResponseBytes: 1024, MaxRedirects: -1}
+		}, wantErr: "agent.tools.http timeout, max_response_bytes and max_redirects must be valid"},
+		{name: "builtin files local in development", mutate: func(c *Config) {
+			c.Agent.Tools.Files = BuiltinFilesConfig{Enabled: true, AllowLocalExecution: true, MaxReadBytes: 1024, MaxWriteBytes: 1024, MaxResults: 10}
+		}},
+		{name: "builtin files local outside development", mutate: func(c *Config) {
+			c.Environment = "staging"
+			c.Agent.Tools.Files = BuiltinFilesConfig{Enabled: true, AllowLocalExecution: true, MaxReadBytes: 1024, MaxWriteBytes: 1024, MaxResults: 10}
+		}, wantErr: "agent.tools.files.allow_local_execution is only allowed in development"},
+		{name: "builtin files without execution path", mutate: func(c *Config) {
+			c.Agent.Tools.Files = BuiltinFilesConfig{Enabled: true, MaxReadBytes: 1024, MaxWriteBytes: 1024, MaxResults: 10}
+		}, wantErr: "agent.tools.files requires local execution or an enforced sandbox runner"},
+		{name: "builtin files relative root", mutate: func(c *Config) {
+			c.Agent.Tools.Files = BuiltinFilesConfig{
+				Enabled: true, AllowLocalExecution: true, Root: "relative/path", MaxReadBytes: 1024, MaxWriteBytes: 1024, MaxResults: 10,
+			}
+		}, wantErr: "agent.tools.files.root must be an absolute path"},
 		// Auth
 		{name: "missing jwt issuer", mutate: func(c *Config) { c.Auth.JWTIssuer = "" }, wantErr: "auth jwt issuer, signing key and refresh token pepper are required"},
 		{name: "short jwt secret", mutate: func(c *Config) { c.Auth.JWTSigningKeySecret = strings.Repeat("a", 31) }, wantErr: "auth jwt issuer, signing key and refresh token pepper are required"},

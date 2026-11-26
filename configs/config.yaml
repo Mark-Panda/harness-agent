@@ -144,6 +144,47 @@ agent:
     timeout: 30s
     # 单次脚本输出截断上限。
     max_output_bytes: 65536
+  # 平台内置工具：Shell 命令与 HTTP 请求；两类工具均为高风险，调用前需人工审批。
+  tools:
+    shell:
+      # 是否向模型暴露 shell_exec；默认关闭。
+      enabled: false
+      # 是否允许在本机进程执行命令；仅开发环境可开启，生产必须走 Sandbox Runner。
+      allow_local_execution: false
+      # 显式确认本机 Shell 共享服务进程用户与密钥环境；仅可信单用户开发环境可开启。
+      allow_unsafe_local_execution: false
+      # 单次命令执行超时。
+      timeout: 30s
+      # 单次输出截断上限。
+      max_output_bytes: 65536
+      # 命令工作目录的基础路径；运行时按用户 ID 派生子目录，为空时使用系统临时目录。
+      workdir: ""
+      # Shell 解释器路径；为空时优先 bash，容器内无 bash 时回退 sh。
+      shell_path: ""
+    http:
+      # 是否向模型暴露 http_request；默认关闭。
+      enabled: false
+      # 是否允许在本机进程发起请求；仅开发环境可开启，生产必须走 Sandbox Runner。
+      allow_local_execution: false
+      # 单次请求超时。
+      timeout: 30s
+      # 响应正文保留上限。
+      max_response_bytes: 1048576
+      # 最大重定向次数。
+      max_redirects: 5
+    files:
+      # 是否向模型暴露文件操作与代码检索工具；默认关闭。
+      enabled: false
+      # 是否允许在本机进程访问文件；仅开发环境可开启，生产必须走 Sandbox Runner。
+      allow_local_execution: false
+      # 工具可访问的基础目录；运行时按用户 ID 派生子目录，为空时使用系统临时目录。
+      root: ""
+      # 单次读取的最大字节数。
+      max_read_bytes: 262144
+      # 单次写入或编辑的最大字节数。
+      max_write_bytes: 262144
+      # 列表、匹配与搜索结果的最大条数。
+      max_results: 200
   # 高风险工具的 Sandbox Runner 配置。
   sandbox:
     # 是否强制高风险工具必须在独立 Sandbox Runner 中执行；本地未配置时关闭。
@@ -154,7 +195,7 @@ agent:
     token: ${SANDBOX_TOKEN}
     # 是否允许明文 HTTP 连接 Sandbox Runner，仅限内网调试。
     allow_insecure: ${SANDBOX_ALLOW_INSECURE}
-    # 单次 Sandbox 调用超时。
+    # 单次 Sandbox 调用超时；不得小于内置工具的 timeout，否则工具超时会被截断。
     timeout: 30s
     # Sandbox 响应允许的最大字节数。
     max_response_bytes: 1048576

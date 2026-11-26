@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -118,6 +119,58 @@ func TestSanitizeMetadataDropsSecretsAndNestedContent(t *testing.T) {
 	}
 	if _, ok := values["nested"]; ok {
 		t.Fatal("nested content was retained")
+	}
+}
+
+// TestSanitizeMetadataPreservesBuiltinTools 验证内置工具绑定明细进入审计元数据，同时过滤非法值。
+func TestSanitizeMetadataPreservesBuiltinTools(t *testing.T) {
+	metadata, err := sanitizeMetadata(map[string]any{
+		"builtin_tools": []any{"shell_exec", "fs_read_file", 42, strings.Repeat("x", 65)},
+		"nested":        []any{"drop"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]any
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := values["builtin_tools"].([]any)
+	if !ok || len(tools) != 2 || tools[0] != "shell_exec" || tools[1] != "fs_read_file" {
+		t.Fatalf("builtin tools = %#v", values["builtin_tools"])
+	}
+	if _, exists := values["nested"]; exists {
+		t.Fatal("nested array was retained")
+	}
+
+	// nil 表示继承平台配置，必须以 null 出现在元数据中。
+	metadata, err = sanitizeMetadata(map[string]any{"builtin_tools": nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values = nil
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		t.Fatal(err)
+	}
+	if value, exists := values["builtin_tools"]; !exists || value != nil {
+		t.Fatalf("nil builtin tools = %#v (exists=%v)", value, exists)
+	}
+
+	// 超过上限时截断，避免异常输入放大审计记录。
+	many := make([]any, maxAuditBuiltinTools+5)
+	for index := range many {
+		many[index] = fmt.Sprintf("tool_%02d", index)
+	}
+	metadata, err = sanitizeMetadata(map[string]any{"builtin_tools": many})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values = nil
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		t.Fatal(err)
+	}
+	if tools, ok := values["builtin_tools"].([]any); !ok || len(tools) != maxAuditBuiltinTools {
+		t.Fatalf("bounded builtin tools = %#v", values["builtin_tools"])
 	}
 }
 

@@ -370,10 +370,29 @@ func sanitizeMetadata(input map[string]any) (datatypes.JSON, error) {
 	allowedKeys := map[string]bool{
 		"error_code": true, "provider": true, "model": true, "tool": true, "result": true,
 		"policy_version": true, "family_id": true, "session_id": true, "agent_id": true,
+		"builtin_tools": true,
 	}
 	output := make(map[string]any)
 	for key, value := range input {
 		if !allowedKeys[key] {
+			continue
+		}
+		// 内置工具绑定是字符串数组，允许为空数组或 null 以区分“禁用全部”和“继承平台配置”。
+		if key == "builtin_tools" {
+			switch tools := value.(type) {
+			case nil:
+				output[key] = nil
+			case []string:
+				output[key] = boundedAuditBuiltinTools(tools)
+			case []any:
+				names := make([]string, 0, len(tools))
+				for _, tool := range tools {
+					if name, ok := tool.(string); ok {
+						names = append(names, name)
+					}
+				}
+				output[key] = boundedAuditBuiltinTools(names)
+			}
 			continue
 		}
 		switch value.(type) {
@@ -389,6 +408,24 @@ func sanitizeMetadata(input map[string]any) (datatypes.JSON, error) {
 		return nil, fmt.Errorf("marshal audit metadata: %w", err)
 	}
 	return datatypes.JSON(metadata), nil
+}
+
+// maxAuditBuiltinTools 限制审计元数据中记录的内置工具数量。
+const maxAuditBuiltinTools = 32
+
+// boundedAuditBuiltinTools 过滤非法名称并限制数量，避免审计元数据被异常输入放大。
+func boundedAuditBuiltinTools(names []string) []string {
+	result := make([]string, 0, min(len(names), maxAuditBuiltinTools))
+	for _, name := range names {
+		if name == "" || len(name) > 64 {
+			continue
+		}
+		result = append(result, name)
+		if len(result) == maxAuditBuiltinTools {
+			break
+		}
+	}
+	return result
 }
 
 func hashEvent(model auditLogModel) []byte {

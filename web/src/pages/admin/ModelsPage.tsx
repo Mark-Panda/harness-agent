@@ -24,6 +24,7 @@ interface ModelFormState {
   streaming: boolean;
   tools: boolean;
   structuredOutput: boolean;
+  disableThinking: boolean;
 }
 
 const emptyModel: ModelFormState = {
@@ -41,6 +42,7 @@ const emptyModel: ModelFormState = {
   streaming: true,
   tools: true,
   structuredOutput: false,
+  disableThinking: false,
 };
 
 // datetime-local 使用浏览器时区，提交时再转换为 UTC。
@@ -71,6 +73,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       streaming: Boolean(initial.capabilities?.streaming),
       tools: Boolean(initial.capabilities?.tools),
       structuredOutput: Boolean(initial.capabilities?.structured_output),
+      disableThinking: Boolean(initial.capabilities?.disable_thinking),
     };
   });
   const [form, setForm] = useState(initialForm);
@@ -115,6 +118,16 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
     }
   };
 
+  const applyRemoteModelName = (value: string) => {
+    // DeepSeek 思考模型在工具调用场景必须关闭思考，否则后续请求会被供应商拒绝。
+    const deepSeek = value.toLowerCase().includes("deepseek");
+    setForm((current) => ({
+      ...current,
+      remoteModelName: value,
+      disableThinking: deepSeek ? true : current.disableThinking,
+    }));
+  };
+
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setBusy(true);
@@ -126,7 +139,12 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
         kind: form.kind,
         context_window_tokens: contextTokens,
         max_output_tokens: Number(form.maxOutputTokens || 0),
-        capabilities: { streaming: form.streaming, tools: form.tools, structured_output: form.structuredOutput },
+        capabilities: {
+          streaming: form.streaming,
+          tools: form.tools,
+          structured_output: form.structuredOutput,
+          disable_thinking: form.kind === "chat" && form.disableThinking,
+        },
         input_price_per_million: Number(form.inputPrice || 0),
         output_price_per_million: Number(form.outputPrice || 0),
         data_region: form.dataRegion.trim(),
@@ -178,7 +196,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       </Field>
       <div className="min-w-0 sm:col-span-2">
         <Field label="模型名称" hint="填写服务商提供的模型 ID。">
-          <Input className="min-w-0 flex-1" value={form.remoteModelName} onChange={(event) => setForm({ ...form, remoteModelName: event.target.value })} required placeholder="例如：deepseek-chat" />
+          <Input className="min-w-0 flex-1" value={form.remoteModelName} onChange={(event) => applyRemoteModelName(event.target.value)} required placeholder="例如：deepseek-chat" />
         </Field>
         <Button type="button" size="sm" variant="secondary" className="mt-2" loading={remoteBusy} disabled={!form.providerId} onClick={() => void pullRemoteModels()}>
           从站点拉取模型
@@ -189,7 +207,7 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
             value=""
             onChange={(event) => {
               if (event.target.value) {
-                setForm({ ...form, remoteModelName: event.target.value });
+                applyRemoteModelName(event.target.value);
               }
             }}
             aria-label="选择拉取到的模型"
@@ -257,15 +275,21 @@ function ModelForm({ initial, providers, onSaved, onCancel }: { initial: Model |
       <fieldset className="flex flex-wrap items-center gap-4 text-sm text-ink-soft">
         <legend className="mb-1 block w-full text-sm font-medium text-ink">能力</legend>
         {([
-          ["streaming", "流式"],
-          ["tools", "工具调用"],
-          ["structuredOutput", "结构化 JSON"],
-        ] as const).map(([key, label]) => (
+          ["streaming", "流式"] as const,
+          ["tools", "工具调用"] as const,
+          ["structuredOutput", "结构化 JSON"] as const,
+          ...(form.kind === "chat" ? [["disableThinking", "关闭思考模式"] as const] : []),
+        ]).map(([key, label]) => (
           <label key={key} className="flex items-center gap-2">
             <input type="checkbox" checked={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.checked })} />
             {label}
           </label>
         ))}
+        {form.kind === "chat" && (
+          <p className="w-full text-xs text-ink-soft">
+            DeepSeek 等思考模型在工具调用场景需勾选“关闭思考模式”，否则后续模型请求会被供应商拒绝。
+          </p>
+        )}
       </fieldset>
     </FormDrawer>
   );

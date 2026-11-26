@@ -57,6 +57,8 @@ type Agent struct {
 	UserSkillOptOuts []uuid.UUID
 	// MCPIDs 绑定的 MCP 列表。
 	MCPIDs []uuid.UUID
+	// BuiltinTools 绑定的平台内置工具名称；nil 表示继承平台全部启用工具，空切片表示禁用全部。
+	BuiltinTools []string
 	// Status 版本生命周期状态。
 	Status AgentStatus
 	// CreatedAt 创建时间（UTC）。
@@ -223,7 +225,7 @@ func (s *AgentService) Create(ctx context.Context, principal Principal, agent Ag
 	if err := s.validate(ctx, &agent, false); err != nil {
 		return Agent{}, err
 	}
-	return s.repo.CreateAgent(ctx, agent, mutationEvent(principal.UserID, "agent.created", "agent", agent.ID))
+	return s.repo.CreateAgent(ctx, agent, agentMutationEvent(principal.UserID, "agent.created", agent))
 }
 
 // CreateVersion 基于已有版本创建新草稿，已发布版本保持不可变。
@@ -247,7 +249,7 @@ func (s *AgentService) CreateVersion(ctx context.Context, principal Principal, s
 	source.Status = AgentDraft
 	source.ConfigSnapshot = nil
 	// 新版本沿用源版本的显式移除标记，避免用户已移除的自动技能在下次提炼时被重新挂回。
-	return s.repo.CreateAgentVersion(ctx, source, sourceAgentID, mutationEvent(principal.UserID, "agent.version_created", "agent", source.ID))
+	return s.repo.CreateAgentVersion(ctx, source, sourceAgentID, agentMutationEvent(principal.UserID, "agent.version_created", source))
 }
 
 // Update 仅允许修改草稿；名称与版本号由服务端保持，防止绕过唯一约束。
@@ -282,7 +284,7 @@ func (s *AgentService) Update(ctx context.Context, principal Principal, agent Ag
 	if err := s.validate(ctx, &agent, false); err != nil {
 		return Agent{}, err
 	}
-	return s.repo.UpdateAgent(ctx, agent, mutationEvent(principal.UserID, "agent.updated", "agent", agent.ID))
+	return s.repo.UpdateAgent(ctx, agent, agentMutationEvent(principal.UserID, "agent.updated", agent))
 }
 
 // Publish 发布草稿并固化配置快照；发布后 Run 只引用该不可变版本。
@@ -310,7 +312,7 @@ func (s *AgentService) Publish(ctx context.Context, principal Principal, agentID
 	}
 	agent.Status = AgentPublished
 	agent.ConfigSnapshot = snapshot
-	return s.repo.UpdateAgent(ctx, agent, mutationEvent(principal.UserID, "agent.published", "agent", agent.ID))
+	return s.repo.UpdateAgent(ctx, agent, agentMutationEvent(principal.UserID, "agent.published", agent))
 }
 
 // Unpublish 取消发布：已发布版本回到草稿，允许继续编辑；历史 Run 与快照不受影响。
@@ -327,7 +329,7 @@ func (s *AgentService) Unpublish(ctx context.Context, principal Principal, agent
 	}
 	// 回到草稿后快照已失效，清空可避免展示过期的发布配置。
 	if err := s.repo.UpdateAgentStatus(ctx, principal.UserID, agentID, AgentPublished, AgentDraft, true,
-		mutationEvent(principal.UserID, "agent.unpublished", "agent", agent.ID)); err != nil {
+		agentMutationEvent(principal.UserID, "agent.unpublished", agent)); err != nil {
 		return Agent{}, err
 	}
 	return s.repo.GetAgent(ctx, principal.UserID, agentID)
@@ -346,7 +348,7 @@ func (s *AgentService) Archive(ctx context.Context, principal Principal, agentID
 		return Agent{}, fmt.Errorf("%w: only published or disabled agents can be archived", ErrResourceConflict)
 	}
 	if err := s.repo.UpdateAgentStatus(ctx, principal.UserID, agentID, agent.Status, AgentArchived, false,
-		mutationEvent(principal.UserID, "agent.archived", "agent", agent.ID)); err != nil {
+		agentMutationEvent(principal.UserID, "agent.archived", agent)); err != nil {
 		return Agent{}, err
 	}
 	return s.repo.GetAgent(ctx, principal.UserID, agentID)
@@ -364,7 +366,7 @@ func (s *AgentService) Delete(ctx context.Context, principal Principal, agentID 
 	if agent.Status != AgentDraft {
 		return fmt.Errorf("%w: only draft agents can be deleted", ErrResourceConflict)
 	}
-	return s.repo.DeleteAgent(ctx, principal.UserID, agentID, mutationEvent(principal.UserID, "agent.deleted", "agent", agent.ID))
+	return s.repo.DeleteAgent(ctx, principal.UserID, agentID, agentMutationEvent(principal.UserID, "agent.deleted", agent))
 }
 
 // Get 读取当前用户的 Agent。
@@ -589,7 +591,7 @@ func (s *AgentService) AdminDelete(ctx context.Context, principal Principal, age
 	if err != nil {
 		return err
 	}
-	event := mutationEvent(principal.UserID, "agent.admin_deleted", "agent", agent.ID)
+	event := agentMutationEvent(principal.UserID, "agent.admin_deleted", agent)
 	event.Payload["target_user_id"] = agent.UserID.String()
 	event.Payload["agent_name"] = agent.Name
 	event.Payload["agent_status"] = string(agent.Status)
@@ -632,6 +634,19 @@ func (s *AgentService) validate(ctx context.Context, agent *Agent, publishing bo
 	}
 	if err := uniqueUUIDs(agent.MCPIDs); err != nil {
 		return err
+	}
+	if len(agent.BuiltinTools) > 32 {
+		return invalid("an agent supports at most 32 builtin tools")
+	}
+	seenTools := make(map[string]struct{}, len(agent.BuiltinTools))
+	for _, name := range agent.BuiltinTools {
+		if !IsBuiltinToolName(name) {
+			return invalid("unknown builtin tool: %s", name)
+		}
+		if _, exists := seenTools[name]; exists {
+			return invalid("builtin tools must be unique")
+		}
+		seenTools[name] = struct{}{}
 	}
 	if agent.ModelPolicyID == nil {
 		if publishing {
@@ -711,7 +726,26 @@ func (s *AgentService) buildSnapshot(ctx context.Context, agent Agent) (map[stri
 	return map[string]any{
 		"agent":        map[string]any{"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "version": agent.Version},
 		"model_policy": policy, "models": models, "skills": skills, "user_skills": userSkills, "mcps": mcps,
+		"builtin_tools": builtinSnapshotValue(agent.BuiltinTools),
 	}, nil
+}
+
+// builtinSnapshotValue 保留 nil 与空切片的语义差异：
+// nil 表示继承平台配置（快照中写 null），空切片表示显式禁用全部（快照中写 []）。
+func builtinSnapshotValue(tools []string) any {
+	if tools == nil {
+		return nil
+	}
+	result := make([]string, len(tools))
+	copy(result, tools)
+	return result
+}
+
+// agentMutationEvent 在审计载荷中记录内置工具绑定明细，保留 nil 与空切片的语义差异。
+func agentMutationEvent(actorID uuid.UUID, action string, agent Agent) OutboxEvent {
+	return mutationEventWithDetails(actorID, action, "agent", agent.ID, map[string]any{
+		"builtin_tools": builtinSnapshotValue(agent.BuiltinTools),
+	})
 }
 
 // uniqueUUIDs 校验绑定 ID 非空且不重复。

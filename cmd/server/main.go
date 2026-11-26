@@ -246,6 +246,9 @@ func run() error {
 		return fmt.Errorf("configure logging: %w", err)
 	}
 	slog.SetDefault(logger)
+	if cfg.Agent.Tools.Shell.Enabled && cfg.Agent.Tools.Shell.AllowLocalExecution {
+		logger.Warn("unsafe local shell execution is enabled; commands share the service user and can read process secrets")
+	}
 	previousCredentialKeys := make([]platformcrypto.Key, 0, len(cfg.Credentials.PreviousKeys))
 	for _, key := range cfg.Credentials.PreviousKeys {
 		previousCredentialKeys = append(previousCredentialKeys, platformcrypto.Key{ID: key.ID, Secret: []byte(key.Secret)})
@@ -541,6 +544,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	filesEnabled := cfg.Agent.Tools.Files.Enabled
+	platformService.BuiltinTools = service.BuiltinToolCatalog(map[string]bool{
+		"shell_exec":    cfg.Agent.Tools.Shell.Enabled,
+		"http_request":  cfg.Agent.Tools.HTTP.Enabled,
+		"fs_read_file":  filesEnabled,
+		"fs_write_file": filesEnabled,
+		"fs_edit_file":  filesEnabled,
+		"fs_list_dir":   filesEnabled,
+		"fs_glob":       filesEnabled,
+		"fs_grep":       filesEnabled,
+	})
 	userSkillService, err := biz.NewUserSkillService(userSkillRepository)
 	if err != nil {
 		return err
@@ -871,6 +885,32 @@ func run() error {
 				AllowLocalExecution: cfg.Agent.Skills.EnableLocalExecution,
 				Timeout:             cfg.Agent.Skills.Timeout.Duration,
 				MaxOutputBytes:      cfg.Agent.Skills.MaxOutputBytes,
+			},
+			BuiltinTools: biz.BuiltinToolConfig{
+				Shell: biz.BuiltinShellConfig{
+					Enabled:                   cfg.Agent.Tools.Shell.Enabled,
+					AllowLocalExecution:       cfg.Agent.Tools.Shell.AllowLocalExecution,
+					AllowUnsafeLocalExecution: cfg.Agent.Tools.Shell.AllowUnsafeLocalExecution,
+					Timeout:                   cfg.Agent.Tools.Shell.Timeout.Duration,
+					MaxOutputBytes:            cfg.Agent.Tools.Shell.MaxOutputBytes,
+					WorkDir:                   cfg.Agent.Tools.Shell.WorkDir,
+					ShellPath:                 cfg.Agent.Tools.Shell.ShellPath,
+				},
+				HTTP: biz.BuiltinHTTPConfig{
+					Enabled:             cfg.Agent.Tools.HTTP.Enabled,
+					AllowLocalExecution: cfg.Agent.Tools.HTTP.AllowLocalExecution,
+					Timeout:             cfg.Agent.Tools.HTTP.Timeout.Duration,
+					MaxResponseBytes:    cfg.Agent.Tools.HTTP.MaxResponseBytes,
+					MaxRedirects:        cfg.Agent.Tools.HTTP.MaxRedirects,
+				},
+				Files: biz.BuiltinFilesConfig{
+					Enabled:             cfg.Agent.Tools.Files.Enabled,
+					AllowLocalExecution: cfg.Agent.Tools.Files.AllowLocalExecution,
+					Root:                cfg.Agent.Tools.Files.Root,
+					MaxReadBytes:        cfg.Agent.Tools.Files.MaxReadBytes,
+					MaxWriteBytes:       cfg.Agent.Tools.Files.MaxWriteBytes,
+					MaxResults:          cfg.Agent.Tools.Files.MaxResults,
+				},
 			},
 			ReactMaxSteps:          cfg.Agent.Worker.ReactMaxSteps,
 			RunDeadline:            cfg.Agent.Worker.RunDeadline.Duration,

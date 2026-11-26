@@ -8,7 +8,7 @@ import { useRemote } from "../lib/hooks";
 import { MultiSelect } from "../components/MultiSelect";
 import { Icon } from "../components/Icon";
 import { useToast } from "../components/Toast";
-import type { Agent, AgentInput, AgentMode, MCP, ModelPolicy, Page, Skill, UserSkill } from "../lib/types";
+import type { Agent, AgentInput, AgentMode, BuiltinTool, MCP, ModelPolicy, Page, Skill, UserSkill } from "../lib/types";
 import { Badge, Button, Callout, Card, ChoiceCard, ConfirmDialog, ErrorBanner, Field, Input, LoadingState, PageHeader, Select, Textarea, cn } from "../components/ui";
 
 const modes: Array<{ value: AgentMode; title: string; description: string; badge?: string }> = [
@@ -21,6 +21,25 @@ const modes: Array<{ value: AgentMode; title: string; description: string; badge
 ];
 
 const stepTitles = ["基本信息", "工作方式", "模型与能力", "检查与发布"];
+
+// 平台内置工具的兜底清单；正常以 /api/v1/builtin-tools 返回的目录为准。
+const fallbackBuiltinTools = [
+  { id: "shell_exec", label: "命令执行", detail: "shell_exec · 高风险，需人工审批" },
+  { id: "http_request", label: "HTTP 请求", detail: "http_request · 高风险，需人工审批" },
+  { id: "fs_read_file", label: "读取文件", detail: "fs_read_file · 低风险" },
+  { id: "fs_write_file", label: "写入文件", detail: "fs_write_file · 中风险，需人工审批" },
+  { id: "fs_edit_file", label: "编辑文件", detail: "fs_edit_file · 中风险，需人工审批" },
+  { id: "fs_list_dir", label: "列举目录", detail: "fs_list_dir · 低风险" },
+  { id: "fs_glob", label: "文件查找", detail: "fs_glob · 低风险" },
+  { id: "fs_grep", label: "内容检索", detail: "fs_grep · 低风险" },
+];
+const fallbackBuiltinToolIDs = fallbackBuiltinTools.map((tool) => tool.id);
+
+function builtinRiskLabel(risk: string): string {
+  if (risk === "high") return "高风险，需人工审批";
+  if (risk === "medium") return "中风险，需人工审批";
+  return "低风险";
+}
 
 export default function AgentWizardPage() {
   const { agentId } = useParams();
@@ -40,6 +59,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const skills = useRemote(() => requestJSON<Page<Skill>>("/api/v1/skills"), []);
   const userSkills = useRemote(() => requestJSON<Page<UserSkill>>("/api/v1/user-skills?limit=200"), []);
   const mcps = useRemote(() => requestJSON<Page<MCP>>("/api/v1/mcps"), []);
+  const builtinCatalog = useRemote(() => requestJSON<{ items: BuiltinTool[] }>("/api/v1/builtin-tools"), []);
 
   const [step, setStep] = useState(0);
   const [name, setName] = useState("");
@@ -50,6 +70,8 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const [userSkillIDs, setUserSkillIDs] = useState<string[]>([]);
   const [excludedInherited, setExcludedInherited] = useState<string[]>([]);
   const [mcpIDs, setMcpIDs] = useState<string[]>([]);
+  const [builtinTools, setBuiltinTools] = useState<string[]>(fallbackBuiltinToolIDs);
+  const [builtinTouched, setBuiltinTouched] = useState(false);
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"draft" | "publish" | null>(null);
@@ -79,12 +101,20 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const inheritableSkills = (editing.data?.inheritable_user_skills ?? [])
     .filter((skill) => !userSkillIDs.includes(skill.id));
   const activeMCPs = (mcps.data?.items ?? []).filter((mcp) => mcp.status === "enabled");
+  const catalogTools = builtinCatalog.data?.items ?? [];
+  const builtinToolOptions = catalogTools.length > 0
+    ? catalogTools.filter((tool) => tool.enabled).map((tool) => ({
+      id: tool.name, label: tool.label, detail: `${tool.name} · ${builtinRiskLabel(tool.risk_level)}`,
+    }))
+    : fallbackBuiltinTools;
+  const defaultBuiltinToolIDs = builtinToolOptions.map((tool) => tool.id);
+  const defaultBuiltinKey = defaultBuiltinToolIDs.join(",");
   const selectedPolicy = publishedPolicies.find((policy) => policy.id === policyID) ?? null;
   const selectedMode = modes.find((item) => item.value === mode) ?? modes[0];
 
   // 编辑草稿时只在首次加载后回填，避免用户输入被轮询覆盖。
   useEffect(() => {
-    if (initialized || !editing.data) {
+    if (initialized || !editing.data || builtinCatalog.loading) {
       return;
     }
     setName(editing.data.name);
@@ -95,8 +125,17 @@ function AgentWizard({ agentId }: { agentId?: string }) {
     setUserSkillIDs(editing.data.user_skill_ids ?? []);
     setExcludedInherited([]);
     setMcpIDs(editing.data.mcp_ids ?? []);
+    setBuiltinTools(editing.data.builtin_tools ?? defaultBuiltinToolIDs);
     setInitialized(true);
-  }, [editing.data, initialized]);
+  }, [editing.data, initialized, builtinCatalog.loading, defaultBuiltinKey]);
+
+  // 新建助手在目录加载后默认选中平台已启用的全部内置工具。
+  useEffect(() => {
+    if (isEditing || builtinTouched || builtinCatalog.loading) {
+      return;
+    }
+    setBuiltinTools(defaultBuiltinToolIDs);
+  }, [isEditing, builtinTouched, builtinCatalog.loading, defaultBuiltinKey]);
 
   // 新建时默认选中第一个已发布规则，减少“不知道为什么不能下一步”的困惑。
   useEffect(() => {
@@ -109,7 +148,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
   const canLeaveModel = selectedPolicy !== null;
   // 有未保存内容时，关闭浏览器和返回列表前都先确认，避免整页填写白费。
   const defaultPolicyID = publishedPolicies[0]?.id ?? "";
-  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...userSkillIDs].sort(), [...excludedInherited].sort(), [...mcpIDs].sort()]);
+  const draftSignature = JSON.stringify([name.trim(), description.trim(), mode, policyID, [...skillIDs].sort(), [...userSkillIDs].sort(), [...excludedInherited].sort(), [...mcpIDs].sort(), [...builtinTools].sort()]);
   const dirty = useMemo(() => {
     if (savedDraft?.signature === draftSignature) return false;
     if (isEditing && editing.data) {
@@ -121,7 +160,8 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         || !sameIDs(skillIDs, editing.data.skill_ids ?? [])
         || !sameIDs(userSkillIDs, editing.data.user_skill_ids ?? [])
         || excludedInherited.length > 0
-        || !sameIDs(mcpIDs, editing.data.mcp_ids ?? []);
+        || !sameIDs(mcpIDs, editing.data.mcp_ids ?? [])
+        || !sameIDs(builtinTools, editing.data.builtin_tools ?? defaultBuiltinToolIDs);
     }
     return name.trim().length > 0
       || description.trim().length > 0
@@ -129,8 +169,10 @@ function AgentWizard({ agentId }: { agentId?: string }) {
       || policyID !== defaultPolicyID
       || skillIDs.length > 0
       || userSkillIDs.length > 0
-      || mcpIDs.length > 0;
-  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, userSkillIDs, excludedInherited, mcpIDs, draftSignature, savedDraft]);
+      || mcpIDs.length > 0
+      || excludedInherited.length > 0
+      || [...builtinTools].sort().join() !== [...defaultBuiltinToolIDs].sort().join();
+  }, [isEditing, editing.data, name, description, mode, policyID, defaultPolicyID, skillIDs, userSkillIDs, excludedInherited, mcpIDs, builtinTools, defaultBuiltinKey, draftSignature, savedDraft]);
 
   const blocker = useBlocker(({ currentLocation, nextLocation }) =>
     !allowNavigation.current && dirty && currentLocation.pathname !== nextLocation.pathname,
@@ -188,6 +230,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
         updated_at: isEditing ? editing.data?.updated_at ?? null : null,
         // 取消继承的自动技能：写成本版本的移除标记，发布时不再补回。
         user_skill_optouts: excludedInherited.filter((id) => !userSkillIDs.includes(id)),
+        builtin_tools: builtinTools,
       };
       const draftID = agentId ?? savedDraft?.id;
       const saved = draftID
@@ -212,7 +255,7 @@ function AgentWizard({ agentId }: { agentId?: string }) {
     }
   };
 
-  const loading = (isEditing && editing.loading) || policies.loading || skills.loading || mcps.loading;
+  const loading = (isEditing && editing.loading) || policies.loading || skills.loading || mcps.loading || builtinCatalog.loading;
   if (loading) {
     return <LoadingState label="正在准备向导…" />;
   }
@@ -418,6 +461,18 @@ function AgentWizard({ agentId }: { agentId?: string }) {
             />
             {mcps.error ? <div className="mt-2"><ErrorBanner message={mcps.error} onRetry={mcps.reload} /></div> : null}
           </div>
+          <div className="min-w-0 sm:col-span-2">
+            <MultiSelect
+              label="内置工具"
+              options={builtinToolOptions}
+              value={builtinTools}
+              onChange={(next) => { setBuiltinTouched(true); setBuiltinTools(next); }}
+              empty="平台未配置内置工具"
+            />
+            <p className="mt-2 text-xs leading-5 text-muted">
+              默认全部启用；取消勾选可让该助手不暴露对应能力。高风险工具每次调用仍需人工审批。
+            </p>
+          </div>
         </div>
       ) : null}
 
@@ -441,9 +496,9 @@ function AgentWizard({ agentId }: { agentId?: string }) {
             </div>
             <div className="rounded-lg border border-line bg-paper-raised p-4">
               <dt className="text-[11px] tracking-wide text-muted">技能与工具</dt>
-              <dd className="mt-1 text-lg text-ink">{skillIDs.length + userSkillIDs.length} 个技能 · {mcpIDs.length} 个工具</dd>
+              <dd className="mt-1 text-lg text-ink">{skillIDs.length + userSkillIDs.length} 个技能 · {mcpIDs.length + builtinTools.length} 个工具</dd>
               <dd className="mt-1 text-xs leading-5 text-muted">
-                {skillIDs.length + userSkillIDs.length + mcpIDs.length === 0 ? "未绑定，只使用基础对话能力" : "已绑定，发布后可在对话中调用"}
+                {skillIDs.length + userSkillIDs.length + mcpIDs.length + builtinTools.length === 0 ? "未绑定，只使用基础对话能力" : "已绑定，发布后可在对话中调用"}
               </dd>
             </div>
           </dl>

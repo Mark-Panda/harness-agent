@@ -31,10 +31,19 @@ func RequireAdmin(principal Principal) error {
 
 // mutationEvent 构造管理变更的审计 Outbox 事件，必须与业务写入同事务提交。
 func mutationEvent(actorID uuid.UUID, action, aggregateType string, aggregateID uuid.UUID) OutboxEvent {
+	return mutationEventWithDetails(actorID, action, aggregateType, aggregateID, nil)
+}
+
+// mutationEventWithDetails 在标准审计载荷上附加业务明细，供审计日志 Metadata 持久化。
+func mutationEventWithDetails(actorID uuid.UUID, action, aggregateType string, aggregateID uuid.UUID, details map[string]any) OutboxEvent {
+	payload := map[string]any{"outcome": "success"}
+	for key, value := range details {
+		payload[key] = value
+	}
 	return OutboxEvent{
 		UserID: actorID, EventType: action, AggregateType: aggregateType, AggregateID: aggregateID.String(),
 		DedupeKey: fmt.Sprintf("%s:%s:%s", action, aggregateID, uuid.NewString()),
-		Payload:   map[string]any{"outcome": "success"},
+		Payload:   payload,
 	}
 }
 

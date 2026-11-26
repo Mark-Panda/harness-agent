@@ -151,7 +151,7 @@ func TestFromProtoModel(t *testing.T) {
 	modelID := uuid.New()
 	verifiedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	model, err := fromProtoModel(providerID.String(), modelID.String(), "gpt-x", "chat", 1048576, 4096,
-		&harnessv1.ModelCapabilities{Streaming: true, Tools: true, StructuredOutput: true},
+		&harnessv1.ModelCapabilities{Streaming: true, Tools: true, StructuredOutput: true, DisableThinking: true},
 		1.5, 2.5, "cn", "manual", timestamppb.New(verifiedAt), "enabled")
 	if err != nil {
 		t.Fatal(err)
@@ -159,6 +159,7 @@ func TestFromProtoModel(t *testing.T) {
 	if model.ID != modelID || model.ProviderID != providerID || model.RemoteModelName != "gpt-x" ||
 		model.Kind != biz.ModelKind("chat") || model.ContextWindowTokens != 1048576 || model.MaxOutputTokens != 4096 ||
 		!model.Capabilities.Streaming || !model.Capabilities.Tools || !model.Capabilities.StructuredOutput ||
+		!model.Capabilities.DisableThinking ||
 		model.InputPricePerMillion != 1.5 || model.OutputPricePerMillion != 2.5 ||
 		model.DataRegion != "cn" || model.VerificationSource != "manual" || model.Status != biz.ModelStatus("enabled") {
 		t.Fatalf("model = %#v", model)
@@ -213,7 +214,7 @@ func TestToProtoModel(t *testing.T) {
 	model := biz.Model{
 		ID: uuid.New(), ProviderID: uuid.New(), RemoteModelName: "gpt-x", Kind: biz.ModelKind("chat"),
 		ContextWindowTokens: 1048576, MaxOutputTokens: 4096,
-		Capabilities:         biz.ModelCapabilities{Streaming: true, Tools: true},
+		Capabilities:         biz.ModelCapabilities{Streaming: true, Tools: true, DisableThinking: true},
 		InputPricePerMillion: 1.5, OutputPricePerMillion: 2.5, DataRegion: "cn",
 		VerificationSource: "manual", VerifiedAt: &verifiedAt, Status: biz.ModelStatus("enabled"),
 	}
@@ -221,7 +222,8 @@ func TestToProtoModel(t *testing.T) {
 	if got.GetId() != model.ID.String() || got.GetProviderId() != model.ProviderID.String() ||
 		got.GetRemoteModelName() != "gpt-x" || got.GetKind() != "chat" || got.GetContextWindowTokens() != 1048576 ||
 		got.GetMaxOutputTokens() != 4096 || !got.GetCapabilities().GetStreaming() || !got.GetCapabilities().GetTools() ||
-		got.GetCapabilities().GetStructuredOutput() || got.GetInputPricePerMillion() != 1.5 ||
+		got.GetCapabilities().GetStructuredOutput() || !got.GetCapabilities().GetDisableThinking() ||
+		got.GetInputPricePerMillion() != 1.5 ||
 		got.GetOutputPricePerMillion() != 2.5 || got.GetDataRegion() != "cn" ||
 		got.GetVerificationSource() != "manual" || got.GetStatus() != "enabled" {
 		t.Fatalf("model proto = %v", got)
@@ -274,7 +276,7 @@ func TestToProtoAgent(t *testing.T) {
 		ID: uuid.New(), UserID: uuid.New(), Name: "assistant", Description: "desc", Mode: biz.AgentMode("react"),
 		ModelPolicyID: &policyID, ModelPolicyVersion: &policyVersion, Version: 4,
 		ConfigSnapshot: map[string]any{"model": "gpt-x"}, SkillIDs: []uuid.UUID{skillID}, MCPIDs: []uuid.UUID{mcpID},
-		Status: biz.AgentStatus("published"),
+		BuiltinTools: []string{"shell_exec"}, Status: biz.AgentStatus("published"),
 	}
 	got := toProtoAgent(agent)
 	if got.GetId() != agent.ID.String() || got.GetUserId() != agent.UserID.String() || got.GetName() != "assistant" ||
@@ -289,11 +291,30 @@ func TestToProtoAgent(t *testing.T) {
 		len(got.GetMcpIds()) != 1 || got.GetMcpIds()[0] != mcpID.String() {
 		t.Fatalf("bindings = %v %v", got.GetSkillIds(), got.GetMcpIds())
 	}
+	if len(got.GetBuiltinTools()) != 1 || got.GetBuiltinTools()[0] != "shell_exec" {
+		t.Fatalf("builtin tools = %v", got.GetBuiltinTools())
+	}
 	// 草稿 Agent：策略引用缺省时指针字段必须为 nil，快照降级为空对象。
 	draft := toProtoAgent(biz.Agent{})
 	if draft.GetModelPolicyId() != "" || draft.ModelPolicyId != nil || draft.ModelPolicyVersion != nil ||
 		draft.GetConfigSnapshot() == nil {
 		t.Fatalf("draft agent proto = %v", draft)
+	}
+}
+
+// TestResolveBuiltinToolsUpdate 验证 gRPC 更新默认保留现有绑定，显式替换时空列表表示禁用全部。
+func TestResolveBuiltinToolsUpdate(t *testing.T) {
+	current := []string{"fs_read_file"}
+	if got := resolveBuiltinToolsUpdate(false, nil, current); len(got) != 1 || got[0] != "fs_read_file" {
+		t.Fatalf("preserve = %v", got)
+	}
+	got := resolveBuiltinToolsUpdate(true, nil, current)
+	if got == nil || len(got) != 0 {
+		t.Fatalf("disable all = %#v", got)
+	}
+	requested := []string{"shell_exec"}
+	if got := resolveBuiltinToolsUpdate(true, requested, current); len(got) != 1 || got[0] != "shell_exec" {
+		t.Fatalf("replace = %v", got)
 	}
 }
 
@@ -396,8 +417,10 @@ func TestGRPCAgentUpdateConvertsOptOutsAndUpdatedAt(t *testing.T) {
 	current := biz.Agent{
 		ID: agentID, UserID: userID, Name: "assistant", Mode: biz.AgentModeReact,
 		Version: 1, Status: biz.AgentDraft, UpdatedAt: loadedAt,
+		BuiltinTools: []string{"fs_read_file"},
 	}
-	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil)
+	// 转换层为保留未显式替换的内置工具会先读取一次，领域层乐观并发校验再读一次。
+	fixture.agents.EXPECT().GetAgent(gomock.Any(), userID, agentID).Return(current, nil).Times(2)
 	fixture.agents.EXPECT().UpdateAgent(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, agent biz.Agent, _ biz.OutboxEvent) (biz.Agent, error) {
 			if !reflect.DeepEqual(agent.UserSkillOptOuts, []uuid.UUID{skillID}) {
@@ -405,6 +428,9 @@ func TestGRPCAgentUpdateConvertsOptOutsAndUpdatedAt(t *testing.T) {
 			}
 			if !agent.UpdatedAt.Equal(loadedAt) {
 				t.Fatalf("updated_at = %s, want %s", agent.UpdatedAt, loadedAt)
+			}
+			if !reflect.DeepEqual(agent.BuiltinTools, []string{"fs_read_file"}) {
+				t.Fatalf("builtin tools = %#v, want preserved [fs_read_file]", agent.BuiltinTools)
 			}
 			return agent, nil
 		})

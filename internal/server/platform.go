@@ -41,6 +41,8 @@ func registerPlatformRoutes(mux *http.ServeMux, auth *authHTTPHandler, platform 
 		})
 	}
 	// 管理员接口：Provider、模型目录、路由策略、Skill 与 MCP。
+	// 内置工具目录对所有已认证用户只读，用于 Agent 创建时选择绑定。
+	handle("GET /api/v1/builtin-tools", handler.listBuiltinTools)
 	handleWrite("POST /api/v1/providers", "llm_provider", handler.createProvider)
 	handle("GET /api/v1/providers", handler.listProviders)
 	handle("GET /api/v1/providers/{id}", handler.getProvider)
@@ -290,6 +292,8 @@ type agentRequest struct {
 	MCPIDs []uuid.UUID `json:"mcp_ids"`
 	// UpdatedAt 读取草稿时拿到的更新时间，用于乐观并发校验；为空时不校验。
 	UpdatedAt *time.Time `json:"updated_at"`
+	// BuiltinTools 绑定的平台内置工具；缺省继承平台配置。
+	BuiltinTools []string `json:"builtin_tools"`
 }
 
 // sessionRequest 是创建会话的请求体。
@@ -689,6 +693,15 @@ func (h *platformHTTPHandler) unbindFeishuBot(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writePlatformResult(w, http.StatusNoContent, nil, h.service.FeishuBotBindings.Unbind(r.Context(), requestPrincipal(r), agentID))
+}
+
+// listBuiltinTools 处理 GET /api/v1/builtin-tools：返回平台内置工具目录与启用状态。
+func (h *platformHTTPHandler) listBuiltinTools(w http.ResponseWriter, _ *http.Request) {
+	items := h.service.BuiltinTools
+	if items == nil {
+		items = service.BuiltinToolCatalog(nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // createProvider 处理 POST /api/v1/providers：创建供应商并加密保存密钥，响应脱敏。
@@ -1457,7 +1470,7 @@ func policyInput(request policyRequest) biz.ModelPolicy {
 
 // agentInput 将 HTTP 请求体转换为 Agent 领域实体（user_id 不来自客户端）。
 func agentInput(request agentRequest) biz.Agent {
-	agent := biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, UserSkillIDs: request.UserSkillIDs, UserSkillOptOuts: request.UserSkillOptOuts, MCPIDs: request.MCPIDs}
+	agent := biz.Agent{Name: request.Name, Description: request.Description, Mode: request.Mode, ModelPolicyID: request.ModelPolicyID, ModelPolicyVersion: request.ModelPolicyVersion, SkillIDs: request.SkillIDs, UserSkillIDs: request.UserSkillIDs, UserSkillOptOuts: request.UserSkillOptOuts, MCPIDs: request.MCPIDs, BuiltinTools: request.BuiltinTools}
 	if request.UpdatedAt != nil {
 		agent.UpdatedAt = *request.UpdatedAt
 	}
@@ -1559,7 +1572,7 @@ func agentResponse(agent biz.Agent) map[string]any {
 		"id": agent.ID, "user_id": agent.UserID, "name": agent.Name, "description": agent.Description, "mode": agent.Mode,
 		"model_policy_id": agent.ModelPolicyID, "model_policy_version": agent.ModelPolicyVersion, "version": agent.Version,
 		"config_snapshot": agent.ConfigSnapshot, "skill_ids": agent.SkillIDs, "user_skill_ids": agent.UserSkillIDs,
-		"mcp_ids": agent.MCPIDs, "status": agent.Status,
+		"mcp_ids": agent.MCPIDs, "builtin_tools": agent.BuiltinTools, "status": agent.Status,
 		"created_at": agent.CreatedAt, "updated_at": agent.UpdatedAt,
 	}
 }
@@ -1571,7 +1584,8 @@ func adminAgentResponse(summary biz.AdminAgent) map[string]any {
 		"id": agent.ID, "user_id": agent.UserID, "username": summary.Username,
 		"name": agent.Name, "description": agent.Description, "mode": agent.Mode, "status": agent.Status,
 		"version": agent.Version, "model_policy_id": agent.ModelPolicyID, "model_policy_version": agent.ModelPolicyVersion,
-		"created_at": agent.CreatedAt, "updated_at": agent.UpdatedAt,
+		"builtin_tools": agent.BuiltinTools,
+		"created_at":    agent.CreatedAt, "updated_at": agent.UpdatedAt,
 	}
 }
 

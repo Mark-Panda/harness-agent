@@ -58,6 +58,7 @@ export interface ModelCapabilities {
   streaming?: boolean;
   tools?: boolean;
   structured_output?: boolean;
+  disable_thinking?: boolean;
 }
 
 export interface Model {
@@ -319,6 +320,14 @@ export interface FeishuBotInput {
   status: FeishuBotStatus;
 }
 
+export interface BuiltinTool {
+  name: string;
+  label: string;
+  description: string;
+  risk_level: string;
+  enabled: boolean;
+}
+
 export interface Agent {
   id: string;
   user_id: string;
@@ -332,6 +341,7 @@ export interface Agent {
   skill_ids: string[];
   user_skill_ids: string[];
   mcp_ids: string[];
+  builtin_tools: string[] | null;
   status: AgentStatus;
   created_at: string;
   updated_at: string;
@@ -348,6 +358,7 @@ export interface AgentInput {
   skill_ids: string[];
   user_skill_ids: string[];
   mcp_ids: string[];
+  builtin_tools: string[] | null;
   // 仅编辑草稿时携带：读取时的更新时间，用于乐观并发校验。
   updated_at?: string | null;
   // 仅编辑草稿时携带：显式取消继承或移除的用户技能。

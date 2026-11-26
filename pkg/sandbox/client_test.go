@@ -75,6 +75,50 @@ func TestClientExecuteAuthenticatesAndParses(t *testing.T) {
 	}
 }
 
+// TestRequestJSONScopesIdentityToBuiltinTools 验证 MCP 请求不携带顶层 user_id/run_id。
+func TestRequestJSONScopesIdentityToBuiltinTools(t *testing.T) {
+	mcpRequest := Request{
+		MCP: &MCPTarget{
+			UserID: uuid.New(), ServerID: uuid.New(), OriginalName: "search",
+			EndpointFingerprint: strings.Repeat("a", 64),
+		},
+		Arguments: json.RawMessage(`{}`), RiskLevel: "high",
+	}
+	encoded, err := json.Marshal(mcpRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["user_id"]; exists {
+		t.Fatalf("MCP request contains top-level user_id: %s", encoded)
+	}
+	if _, exists := fields["run_id"]; exists {
+		t.Fatalf("MCP request contains top-level run_id: %s", encoded)
+	}
+
+	userID, runID := uuid.New(), uuid.New()
+	encoded, err = json.Marshal(Request{
+		Tool: "shell_exec", UserID: &userID, RunID: &runID,
+		Arguments: json.RawMessage(`{}`), RiskLevel: "high",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields = nil
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["user_id"]; !exists {
+		t.Fatalf("builtin request is missing user_id: %s", encoded)
+	}
+	if _, exists := fields["run_id"]; !exists {
+		t.Fatalf("builtin request is missing run_id: %s", encoded)
+	}
+}
+
 func TestClientUsesMCPIdentityWithoutAliasFallback(t *testing.T) {
 	target := MCPTarget{
 		UserID: uuid.New(), ServerID: uuid.New(), OriginalName: "delete",

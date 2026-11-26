@@ -47,6 +47,11 @@ type Request struct {
 	Tool string `json:"tool,omitempty"`
 	// MCP requests use the identity-aware endpoint.
 	MCP *MCPTarget `json:"mcp,omitempty"`
+	// UserID 内置工具所属用户；Runner 必须据此隔离工作区与文件。
+	// MCP 请求使用 MCPTarget.UserID，此字段为 nil。
+	UserID *uuid.UUID `json:"user_id,omitempty"`
+	// RunID 内置工具所属 Run，便于 Runner 审计与单次执行隔离。
+	RunID *uuid.UUID `json:"run_id,omitempty"`
 	// Arguments 工具参数 JSON。
 	Arguments json.RawMessage `json:"arguments"`
 	// RiskLevel 工具风险等级。

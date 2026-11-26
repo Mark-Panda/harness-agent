@@ -498,8 +498,10 @@ type ModelCapabilities struct {
 	Tools bool `protobuf:"varint,2,opt,name=tools,proto3" json:"tools,omitempty"`
 	// structured_output 是否支持结构化 JSON 输出。
 	StructuredOutput bool `protobuf:"varint,3,opt,name=structured_output,json=structuredOutput,proto3" json:"structured_output,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// disable_thinking 是否在请求中关闭供应商思考模式。
+	DisableThinking bool `protobuf:"varint,4,opt,name=disable_thinking,json=disableThinking,proto3" json:"disable_thinking,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ModelCapabilities) Reset() {
@@ -549,6 +551,13 @@ func (x *ModelCapabilities) GetTools() bool {
 func (x *ModelCapabilities) GetStructuredOutput() bool {
 	if x != nil {
 		return x.StructuredOutput
+	}
+	return false
+}
+
+func (x *ModelCapabilities) GetDisableThinking() bool {
+	if x != nil {
+		return x.DisableThinking
 	}
 	return false
 }
@@ -1835,7 +1844,9 @@ type Agent struct {
 	// updated_at 更新时间（UTC）。
 	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	// user_skill_ids 绑定的用户级技能列表。
-	UserSkillIds  []string `protobuf:"bytes,15,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	UserSkillIds []string `protobuf:"bytes,15,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	// builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+	BuiltinTools  []string `protobuf:"bytes,16,rep,name=builtin_tools,json=builtinTools,proto3" json:"builtin_tools,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1975,6 +1986,13 @@ func (x *Agent) GetUserSkillIds() []string {
 	return nil
 }
 
+func (x *Agent) GetBuiltinTools() []string {
+	if x != nil {
+		return x.BuiltinTools
+	}
+	return nil
+}
+
 // CreateAgentRequest 是创建 Agent 草稿的入参。
 type CreateAgentRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1993,7 +2011,9 @@ type CreateAgentRequest struct {
 	// mcp_ids 绑定的 MCP 列表。
 	McpIds []string `protobuf:"bytes,7,rep,name=mcp_ids,json=mcpIds,proto3" json:"mcp_ids,omitempty"`
 	// user_skill_ids 绑定的用户级技能列表。
-	UserSkillIds  []string `protobuf:"bytes,8,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	UserSkillIds []string `protobuf:"bytes,8,rep,name=user_skill_ids,json=userSkillIds,proto3" json:"user_skill_ids,omitempty"`
+	// builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+	BuiltinTools  []string `protobuf:"bytes,9,rep,name=builtin_tools,json=builtinTools,proto3" json:"builtin_tools,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2084,6 +2104,13 @@ func (x *CreateAgentRequest) GetUserSkillIds() []string {
 	return nil
 }
 
+func (x *CreateAgentRequest) GetBuiltinTools() []string {
+	if x != nil {
+		return x.BuiltinTools
+	}
+	return nil
+}
+
 // UpdateAgentRequest 是更新 Agent 草稿的入参；名称与版本由服务端保持。
 type UpdateAgentRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -2106,9 +2133,14 @@ type UpdateAgentRequest struct {
 	// user_skill_optouts 显式取消继承或移除的用户技能。
 	UserSkillOptouts []string `protobuf:"bytes,9,rep,name=user_skill_optouts,json=userSkillOptouts,proto3" json:"user_skill_optouts,omitempty"`
 	// updated_at 读取草稿时的时间戳，用于乐观并发校验；为空时不校验。
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// builtin_tools 绑定的平台内置工具名称；为空表示继承平台配置。
+	BuiltinTools []string `protobuf:"bytes,11,rep,name=builtin_tools,json=builtinTools,proto3" json:"builtin_tools,omitempty"`
+	// replace_builtin_tools 是否用 builtin_tools 全量替换现有绑定。
+	// 为 false 时保留现有绑定，避免未携带该字段的更新意外放宽工具权限。
+	ReplaceBuiltinTools *bool `protobuf:"varint,12,opt,name=replace_builtin_tools,json=replaceBuiltinTools,proto3,oneof" json:"replace_builtin_tools,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *UpdateAgentRequest) Reset() {
@@ -2209,6 +2241,20 @@ func (x *UpdateAgentRequest) GetUpdatedAt() *timestamppb.Timestamp {
 		return x.UpdatedAt
 	}
 	return nil
+}
+
+func (x *UpdateAgentRequest) GetBuiltinTools() []string {
+	if x != nil {
+		return x.BuiltinTools
+	}
+	return nil
+}
+
+func (x *UpdateAgentRequest) GetReplaceBuiltinTools() bool {
+	if x != nil && x.ReplaceBuiltinTools != nil {
+		return *x.ReplaceBuiltinTools
+	}
+	return false
 }
 
 // GetAgentRequest 是读取 Agent 的入参。
@@ -5610,11 +5656,12 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"\x16\n" +
 	"\x14ListProvidersRequest\"C\n" +
 	"\x15ListProvidersResponse\x12*\n" +
-	"\x05items\x18\x01 \x03(\v2\x14.harness.v1.ProviderR\x05items\"t\n" +
+	"\x05items\x18\x01 \x03(\v2\x14.harness.v1.ProviderR\x05items\"\x9f\x01\n" +
 	"\x11ModelCapabilities\x12\x1c\n" +
 	"\tstreaming\x18\x01 \x01(\bR\tstreaming\x12\x14\n" +
 	"\x05tools\x18\x02 \x01(\bR\x05tools\x12+\n" +
-	"\x11structured_output\x18\x03 \x01(\bR\x10structuredOutput\"\xbd\x05\n" +
+	"\x11structured_output\x18\x03 \x01(\bR\x10structuredOutput\x12)\n" +
+	"\x10disable_thinking\x18\x04 \x01(\bR\x0fdisableThinking\"\xbd\x05\n" +
 	"\x05Model\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
 	"\vprovider_id\x18\x02 \x01(\tR\n" +
@@ -5727,7 +5774,7 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"\x15\n" +
 	"\x13ListPoliciesRequest\"E\n" +
 	"\x14ListPoliciesResponse\x12-\n" +
-	"\x05items\x18\x01 \x03(\v2\x17.harness.v1.ModelPolicyR\x05items\"\xd1\x04\n" +
+	"\x05items\x18\x01 \x03(\v2\x17.harness.v1.ModelPolicyR\x05items\"\xf6\x04\n" +
 	"\x05Agent\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
 	"\auser_id\x18\x02 \x01(\tR\x06userId\x12\x12\n" +
@@ -5746,9 +5793,10 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"created_at\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
 	"updated_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12$\n" +
-	"\x0euser_skill_ids\x18\x0f \x03(\tR\fuserSkillIdsB\x12\n" +
+	"\x0euser_skill_ids\x18\x0f \x03(\tR\fuserSkillIds\x12#\n" +
+	"\rbuiltin_tools\x18\x10 \x03(\tR\fbuiltinToolsB\x12\n" +
 	"\x10_model_policy_idB\x17\n" +
-	"\x15_model_policy_version\"\xcb\x02\n" +
+	"\x15_model_policy_version\"\xf0\x02\n" +
 	"\x12CreateAgentRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
@@ -5757,9 +5805,10 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x14model_policy_version\x18\x05 \x01(\x05H\x01R\x12modelPolicyVersion\x88\x01\x01\x12\x1b\n" +
 	"\tskill_ids\x18\x06 \x03(\tR\bskillIds\x12\x17\n" +
 	"\amcp_ids\x18\a \x03(\tR\x06mcpIds\x12$\n" +
-	"\x0euser_skill_ids\x18\b \x03(\tR\fuserSkillIdsB\x12\n" +
+	"\x0euser_skill_ids\x18\b \x03(\tR\fuserSkillIds\x12#\n" +
+	"\rbuiltin_tools\x18\t \x03(\tR\fbuiltinToolsB\x12\n" +
 	"\x10_model_policy_idB\x17\n" +
-	"\x15_model_policy_version\"\xb0\x03\n" +
+	"\x15_model_policy_version\"\xa8\x04\n" +
 	"\x12UpdateAgentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12\x12\n" +
@@ -5772,9 +5821,12 @@ const file_harness_v1_platform_proto_rawDesc = "" +
 	"\x12user_skill_optouts\x18\t \x03(\tR\x10userSkillOptouts\x129\n" +
 	"\n" +
 	"updated_at\x18\n" +
-	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAtB\x12\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12#\n" +
+	"\rbuiltin_tools\x18\v \x03(\tR\fbuiltinTools\x127\n" +
+	"\x15replace_builtin_tools\x18\f \x01(\bH\x02R\x13replaceBuiltinTools\x88\x01\x01B\x12\n" +
 	"\x10_model_policy_idB\x17\n" +
-	"\x15_model_policy_version\"!\n" +
+	"\x15_model_policy_versionB\x18\n" +
+	"\x16_replace_builtin_tools\"!\n" +
 	"\x0fGetAgentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"$\n" +
 	"\x12DeleteAgentRequest\x12\x0e\n" +

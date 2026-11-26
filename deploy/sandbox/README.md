@@ -21,6 +21,25 @@ Content-Type: application/json
 {"mcp":{"user_id":"<uuid>","server_id":"<uuid>","original_name":"<tool>","endpoint_fingerprint":"<sha256-hex>"},"arguments":{...},"risk_level":"high","timeout_ms":30000}
 ```
 
+内置高风险工具同样走 `/execute`，按 `tool` 名路由；`user_id` 与 `run_id`
+为必填维度，Runner 必须按用户隔离工作区，禁止跨用户读取或复用文件：
+
+```json
+{"tool":"shell_exec","user_id":"<uuid>","run_id":"<uuid>","arguments":{"command":"ls -la","timeout_seconds":30},"risk_level":"high","timeout_ms":30000}
+{"tool":"http_request","user_id":"<uuid>","run_id":"<uuid>","arguments":{"method":"GET","url":"https://example.com","headers":{"Accept":"application/json"}},"risk_level":"high","timeout_ms":30000}
+{"tool":"fs_read_file","user_id":"<uuid>","run_id":"<uuid>","arguments":{"path":"README.md"},"risk_level":"low","timeout_ms":30000}
+{"tool":"fs_write_file","user_id":"<uuid>","run_id":"<uuid>","arguments":{"path":"notes/a.txt","content":"hello"},"risk_level":"medium","timeout_ms":30000}
+```
+
+文件与检索工具固定为 `fs_read_file`、`fs_write_file`、`fs_edit_file`、
+`fs_list_dir`、`fs_glob`、`fs_grep`；Runner 必须把它们限制在按 `user_id`
+划分的工作目录内，并拒绝绝对路径与 `..` 越界。低风险工具（读取、列举、
+glob、grep）不带审批，但同样不得在应用进程内执行。
+
+Runner 对未注册的工具名必须返回 4xx，禁止回退到进程内执行。`shell_exec`
+在 Runner 内以非 root、只读根文件系统执行，默认无网络；`http_request` 仅在
+白名单出站策略下放行目标域名与端口，并限制重定向次数与响应大小。
+
 Runner 必须在该用户可用的 MCP 注册中查找 `server_id`，校验配置端点的 SHA-256 指纹，并仅调用匹配的 `original_name`。目标无法核验时返回 4xx。部署新版应用前需为 Runner 提供此接口，应用收到接口错误时会停止调用。
 
 成功响应：
