@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 )
 
@@ -54,5 +56,32 @@ func TestQueryLoggerRedactsSQLAndReportsSlowQueries(t *testing.T) {
 	logger.Trace(context.Background(), time.Now(), func() (string, int64) { return "UPDATE secret", 0 }, errors.New("db down"))
 	if content := buffer.String(); strings.Contains(content, "secret") || strings.Contains(content, "db down") {
 		t.Fatalf("failed log leaked details: %q", content)
+	}
+}
+
+// TestQueryLoggerDowngradesIdempotentJobConflict 验证幂等任务入队的去重冲突降级为 Debug，其他冲突仍按失败告警。
+func TestQueryLoggerDowngradesIdempotentJobConflict(t *testing.T) {
+	conflict := fmt.Errorf("%w: %w", gorm.ErrDuplicatedKey,
+		&pgconn.PgError{Code: "23505", ConstraintName: idempotentJobConflictConstraint})
+
+	var buffer bytes.Buffer
+	logger := queryLogger{logger: slog.New(slog.NewJSONHandler(&buffer, nil)), slow: time.Hour}
+	logger.Trace(context.Background(), time.Now(), func() (string, int64) { return "INSERT INTO jobs", 0 }, conflict)
+	if buffer.Len() != 0 {
+		t.Fatalf("idempotent conflict was logged as warning: %q", buffer.String())
+	}
+
+	buffer.Reset()
+	debugLogger := queryLogger{logger: slog.New(slog.NewJSONHandler(&buffer, &slog.HandlerOptions{Level: slog.LevelDebug})), slow: time.Hour}
+	debugLogger.Trace(context.Background(), time.Now(), func() (string, int64) { return "INSERT INTO jobs", 0 }, conflict)
+	if content := buffer.String(); !strings.Contains(content, "database query dedupe conflict") || strings.Contains(content, "INSERT INTO jobs") {
+		t.Fatalf("debug conflict log = %q", content)
+	}
+
+	buffer.Reset()
+	logger.Trace(context.Background(), time.Now(), func() (string, int64) { return "INSERT INTO users", 0 },
+		fmt.Errorf("%w: %w", gorm.ErrDuplicatedKey, &pgconn.PgError{Code: "23505", ConstraintName: "users_username_key"}))
+	if content := buffer.String(); !strings.Contains(content, "database query failed") {
+		t.Fatalf("unexpected conflict was not logged: %q", content)
 	}
 }

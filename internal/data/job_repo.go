@@ -192,15 +192,25 @@ func (r *JobRepository) EnqueueSummary(ctx context.Context, task biz.SummaryTask
 		Payload: datatypes.JSON(payload), Status: "pending", MaxAttempts: 8,
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
+	duplicated := false
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
+		// dedupe_key 上是部分唯一索引，ON CONFLICT 不指定列才能匹配到该索引。
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		duplicated = result.RowsAffected == 0
+		return nil
 	})
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
+	if err != nil {
+		return catalogError("enqueue summary job", err)
+	}
+	if duplicated {
 		// 去重键可能指向已终止但未产出摘要的旧任务（生成被永久拒绝或版本落后被跳过），
 		// 仅“视为成功”会让同一来源范围被永久吸收，摘要再也无法推进；此处按尝试次数重新激活。
 		return r.rearmTerminalSummaryJob(ctx, dedupe, availableAt)
 	}
-	return catalogError("enqueue summary job", err)
+	return nil
 }
 
 // rearmTerminalSummaryJob 把同一来源指纹下已终止的摘要任务重新置为待处理。
@@ -247,12 +257,10 @@ func (r *JobRepository) EnqueueMemory(ctx context.Context, task biz.MemoryTask, 
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
+		// 同一批消息与版本的重复触发命中唯一索引时直接跳过，
+		// 避免把唯一冲突异常当作幂等控制流。
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record).Error
 	})
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		// 同一批消息与版本的重复触发直接视为成功。
-		return nil
-	}
 	return catalogError("enqueue memory job", err)
 }
 
@@ -297,11 +305,9 @@ func (r *JobRepository) EnqueueFacts(ctx context.Context, task biz.FactTask, ava
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
+		// 重复触发命中去重索引时直接跳过，保持幂等且不产生唯一冲突异常。
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record).Error
 	})
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		return nil
-	}
 	return catalogError("enqueue fact job", err)
 }
 
@@ -324,12 +330,9 @@ func (r *JobRepository) EnqueueFeishuEvent(ctx context.Context, eventID string, 
 		AvailableAt: availableAt, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	err = WithScope(ctx, r.db, Scope{System: true}, func(tx *gorm.DB) error {
-		return tx.Create(&record).Error
+		// 事件重复投递或上次入库后入队失败时保留已有任务继续处理，无需抛出唯一冲突。
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&record).Error
 	})
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		// 事件重复投递或上次入库后入队失败，已有任务继续处理即可。
-		return nil
-	}
 	return catalogError("enqueue feishu event job", err)
 }
 
