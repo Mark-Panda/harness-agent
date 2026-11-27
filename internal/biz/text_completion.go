@@ -13,19 +13,44 @@ import (
 // textCompletionFunc 执行一次真实模型调用；预算检查与用量记录由调用方在每次调用内完成。
 type textCompletionFunc func(context.Context, []react.Message) (react.Completion, error)
 
-// completeText 为文本/JSON 专用模型调用提供统一响应守卫与最多一次长度续写。
+// reasoningOnlyRetryInstruction 在模型只返回推理内容时要求其直接给出最终答案。
+// 思考模型可能把输出预算耗尽在推理阶段，或网关偶发只回推理内容；
+// 重试一次可避免后台任务被误判为永久不可用（例如技能提炼整天被跳过）。
+const reasoningOnlyRetryInstruction = "上一次回答只包含思考过程，没有给出最终答案。请直接输出最终答案，不要再输出思考过程。"
+
+// completeText 为文本/JSON 专用模型调用提供统一响应守卫、推理-only 重试与最多一次长度续写。
 func completeText(ctx context.Context, messages []react.Message, complete textCompletionFunc) (react.Completion, error) {
 	completion, err := complete(ctx, messages)
 	if err != nil {
 		return completion, err
 	}
-	if err := react.ValidateCompletion(completion, false); err != nil {
-		return completion, err
+	contextMessages := messages
+	if validateErr := react.ValidateCompletion(completion, false); validateErr != nil {
+		if !errors.Is(validateErr, react.ErrReasoningOnly) {
+			return completion, validateErr
+		}
+		contextMessages = append(append([]react.Message{}, messages...), react.Message{
+			Role: react.RoleUser, Content: reasoningOnlyRetryInstruction,
+		})
+		retried, retryErr := complete(ctx, contextMessages)
+		// 第二次真实请求的用量同样要返回给上层计量。
+		completion.Usage.InputTokens += retried.Usage.InputTokens
+		completion.Usage.OutputTokens += retried.Usage.OutputTokens
+		completion.EstimatedCost += retried.EstimatedCost
+		if retryErr != nil {
+			return completion, retryErr
+		}
+		retried.Usage = completion.Usage
+		retried.EstimatedCost = completion.EstimatedCost
+		completion = retried
+		if err := react.ValidateCompletion(completion, false); err != nil {
+			return completion, err
+		}
 	}
 	if !react.IsLengthFinish(completion) {
 		return completion, nil
 	}
-	continued, err := complete(ctx, react.ContinuationMessages(messages, completion))
+	continued, err := complete(ctx, react.ContinuationMessages(contextMessages, completion))
 	if err != nil {
 		completion.Usage.InputTokens += continued.Usage.InputTokens
 		completion.Usage.OutputTokens += continued.Usage.OutputTokens
